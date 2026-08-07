@@ -20,7 +20,6 @@ import statistics
 import sys
 from pathlib import Path
 from typing import Callable
-from typing import Literal
 
 import torch
 import triton
@@ -30,9 +29,9 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import helion_attention  # noqa: E402
 import helion_attention.vllm_flash_attn as vllm_flash_attn  # noqa: E402
-from helion_attention._registry import available_paged_shapes  # noqa: E402
-from helion_attention._registry import available_shapes  # noqa: E402
-from helion_attention._registry import available_varlen_shapes  # noqa: E402
+from benchmarks.inventory import BenchmarkKind  # noqa: E402
+from benchmarks.inventory import benchmark_entries  # noqa: E402
+from benchmarks.inventory import benchmark_key  # noqa: E402
 from helion_attention._registry import spec_from_manifest_entry  # noqa: E402
 from helion_attention._sdpa import sdpa_causal_options  # noqa: E402
 from helion_attention._shape import AttnShape  # noqa: E402
@@ -57,7 +56,6 @@ from torch.nn.attention import sdpa_kernel  # noqa: E402
 
 BenchmarkOutput = torch.Tensor | tuple[torch.Tensor, ...]
 Candidate = Callable[[], BenchmarkOutput]
-BenchmarkKind = Literal["forward", "backward", "varlen", "paged"]
 FLASH_ATTN_PAGE_SIZE = 256
 
 
@@ -343,24 +341,40 @@ def build_paged_candidates(
             causal=spec.causal,
         )
     }
-    if _flash_attn_varlen_func is not None:
+    flash_candidate = (
+        _flash_attn_with_kvcache if spec.is_decode else _flash_attn_varlen_func
+    )
+    if flash_candidate is not None:
         flash_k, flash_v, flash_blocks = pack_paged_cache(
             keys,
             values,
             page_size=FLASH_ATTN_PAGE_SIZE,
             max_seqlen_k=spec.seqlen_k,
         )
-        candidates["flash-attn"] = lambda: _flash_attn_varlen_func(
-            q,
-            flash_k,
-            flash_v,
-            cu_q,
-            cu_k,
-            spec.seqlen_q,
-            spec.seqlen_k,
-            causal=spec.causal,
-            block_table=flash_blocks,
-        )
+        if spec.is_decode:
+            flash_q = q.reshape(
+                spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
+            )
+            candidates["flash-attn"] = lambda: _flash_attn_with_kvcache(
+                flash_q,
+                flash_k,
+                flash_v,
+                cache_seqlens=seqused_k,
+                block_table=flash_blocks,
+                causal=spec.causal,
+            ).reshape_as(q)
+        else:
+            candidates["flash-attn"] = lambda: _flash_attn_varlen_func(
+                q,
+                flash_k,
+                flash_v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=spec.causal,
+                block_table=flash_blocks,
+            )
 
     reference, operation_count = packed_reference(
         q, keys, values, lengths_q, spec
@@ -470,27 +484,6 @@ def measure(
     }
 
 
-def benchmark_key(entry: dict[str, object], kind: BenchmarkKind) -> str:
-    key = str(entry["key"])
-    return f"{key}_backward" if kind == "backward" else key
-
-
-def benchmark_entries(only: str = "") -> list[tuple[dict[str, object], BenchmarkKind]]:
-    """Every checked-in generated kernel artifact, in manifest order."""
-    entries: list[tuple[dict[str, object], BenchmarkKind]] = []
-    for entry in available_shapes():
-        entries.append((entry, "forward"))
-        if entry.get("backward", False):
-            entries.append((entry, "backward"))
-    entries.extend((entry, "varlen") for entry in available_varlen_shapes())
-    entries.extend((entry, "paged") for entry in available_paged_shapes())
-    return [
-        (entry, kind)
-        for entry, kind in entries
-        if only in benchmark_key(entry, kind)
-    ]
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
@@ -538,6 +531,15 @@ def main() -> int:
             "varlen": kind == "varlen",
             "paged": kind == "paged",
             "backward": kind == "backward",
+            "flash_attn_api": (
+                "flash_attn_with_kvcache"
+                if spec.is_decode and kind in ("forward", "paged")
+                else "flash_attn_varlen_func"
+                if kind in ("varlen", "paged")
+                else "flash_attn_func backward"
+                if kind == "backward"
+                else "flash_attn_func"
+            ),
             "note": entry.get("note", ""),
             "implementations": {
                 name: {
@@ -572,7 +574,9 @@ def render_markdown(report: dict[str, object]) -> str:
     if "paged" in kinds:
         notes.append(
             "Paged rows use identical logical caches with native page sizes "
-            f"(Helion: 16; FlashAttention: {FLASH_ATTN_PAGE_SIZE})."
+            f"(Helion: 16; FlashAttention: {FLASH_ATTN_PAGE_SIZE}); paged decode "
+            "uses flash_attn_with_kvcache and chunked prefill uses "
+            "flash_attn_varlen_func."
         )
     if "backward" in kinds:
         notes.append(

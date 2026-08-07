@@ -10,6 +10,8 @@ from pathlib import Path
 import pytest
 import torch
 
+from benchmarks.inventory import benchmark_entries
+from benchmarks.inventory import benchmark_key
 from helion_attention._sdpa import sdpa_causal_options
 from helion_attention._shape import AttnShape
 
@@ -22,15 +24,6 @@ assert UPDATE_README_SPEC is not None
 assert UPDATE_README_SPEC.loader is not None
 update_readme = importlib.util.module_from_spec(UPDATE_README_SPEC)
 UPDATE_README_SPEC.loader.exec_module(update_readme)
-
-BENCH_PATH = REPO_ROOT / "benchmarks" / "bench.py"
-BENCH_SPEC = importlib.util.spec_from_file_location(
-    "helion_attention_benchmarks", BENCH_PATH
-)
-assert BENCH_SPEC is not None
-assert BENCH_SPEC.loader is not None
-bench = importlib.util.module_from_spec(BENCH_SPEC)
-BENCH_SPEC.loader.exec_module(bench)
 
 
 def test_decode_omits_all_true_causal_mask_for_fused_sdpa() -> None:
@@ -122,22 +115,35 @@ def test_discovery_and_report_cover_every_checked_in_kernel() -> None:
     for section in ("varlen_kernels", "paged_kernels"):
         expected.extend(entry["key"] for entry in manifest[section])
 
-    discovered = bench.benchmark_entries()
-    discovered_keys = [bench.benchmark_key(entry, kind) for entry, kind in discovered]
+    discovered = benchmark_entries()
+    discovered_keys = [benchmark_key(entry, kind) for entry, kind in discovered]
     artifact_keys = {
         path.stem
         for path in (REPO_ROOT / "helion_attention" / "kernels").glob("*.py")
         if path.name != "__init__.py"
     }
     report = json.loads((REPO_ROOT / "docs" / "benchmarks.json").read_text())
+    report_by_key = {row["key"]: row for row in report["results"]}
 
     assert discovered_keys == expected
     assert set(discovered_keys) == artifact_keys
     assert [row["key"] for row in report["results"]] == expected
-    assert [kind for _, kind in bench.benchmark_entries("paged")] == [
+    assert [kind for _, kind in benchmark_entries("paged")] == [
         "paged",
         "paged",
     ]
-    assert [kind for _, kind in bench.benchmark_entries("backward")] == [
+    assert [kind for _, kind in benchmark_entries("backward")] == [
         "backward"
     ]
+    assert (
+        report_by_key["paged_b2_sq200_sk320_hq8_hkv2_d128_bf16_causal_ps16"][
+            "flash_attn_api"
+        ]
+        == "flash_attn_varlen_func"
+    )
+    assert (
+        report_by_key["paged_b4_sq1_sk1024_hq8_hkv2_d128_bf16_causal_ps16"][
+            "flash_attn_api"
+        ]
+        == "flash_attn_with_kvcache"
+    )

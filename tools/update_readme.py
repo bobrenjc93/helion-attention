@@ -62,7 +62,9 @@ def benchmark_table() -> str:
     if "paged" in kinds:
         notes.append(
             "Paged rows use identical logical caches with each implementation's native "
-            "page size: 16 for Helion and FlashAttention's minimum of 256."
+            "page size: 16 for Helion and FlashAttention's minimum of 256. Paged "
+            "decode uses `flash_attn_with_kvcache`; chunked prefill uses "
+            "`flash_attn_varlen_func`."
         )
     if "backward" in kinds:
         notes.append(
