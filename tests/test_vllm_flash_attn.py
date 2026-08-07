@@ -29,6 +29,8 @@ VLLM_KEYWORDS = {
     "window_size",
     "softcap",
     "alibi_slopes",
+    "deterministic",
+    "return_attn_probs",
     "block_table",
     "return_softmax_lse",
     "out",
@@ -37,6 +39,7 @@ VLLM_KEYWORDS = {
     "k_descale",
     "v_descale",
     "num_splits",
+    "output_scale",
     "fa_version",
     "s_aux",
     "cp_world_size",
@@ -44,7 +47,9 @@ VLLM_KEYWORDS = {
     "cp_tot_seqused_k",
     "dynamic_causal",
     "mask_mod",
+    "block_sparse_tensors",
     "aux_tensors",
+    "aux_tensor_leading_dims",
 }
 
 
@@ -96,8 +101,14 @@ def test_vllm_surface_has_no_shape_argument() -> None:
     assert VLLM_KEYWORDS <= parameters.keys()
     assert "shape" not in parameters
     assert parameters["dropout_p"].default == 0.0
+    assert parameters["deterministic"].default is False
+    assert parameters["return_attn_probs"].default is False
+    assert parameters["output_scale"].default is None
+    assert parameters["fa_version"].default == 2
     assert parameters["cp_world_size"].default == 1
     assert parameters["cp_rank"].default == 0
+    assert parameters["block_sparse_tensors"].default is None
+    assert parameters["aux_tensor_leading_dims"].default is None
     assert compat.compile_flash_attn_varlen_func_from_specs is None
 
     assert compat.is_fa_version_supported(2)
@@ -130,6 +141,117 @@ def test_nonzero_dropout_is_rejected_explicitly() -> None:
             cu_seqlens_k=cumulative,
             dropout_p=0.1,
         )
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        pytest.param("deterministic", True, id="deterministic"),
+        pytest.param("return_attn_probs", True, id="attention-probabilities"),
+        pytest.param("output_scale", torch.tensor(1.0), id="output-scale"),
+        pytest.param("block_sparse_tensors", object(), id="block-sparse"),
+        pytest.param("aux_tensor_leading_dims", (0,), id="aux-leading-dims"),
+    ],
+)
+def test_unsupported_upstream_optional_values_are_rejected(
+    name: str, value: object
+) -> None:
+    tensor = torch.zeros(1, 1, 1)
+    cumulative = torch.tensor([0, 1], dtype=torch.int32)
+    with pytest.raises(NotImplementedError):
+        compat.flash_attn_varlen_func(
+            q=tensor,
+            k=tensor,
+            v=tensor,
+            max_seqlen_q=1,
+            cu_seqlens_q=cumulative,
+            max_seqlen_k=1,
+            cu_seqlens_k=cumulative,
+            **{name: value},
+        )
+
+
+def test_fa3_mla_prefill_accepts_current_optional_surface() -> None:
+    generator = torch.Generator().manual_seed(911)
+    query_length, key_length = 2, 3
+    nheads, head_dim, value_dim = 2, 4, 6
+    q = torch.randn(query_length, nheads, head_dim, generator=generator)
+    q_v = torch.randn(query_length, nheads, value_dim, generator=generator)
+    k = torch.randn(key_length, 1, head_dim, generator=generator)
+    v = torch.randn(key_length, 1, value_dim, generator=generator)
+    cu_q = torch.tensor([0, query_length], dtype=torch.int32)
+    cu_k = torch.tensor([0, key_length], dtype=torch.int32)
+    scale = 0.23
+
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        q_v=q_v,
+        max_seqlen_q=query_length,
+        cu_seqlens_q=cu_q,
+        max_seqlen_k=key_length,
+        cu_seqlens_k=cu_k,
+        dropout_p=0.0,
+        softmax_scale=scale,
+        deterministic=False,
+        return_attn_probs=False,
+        output_scale=None,
+        fa_version=3,
+        block_sparse_tensors=None,
+        aux_tensors=None,
+        aux_tensor_leading_dims=None,
+        dynamic_causal=None,
+    )
+    assert isinstance(result, torch.Tensor)
+
+    query = q.float().transpose(0, 1)
+    query_v = q_v.float().transpose(0, 1)
+    key = k.float().transpose(0, 1).expand(nheads, -1, -1)
+    value = v.float().transpose(0, 1).expand(nheads, -1, -1)
+    scores = (
+        torch.matmul(query, key.transpose(-1, -2))
+        + torch.matmul(query_v, value.transpose(-1, -2))
+    ) * scale
+    expected = torch.matmul(torch.softmax(scores, dim=-1), value).transpose(0, 1)
+    torch.testing.assert_close(result, expected)
+
+
+def test_default_fa_version_uses_fa2_alibi_lse_convention() -> None:
+    tokens, nheads, head_dim = 4, 2, 8
+    q = torch.zeros(tokens, nheads, head_dim)
+    k = torch.zeros_like(q)
+    v = torch.arange(q.numel(), dtype=q.dtype).reshape_as(q)
+    cumulative = torch.tensor([0, tokens], dtype=torch.int32)
+    slopes = torch.tensor([0.1, 0.4])
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "max_seqlen_q": tokens,
+        "cu_seqlens_q": cumulative,
+        "max_seqlen_k": tokens,
+        "cu_seqlens_k": cumulative,
+        "causal": True,
+        "alibi_slopes": slopes,
+        "return_softmax_lse": True,
+    }
+
+    implicit = compat.flash_attn_varlen_func(**kwargs)
+    explicit_fa2 = compat.flash_attn_varlen_func(**kwargs, fa_version=2)
+    explicit_fa3 = compat.flash_attn_varlen_func(**kwargs, fa_version=3)
+    assert isinstance(implicit, tuple)
+    assert isinstance(explicit_fa2, tuple)
+    assert isinstance(explicit_fa3, tuple)
+    implicit_out, implicit_lse = implicit
+    fa2_out, fa2_lse = explicit_fa2
+    fa3_out, fa3_lse = explicit_fa3
+
+    torch.testing.assert_close(implicit_out, fa2_out)
+    torch.testing.assert_close(implicit_lse, fa2_lse)
+    torch.testing.assert_close(implicit_out, fa3_out)
+    expected_shift = slopes[:, None] * torch.arange(tokens, dtype=torch.float32)
+    torch.testing.assert_close(fa2_lse - fa3_lse, expected_shift)
 
 
 @requires_cuda

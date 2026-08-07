@@ -382,6 +382,8 @@ def flash_attn_varlen_func(
     window_size: Sequence[int] | None = None,
     softcap: float = 0.0,
     alibi_slopes: torch.Tensor | None = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
     block_table: torch.Tensor | None = None,
     return_softmax_lse: bool = False,
     out: torch.Tensor | None = None,
@@ -390,14 +392,17 @@ def flash_attn_varlen_func(
     k_descale: torch.Tensor | None = None,
     v_descale: torch.Tensor | None = None,
     num_splits: int = 0,
-    fa_version: int = 3,
+    output_scale: torch.Tensor | None = None,
+    fa_version: int = 2,
     s_aux: torch.Tensor | None = None,
     cp_world_size: int = 1,
     cp_rank: int = 0,
     cp_tot_seqused_k: torch.Tensor | None = None,
-    dynamic_causal: torch.Tensor | None = None,
     mask_mod: object | None = None,
+    block_sparse_tensors: object | None = None,
     aux_tensors: Sequence[torch.Tensor] | None = None,
+    aux_tensor_leading_dims: Sequence[int] | None = None,
+    dynamic_causal: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run vLLM's packed or paged variable-length attention call.
 
@@ -414,9 +419,22 @@ def flash_attn_varlen_func(
     if not is_fa_version_supported(fa_version):
         reason = fa_version_unsupported_reason(fa_version)
         raise ValueError(f"unsupported fa_version={fa_version}: {reason}")
-    if dynamic_causal is not None or mask_mod is not None or aux_tensors is not None:
+    if deterministic:
+        raise NotImplementedError("deterministic=True is not supported")
+    if return_attn_probs:
+        raise NotImplementedError("return_attn_probs=True is not supported")
+    if output_scale is not None:
+        raise NotImplementedError("output_scale requires unsupported FA4")
+    if (
+        dynamic_causal is not None
+        or mask_mod is not None
+        or block_sparse_tensors is not None
+        or aux_tensors is not None
+        or aux_tensor_leading_dims is not None
+    ):
         raise NotImplementedError(
-            "dynamic_causal, mask_mod, and aux_tensors require unsupported FA4"
+            "dynamic_causal, mask_mod, block_sparse_tensors, aux_tensors, and "
+            "aux_tensor_leading_dims require unsupported FA4"
         )
     if float(dropout_p) != 0.0:
         raise NotImplementedError(
