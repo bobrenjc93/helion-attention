@@ -620,6 +620,14 @@ def flash_attn_varlen_func(
             running_max + torch.log(safe_sum),
             torch.full_like(running_max, float("-inf")),
         )
+        if fa_version == 2 and causal and left_window < 0 and slopes is not None:
+            # FA2's global causal ALiBi kernel drops the row-constant
+            # ``-slope * aligned_query_position`` while accumulating LSE.  It
+            # has no effect on softmax probabilities, but callers merging
+            # split attention states rely on this position-shifted LSE.
+            lse_tile = lse_tile + slopes.reshape(state_shape) * (
+                aligned_query_positions[:, None, None].float()
+            )
         outputs.append(result_tile.to(output_dtype))
         lse_parts.append(lse_tile.reshape(q_stop - q_start, nheads_q).transpose(0, 1))
 

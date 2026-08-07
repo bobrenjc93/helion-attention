@@ -220,7 +220,13 @@ def test_paged_fallback_supports_cuda_graph_capture() -> None:
         for length in key_lengths
     ]
     per_request_v = [
-        torch.randn_like(key, generator=generator) for key in per_request_k
+        torch.randn(
+            key.shape,
+            device=key.device,
+            dtype=key.dtype,
+            generator=generator,
+        )
+        for key in per_request_k
     ]
     k_cache = torch.zeros(
         7,
@@ -269,6 +275,63 @@ def test_paged_fallback_supports_cuda_graph_capture() -> None:
     assert isinstance(returned, torch.Tensor)
     assert returned.data_ptr() == captured_out.data_ptr()
     torch.testing.assert_close(captured_out, expected)
+
+
+@requires_cuda
+def test_fa2_causal_alibi_lse_matches_upstream() -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    generator = torch.Generator(device="cuda").manual_seed(456)
+    query_lengths = [3, 2]
+    key_lengths = [5, 4]
+    nheads, head_dim = 2, 64
+
+    def random(total: int) -> torch.Tensor:
+        return torch.randn(
+            total,
+            nheads,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+
+    q = random(sum(query_lengths))
+    k = random(sum(key_lengths))
+    v = random(sum(key_lengths))
+    cu_q = torch.tensor([0, 3, 5], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 5, 9], device="cuda", dtype=torch.int32)
+    slopes = torch.tensor([0.2, 0.4], device="cuda", dtype=torch.float32)
+
+    expected_out, expected_lse, _ = flash_attn.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max(query_lengths),
+        max(key_lengths),
+        causal=True,
+        alibi_slopes=slopes,
+        return_attn_probs=True,
+    )
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=max(query_lengths),
+        cu_seqlens_q=cu_q,
+        max_seqlen_k=max(key_lengths),
+        cu_seqlens_k=cu_k,
+        causal=True,
+        alibi_slopes=slopes,
+        return_softmax_lse=True,
+        fa_version=2,
+    )
+    assert isinstance(result, tuple)
+    actual_out, actual_lse = result
+
+    torch.testing.assert_close(actual_out, expected_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-3, rtol=1e-3)
 
 
 @requires_cuda
