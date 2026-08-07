@@ -34,9 +34,12 @@ sys.path.insert(0, str(REPO_ROOT))
 
 MODULE = "helion_attention.vllm_flash_attn"
 
-# Exact keyword surface of vllm_flash_attn.flash_attn_varlen_func as called from
-# vllm/v1/attention/backends/flash_attn.py. vLLM passes everything by keyword,
-# so accepting these names is what matters, not their order.
+# Full keyword surface of vllm_flash_attn.flash_attn_varlen_func. vLLM passes
+# everything by keyword, so accepting these names is what matters, not order.
+# The second group is not exercised by the behavioural checks below, but vLLM
+# does pass several of them unconditionally -- FA3 MLA prefill always sends
+# output_scale=None, for instance -- so omitting any one of them is a TypeError
+# in normal serving rather than a missing optional feature.
 VLLM_KEYWORDS = [
     "q", "k", "v",
     "max_seqlen_q", "cu_seqlens_q", "max_seqlen_k", "cu_seqlens_k",
@@ -44,6 +47,10 @@ VLLM_KEYWORDS = [
     "alibi_slopes", "block_table", "return_softmax_lse", "out",
     "scheduler_metadata", "q_descale", "k_descale", "v_descale",
     "num_splits", "fa_version", "s_aux",
+    "q_v", "dropout_p", "deterministic", "return_attn_probs", "output_scale",
+    "cp_world_size", "cp_rank", "cp_tot_seqused_k",
+    "mask_mod", "aux_tensors", "aux_tensor_leading_dims",
+    "block_sparse_tensors", "dynamic_causal",
 ]
 
 HELPER_SYMBOLS = [
