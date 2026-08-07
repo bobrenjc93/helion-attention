@@ -1247,3 +1247,63 @@ def test_exact_shape_dispatch_infers_specialization(
     assert spec.dtype == torch.bfloat16
     assert spec.causal is True
     torch.testing.assert_close(result, torch.full_like(q, 7))
+
+
+@requires_cuda
+def test_exact_paged_shape_dispatch_infers_specialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.zeros(4, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(64, 16, 2, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    cumulative = torch.arange(5, device="cuda", dtype=torch.int32)
+    seqused_k = torch.ones(4, device="cuda", dtype=torch.int32)
+    block_table = torch.arange(
+        256, device="cuda", dtype=torch.int32
+    ).reshape(4, 64) % 64
+    seen: dict[str, object] = {}
+
+    def fake_has_kernel(spec: object, page_size: int) -> bool:
+        seen["spec"] = spec
+        seen["page_size"] = page_size
+        return True
+
+    def fake_kernel(*args: object) -> torch.Tensor:
+        seen["kernel_args"] = args
+        return torch.full_like(q, 9)
+
+    def fake_lookup(spec: object, page_size: int) -> object:
+        assert spec is seen["spec"]
+        assert page_size == 16
+        return fake_kernel
+
+    monkeypatch.setattr(compat, "has_paged_kernel", fake_has_kernel)
+    monkeypatch.setattr(compat, "lookup_paged", fake_lookup)
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=1,
+        cu_seqlens_q=cumulative,
+        max_seqlen_k=1024,
+        seqused_k=seqused_k,
+        block_table=block_table,
+        causal=True,
+        fa_version=3,
+    )
+
+    spec = seen["spec"]
+    assert isinstance(spec, AttnShape)
+    assert spec.batch == 4
+    assert spec.seqlen_q == 1
+    assert spec.seqlen_k == 1024
+    assert spec.nheads_q == 8
+    assert spec.nheads_kv == 2
+    assert spec.head_dim == 128
+    assert spec.causal is True
+    assert seen["page_size"] == 16
+    kernel_args = seen["kernel_args"]
+    assert isinstance(kernel_args, tuple)
+    assert kernel_args[4] is seqused_k
+    assert kernel_args[5] is block_table
+    torch.testing.assert_close(result, torch.full_like(q, 9))

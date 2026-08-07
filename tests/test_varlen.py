@@ -284,7 +284,11 @@ def test_support_queries_are_metadata_only_and_varlen_is_separate(
 
     monkeypatch.setattr(_registry, "_load", fail_load)
     monkeypatch.setattr(_registry, "_load_varlen", fail_load)
+    monkeypatch.setattr(_registry, "_load_paged", fail_load)
     shape = (8, 512, 16, 64)
     assert helion_attention.is_shape_supported(shape)
     assert helion_attention.is_varlen_shape_supported(shape)
+    assert helion_attention.is_paged_shape_supported(
+        (4, 1, 1024, 8, 2, 128), causal=True, page_size=16
+    )
     assert not helion_attention.is_varlen_shape_supported((3, 77, 5, 64))

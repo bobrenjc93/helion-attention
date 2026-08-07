@@ -21,6 +21,8 @@ class ShapeRequest(NamedTuple):
     seqlen_k: int | None = None
     backward: bool = False
     varlen: bool = False
+    paged: bool = False
+    page_size: int = 16
 
     @property
     def args(self) -> list[str]:
@@ -41,6 +43,8 @@ class ShapeRequest(NamedTuple):
             argv.append("--backward")
         if self.varlen:
             argv.append("--varlen")
+        if self.paged:
+            argv += ["--paged", "--page-size", str(self.page_size)]
         if self.label:
             argv += ["--label", self.label]
         return argv
@@ -49,11 +53,12 @@ class ShapeRequest(NamedTuple):
     def name(self) -> str:
         kv = "" if self.nheads_kv is None else f"_hkv{self.nheads_kv}"
         sk = "" if self.seqlen_k is None else f"_sk{self.seqlen_k}"
-        prefix = "varlen_" if self.varlen else ""
+        prefix = "paged_" if self.paged else "varlen_" if self.varlen else ""
+        suffix = f"_ps{self.page_size}" if self.paged else ""
         return prefix + (
             f"b{self.batch}_s{self.seqlen}{sk}_h{self.nheads}{kv}_d{self.head_dim}"
             f"_{self.dtype}_{'causal' if self.causal else 'noncausal'}"
-        )
+        ) + suffix
 
 
 CATALOGUE: list[ShapeRequest] = [
@@ -133,5 +138,27 @@ CATALOGUE: list[ShapeRequest] = [
         causal=True,
         label="ragged decoder batch",
         varlen=True,
+    ),
+    ShapeRequest(
+        4,
+        1,
+        8,
+        128,
+        causal=True,
+        nheads_kv=2,
+        label="vLLM paged ragged decode",
+        seqlen_k=1024,
+        paged=True,
+    ),
+    ShapeRequest(
+        2,
+        200,
+        8,
+        128,
+        causal=True,
+        nheads_kv=2,
+        label="vLLM paged chunked prefill",
+        seqlen_k=320,
+        paged=True,
     ),
 ]

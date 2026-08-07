@@ -16,6 +16,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import helion_attention  # noqa: E402
 from helion_attention._registry import available_shapes  # noqa: E402
+from helion_attention._registry import available_paged_shapes  # noqa: E402
 from helion_attention._registry import available_varlen_shapes  # noqa: E402
 from helion_attention._registry import spec_from_manifest_entry as entry_to_spec  # noqa: E402
 from helion_attention._shape import AttnShape  # noqa: E402
@@ -140,6 +141,117 @@ def check_varlen(spec: AttnShape) -> float:
     return (got.float() - expected).abs().max().item()
 
 
+def check_paged(spec: AttnShape, page_size: int) -> float:
+    """Exercise block-table translation with reverse-ordered physical pages."""
+    from helion_attention import vllm_flash_attn
+
+    generator = torch.Generator(device="cuda").manual_seed(9876)
+    if spec.seqlen_q == 1:
+        lengths_q = [1] * spec.batch
+    else:
+        lengths_q = [
+            max(1, spec.seqlen_q * (index + 1) // spec.batch)
+            for index in range(spec.batch)
+        ]
+    lengths_k = [
+        max(1, spec.seqlen_k * (spec.batch - index) // spec.batch)
+        for index in range(spec.batch)
+    ]
+
+    offsets = [0]
+    for length in lengths_q:
+        offsets.append(offsets[-1] + length)
+    cu_q = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    q = torch.randn(
+        (sum(lengths_q), spec.nheads_q, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    request_kv = [
+        (
+            torch.randn(
+                (length, spec.nheads_kv, spec.head_dim),
+                device="cuda",
+                dtype=spec.dtype,
+                generator=generator,
+            ),
+            torch.randn(
+                (length, spec.nheads_kv, spec.head_dim),
+                device="cuda",
+                dtype=spec.dtype,
+                generator=generator,
+            ),
+        )
+        for length in lengths_k
+    ]
+    blocks_per_request = [
+        (length + page_size - 1) // page_size for length in lengths_k
+    ]
+    total_blocks = sum(blocks_per_request) + 3
+    k_cache = torch.zeros(
+        (total_blocks, page_size, spec.nheads_kv, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    block_table = torch.zeros(
+        (spec.batch, (spec.seqlen_k + page_size - 1) // page_size),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    next_physical = total_blocks - 1
+    for request, ((key, value), request_blocks) in enumerate(
+        zip(request_kv, blocks_per_request)
+    ):
+        for logical_block in range(request_blocks):
+            physical_block = next_physical
+            next_physical -= 1
+            block_table[request, logical_block] = physical_block
+            start = logical_block * page_size
+            stop = min(start + page_size, key.shape[0])
+            k_cache[physical_block, : stop - start] = key[start:stop]
+            v_cache[physical_block, : stop - start] = value[start:stop]
+
+    scale = 1.0 / math.sqrt(spec.head_dim)
+    got = vllm_flash_attn.flash_attn_varlen_func(
+        q=q,
+        k=k_cache,
+        v=v_cache,
+        cu_seqlens_q=cu_q,
+        seqused_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
+        block_table=block_table,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        softmax_scale=scale,
+        causal=spec.causal,
+        fa_version=3,
+    )
+
+    expected_parts = []
+    q_start = 0
+    for length_q, (key, value) in zip(lengths_q, request_kv):
+        query = q[q_start : q_start + length_q]
+        q_start += length_q
+        row = torch.arange(length_q, device="cuda")[:, None]
+        col = torch.arange(key.shape[0], device="cuda")[None, :]
+        mask = col <= row + key.shape[0] - length_q if spec.causal else None
+        expected_parts.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                query.float().transpose(0, 1).unsqueeze(0),
+                key.float().transpose(0, 1).unsqueeze(0),
+                value.float().transpose(0, 1).unsqueeze(0),
+                attn_mask=mask,
+                scale=scale,
+                enable_gqa=spec.nheads_q != spec.nheads_kv,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+    expected = torch.cat(expected_parts)
+    return (got.float() - expected).abs().max().item()
+
+
 def check_gradients(
     spec: AttnShape, softmax_scale: float | None = None
 ) -> tuple[list[float], list[int]]:
@@ -201,7 +313,9 @@ def check_gradients(
 
 
 def main(argv: list[str]) -> int:
-    all_entries = available_shapes() + available_varlen_shapes()
+    all_entries = (
+        available_shapes() + available_varlen_shapes() + available_paged_shapes()
+    )
     entries = {str(entry["key"]): entry for entry in all_entries}
     keys = argv or sorted(entries)
     if not keys:
@@ -217,11 +331,15 @@ def main(argv: list[str]) -> int:
             entry = module.KERNEL_SPEC
         spec = entry_to_spec(entry)
         is_varlen = bool(entry.get("varlen", False))
-        error = check_varlen(spec) if is_varlen else check(spec)
+        is_paged = bool(entry.get("paged", False))
+        if is_paged:
+            error = check_paged(spec, int(entry["page_size"]))
+        else:
+            error = check_varlen(spec) if is_varlen else check(spec)
         status = "ok " if error <= TOLERANCE else "FAIL"
         failures += error > TOLERANCE
         print(f"[{status}] {key}: max abs error {error:.4g}")
-        if entry.get("backward", False) and not is_varlen:
+        if entry.get("backward", False) and not is_varlen and not is_paged:
             for scale_name, softmax_scale in (("default", None), ("1.0", 1.0)):
                 grad_errors, mismatches = check_gradients(spec, softmax_scale)
                 grad_ok = not any(mismatches)

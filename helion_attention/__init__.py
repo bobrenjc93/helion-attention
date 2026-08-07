@@ -19,9 +19,11 @@ import torch
 
 from ._autograd import attention_autograd
 from ._registry import UnsupportedShapeError
+from ._registry import available_paged_shapes
 from ._registry import available_shapes
 from ._registry import available_varlen_shapes
 from ._registry import has_kernel
+from ._registry import has_paged_kernel
 from ._registry import has_varlen_kernel
 from ._registry import lookup
 from ._registry import lookup_backward
@@ -35,6 +37,7 @@ from ._shape import normalize_shape
 __all__ = [
     "AttnShape",
     "UnsupportedShapeError",
+    "available_paged_shapes",
     "available_shapes",
     "available_varlen_shapes",
     "flash_attn_func",
@@ -43,6 +46,7 @@ __all__ = [
     "flash_attn_varlen_func",
     "flash_attn_with_kvcache",
     "is_shape_supported",
+    "is_paged_shape_supported",
     "is_varlen_shape_supported",
 ]
 
@@ -80,6 +84,16 @@ def is_varlen_shape_supported(
 ) -> bool:
     """True when a packed-sequence kernel for this maximum shape is checked in."""
     return has_varlen_kernel(normalize_shape(shape, dtype, causal))
+
+
+def is_paged_shape_supported(
+    shape: ShapeLike,
+    dtype: torch.dtype = torch.bfloat16,
+    causal: bool = False,
+    page_size: int = 16,
+) -> bool:
+    """True when vLLM paged attention has this maximum shape and page size."""
+    return has_paged_kernel(normalize_shape(shape, dtype, causal), page_size)
 
 
 def flash_attn_func(

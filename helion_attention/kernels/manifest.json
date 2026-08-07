@@ -342,6 +342,42 @@
       "seqlen_q": 512
     }
   ],
+  "paged_kernels": [
+    {
+      "backward": false,
+      "batch": 2,
+      "causal": true,
+      "description": "paged page_size=16 batch=2 seqlen_q=200 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 128,
+      "key": "paged_b2_sq200_sk320_hq8_hkv2_d128_bf16_causal_ps16",
+      "nheads_kv": 2,
+      "nheads_q": 8,
+      "note": "vLLM paged chunked prefill",
+      "page_size": 16,
+      "paged": true,
+      "seqlen_k": 320,
+      "seqlen_q": 200,
+      "varlen": false
+    },
+    {
+      "backward": false,
+      "batch": 4,
+      "causal": true,
+      "description": "paged page_size=16 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 128,
+      "key": "paged_b4_sq1_sk1024_hq8_hkv2_d128_bf16_causal_ps16",
+      "nheads_kv": 2,
+      "nheads_q": 8,
+      "note": "vLLM paged ragged decode",
+      "page_size": 16,
+      "paged": true,
+      "seqlen_k": 1024,
+      "seqlen_q": 1,
+      "varlen": false
+    }
+  ],
   "varlen_kernels": [
     {
       "backward": false,
