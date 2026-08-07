@@ -190,41 +190,46 @@ reading actual query/cache lengths and physical page assignments on-device:
 <!-- BENCHMARKS:START -->
 Measured on NVIDIA H100 (torch 2.14.0a0+git774d172, triton 3.6.0). Times are the median of interleaved rounds; lower is better.
 
+Paged rows use identical logical caches with each implementation's native page size: 16 for Helion and FlashAttention's minimum of 256. Backward rows time dQ/dK/dV only; their forward graphs are prepared outside the timed region, and TFLOP/s uses the standard 2.5x-forward operation estimate.
+
 | shape | helion-attention µs | flash-attn µs | sdpa-flash µs | sdpa-cudnn µs | helion TFLOP/s | comparison vs flash-attn |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True | 2945 | 3238 | 3593 | 2100 | 373 | **1.10x faster** |
-| batch=1 seqlen_q=1 seqlen_k=1024 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 27 | 77 | 252 | 195 | 1 | **2.85x faster** |
-| batch=1 seqlen_q=1 seqlen_k=16384 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 99 | 83 | 259 | 197 | 3 | **1.20x slower** |
-| batch=1 seqlen_q=1 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 45 | 84 | 258 | 195 | 2 | **1.88x faster** |
-| batch=1 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 412 | 213 | 208 | 195 | 73 | **1.93x slower** |
-| batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True | 387 | 230 | 230 | 201 | 89 | **1.69x slower** |
-| batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 390 | 232 | 226 | 198 | 88 | **1.68x slower** |
-| batch=1 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 1431 | 426 | 459 | 236 | 84 | **3.36x slower** |
-| batch=1 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1450 | 471 | 510 | 269 | 95 | **3.08x slower** |
-| batch=1 seqlen_q=64 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 28 | 222 | n/a | 331 | 3 | **8.00x faster** |
-| batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 5191 | 1479 | 1600 | 873 | 93 | **3.51x slower** |
-| batch=1 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 5477 | 1675 | 1802 | 1001 | 100 | **3.27x slower** |
-| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True | 119 | 203 | 202 | 202 | 72 | **1.71x faster** |
-| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False | 116 | 205 | 207 | 199 | 148 | **1.77x faster** |
-| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=fp16 causal=False | 131 | 205 | 204 | 199 | 131 | **1.56x faster** |
-| batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True | 5747 | 1695 | 1819 | 1006 | 96 | **3.39x slower** |
-| batch=4 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 397 | 404 | 437 | 244 | 303 | **1.02x faster** |
-| batch=4 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 424 | 460 | 490 | 290 | 325 | **1.09x faster** |
-| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 1463 | 1488 | 1589 | 960 | 329 | **1.02x faster** |
-| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=True | 1832 | 1704 | 1834 | 1124 | 300 | **1.08x slower** |
-| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=False | 2593 | 3041 | 3369 | 2040 | 424 | **1.17x faster** |
-| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=fp16 causal=True | 1709 | 1739 | 1859 | 1149 | 322 | **1.02x faster** |
-| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1544 | 1678 | 1819 | 1117 | 356 | **1.09x faster** |
-| batch=4 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 5649 | 5589 | 6312 | 3597 | 341 | **1.01x slower** |
-| batch=4 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 5919 | 6274 | 7165 | 3998 | 372 | **1.06x faster** |
-| batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True | 295 | 276 | 290 | 274 | 233 | **1.07x slower** |
-| batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 53 | 203 | 202 | 196 | 161 | **3.79x faster** |
-| varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=True | 79 | 207 | n/a | n/a | 13 | **2.63x faster** |
-| varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 81 | 210 | n/a | n/a | 25 | **2.58x faster** |
+| batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True | 2957 | 3227 | 3596 | 2104 | 372 | **1.09x faster** |
+| batch=1 seqlen_q=1 seqlen_k=1024 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 29 | 82 | 254 | 194 | 1 | **2.83x faster** |
+| batch=1 seqlen_q=1 seqlen_k=16384 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 96 | 87 | 262 | 204 | 3 | **1.11x slower** |
+| batch=1 seqlen_q=1 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 42 | 83 | 251 | 193 | 2 | **1.96x faster** |
+| batch=1 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 412 | 213 | 210 | 195 | 73 | **1.93x slower** |
+| batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True | 389 | 224 | 227 | 199 | 88 | **1.73x slower** |
+| batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 393 | 221 | 223 | 195 | 88 | **1.77x slower** |
+| batch=1 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 1444 | 425 | 458 | 236 | 83 | **3.39x slower** |
+| batch=1 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1453 | 473 | 508 | 270 | 95 | **3.07x slower** |
+| batch=1 seqlen_q=64 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 26 | 220 | n/a | 336 | 3 | **8.35x faster** |
+| batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 5203 | 1474 | 1585 | 872 | 92 | **3.53x slower** |
+| batch=1 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 5446 | 1678 | 1800 | 996 | 101 | **3.24x slower** |
+| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True | 115 | 199 | 202 | 199 | 75 | **1.73x faster** |
+| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False | 115 | 199 | 203 | 202 | 150 | **1.73x faster** |
+| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=fp16 causal=False | 120 | 197 | 200 | 197 | 143 | **1.64x faster** |
+| batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True | 5746 | 1696 | 1815 | 1002 | 96 | **3.39x slower** |
+| batch=4 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 400 | 408 | 437 | 243 | 301 | **1.02x faster** |
+| batch=4 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 423 | 457 | 490 | 293 | 325 | **1.08x faster** |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 1455 | 1474 | 1593 | 957 | 331 | **1.01x faster** |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=True | 1832 | 1696 | 1822 | 1116 | 300 | **1.08x slower** |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=False | 2572 | 3035 | 3334 | 2045 | 427 | **1.18x faster** |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=fp16 causal=True | 1699 | 1731 | 1875 | 1160 | 324 | **1.02x faster** |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1534 | 1687 | 1815 | 1104 | 358 | **1.10x faster** |
+| batch=4 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 5611 | 5503 | 6207 | 3605 | 343 | **1.02x slower** |
+| batch=4 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 5888 | 6235 | 7130 | 4022 | 374 | **1.06x faster** |
+| batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True | 295 | 272 | 286 | 225 | 233 | **1.09x slower** |
+| batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 57 | 198 | 201 | 194 | 152 | **3.51x faster** |
+| backward batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 3511 | 572 | n/a | n/a | 6 | **6.14x slower** |
+| varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=True | 79 | 206 | n/a | n/a | 13 | **2.62x faster** |
+| varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 78 | 207 | n/a | n/a | 26 | **2.66x faster** |
+| paged page_size=16 batch=2 seqlen_q=200 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 99 | 210 | n/a | n/a | 2 | **2.12x faster** |
+| paged page_size=16 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 119 | 490 | n/a | n/a | 0 | **4.12x faster** |
 
-Helion is faster than flash-attn on 17 shapes and slower on 12 shapes.
+Helion is faster than flash-attn on 19 kernel workloads and slower on 13 kernel workloads.
 
-Geomean speedup over flash-attn across all 29 shapes: **1.04x**.
+Geomean speedup over flash-attn across all 32 kernel workloads: **1.05x**.
 <!-- BENCHMARKS:END -->
 
 Reproduce with:
@@ -233,6 +238,8 @@ Reproduce with:
 pip install flash-attn --no-build-isolation
 python benchmarks/bench.py
 python benchmarks/bench.py --only varlen
+python benchmarks/bench.py --only paged
+python benchmarks/bench.py --only backward
 ```
 
 `sdpa-flash` and `sdpa-cudnn` are PyTorch's `scaled_dot_product_attention` pinned
