@@ -83,18 +83,22 @@ installed helion-attention distribution registers an opt-in
 `vllm.general_plugins` hook that points only those call exports at
 `helion_attention.vllm_flash_attn`. It preserves vLLM's package and
 compiled/nested modules, including `vllm.vllm_flash_attn.layers.rotary`, and
-vLLM loads the hook in every engine and worker process when
-`HELION_ATTENTION_VLLM=1`.
+vLLM loads the hook in every engine and worker process when `helion_attention`
+is in its `VLLM_PLUGINS` environment variable. `VLLM_PLUGINS` is a
+comma-separated allowlist: include every other vLLM plugin you use as well.
+Unlike project-specific environment variables, vLLM 0.10.1.1 propagates this
+registered variable to Ray workers.
+`enable_vllm_plugin()` below retains an existing allowlist; when none is set,
+it includes all currently installed general plugins before adding this one.
 
 For the Python API, install explicitly before the first attention backend can
 be imported (the later general-plugin call is idempotent):
 
 ```python
-import os
-
+from helion_attention.vllm_plugin import enable_vllm_plugin
 from helion_attention.vllm_plugin import install_vllm_flash_attn
 
-os.environ["HELION_ATTENTION_VLLM"] = "1"  # inherited by vLLM workers
+enable_vllm_plugin()  # retains other installed/configured vLLM plugins
 install_vllm_flash_attn()
 
 from vllm import LLM  # import vLLM after installing the adapter
@@ -105,12 +109,11 @@ llm = LLM(model="meta-llama/Meta-Llama-3-8B")
 For `vllm serve`, use a complete launcher such as `serve_with_helion.py`:
 
 ```python
-import os
-
+from helion_attention.vllm_plugin import enable_vllm_plugin
 from helion_attention.vllm_plugin import install_vllm_flash_attn
 
 # Keep installation at module scope: a spawned worker re-executes this file.
-os.environ["HELION_ATTENTION_VLLM"] = "1"
+enable_vllm_plugin()  # retains other installed/configured vLLM plugins
 install_vllm_flash_attn()
 
 
@@ -128,7 +131,9 @@ Run it with the normal arguments, for example
 `python serve_with_helion.py serve meta-llama/Meta-Llama-3-8B`. The guard keeps
 spawned children from recursively starting the CLI; module-scope installation
 patches those children, and the registered general plugin also patches Ray and
-other vLLM-managed workers.
+other vLLM-managed workers after vLLM propagates the allowlist. If an existing
+deployment already sets `VLLM_PLUGINS`, append `helion_attention` rather than
+replacing its current names.
 
 There is deliberately no `shape` argument on this path: vLLM never passes one,
 so the adapter infers the specialization from the packed tensors, maximum

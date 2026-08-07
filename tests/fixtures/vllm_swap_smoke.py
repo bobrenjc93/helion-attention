@@ -12,13 +12,15 @@ STUB_ROOT = Path(__file__).resolve().parent / "vllm_stub"
 sys.path.insert(0, str(STUB_ROOT))
 
 from helion_attention import vllm_flash_attn as compatibility  # noqa: E402
+from helion_attention.vllm_plugin import enable_vllm_plugin  # noqa: E402
 from helion_attention.vllm_plugin import load_vllm_plugin  # noqa: E402
 from vllm.attention.utils import fa_utils as _preloaded_fa_utils  # noqa: E402,F401
 
 # Spawn re-executes this module as ``__mp_main__``. Installation remains at
 # module scope so every child receives the swap, while the CLI/main body below
 # is guarded against recursive execution.
-os.environ["HELION_ATTENTION_VLLM"] = "1"
+os.environ.setdefault("VLLM_PLUGINS", "existing_plugin")
+enable_vllm_plugin()
 load_vllm_plugin()
 
 
@@ -32,6 +34,8 @@ def _worker(connection: Any) -> None:
             "package_preserved": package.PACKAGE_MARKER == "vllm package preserved",
             "package_path_preserved": hasattr(package, "__path__"),
             "rotary_imported": rotary.ROTARY_IMPORT_SUCCEEDED,
+            "allowlist_preserved": set(os.environ["VLLM_PLUGINS"].split(","))
+            == {"existing_plugin", "helion_attention"},
             "attention_patched": (
                 fa_utils.flash_attn_varlen_func
                 is compatibility.flash_attn_varlen_func

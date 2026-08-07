@@ -8,8 +8,9 @@ four Python exports helion-attention implements and leaves the package, its
 ``__path__``, compiled extensions, and child modules intact.
 
 An opt-in wrapper is registered as a ``vllm.general_plugins`` entry point.
-With ``HELION_ATTENTION_VLLM=1``, vLLM installs the swap in each engine and
-worker process, including spawned and Ray workers.
+When ``helion_attention`` is present in vLLM's ``VLLM_PLUGINS`` allowlist,
+vLLM installs the swap in each engine and worker process, including spawned
+and Ray workers.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from __future__ import annotations
 import os
 import sys
 from importlib import import_module
+from importlib.metadata import entry_points
 from types import ModuleType
 from typing import Any
 
@@ -31,7 +33,24 @@ _INTERFACE_EXPORTS = (
     "fa_version_unsupported_reason",
 )
 _MISSING = object()
-_ENABLE_ENV = "HELION_ATTENTION_VLLM"
+_PLUGIN_NAME = "helion_attention"
+
+
+def enable_vllm_plugin() -> None:
+    """Add this plugin to vLLM's propagated allowlist.
+
+    Existing configured names are retained.  When no allowlist exists, all
+    currently installed vLLM general plugins are included to preserve vLLM's
+    default load-all behavior before the allowlist becomes explicit.
+    """
+    configured = os.environ.get("VLLM_PLUGINS")
+    if configured is None:
+        names = [item.name for item in entry_points(group="vllm.general_plugins")]
+    else:
+        names = [name for name in configured.split(",") if name]
+    if _PLUGIN_NAME not in names:
+        names.append(_PLUGIN_NAME)
+    os.environ["VLLM_PLUGINS"] = ",".join(dict.fromkeys(names))
 
 
 def install_vllm_flash_attn() -> None:
@@ -74,8 +93,13 @@ def install_vllm_flash_attn() -> None:
 
 def load_vllm_plugin() -> None:
     """Install from vLLM's plugin hook when the swap was explicitly enabled."""
-    if os.environ.get(_ENABLE_ENV) == "1":
+    allowed_plugins = os.environ.get("VLLM_PLUGINS", "").split(",")
+    if _PLUGIN_NAME in allowed_plugins:
         install_vllm_flash_attn()
 
 
-__all__ = ["install_vllm_flash_attn", "load_vllm_plugin"]
+__all__ = [
+    "enable_vllm_plugin",
+    "install_vllm_flash_attn",
+    "load_vllm_plugin",
+]
