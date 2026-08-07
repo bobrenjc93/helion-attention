@@ -36,6 +36,9 @@ VLLM_KEYWORDS = {
     "num_splits",
     "fa_version",
     "s_aux",
+    "dynamic_causal",
+    "mask_mod",
+    "aux_tensors",
 }
 
 
@@ -104,6 +107,36 @@ def test_vllm_surface_has_no_shape_argument() -> None:
     )
 
 
+@requires_cuda
+def test_fp8_without_out_returns_bfloat16() -> None:
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is None:
+        pytest.skip("PyTorch build does not expose float8_e4m3fn")
+    generator = torch.Generator(device="cuda").manual_seed(741)
+
+    def fp8_random(tokens: int) -> torch.Tensor:
+        return torch.randn(
+            tokens, 2, 16, device="cuda", dtype=torch.float32, generator=generator
+        ).to(fp8_dtype)
+
+    q = fp8_random(2)
+    k = fp8_random(3)
+    v = fp8_random(3)
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=2,
+        cu_seqlens_q=torch.tensor([0, 2], device="cuda", dtype=torch.int32),
+        max_seqlen_k=3,
+        cu_seqlens_k=torch.tensor([0, 3], device="cuda", dtype=torch.int32),
+        fa_version=3,
+    )
+
+    assert isinstance(result, torch.Tensor)
+    assert result.dtype == torch.bfloat16
+
+
 def test_nonpaged_fallback_features_and_out_parameter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -147,6 +180,9 @@ def test_nonpaged_fallback_features_and_out_parameter(
         k_descale=k_descale,
         v_descale=v_descale,
         s_aux=sink,
+        dynamic_causal=None,
+        mask_mod=None,
+        aux_tensors=None,
     )
 
     expected_outputs = []
@@ -315,7 +351,10 @@ def test_paged_fallback_supports_cuda_graph_capture() -> None:
 
 
 @requires_cuda
-def test_fa2_causal_alibi_lse_matches_upstream() -> None:
+@pytest.mark.parametrize(
+    "window", [(-1, -1), (5, 0)], ids=["unbounded", "effective-global"]
+)
+def test_fa2_causal_alibi_lse_matches_upstream(window: tuple[int, int]) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     generator = torch.Generator(device="cuda").manual_seed(456)
     query_lengths = [3, 2]
@@ -348,6 +387,7 @@ def test_fa2_causal_alibi_lse_matches_upstream() -> None:
         max(query_lengths),
         max(key_lengths),
         causal=True,
+        window_size=window,
         alibi_slopes=slopes,
         return_attn_probs=True,
     )
@@ -360,6 +400,7 @@ def test_fa2_causal_alibi_lse_matches_upstream() -> None:
         max_seqlen_k=max(key_lengths),
         cu_seqlens_k=cu_k,
         causal=True,
+        window_size=window,
         alibi_slopes=slopes,
         return_softmax_lse=True,
         fa_version=2,

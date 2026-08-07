@@ -39,6 +39,16 @@ __all__ = [
 compile_flash_attn_varlen_func_from_specs = None
 
 _SUPPORTED_FA_VERSIONS = frozenset({2, 3})
+_FP8_DTYPES: frozenset[torch.dtype] = frozenset(
+    getattr(torch, name)
+    for name in (
+        "float8_e4m3fn",
+        "float8_e5m2",
+        "float8_e4m3fnuz",
+        "float8_e5m2fnuz",
+    )
+    if hasattr(torch, name)
+)
 
 # Bound the largest temporary tensors used by the correctness fallback.  The
 # online-softmax state is carried across key tiles, so these constants affect
@@ -332,6 +342,9 @@ def flash_attn_varlen_func(
     num_splits: int = 0,
     fa_version: int = 3,
     s_aux: torch.Tensor | None = None,
+    dynamic_causal: torch.Tensor | None = None,
+    mask_mod: object | None = None,
+    aux_tensors: Sequence[torch.Tensor] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run vLLM's packed or paged variable-length attention call.
 
@@ -347,6 +360,10 @@ def flash_attn_varlen_func(
     if not is_fa_version_supported(fa_version):
         reason = fa_version_unsupported_reason(fa_version)
         raise ValueError(f"unsupported fa_version={fa_version}: {reason}")
+    if dynamic_causal is not None or mask_mod is not None or aux_tensors is not None:
+        raise NotImplementedError(
+            "dynamic_causal, mask_mod, and aux_tensors require unsupported FA4"
+        )
     del scheduler_metadata, num_splits  # Optimization selectors only.
 
     for name, tensor in (("q", q), ("k", k), ("v", v)):
@@ -477,7 +494,9 @@ def flash_attn_varlen_func(
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
 
-    output_dtype = q.dtype if out is None else out.dtype
+    output_dtype = torch.bfloat16 if out is None and q.dtype in _FP8_DTYPES else q.dtype
+    if out is not None:
+        output_dtype = out.dtype
     outputs: list[torch.Tensor] = []
     lse_parts: list[torch.Tensor] = []
     left_window, right_window = real_window
@@ -625,7 +644,8 @@ def flash_attn_varlen_func(
             running_max + torch.log(safe_sum),
             torch.full_like(running_max, float("-inf")),
         )
-        fa2_one_sided_alibi = left_window < 0 and (causal or right_window == 0)
+        fa2_global_left = left_window < 0 or left_window >= max_seqlen_k
+        fa2_one_sided_alibi = fa2_global_left and (causal or right_window == 0)
         if fa_version == 2 and fa2_one_sided_alibi and slopes is not None:
             # FA2's global one-sided ALiBi kernel drops the row-constant
             # ``-slope * aligned_query_position`` while accumulating LSE.  It
