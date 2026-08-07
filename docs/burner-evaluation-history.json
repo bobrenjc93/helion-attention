@@ -298,6 +298,36 @@
         "eval_5b403bea": 71,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:e0c5385e270ca9c692042d8dbbf97f28b0843319",
+      "commit": "e0c5385e270ca9c692042d8dbbf97f28b0843319",
+      "recordedAt": "2026-08-07T22:55:19.633Z",
+      "label": "base e0c5385",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 57,
+        "eval_1afd133e": 45,
+        "eval_5b403bea": 69,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:12",
+      "recordedAt": "2026-08-07T22:55:19.633Z",
+      "label": "PR #12",
+      "kind": "leaf",
+      "prNumber": 12,
+      "title": "Benchmark and document every checked-in kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 58,
+        "eval_1afd133e": 45,
+        "eval_5b403bea": 91,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
