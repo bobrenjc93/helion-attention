@@ -74,6 +74,34 @@
         "eval_1afd133e": 34,
         "eval_5b403bea": 73
       }
+    },
+    {
+      "key": "base:15acba1a7e3209006fb1fb9d874ab49fc0a7fd80",
+      "commit": "15acba1a7e3209006fb1fb9d874ab49fc0a7fd80",
+      "recordedAt": "2026-08-07T09:09:47.078Z",
+      "label": "base 15acba1",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 57,
+        "eval_1afd133e": 38,
+        "eval_5b403bea": 76
+      }
+    },
+    {
+      "key": "pr:3",
+      "recordedAt": "2026-08-07T09:09:47.078Z",
+      "label": "PR #3",
+      "kind": "leaf",
+      "prNumber": 3,
+      "title": "Support decode-shaped attention (seqlen_q=1) with a KV cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 61,
+        "eval_1afd133e": 45,
+        "eval_5b403bea": 74
+      }
     }
   ]
 }
