@@ -190,32 +190,67 @@ def causal_attention_bshd(
     group = nheads_q // nheads_kv
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
-    for b, h in hl.grid([batch, nheads_q]):
+    # Keep query tiles in the launch grid.  Nesting this loop below a
+    # ``[batch, heads]`` grid makes one CTA walk every query tile, which leaves
+    # batch=1 prefill shapes with only ``nheads_q`` resident programs and a
+    # severe causal-tail imbalance.
+    for tile_b, tile_h, tile_m in hl.tile(
+        [batch, nheads_q, m_dim], block_size=[1, 1, None]
+    ):
+        b = tile_b.begin
+        h = tile_h.begin
         h_kv = h // group
-        for tile_m in hl.tile(m_dim):
-            m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-            l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
-            acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
-            q_blk = q[b, tile_m, h, :]
-            for tile_n in hl.tile(0, tile_m.end):
-                k_blk = k[b, tile_n, h_kv, :]
-                qk = hl.dot(q_blk * qk_scale, k_blk.T, out_dtype=torch.float32)
-                qk = torch.where(
-                    tile_m.index[:, None] >= tile_n.index[None, :], qk, float("-inf")
-                )
-                m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-                qk = qk - m_ij[:, None]
-                p = torch.exp2(qk)
-                l_ij = torch.sum(p, -1)
-                alpha = torch.exp2(m_i - m_ij)
-                l_i = l_i * alpha + l_ij
-                acc = acc * alpha[:, None]
-                v_blk = v[b, tile_n, h_kv, :]
-                acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
-                m_i = m_ij
-            acc = acc / l_i[:, None]
-            out[b, tile_m, h, :] = acc.to(out.dtype)
+        m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+        l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+        acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+        q_blk = q[b, tile_m, h, :] * qk_scale
+        for tile_n in hl.tile(0, tile_m.end):
+            k_blk = k[b, tile_n, h_kv, :]
+            qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32)
+            qk = torch.where(
+                tile_m.index[:, None] >= tile_n.index[None, :], qk, float("-inf")
+            )
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, None]
+            v_blk = v[b, tile_n, h_kv, :]
+            acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
+            m_i = m_ij
+        acc = acc / l_i[:, None]
+        out[b, tile_m, h, :] = acc.to(out.dtype)
     return out
+
+
+# The 16K batch=1 specialization has only sixteen batch/head pairs.  Give it a
+# one-CTA-per-SM persistent grid whose strided work loop interleaves short and
+# long causal rows.  Other causal shapes retain normal per-shape autotuning.
+causal_attention_bshd_16k = helion.kernel(
+    causal_attention_bshd.fn,
+    config=helion.Config(
+        block_sizes=[128, 128],
+        num_warps=8,
+        num_stages=3,
+        pid_type="persistent_interleaved",
+        num_sm_multiplier=1,
+        # Use Hopper's descriptor path for K while retaining a masked block
+        # pointer for V; making both descriptor loads exceeds shared memory.
+        indexing=[
+            "pointer",
+            "tensor_descriptor",
+            "block_ptr",
+            "pointer",
+            "pointer",
+        ],
+    ),
+    static_shapes=True,
+    autotune_baseline_fn=_causal_sdpa_reference,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
 
 
 @helion.kernel(
@@ -519,4 +554,6 @@ def select_kernel(*, causal: bool, seqlen_q: int, seqlen_k: int) -> object:
                 "unequal causal lengths are supported only for seqlen_q=1 decode"
             )
         return decode_attention_bshd
+    if causal and seqlen_q == 16384:
+        return causal_attention_bshd_16k
     return KERNELS[causal]

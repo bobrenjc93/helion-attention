@@ -1,6 +1,7 @@
 {
   "kernels": [
     {
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True",
@@ -11,7 +12,8 @@
       "nheads_q": 16,
       "note": "16k context, single sequence",
       "seqlen_k": 16384,
-      "seqlen_q": 16384
+      "seqlen_q": 16384,
+      "varlen": false
     },
     {
       "batch": 1,
