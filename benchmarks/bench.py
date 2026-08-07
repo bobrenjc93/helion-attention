@@ -31,6 +31,7 @@ import helion_attention  # noqa: E402
 from helion_attention._registry import available_shapes  # noqa: E402
 from helion_attention._registry import available_varlen_shapes  # noqa: E402
 from helion_attention._registry import spec_from_manifest_entry  # noqa: E402
+from helion_attention._sdpa import sdpa_causal_options  # noqa: E402
 from helion_attention._shape import AttnShape  # noqa: E402
 
 try:
@@ -68,19 +69,6 @@ def flops(spec: AttnShape) -> float:
         * attended_pairs
         * spec.head_dim
     )
-
-
-def sdpa_causal_options(
-    spec: AttnShape, causal_mask: torch.Tensor | None
-) -> tuple[torch.Tensor | None, bool]:
-    """Choose fused-SDPA mask arguments without changing causal semantics."""
-    is_causal = spec.causal and spec.seqlen_q == spec.seqlen_k
-    mask = (
-        causal_mask
-        if spec.causal and not (is_causal or spec.is_decode)
-        else None
-    )
-    return mask, is_causal
 
 
 def build_candidates(

@@ -230,10 +230,6 @@ def causal_attention_bshd(
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
     causal_offset = n_dim - m_dim
-    # Equal lengths stop at the current query tile. Unequal lengths scan the
-    # full key range so Helion's tile-size choices cannot truncate the offset
-    # boundary; score_mask still skips every disallowed key.
-    unequal_key_padding = min(1, abs(causal_offset)) * n_dim
     for b, h in hl.grid([batch, nheads_q]):
         h_kv = h // group
         for tile_m in hl.tile(m_dim):
@@ -241,7 +237,13 @@ def causal_attention_bshd(
             l_i = hl.zeros([tile_m], dtype=torch.float32)
             acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
             q_blk = q[b, tile_m, h, :]
-            key_stop = min(n_dim, tile_m.end + unequal_key_padding)
+            # Keep the equal-length triangular bound as a direct tile value.
+            # Combining it algebraically with the unequal-length bound can
+            # make Helion lower the first tile's stop to zero.
+            if m_dim == n_dim:
+                key_stop = tile_m.end
+            else:
+                key_stop = n_dim
             for tile_n in hl.tile(0, key_stop):
                 k_blk = k[b, tile_n, h_kv, :]
                 qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
@@ -305,7 +307,6 @@ def causal_attention_bshd_16k(
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
     causal_offset = n_dim - m_dim
-    unequal_key_padding = min(1, abs(causal_offset)) * n_dim
     # A one-CTA-per-SM persistent grid interleaves short and long causal rows
     # instead of assigning all query tiles to only sixteen batch/head CTAs.
     for tile_b, tile_h, tile_m in hl.tile(
@@ -318,7 +319,10 @@ def causal_attention_bshd_16k(
         l_i = hl.zeros([tile_m], dtype=torch.float32)
         acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
         q_blk = q[b, tile_m, h, :]
-        key_stop = min(n_dim, tile_m.end + unequal_key_padding)
+        if m_dim == n_dim:
+            key_stop = tile_m.end
+        else:
+            key_stop = n_dim
         for tile_n in hl.tile(0, key_stop):
             k_blk = k[b, tile_n, h_kv, :]
             qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
