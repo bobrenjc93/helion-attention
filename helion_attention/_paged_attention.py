@@ -7,6 +7,9 @@ import triton
 import triton.language as tl
 
 
+_EMPTY_SOFTMAX_LSE = torch.finfo(torch.float32).min
+
+
 @triton.jit
 def _varlen_attention_kernel(
     q,
@@ -86,6 +89,7 @@ def _varlen_attention_kernel(
     HAS_DYNAMIC_MAX_Q: tl.constexpr,
     HAS_DYNAMIC_MAX_K: tl.constexpr,
     FA_VERSION_2: tl.constexpr,
+    EMPTY_SOFTMAX_LSE: tl.constexpr,
     INPUT_FP16: tl.constexpr,
     CP_WORLD_SIZE: tl.constexpr,
     CP_RANK: tl.constexpr,
@@ -328,14 +332,15 @@ def _varlen_attention_kernel(
         mask=valid_m[:, None] & (offs_dv[None, :] < VALUE_DIM),
     )
     if STORE_LSE:
-        empty_lse = float("inf") if FA_VERSION_2 else float("-inf")
-        lse = tl.where(has_mass, running_max + tl.log(safe_sum), empty_lse)
+        lse = tl.where(
+            has_mass, running_max + tl.log(safe_sum), EMPTY_SOFTMAX_LSE
+        )
         if SHIFT_FA2_LSE and HAS_ALIBI:
             slope = tl.load(
                 alibi_slopes + batch * stride_alibi_b + head_q * stride_alibi_h
             )
             shifted_lse = lse + slope * aligned_query
-            lse = tl.where(window_left < 0, shifted_lse, lse)
+            lse = tl.where((window_left < 0) & has_mass, shifted_lse, lse)
         tl.store(
             lse_out + head_q * stride_lseh + q_indices * stride_lset,
             lse,
@@ -563,6 +568,7 @@ def _attention(
             HAS_DYNAMIC_MAX_Q=dynamic_max_seqlen_q is not None,
             HAS_DYNAMIC_MAX_K=dynamic_max_seqlen_k is not None,
             FA_VERSION_2=fa_version == 2,
+            EMPTY_SOFTMAX_LSE=_EMPTY_SOFTMAX_LSE,
             INPUT_FP16=q.dtype == torch.float16,
             CP_WORLD_SIZE=cp_world_size,
             CP_RANK=cp_rank,
