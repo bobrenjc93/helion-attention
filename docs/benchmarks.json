@@ -5,28 +5,55 @@
   "python": "3.10.20",
   "results": [
     {
+      "key": "b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True",
+      "note": "16k context, single sequence",
+      "implementations": {
+        "helion-attention": {
+          "us": 20596.569061279297,
+          "tflops": 53.383241864444145,
+          "max_abs_error": 0.013725638389587402
+        },
+        "flash-attn": {
+          "us": 3303.603406812324,
+          "tflops": 332.8219196979604,
+          "max_abs_error": 0.008774995803833008
+        },
+        "sdpa-flash": {
+          "us": 3455.5659640919075,
+          "tflops": 318.18568628162245,
+          "max_abs_error": 0.008774995803833008
+        },
+        "sdpa-cudnn": {
+          "us": 1968.7888284899154,
+          "tflops": 558.4710822538234,
+          "max_abs_error": 0.008774995803833008
+        }
+      }
+    },
+    {
       "key": "b1_sq2048_sk2048_hq32_hkv32_d128_bf16_causal",
       "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True",
       "note": "single-sequence 7B prefill",
       "implementations": {
         "helion-attention": {
-          "us": 387.4671326316509,
-          "tflops": 88.67781412743567,
+          "us": 386.4746940319826,
+          "tflops": 88.90553223429572,
           "max_abs_error": 0.011789083480834961
         },
         "flash-attn": {
-          "us": 229.79433889008834,
-          "tflops": 149.5238678809856,
+          "us": 228.65236340114822,
+          "tflops": 150.27064604497087,
           "max_abs_error": 0.007561683654785156
         },
         "sdpa-flash": {
-          "us": 225.26266915385307,
-          "tflops": 152.53187976980112,
+          "us": 225.36804950477915,
+          "tflops": 152.46055704658067,
           "max_abs_error": 0.007561683654785156
         },
         "sdpa-cudnn": {
-          "us": 193.94434488103082,
-          "tflops": 177.16287829416694,
+          "us": 197.16592333046032,
+          "tflops": 174.26813816306023,
           "max_abs_error": 0.007561683654785156
         }
       }
@@ -37,23 +64,23 @@
       "note": "GPT-2 medium style, causal",
       "implementations": {
         "helion-attention": {
-          "us": 91.1387826374328,
-          "tflops": 94.25114472038071,
+          "us": 92.09041426704509,
+          "tflops": 93.27718482285015,
           "max_abs_error": 0.01050710678100586
         },
         "flash-attn": {
-          "us": 198.4039999109197,
-          "tflops": 43.29516842330168,
+          "us": 197.77253301243147,
+          "tflops": 43.433405342793776,
           "max_abs_error": 0.007910013198852539
         },
         "sdpa-flash": {
-          "us": 199.69977077784813,
-          "tflops": 43.01424362452421,
+          "us": 199.56553860352588,
+          "tflops": 43.0431759516632,
           "max_abs_error": 0.007910013198852539
         },
         "sdpa-cudnn": {
-          "us": 201.28903956661773,
-          "tflops": 42.67462654943571,
+          "us": 195.1155835147357,
+          "tflops": 44.02485151244346,
           "max_abs_error": 0.007910013198852539
         }
       }
@@ -64,24 +91,51 @@
       "note": "GPT-2 medium style prefill",
       "implementations": {
         "helion-attention": {
-          "us": 98.56563009362402,
-          "tflops": 174.29878110332623,
+          "us": 99.53011979736836,
+          "tflops": 172.6097508872309,
           "max_abs_error": 0.003585129976272583
         },
         "flash-attn": {
-          "us": 198.3996539893438,
-          "tflops": 86.59223359796155,
+          "us": 198.32164480864444,
+          "tflops": 86.62629437435547,
           "max_abs_error": 0.0010672807693481445
         },
         "sdpa-flash": {
-          "us": 197.62624619228984,
-          "tflops": 86.93111120111057,
+          "us": 199.9283277165365,
+          "tflops": 85.93013996674877,
           "max_abs_error": 0.0010672807693481445
         },
         "sdpa-cudnn": {
-          "us": 196.42482776155714,
-          "tflops": 87.46281913432493,
+          "us": 197.70524046160168,
+          "tflops": 86.89637737415805,
           "max_abs_error": 0.001183927059173584
+        }
+      }
+    },
+    {
+      "key": "b2_sq1024_sk1024_hq32_hkv32_d64_fp16_noncausal",
+      "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=fp16 causal=False",
+      "note": "fp16 coverage",
+      "implementations": {
+        "helion-attention": {
+          "us": 102.15569440180546,
+          "tflops": 168.17338753948474,
+          "max_abs_error": 0.00047531723976135254
+        },
+        "flash-attn": {
+          "us": 202.10900949169172,
+          "tflops": 85.00298540479577,
+          "max_abs_error": 0.0001392662525177002
+        },
+        "sdpa-flash": {
+          "us": 200.04229272556742,
+          "tflops": 85.88118517302036,
+          "max_abs_error": 0.0001392662525177002
+        },
+        "sdpa-cudnn": {
+          "us": 196.69842855496842,
+          "tflops": 87.3411613413017,
+          "max_abs_error": 0.00013208389282226562
         }
       }
     },
@@ -91,23 +145,23 @@
       "note": "long-context causal",
       "implementations": {
         "helion-attention": {
-          "us": 5749.966358316356,
-          "tflops": 95.61026615275253,
+          "us": 5730.523250721119,
+          "tflops": 95.93466247935032,
           "max_abs_error": 0.013725638389587402
         },
         "flash-attn": {
-          "us": 1690.7728703125665,
-          "tflops": 325.15060037979487,
+          "us": 1682.3519961587315,
+          "tflops": 326.7781148910825,
           "max_abs_error": 0.00937962532043457
         },
         "sdpa-flash": {
-          "us": 1815.0015262642291,
-          "tflops": 302.8955105175852,
+          "us": 1809.721476823381,
+          "tflops": 303.7792394733531,
           "max_abs_error": 0.00937962532043457
         },
         "sdpa-cudnn": {
-          "us": 1005.9691786766052,
-          "tflops": 546.4936953746703,
+          "us": 998.5148310661316,
+          "tflops": 550.5735085587223,
           "max_abs_error": 0.00937962532043457
         }
       }
@@ -118,23 +172,23 @@
       "note": "7B-class prefill, causal",
       "implementations": {
         "helion-attention": {
-          "us": 1816.959081377302,
-          "tflops": 302.56917699614394,
+          "us": 1809.0209837229747,
+          "tflops": 303.89686954133595,
           "max_abs_error": 0.01401054859161377
         },
         "flash-attn": {
-          "us": 1693.5048525312307,
-          "tflops": 324.6260635547023,
+          "us": 1701.1651460613523,
+          "tflops": 323.1642825276724,
           "max_abs_error": 0.008622884750366211
         },
         "sdpa-flash": {
-          "us": 1815.8412528973001,
-          "tflops": 302.7554380157553,
+          "us": 1818.1791695037691,
+          "tflops": 302.36613811720406,
           "max_abs_error": 0.008622884750366211
         },
         "sdpa-cudnn": {
-          "us": 1126.6003041654021,
-          "tflops": 487.97768991840024,
+          "us": 1112.5944109373195,
+          "tflops": 494.12059640390527,
           "max_abs_error": 0.008622884750366211
         }
       }
@@ -145,24 +199,78 @@
       "note": "7B-class prefill, bidirectional",
       "implementations": {
         "helion-attention": {
-          "us": 2573.7571646185484,
-          "tflops": 427.20099739438956,
+          "us": 2560.600348372958,
+          "tflops": 429.39603147154355,
           "max_abs_error": 0.0035891830921173096
         },
         "flash-attn": {
-          "us": 3039.6565278371177,
-          "tflops": 361.7223254360133,
+          "us": 3033.797787838295,
+          "tflops": 362.4208680564195,
           "max_abs_error": 0.0006209760904312134
         },
         "sdpa-flash": {
-          "us": 3348.0867773799573,
-          "tflops": 328.39997911775214,
+          "us": 3303.661243668918,
+          "tflops": 332.81609301894554,
           "max_abs_error": 0.0006209760904312134
         },
         "sdpa-cudnn": {
-          "us": 2037.2184560849118,
-          "tflops": 539.7121867278881,
+          "us": 2018.513234762045,
+          "tflops": 544.7136084325042,
           "max_abs_error": 0.000578463077545166
+        }
+      }
+    },
+    {
+      "key": "b4_sq4096_sk4096_hq32_hkv32_d128_fp16_causal",
+      "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=fp16 causal=True",
+      "note": "fp16 causal coverage",
+      "implementations": {
+        "helion-attention": {
+          "us": 1689.3346102341363,
+          "tflops": 325.4274260158594,
+          "max_abs_error": 0.0018554925918579102
+        },
+        "flash-attn": {
+          "us": 1725.3241494849876,
+          "tflops": 318.639146187169,
+          "max_abs_error": 0.0012814998626708984
+        },
+        "sdpa-flash": {
+          "us": 1852.3413412498705,
+          "tflops": 296.78969077969793,
+          "max_abs_error": 0.0012814998626708984
+        },
+        "sdpa-cudnn": {
+          "us": 1142.4468465931507,
+          "tflops": 481.20909565937956,
+          "max_abs_error": 0.0012814998626708984
+        }
+      }
+    },
+    {
+      "key": "b4_sq4096_sk4096_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "note": "Llama-3-8B GQA 4:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 1522.4145757089746,
+          "tflops": 361.1078234928115,
+          "max_abs_error": 0.013426065444946289
+        },
+        "flash-attn": {
+          "us": 1686.3426788993504,
+          "tflops": 326.0048036303138,
+          "max_abs_error": 0.009511709213256836
+        },
+        "sdpa-flash": {
+          "us": 1812.4100999924744,
+          "tflops": 303.32859758963093,
+          "max_abs_error": 0.009511709213256836
+        },
+        "sdpa-cudnn": {
+          "us": 1101.636641128089,
+          "tflops": 499.03551984712817,
+          "max_abs_error": 0.009511709213256836
         }
       }
     },
@@ -172,23 +280,23 @@
       "note": "small decoder, long batch",
       "implementations": {
         "helion-attention": {
-          "us": 295.8819586706359,
-          "tflops": 232.2530141572295,
+          "us": 295.2675996348262,
+          "tflops": 232.73625965391795,
           "max_abs_error": 0.013665199279785156
         },
         "flash-attn": {
-          "us": 271.41858845762516,
-          "tflops": 253.1863315866029,
+          "us": 273.31591728317295,
+          "tflops": 251.42874011542543,
           "max_abs_error": 0.009153127670288086
         },
         "sdpa-flash": {
-          "us": 290.78223288945077,
-          "tflops": 236.32625712082515,
+          "us": 287.8297553116963,
+          "tflops": 238.75042613847333,
           "max_abs_error": 0.009153127670288086
         },
         "sdpa-cudnn": {
-          "us": 223.00222337531585,
-          "tflops": 308.1560160965039,
+          "us": 219.62912016911127,
+          "tflops": 312.8887311622748,
           "max_abs_error": 0.009153127670288086
         }
       }
@@ -199,23 +307,23 @@
       "note": "short-sequence encoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 44.0183445127402,
-          "tflops": 195.14442642234812,
+          "us": 40.65980715713953,
+          "tflops": 211.26353498928677,
           "max_abs_error": 0.005711734294891357
         },
         "flash-attn": {
-          "us": 203.8641610251577,
-          "tflops": 42.135579636971926,
+          "us": 194.52795028224475,
+          "tflops": 44.1578425081675,
           "max_abs_error": 0.0019145607948303223
         },
         "sdpa-flash": {
-          "us": 203.86929775508034,
-          "tflops": 42.13451798082697,
+          "us": 195.0457522201034,
+          "tflops": 44.04061351875283,
           "max_abs_error": 0.0019145607948303223
         },
         "sdpa-cudnn": {
-          "us": 201.0000001087233,
-          "tflops": 42.73599297190847,
+          "us": 190.3000776454116,
+          "tflops": 45.1388916824602,
           "max_abs_error": 0.0019145607948303223
         }
       }

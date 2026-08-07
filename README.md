@@ -69,16 +69,20 @@ one is an autotuning run, not a code change.
 <!-- SHAPES:START -->
 | batch | seqlen q | seqlen k | heads q | heads kv | head dim | dtype | causal | note |
 | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 1 | 16384 | 16384 | 16 | 16 | 128 | bf16 | yes | 16k context, single sequence |
 | 1 | 2048 | 2048 | 32 | 32 | 128 | bf16 | yes | single-sequence 7B prefill |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | bf16 | yes | GPT-2 medium style, causal |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | bf16 | no | GPT-2 medium style prefill |
+| 2 | 1024 | 1024 | 32 | 32 | 64 | fp16 | no | fp16 coverage |
 | 2 | 8192 | 8192 | 16 | 16 | 128 | bf16 | yes | long-context causal |
 | 4 | 4096 | 4096 | 32 | 32 | 128 | bf16 | yes | 7B-class prefill, causal |
 | 4 | 4096 | 4096 | 32 | 32 | 128 | bf16 | no | 7B-class prefill, bidirectional |
+| 4 | 4096 | 4096 | 32 | 32 | 128 | fp16 | yes | fp16 causal coverage |
+| 4 | 4096 | 4096 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
 | 8 | 2048 | 2048 | 16 | 16 | 64 | bf16 | yes | small decoder, long batch |
 | 8 | 512 | 512 | 16 | 16 | 64 | bf16 | no | short-sequence encoder batch |
 
-8 kernels.
+12 kernels.
 <!-- SHAPES:END -->
 
 ## Benchmarks
@@ -88,16 +92,20 @@ Measured on NVIDIA H100 (torch 2.14.0a0+git774d172, triton 3.6.0). Times are the
 
 | shape | helion-attention µs | flash-attn µs | sdpa-flash µs | sdpa-cudnn µs | helion TFLOP/s | speedup vs flash-attn |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True | 387 | 230 | 225 | 194 | 89 | 0.59x |
-| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True | 91 | 198 | 200 | 201 | 94 | **2.18x** |
-| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False | 99 | 198 | 198 | 196 | 174 | **2.01x** |
-| batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True | 5750 | 1691 | 1815 | 1006 | 96 | 0.29x |
-| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=True | 1817 | 1694 | 1816 | 1127 | 303 | 0.93x |
-| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=False | 2574 | 3040 | 3348 | 2037 | 427 | **1.18x** |
-| batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True | 296 | 271 | 291 | 223 | 232 | 0.92x |
-| batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 44 | 204 | 204 | 201 | 195 | **4.63x** |
+| batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True | 20597 | 3304 | 3456 | 1969 | 53 | 0.16x |
+| batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True | 386 | 229 | 225 | 197 | 89 | 0.59x |
+| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True | 92 | 198 | 200 | 195 | 93 | **2.15x** |
+| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False | 100 | 198 | 200 | 198 | 173 | **1.99x** |
+| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=fp16 causal=False | 102 | 202 | 200 | 197 | 168 | **1.98x** |
+| batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True | 5731 | 1682 | 1810 | 999 | 96 | 0.29x |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=True | 1809 | 1701 | 1818 | 1113 | 304 | 0.94x |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=False | 2561 | 3034 | 3304 | 2019 | 429 | **1.18x** |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=fp16 causal=True | 1689 | 1725 | 1852 | 1142 | 325 | **1.02x** |
+| batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1522 | 1686 | 1812 | 1102 | 361 | **1.11x** |
+| batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True | 295 | 273 | 288 | 220 | 233 | 0.93x |
+| batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 41 | 195 | 195 | 190 | 211 | **4.78x** |
 
-Geomean speedup over flash-attn across all 8 shapes: **1.17x**.
+Geomean speedup over flash-attn across all 12 shapes: **1.02x**.
 <!-- BENCHMARKS:END -->
 
 Reproduce with:
