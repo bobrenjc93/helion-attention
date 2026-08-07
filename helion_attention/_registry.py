@@ -125,6 +125,16 @@ def _entry_for_spec(spec: AttnShape) -> dict[str, object] | None:
     return entry
 
 
+def has_kernel(spec: AttnShape) -> bool:
+    """Whether dense metadata exists for ``spec``, without importing Triton."""
+    return _entry_for_spec(spec) is not None
+
+
+def has_varlen_kernel(spec: AttnShape) -> bool:
+    """Whether packed metadata exists for ``spec``, without importing Triton."""
+    return f"varlen_{spec.key}" in _varlen_manifest()
+
+
 def _nearest(spec: AttnShape, limit: int = 8) -> list[str]:
     """Shapes that differ from ``spec`` in the fewest fields, for the error text."""
     fields = ("batch", "seqlen_q", "seqlen_k", "nheads_q", "nheads_kv", "head_dim")

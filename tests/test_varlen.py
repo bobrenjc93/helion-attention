@@ -274,7 +274,17 @@ def test_varlen_validates_maxima_cu_seqlens_and_forward_only_contract() -> None:
         helion_attention.flash_attn_varlen_func(*call_args, shape=spec)
 
 
-def test_varlen_support_query_is_separate_from_dense_support() -> None:
+def test_support_queries_are_metadata_only_and_varlen_is_separate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from helion_attention import _registry
+
+    def fail_load(key: str) -> None:
+        raise AssertionError(f"support query tried to load {key}")
+
+    monkeypatch.setattr(_registry, "_load", fail_load)
+    monkeypatch.setattr(_registry, "_load_varlen", fail_load)
     shape = (8, 512, 16, 64)
+    assert helion_attention.is_shape_supported(shape)
     assert helion_attention.is_varlen_shape_supported(shape)
     assert not helion_attention.is_varlen_shape_supported((3, 77, 5, 64))

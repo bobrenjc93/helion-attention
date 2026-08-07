@@ -21,6 +21,8 @@ from ._autograd import attention_autograd
 from ._registry import UnsupportedShapeError
 from ._registry import available_shapes
 from ._registry import available_varlen_shapes
+from ._registry import has_kernel
+from ._registry import has_varlen_kernel
 from ._registry import lookup
 from ._registry import lookup_backward
 from ._registry import lookup_varlen
@@ -70,22 +72,14 @@ def is_shape_supported(
     shape: ShapeLike, dtype: torch.dtype = torch.bfloat16, causal: bool = False
 ) -> bool:
     """True when a kernel for this exact shape is checked in."""
-    try:
-        lookup(normalize_shape(shape, dtype, causal))
-    except UnsupportedShapeError:
-        return False
-    return True
+    return has_kernel(normalize_shape(shape, dtype, causal))
 
 
 def is_varlen_shape_supported(
     shape: ShapeLike, dtype: torch.dtype = torch.bfloat16, causal: bool = False
 ) -> bool:
     """True when a packed-sequence kernel for this maximum shape is checked in."""
-    try:
-        lookup_varlen(normalize_shape(shape, dtype, causal))
-    except UnsupportedShapeError:
-        return False
-    return True
+    return has_varlen_kernel(normalize_shape(shape, dtype, causal))
 
 
 def flash_attn_func(
