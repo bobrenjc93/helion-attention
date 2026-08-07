@@ -46,6 +46,34 @@
         "eval_1afd133e": 43,
         "eval_5b403bea": 97
       }
+    },
+    {
+      "key": "base:d9558cf7350779cb61f98456acb34670235586fc",
+      "commit": "d9558cf7350779cb61f98456acb34670235586fc",
+      "recordedAt": "2026-08-07T08:07:16.479Z",
+      "label": "base d9558cf",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 42,
+        "eval_1afd133e": 32,
+        "eval_5b403bea": 95
+      }
+    },
+    {
+      "key": "pr:2",
+      "recordedAt": "2026-08-07T08:07:16.479Z",
+      "label": "PR #2",
+      "kind": "leaf",
+      "prNumber": 2,
+      "title": "Ship kernels for Llama-3-8B and Qwen2-7B production shapes",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 57,
+        "eval_1afd133e": 34,
+        "eval_5b403bea": 73
+      }
     }
   ]
 }
