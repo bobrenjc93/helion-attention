@@ -90,12 +90,16 @@ def build_inputs(spec: "AttnShape") -> tuple[torch.Tensor, torch.Tensor, torch.T
 
 
 def reference(q, k, v, sm_scale, causal):  # noqa: ANN001, ANN201
+    # PyTorch's is_causal mask is top-left aligned for unequal sequence
+    # lengths. FlashAttention's is bottom-right aligned, which means a single
+    # newest-token query sees the full cache and needs no explicit mask.
+    is_causal = causal and q.size(1) == k.size(1)
     return torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2).float(),
         k.transpose(1, 2).float(),
         v.transpose(1, 2).float(),
         scale=sm_scale,
-        is_causal=causal,
+        is_causal=is_causal,
         enable_gqa=q.size(2) != k.size(2),
     ).transpose(1, 2)
 
@@ -150,12 +154,18 @@ def main() -> int:
         dtype=DTYPES[args.dtype],
         causal=args.causal,
     )
-    if spec.causal and spec.seqlen_q != spec.seqlen_k:
-        raise SystemExit("causal kernels require seqlen_q == seqlen_k")
+    if spec.causal and spec.seqlen_q != spec.seqlen_k and not spec.is_decode:
+        raise SystemExit(
+            "unequal causal lengths are supported only for seqlen_q=1 decode"
+        )
 
     import helion_kernels
 
-    kernel = helion_kernels.KERNELS[spec.causal]
+    kernel = helion_kernels.select_kernel(
+        causal=spec.causal,
+        seqlen_q=spec.seqlen_q,
+        seqlen_k=spec.seqlen_k,
+    )
     q, k, v, sm_scale = build_inputs(spec)
 
     print(f"autotuning {spec.describe()}", flush=True)

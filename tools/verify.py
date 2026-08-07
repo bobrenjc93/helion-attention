@@ -37,13 +37,18 @@ def check(spec: AttnShape) -> float:
     k = rand(spec.seqlen_k, spec.nheads_kv)
     v = rand(spec.seqlen_k, spec.nheads_kv)
     scale = 1.0 / math.sqrt(spec.head_dim)
-    got = helion_attention.flash_attn_func(q, k, v, causal=spec.causal, shape=spec)
+    if spec.is_decode:
+        got = helion_attention.flash_attn_with_kvcache(
+            q, k, v, causal=spec.causal, shape=spec
+        )
+    else:
+        got = helion_attention.flash_attn_func(q, k, v, causal=spec.causal, shape=spec)
     expected = torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2).float(),
         k.transpose(1, 2).float(),
         v.transpose(1, 2).float(),
         scale=scale,
-        is_causal=spec.causal,
+        is_causal=spec.causal and not spec.is_decode,
         enable_gqa=spec.nheads_q != spec.nheads_kv,
     ).transpose(1, 2)
     return (got.float() - expected).abs().max().item()

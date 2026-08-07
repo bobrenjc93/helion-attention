@@ -32,6 +32,7 @@ __all__ = [
     "flash_attn_func",
     "flash_attn_kvpacked_func",
     "flash_attn_qkvpacked_func",
+    "flash_attn_with_kvcache",
     "is_shape_supported",
 ]
 
@@ -90,7 +91,8 @@ def flash_attn_func(
         k: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
-        causal: bottom-of-the-diagonal masking; requires ``seqlen_q == seqlen_k``.
+        causal: bottom-right causal masking. Unequal sequence lengths are
+            supported for single-token decode (``seqlen_q == 1``).
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -104,9 +106,10 @@ def flash_attn_func(
     _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
     spec = normalize_shape(shape, q.dtype, causal)
     check_tensors(q, k, v, spec)
-    if causal and spec.seqlen_q != spec.seqlen_k:
+    if causal and spec.seqlen_q != spec.seqlen_k and not spec.is_decode:
         raise NotImplementedError(
-            "causal attention with seqlen_q != seqlen_k is not implemented"
+            "causal attention with unequal sequence lengths is implemented only "
+            "for single-token decode (seqlen_q=1)"
         )
     if q.requires_grad or k.requires_grad or v.requires_grad:
         raise NotImplementedError(
@@ -116,6 +119,99 @@ def flash_attn_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     return lookup(spec)(q, k, v, float(softmax_scale))
+
+
+def flash_attn_with_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: torch.Tensor | None = None,
+    v: torch.Tensor | None = None,
+    rotary_cos: torch.Tensor | None = None,
+    rotary_sin: torch.Tensor | None = None,
+    cache_seqlens: int | torch.Tensor | None = None,
+    cache_batch_idx: torch.Tensor | None = None,
+    cache_leftpad: torch.Tensor | None = None,
+    block_table: torch.Tensor | None = None,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    rotary_interleaved: bool = True,
+    alibi_slopes: torch.Tensor | None = None,
+    num_splits: int = 0,
+    return_softmax_lse: bool = False,
+    *,
+    shape: ShapeLike,
+) -> torch.Tensor:
+    """Read a full KV cache with FlashAttention's decode entry-point shape.
+
+    The supported path is a dense, contiguous, read-only cache and exactly one
+    query token. As with every entry point in this package, ``shape`` is
+    required and describes ``q`` plus the cache:
+    ``(batch, 1, cache_len, nheads_q, nheads_kv, head_dim)``.
+
+    ``cache_seqlens`` may be omitted or supplied as a Python integer equal to
+    the declared cache length. Tensor-valued lengths, cache appends,
+    partial/ragged caches, rotary embeddings, paged caches, and softmax LSE
+    output are not implemented yet and fail explicitly.
+    """
+    if k is not None or v is not None:
+        raise NotImplementedError("updating the KV cache with k/v is not implemented")
+    if rotary_cos is not None or rotary_sin is not None:
+        raise NotImplementedError(
+            "rotary embeddings in the KV-cache entry point are not implemented"
+        )
+    if cache_batch_idx is not None:
+        raise NotImplementedError("cache_batch_idx is not implemented")
+    if cache_leftpad is not None:
+        raise NotImplementedError("cache_leftpad is not implemented")
+    if block_table is not None:
+        raise NotImplementedError("paged KV caches are not implemented")
+    if num_splits != 0:
+        raise NotImplementedError(
+            "explicit num_splits is not implemented; pass num_splits=0"
+        )
+    if return_softmax_lse:
+        raise NotImplementedError("return_softmax_lse is not implemented")
+
+    # This flag changes only how rotary pairs are laid out, so it is irrelevant
+    # when rotary_cos/rotary_sin are absent. Keep it in the compatible signature.
+    del rotary_interleaved
+
+    _reject_unsupported(0.0, window_size, softcap, alibi_slopes, False)
+    spec = normalize_shape(shape, q.dtype, causal)
+    if not spec.is_decode:
+        raise NotImplementedError(
+            "flash_attn_with_kvcache currently supports only seqlen_q=1 "
+            "with a non-empty cache"
+        )
+    if cache_seqlens is not None:
+        if isinstance(cache_seqlens, int):
+            if cache_seqlens != spec.seqlen_k:
+                raise NotImplementedError(
+                    "partial or ragged KV caches are not implemented; cache_seqlens "
+                    "must equal the cache length declared by shape"
+                )
+        elif isinstance(cache_seqlens, torch.Tensor):
+            # Reading a CUDA tensor on the host would synchronize and break
+            # graph capture, while a device assertion would poison the CUDA
+            # context for an ordinary input error. Reject this unsupported
+            # dynamic form recoverably before launching any CUDA work.
+            raise NotImplementedError(
+                "tensor-valued cache_seqlens are not implemented; omit "
+                "cache_seqlens or pass the full cache length as a Python int"
+            )
+        else:
+            raise TypeError("cache_seqlens must be an int, a torch.Tensor, or None")
+    return flash_attn_func(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        shape=spec,
+    )
 
 
 def flash_attn_qkvpacked_func(

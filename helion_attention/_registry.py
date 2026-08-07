@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Callable
@@ -83,6 +84,12 @@ def _nearest(spec: AttnShape, limit: int = 8) -> list[str]:
 def lookup(spec: AttnShape) -> AttnKernel:
     """Return the generated kernel for ``spec`` or explain how to get one."""
     entry = _manifest().get(spec.key)
+    if entry is None and spec.is_decode:
+        # With a single bottom-right-aligned query, causal and non-causal both
+        # expose the entire cache. Reuse the one generated specialization so
+        # the FlashAttention-compatible default (causal=False) also works.
+        equivalent = replace(spec, causal=not spec.causal)
+        entry = _manifest().get(equivalent.key)
     if entry is None:
         nearest = _nearest(spec)
         listing = "\n".join(f"    {item}" for item in nearest)
@@ -93,4 +100,4 @@ def lookup(spec: AttnShape) -> AttnKernel:
             "https://github.com/bobrenjc93/helion-attention/issues with the shape "
             "above and it can be generated and added."
         )
-    return _load(spec.key)
+    return _load(str(entry["key"]))

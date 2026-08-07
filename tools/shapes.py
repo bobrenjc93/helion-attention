@@ -18,6 +18,7 @@ class ShapeRequest(NamedTuple):
     causal: bool = False
     nheads_kv: int | None = None
     label: str = ""
+    seqlen_k: int | None = None
 
     @property
     def args(self) -> list[str]:
@@ -30,6 +31,8 @@ class ShapeRequest(NamedTuple):
         ]
         if self.nheads_kv is not None:
             argv += ["--nheads-kv", str(self.nheads_kv)]
+        if self.seqlen_k is not None:
+            argv += ["--seqlen-k", str(self.seqlen_k)]
         if self.causal:
             argv.append("--causal")
         if self.label:
@@ -39,8 +42,9 @@ class ShapeRequest(NamedTuple):
     @property
     def name(self) -> str:
         kv = "" if self.nheads_kv is None else f"_hkv{self.nheads_kv}"
+        sk = "" if self.seqlen_k is None else f"_sk{self.seqlen_k}"
         return (
-            f"b{self.batch}_s{self.seqlen}_h{self.nheads}{kv}_d{self.head_dim}"
+            f"b{self.batch}_s{self.seqlen}{sk}_h{self.nheads}{kv}_d{self.head_dim}"
             f"_{self.dtype}_{'causal' if self.causal else 'noncausal'}"
         )
 
@@ -69,4 +73,34 @@ CATALOGUE: list[ShapeRequest] = [
     ShapeRequest(4, 2048, 28, 128, causal=True, nheads_kv=4, label="Qwen2-7B GQA 7:1"),
     ShapeRequest(4, 4096, 28, 128, causal=True, nheads_kv=4, label="Qwen2-7B GQA 7:1"),
     ShapeRequest(4, 8192, 28, 128, causal=True, nheads_kv=4, label="Qwen2-7B GQA 7:1"),
+    ShapeRequest(
+        1,
+        1,
+        32,
+        128,
+        causal=True,
+        nheads_kv=8,
+        label="Llama-3-8B single-token decode, 1k KV cache",
+        seqlen_k=1024,
+    ),
+    ShapeRequest(
+        1,
+        1,
+        32,
+        128,
+        causal=True,
+        nheads_kv=8,
+        label="Llama-3-8B single-token decode, 4k KV cache",
+        seqlen_k=4096,
+    ),
+    ShapeRequest(
+        1,
+        1,
+        32,
+        128,
+        causal=True,
+        nheads_kv=8,
+        label="Llama-3-8B single-token decode, 16k KV cache",
+        seqlen_k=16384,
+    ),
 ]
