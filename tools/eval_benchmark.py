@@ -32,8 +32,8 @@ def main() -> int:
             {
                 "score": 0,
                 "summary": "benchmark harness failed to run",
-                "evidence": (completed.stdout + completed.stderr)[-4000:],
-                "suggestions": "fix benchmarks/bench.py so the benchmark can run at all",
+                "evidence": [(completed.stdout + completed.stderr)[-4000:]],
+                "suggestions": ["fix benchmarks/bench.py so the benchmark can run at all"],
             },
             sys.stdout,
         )
@@ -64,8 +64,8 @@ def main() -> int:
             {
                 "score": 0,
                 "summary": "no comparable measurements",
-                "evidence": completed.stdout[-4000:],
-                "suggestions": "check that flash-attn is installed in the benchmark environment",
+                "evidence": [completed.stdout[-4000:]],
+                "suggestions": ["check that flash-attn is installed in the benchmark environment"],
             },
             sys.stdout,
         )
@@ -93,8 +93,8 @@ def main() -> int:
                 f"{len(speedups)} kernels, geomean {geomean:.2f}x vs FlashAttention, "
                 f"{len(losses)} slower than FlashAttention"
             ),
-            "evidence": "\n".join(rows),
-            "suggestions": " ".join(suggestions) or "every kernel beats FlashAttention",
+            "evidence": rows[:8],
+            "suggestions": suggestions or ["every kernel beats FlashAttention"],
         },
         sys.stdout,
     )

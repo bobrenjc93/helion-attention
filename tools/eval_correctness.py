@@ -54,8 +54,11 @@ def main() -> int:
                 f"verify {'passed' if verify_code == 0 else 'FAILED'}; "
                 f"pytest {'passed' if test_code == 0 else 'FAILED'}"
             ),
-            "evidence": f"$ tools/verify.py\n{verify_output}\n\n$ pytest -q tests\n{test_output}",
-            "suggestions": " ".join(suggestions) or "correctness is clean",
+            "evidence": [
+                f"$ tools/verify.py\n{verify_output}",
+                f"$ pytest -q tests\n{test_output}",
+            ],
+            "suggestions": suggestions or ["correctness is clean"],
         },
         sys.stdout,
     )
