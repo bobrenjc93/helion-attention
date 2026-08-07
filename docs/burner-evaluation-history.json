@@ -130,6 +130,20 @@
         "eval_1afd133e": 44,
         "eval_5b403bea": 74
       }
+    },
+    {
+      "key": "pr:5",
+      "recordedAt": "2026-08-07T12:15:23.910Z",
+      "label": "PR #5",
+      "kind": "leaf",
+      "prNumber": 5,
+      "title": "Implement flash_attn_varlen_func for packed sequences",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 63,
+        "eval_1afd133e": 52,
+        "eval_5b403bea": 77
+      }
     }
   ]
 }
