@@ -3,13 +3,13 @@
 vLLM calls FlashAttention through a varlen API that does not carry
 ``helion_attention``'s explicit ``shape`` argument.  This module infers the
 specialization from the packed tensors and maximum sequence lengths.  Calls
-matching a checked-in varlen kernel use it; all other calls use a correctness
-fallback implemented with PyTorch operations.
+matching a checked-in varlen kernel use it, paged CUDA calls use a generic
+single-launch Triton kernel, and remaining calls use a correctness fallback
+implemented with PyTorch operations.
 
-The fallback deliberately favors coverage and correctness over performance.
-It keeps sequence metadata on-device for CUDA-graph capture and evaluates
-paged attention with fixed-size tiles and online softmax state, rather than
-materializing a quadratic attention matrix.
+Both generic paths keep sequence metadata on-device and carry tiled online
+softmax state rather than materializing a quadratic attention matrix.  The
+PyTorch path deliberately favors coverage and correctness over performance.
 """
 
 from __future__ import annotations
@@ -49,12 +49,23 @@ _FP8_DTYPES: frozenset[torch.dtype] = frozenset(
     )
     if hasattr(torch, name)
 )
+_PAGED_DTYPES: frozenset[torch.dtype] = _FP8_DTYPES | {
+    torch.float16,
+    torch.bfloat16,
+}
 
 # Bound the largest temporary tensors used by the correctness fallback.  The
 # online-softmax state is carried across key tiles, so these constants affect
 # launch count but not numerical semantics.
 _QUERY_TILE_SIZE = 16
 _KEY_TILE_SIZE = 128
+
+
+def _paged_attention(*args: Any, **kwargs: Any) -> Any:
+    """Import Triton only when a CUDA paged call reaches the fast path."""
+    from ._paged_attention import paged_attention
+
+    return paged_attention(*args, **kwargs)
 
 
 def is_fa_version_supported(fa_version: int) -> bool:
@@ -116,6 +127,32 @@ def _normalize_window(window_size: Sequence[int] | None) -> tuple[int, int]:
     return left, right
 
 
+def _normalize_maximum(
+    value: int | torch.Tensor,
+    name: str,
+    *,
+    capture_fallback: int,
+) -> int:
+    """Accept vLLM's Python integers and zero-dimensional integer tensors."""
+    if type(value) is int:
+        result = value
+    elif isinstance(value, torch.Tensor) and value.ndim == 0:
+        if value.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"{name} tensor must have dtype torch.int32 or torch.int64")
+        if value.is_cuda and torch.cuda.is_current_stream_capturing():
+            # CUDA graphs cannot synchronize a device scalar back to Python.
+            # Static storage bounds are conservative launch bounds; actual
+            # per-request lengths remain in device-side metadata.
+            result = capture_fallback
+        else:
+            result = int(value.detach().item())
+    else:
+        raise TypeError(f"{name} must be a Python integer or scalar integer tensor")
+    if result < 0:
+        raise ValueError(f"{name} cannot be negative")
+    return result
+
+
 def _validate_cumulative(
     name: str,
     cumulative: torch.Tensor,
@@ -132,6 +169,8 @@ def _validate_cumulative(
         raise ValueError(f"{name} must have dtype torch.int32")
     if cumulative.device != device:
         raise ValueError(f"{name} must be on device {device}")
+    if not cumulative.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
     if cumulative.numel() != expected_size:
         raise ValueError(
             f"{name} must contain {expected_size} offsets, got {cumulative.numel()}"
@@ -139,21 +178,24 @@ def _validate_cumulative(
 
 
 def _validate_lengths(
-    seqused_k: torch.Tensor,
+    lengths: torch.Tensor,
     *,
+    name: str = "seqused_k",
     batch: int,
     device: torch.device,
 ) -> None:
-    if not isinstance(seqused_k, torch.Tensor):
-        raise TypeError("seqused_k must be a torch.Tensor")
-    if tuple(seqused_k.shape) != (batch,):
+    if not isinstance(lengths, torch.Tensor):
+        raise TypeError(f"{name} must be a torch.Tensor")
+    if tuple(lengths.shape) != (batch,):
         raise ValueError(
-            f"seqused_k must have shape ({batch},), got {tuple(seqused_k.shape)}"
+            f"{name} must have shape ({batch},), got {tuple(lengths.shape)}"
         )
-    if seqused_k.dtype != torch.int32:
-        raise ValueError("seqused_k must have dtype torch.int32")
-    if seqused_k.device != device:
-        raise ValueError(f"seqused_k must be on device {device}")
+    if lengths.dtype != torch.int32:
+        raise ValueError(f"{name} must have dtype torch.int32")
+    if lengths.device != device:
+        raise ValueError(f"{name} must be on device {device}")
+    if not lengths.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
 
 
 def _head_values_for_requests(
@@ -268,6 +310,9 @@ def _try_specialized(
     k_descale: torch.Tensor | None,
     v_descale: torch.Tensor | None,
     s_aux: torch.Tensor | None,
+    q_v: torch.Tensor | None,
+    cp_world_size: int,
+    cp_tot_seqused_k: torch.Tensor | None,
 ) -> torch.Tensor | None:
     """Use a checked-in kernel when every semantic and layout constraint fits."""
     if (
@@ -280,6 +325,9 @@ def _try_specialized(
         or softcap > 0.0
         or alibi_slopes is not None
         or return_softmax_lse
+        or q_v is not None
+        or cp_world_size != 1
+        or cp_tot_seqused_k is not None
         or any(item is not None for item in (q_descale, k_descale, v_descale, s_aux))
         or not q.is_cuda
         or not all(tensor.is_contiguous() for tensor in (q, k, v))
@@ -322,11 +370,13 @@ def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    max_seqlen_q: int,
+    max_seqlen_q: int | torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    max_seqlen_k: int,
+    max_seqlen_k: int | torch.Tensor,
     cu_seqlens_k: torch.Tensor | None = None,
     seqused_k: torch.Tensor | None = None,
+    q_v: torch.Tensor | None = None,
+    dropout_p: float = 0.0,
     softmax_scale: float | None = None,
     causal: bool = False,
     window_size: Sequence[int] | None = None,
@@ -342,6 +392,9 @@ def flash_attn_varlen_func(
     num_splits: int = 0,
     fa_version: int = 3,
     s_aux: torch.Tensor | None = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+    cp_tot_seqused_k: torch.Tensor | None = None,
     dynamic_causal: torch.Tensor | None = None,
     mask_mod: object | None = None,
     aux_tensors: Sequence[torch.Tensor] | None = None,
@@ -353,8 +406,9 @@ def flash_attn_varlen_func(
     caches use ``[blocks, page_size, heads_kv, head_dim]`` together with
     ``block_table`` and ``seqused_k``.
 
-    The fallback implements FlashAttention's bottom-right mask alignment,
-    GQA/MQA, local windows, softcap, ALiBi, FP8 descales, attention sinks,
+    The generic implementations cover FlashAttention's bottom-right mask
+    alignment, GQA/MQA, MLA's additional QV score term, context-parallel key
+    positions, local windows, softcap, ALiBi, FP8 descales, attention sinks,
     optional LSE output, and ``out=`` semantics.
     """
     if not is_fa_version_supported(fa_version):
@@ -363,6 +417,22 @@ def flash_attn_varlen_func(
     if dynamic_causal is not None or mask_mod is not None or aux_tensors is not None:
         raise NotImplementedError(
             "dynamic_causal, mask_mod, and aux_tensors require unsupported FA4"
+        )
+    if float(dropout_p) != 0.0:
+        raise NotImplementedError(
+            "helion-attention's vLLM adapter only supports dropout_p=0.0"
+        )
+    if type(cp_world_size) is not int or type(cp_rank) is not int:
+        raise TypeError("cp_world_size and cp_rank must be Python integers")
+    if cp_world_size <= 0:
+        raise ValueError("cp_world_size must be positive")
+    if cp_rank < 0 or cp_rank >= cp_world_size:
+        raise ValueError("cp_rank must be in [0, cp_world_size)")
+    if cp_world_size > 1 and fa_version != 3:
+        raise NotImplementedError("context parallelism is only supported with FA3")
+    if cp_world_size > 1 and cp_tot_seqused_k is None:
+        raise ValueError(
+            "cp_tot_seqused_k is required when cp_world_size is greater than one"
         )
     del scheduler_metadata, num_splits  # Optimization selectors only.
 
@@ -389,10 +459,32 @@ def flash_attn_varlen_func(
         raise ValueError("q, k, and v must have the same dtype")
     if k.device != q.device or v.device != q.device:
         raise ValueError("q, k, and v must be on the same device")
-    if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
-        raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
-    if max_seqlen_q < 0 or max_seqlen_k < 0:
-        raise ValueError("maximum sequence lengths cannot be negative")
+    if q_v is not None:
+        if fa_version != 3:
+            raise NotImplementedError("q_v is only supported with FA3")
+        if not isinstance(q_v, torch.Tensor):
+            raise TypeError("q_v must be a torch.Tensor or None")
+        expected_q_v_shape = (q.shape[0], q.shape[1], v.shape[-1])
+        if tuple(q_v.shape) != expected_q_v_shape:
+            raise ValueError(
+                f"q_v must have shape {expected_q_v_shape}, got {tuple(q_v.shape)}"
+            )
+        if q_v.device != q.device or q_v.dtype != q.dtype:
+            raise ValueError("q_v must have the same device and dtype as q")
+    max_k_storage = k.shape[0]
+    if k.ndim == 4:
+        max_k_storage = k.shape[1]
+        if (
+            isinstance(block_table, torch.Tensor)
+            and block_table.ndim == 2
+        ):
+            max_k_storage = block_table.shape[1] * k.shape[1]
+    max_seqlen_q = _normalize_maximum(
+        max_seqlen_q, "max_seqlen_q", capture_fallback=q.shape[0]
+    )
+    max_seqlen_k = _normalize_maximum(
+        max_seqlen_k, "max_seqlen_k", capture_fallback=max_k_storage
+    )
     if not isinstance(cu_seqlens_q, torch.Tensor) or cu_seqlens_q.ndim != 1:
         raise ValueError("cu_seqlens_q must be a one-dimensional tensor")
     if cu_seqlens_q.dtype != torch.int32 or cu_seqlens_q.device != q.device:
@@ -413,6 +505,10 @@ def flash_attn_varlen_func(
             raise ValueError("out must be on the same device as q")
 
     real_window = _normalize_window(window_size)
+    if cp_world_size > 1 and real_window != (-1, -1):
+        raise NotImplementedError(
+            "local attention is not supported with context parallelism"
+        )
     scale = None if softmax_scale is None else float(softmax_scale)
     cap = float(softcap)
 
@@ -437,6 +533,9 @@ def flash_attn_varlen_func(
         k_descale,
         v_descale,
         s_aux,
+        q_v,
+        cp_world_size,
+        cp_tot_seqused_k,
     )
     if specialized is not None:
         return specialized
@@ -469,6 +568,17 @@ def flash_attn_varlen_func(
                 (torch.zeros_like(seqused_k[:1]), torch.cumsum(seqused_k, dim=0)[:-1])
             )
 
+    if cp_tot_seqused_k is not None:
+        _validate_lengths(
+            cp_tot_seqused_k,
+            name="cp_tot_seqused_k",
+            batch=batch,
+            device=q.device,
+        )
+    total_key_lengths = (
+        key_lengths if cp_tot_seqused_k is None else cp_tot_seqused_k
+    )
+
     if block_table is not None:
         if k.ndim != 4:
             raise ValueError(
@@ -494,6 +604,51 @@ def flash_attn_varlen_func(
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
 
+    differentiable_inputs = (q, k, v) if q_v is None else (q, k, v, q_v)
+    if (
+        block_table is not None
+        and q.is_cuda
+        and q.dtype in _PAGED_DTYPES
+        and not (
+            torch.is_grad_enabled()
+            and any(tensor.requires_grad for tensor in differentiable_inputs)
+        )
+    ):
+        left_window, right_window = real_window
+        fa2_global_left = left_window < 0 or left_window >= max_seqlen_k
+        shift_fa2_lse = (
+            fa_version == 2
+            and alibi_slopes is not None
+            and fa2_global_left
+            and (causal or right_window == 0)
+        )
+        assert seqused_k is not None
+        return _paged_attention(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=scale,
+            causal=bool(causal),
+            window_size=real_window,
+            softcap=cap,
+            alibi_slopes=alibi_slopes,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            s_aux=s_aux,
+            q_v=q_v,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqused_k=cp_tot_seqused_k,
+            out=out,
+            return_softmax_lse=bool(return_softmax_lse),
+            shift_fa2_lse=shift_fa2_lse,
+        )
+
     output_dtype = torch.bfloat16 if out is None and q.dtype in _FP8_DTYPES else q.dtype
     if out is not None:
         output_dtype = out.dtype
@@ -515,8 +670,9 @@ def flash_attn_varlen_func(
         query_lengths = query_stops - query_starts
         local_query_positions = token_positions - query_starts
         tile_key_lengths = key_lengths.index_select(0, request_ids)
+        tile_total_key_lengths = total_key_lengths.index_select(0, request_ids)
         aligned_query_positions = (
-            local_query_positions + tile_key_lengths - query_lengths
+            local_query_positions + tile_total_key_lengths - query_lengths
         )
 
         query_f = (
@@ -524,6 +680,13 @@ def flash_attn_varlen_func(
             .float()
             .reshape(q_stop - q_start, nheads_kv, group_size, q.shape[-1])
         )
+        query_v_f = None
+        if q_v is not None:
+            query_v_f = (
+                q_v[q_start:q_stop]
+                .float()
+                .reshape(q_stop - q_start, nheads_kv, group_size, v.shape[-1])
+            )
         query_descale = _head_values_for_requests(
             q_descale,
             name="q_descale",
@@ -564,6 +727,10 @@ def flash_attn_varlen_func(
             query_f = query_f * query_descale.reshape(
                 q_stop - q_start, nheads_kv, group_size, 1
             )
+            if query_v_f is not None:
+                query_v_f = query_v_f * query_descale.reshape(
+                    q_stop - q_start, nheads_kv, group_size, 1
+                )
 
         state_shape = (q_stop - q_start, nheads_kv, group_size)
         if sink is None:
@@ -596,18 +763,29 @@ def flash_attn_varlen_func(
             if value_descale is not None:
                 value_f = value_f * value_descale[:, None, :, None]
 
-            scores = torch.einsum("qhgd,qkhd->qhgk", query_f, key_f) * scale
+            scores = torch.einsum("qhgd,qkhd->qhgk", query_f, key_f)
+            if query_v_f is not None:
+                scores = scores + torch.einsum(
+                    "qhgd,qkhd->qhgk", query_v_f, value_f
+                )
+            scores = scores * scale
             if cap > 0.0:
                 scores = cap * torch.tanh(scores / cap)
 
             columns = key_positions[None, :]
+            global_columns = columns * cp_world_size + cp_rank
             keep = columns < tile_key_lengths[:, None]
+            keep &= global_columns < tile_total_key_lengths[:, None]
             if causal:
-                keep &= columns <= aligned_query_positions[:, None]
+                keep &= global_columns <= aligned_query_positions[:, None]
             if left_window >= 0:
-                keep &= columns >= aligned_query_positions[:, None] - left_window
+                keep &= (
+                    global_columns >= aligned_query_positions[:, None] - left_window
+                )
             if right_window >= 0:
-                keep &= columns <= aligned_query_positions[:, None] + right_window
+                keep &= (
+                    global_columns <= aligned_query_positions[:, None] + right_window
+                )
 
             # A zero attention weight does not neutralize NaN/Inf under IEEE
             # multiplication.  Clear masked values before the contraction so
@@ -615,7 +793,9 @@ def flash_attn_varlen_func(
             value_f = value_f.masked_fill(~keep[:, :, None, None], 0.0)
 
             if slopes is not None:
-                distance = (aligned_query_positions[:, None] - columns).abs().float()
+                distance = (
+                    aligned_query_positions[:, None] - global_columns
+                ).abs().float()
                 scores = (
                     scores
                     - slopes.reshape(q_stop - q_start, nheads_kv, group_size, 1)

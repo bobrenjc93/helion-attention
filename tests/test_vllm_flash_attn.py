@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import time
 
 import pytest
 import torch
@@ -21,6 +22,8 @@ VLLM_KEYWORDS = {
     "max_seqlen_k",
     "cu_seqlens_k",
     "seqused_k",
+    "q_v",
+    "dropout_p",
     "softmax_scale",
     "causal",
     "window_size",
@@ -36,6 +39,9 @@ VLLM_KEYWORDS = {
     "num_splits",
     "fa_version",
     "s_aux",
+    "cp_world_size",
+    "cp_rank",
+    "cp_tot_seqused_k",
     "dynamic_causal",
     "mask_mod",
     "aux_tensors",
@@ -89,6 +95,9 @@ def test_vllm_surface_has_no_shape_argument() -> None:
     parameters = inspect.signature(compat.flash_attn_varlen_func).parameters
     assert VLLM_KEYWORDS <= parameters.keys()
     assert "shape" not in parameters
+    assert parameters["dropout_p"].default == 0.0
+    assert parameters["cp_world_size"].default == 1
+    assert parameters["cp_rank"].default == 0
     assert compat.compile_flash_attn_varlen_func_from_specs is None
 
     assert compat.is_fa_version_supported(2)
@@ -105,6 +114,111 @@ def test_vllm_surface_has_no_shape_argument() -> None:
         headdim=8,
         cache_seqlens=torch.tensor([4], dtype=torch.int32),
     )
+
+
+def test_nonzero_dropout_is_rejected_explicitly() -> None:
+    tensor = torch.zeros(1, 1, 1)
+    cumulative = torch.tensor([0, 1], dtype=torch.int32)
+    with pytest.raises(NotImplementedError, match="dropout_p=0.0"):
+        compat.flash_attn_varlen_func(
+            q=tensor,
+            k=tensor,
+            v=tensor,
+            max_seqlen_q=1,
+            cu_seqlens_q=cumulative,
+            max_seqlen_k=1,
+            cu_seqlens_k=cumulative,
+            dropout_p=0.1,
+        )
+
+
+@requires_cuda
+def test_fa3_mla_qv_cp_and_scalar_tensor_maxima() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(1601)
+    query_length, local_key_length = 2, 2
+    nheads, head_dim, value_dim, page_size = 2, 16, 32, 4
+    scale = 0.17
+    q = torch.randn(
+        query_length,
+        nheads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    q_v = torch.randn(
+        query_length,
+        nheads,
+        value_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    k = torch.randn(
+        1,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    v = torch.randn(
+        1,
+        page_size,
+        1,
+        value_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    cu_q = torch.tensor([0, query_length], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor(
+        [local_key_length], device="cuda", dtype=torch.int32
+    )
+    total_seqused_k = torch.tensor([5], device="cuda", dtype=torch.int32)
+    block_table = torch.tensor([[0]], device="cuda", dtype=torch.int32)
+
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        q_v=q_v,
+        max_seqlen_q=torch.tensor(query_length, device="cuda", dtype=torch.int32),
+        cu_seqlens_q=cu_q,
+        max_seqlen_k=torch.tensor(page_size, device="cuda", dtype=torch.int64),
+        seqused_k=seqused_k,
+        block_table=block_table,
+        dropout_p=0.0,
+        softmax_scale=scale,
+        causal=True,
+        return_softmax_lse=True,
+        fa_version=3,
+        cp_world_size=2,
+        cp_rank=1,
+        cp_tot_seqused_k=total_seqused_k,
+    )
+    assert isinstance(result, tuple)
+    actual, actual_lse = result
+
+    query = q.float().transpose(0, 1)
+    query_v = q_v.float().transpose(0, 1)
+    key = k[0, :local_key_length, 0].float()
+    value = v[0, :local_key_length, 0].float()
+    scores = (
+        torch.matmul(query, key.transpose(0, 1))
+        + torch.matmul(query_v, value.transpose(0, 1))
+    ) * scale
+    global_keys = torch.arange(local_key_length, device="cuda") * 2 + 1
+    aligned_queries = torch.arange(query_length, device="cuda") + 5 - query_length
+    keep = global_keys[None, :] <= aligned_queries[:, None]
+    scores = scores.masked_fill(~keep[None], float("-inf"))
+    probabilities = torch.softmax(scores, dim=-1)
+    expected = torch.matmul(probabilities, value).transpose(0, 1)
+    expected_lse = torch.logsumexp(scores, dim=-1)
+
+    torch.testing.assert_close(actual.float(), expected, atol=4e-2, rtol=3e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=3e-2, rtol=2e-2)
 
 
 @requires_cuda
@@ -325,9 +439,13 @@ def test_paged_fallback_supports_cuda_graph_capture() -> None:
         "q": q,
         "k": k_cache,
         "v": v_cache,
-        "max_seqlen_q": max(query_lengths),
+        "max_seqlen_q": torch.tensor(
+            max(query_lengths), device="cuda", dtype=torch.int32
+        ),
         "cu_seqlens_q": cu_q,
-        "max_seqlen_k": max(key_lengths),
+        "max_seqlen_k": torch.tensor(
+            max(key_lengths), device="cuda", dtype=torch.int32
+        ),
         "seqused_k": seqused_k,
         "block_table": block_table,
         "causal": True,
@@ -348,6 +466,82 @@ def test_paged_fallback_supports_cuda_graph_capture() -> None:
     assert isinstance(returned, torch.Tensor)
     assert returned.data_ptr() == captured_out.data_ptr()
     torch.testing.assert_close(captured_out, expected)
+
+
+@requires_cuda
+def test_paged_2048_has_bounded_launch_and_memory_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens, nheads_q, nheads_kv, head_dim, page_size = 2048, 4, 2, 64, 16
+    num_blocks = tokens // page_size
+    generator = torch.Generator(device="cuda").manual_seed(2048)
+    q = torch.randn(
+        tokens,
+        nheads_q,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    k = torch.randn(
+        num_blocks,
+        page_size,
+        nheads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    v = torch.randn(
+        k.shape,
+        device=k.device,
+        dtype=k.dtype,
+        generator=generator,
+    )
+    cu_q = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor([tokens], device="cuda", dtype=torch.int32)
+    block_table = torch.arange(
+        num_blocks, device="cuda", dtype=torch.int32
+    ).reshape(1, -1)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "max_seqlen_q": tokens,
+        "cu_seqlens_q": cu_q,
+        "max_seqlen_k": tokens,
+        "seqused_k": seqused_k,
+        "block_table": block_table,
+        "causal": True,
+        "fa_version": 3,
+    }
+
+    # Compile before measuring. The production path must remain one adapter
+    # dispatch, regardless of the O(sequence^2) attention work done in-kernel.
+    original = compat._paged_attention
+    calls = 0
+
+    def counted(*args: object, **call_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **call_kwargs)
+
+    monkeypatch.setattr(compat, "_paged_attention", counted)
+    compat.flash_attn_varlen_func(**kwargs)
+    torch.cuda.synchronize()
+    calls = 0
+    torch.cuda.reset_peak_memory_stats()
+    starting_memory = torch.cuda.memory_allocated()
+    started = time.perf_counter()
+    result = compat.flash_attn_varlen_func(**kwargs)
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - started
+    extra_peak_memory = torch.cuda.max_memory_allocated() - starting_memory
+
+    assert isinstance(result, torch.Tensor)
+    assert calls == 1
+    assert elapsed < 2.0
+    assert extra_peak_memory < 128 * 1024 * 1024
 
 
 @requires_cuda
