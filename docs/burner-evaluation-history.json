@@ -238,6 +238,36 @@
         "eval_5b403bea": 70,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:66dc79725ea5c25c42c7ee6ede5df40052b259b8",
+      "commit": "66dc79725ea5c25c42c7ee6ede5df40052b259b8",
+      "recordedAt": "2026-08-07T20:50:11.013Z",
+      "label": "base 66dc797",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 50,
+        "eval_1afd133e": 46,
+        "eval_5b403bea": 72,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:9",
+      "recordedAt": "2026-08-07T20:50:11.013Z",
+      "label": "PR #9",
+      "kind": "leaf",
+      "prNumber": 9,
+      "title": "Bottom-right causal alignment for seqlen_q != seqlen_k",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 57,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 71,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
