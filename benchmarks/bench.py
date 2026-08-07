@@ -344,12 +344,18 @@ def render_markdown(report: dict[str, object]) -> str:
             cells.append("n/a" if entry is None else f"{entry['us']:.0f}")
         helion = impls.get("helion-attention")
         flash = impls.get("flash-attn")
-        speedup = (
-            f"{flash['us'] / helion['us']:.2f}x"
-            if helion is not None and flash is not None
-            else "n/a"
+        if helion is not None and flash is not None:
+            speedup = flash["us"] / helion["us"]
+            comparison = (
+                f"{speedup:.2f}x faster"
+                if speedup >= 1
+                else f"{1 / speedup:.2f}x slower"
+            )
+        else:
+            comparison = "n/a"
+        lines.append(
+            f"| {row['description']} | " + " | ".join(cells) + f" | {comparison} |"
         )
-        lines.append(f"| {row['description']} | " + " | ".join(cells) + f" | {speedup} |")
     return "\n".join(lines) + "\n"
 
 

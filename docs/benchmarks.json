@@ -7,80 +7,358 @@
     {
       "key": "b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal",
       "description": "batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
       "note": "16k context, single sequence",
       "implementations": {
         "helion-attention": {
-          "us": 20596.569061279297,
-          "tflops": 53.383241864444145,
+          "us": 2945.429512711822,
+          "tflops": 373.3169413474203,
           "max_abs_error": 0.013725638389587402
         },
         "flash-attn": {
-          "us": 3303.603406812324,
-          "tflops": 332.8219196979604,
+          "us": 3237.583125721325,
+          "tflops": 339.629499519033,
           "max_abs_error": 0.008774995803833008
         },
         "sdpa-flash": {
-          "us": 3455.5659640919075,
-          "tflops": 318.18568628162245,
+          "us": 3592.51316243952,
+          "tflops": 306.0750752805381,
           "max_abs_error": 0.008774995803833008
         },
         "sdpa-cudnn": {
-          "us": 1968.7888284899154,
-          "tflops": 558.4710822538234,
+          "us": 2099.856924552184,
+          "tflops": 523.6445987264091,
           "max_abs_error": 0.008774995803833008
+        }
+      }
+    },
+    {
+      "key": "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=1 seqlen_k=1024 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Llama-3-8B single-token decode, 1k KV cache",
+      "implementations": {
+        "helion-attention": {
+          "us": 27.152307283413904,
+          "tflops": 0.6178928304280215,
+          "max_abs_error": 0.0005254894495010376
+        },
+        "flash-attn": {
+          "us": 77.40964554421282,
+          "tflops": 0.21673288751099665,
+          "max_abs_error": 0.0005336552858352661
+        },
+        "sdpa-flash": {
+          "us": 251.5026431254279,
+          "tflops": 0.06670791126291649,
+          "max_abs_error": 0.0005336552858352661
+        },
+        "sdpa-cudnn": {
+          "us": 194.77417969150457,
+          "tflops": 0.08613675604524582,
+          "max_abs_error": 0.0005336552858352661
+        }
+      }
+    },
+    {
+      "key": "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=1 seqlen_k=16384 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Llama-3-8B single-token decode, 16k KV cache",
+      "implementations": {
+        "helion-attention": {
+          "us": 99.38829040604118,
+          "tflops": 2.700876078090619,
+          "max_abs_error": 0.00014953315258026123
+        },
+        "flash-attn": {
+          "us": 83.13094885734311,
+          "tflops": 3.2290676299226266,
+          "max_abs_error": 0.00014037638902664185
+        },
+        "sdpa-flash": {
+          "us": 259.2797998825425,
+          "tflops": 1.0353118759024236,
+          "max_abs_error": 0.00014037638902664185
+        },
+        "sdpa-cudnn": {
+          "us": 196.8450371203599,
+          "tflops": 1.3636892244119239,
+          "max_abs_error": 0.00014037638902664185
+        }
+      }
+    },
+    {
+      "key": "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=1 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Llama-3-8B single-token decode, 4k KV cache",
+      "implementations": {
+        "helion-attention": {
+          "us": 44.662359702591786,
+          "tflops": 1.5025821395662984,
+          "max_abs_error": 0.0002873539924621582
+        },
+        "flash-attn": {
+          "us": 84.0962172768627,
+          "tflops": 0.7980009823636097,
+          "max_abs_error": 0.0002873539924621582
+        },
+        "sdpa-flash": {
+          "us": 258.37052519168327,
+          "tflops": 0.2597388535329732,
+          "max_abs_error": 0.0002873539924621582
+        },
+        "sdpa-cudnn": {
+          "us": 194.63508210886366,
+          "tflops": 0.34479325758171664,
+          "max_abs_error": 0.0002873539924621582
+        }
+      }
+    },
+    {
+      "key": "b1_sq2048_sk2048_hq28_hkv4_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Qwen2-7B GQA 7:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 412.4439905222495,
+          "tflops": 72.92978398815427,
+          "max_abs_error": 0.01452183723449707
+        },
+        "flash-attn": {
+          "us": 213.3888574333878,
+          "tflops": 140.96073945843074,
+          "max_abs_error": 0.008452892303466797
+        },
+        "sdpa-flash": {
+          "us": 208.32812218764508,
+          "tflops": 144.3849770263223,
+          "max_abs_error": 0.008452892303466797
+        },
+        "sdpa-cudnn": {
+          "us": 194.70171460083552,
+          "tflops": 154.48991395718772,
+          "max_abs_error": 0.008452892303466797
         }
       }
     },
     {
       "key": "b1_sq2048_sk2048_hq32_hkv32_d128_bf16_causal",
       "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
       "note": "single-sequence 7B prefill",
       "implementations": {
         "helion-attention": {
-          "us": 386.4746940319826,
-          "tflops": 88.90553223429572,
+          "us": 387.19287097762907,
+          "tflops": 88.78395797216571,
           "max_abs_error": 0.011789083480834961
         },
         "flash-attn": {
-          "us": 228.65236340114822,
-          "tflops": 150.27064604497087,
+          "us": 229.6806010342668,
+          "tflops": 149.67095797033053,
           "max_abs_error": 0.007561683654785156
         },
         "sdpa-flash": {
-          "us": 225.36804950477915,
-          "tflops": 152.46055704658067,
+          "us": 230.26932914161242,
+          "tflops": 149.28829519826726,
           "max_abs_error": 0.007561683654785156
         },
         "sdpa-cudnn": {
-          "us": 197.16592333046032,
-          "tflops": 174.26813816306023,
+          "us": 201.14828160858778,
+          "tflops": 170.90136345729707,
           "max_abs_error": 0.007561683654785156
+        }
+      }
+    },
+    {
+      "key": "b1_sq2048_sk2048_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Llama-3-8B GQA 4:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 389.66366570861163,
+          "tflops": 88.22099315183925,
+          "max_abs_error": 0.013182997703552246
+        },
+        "flash-attn": {
+          "us": 232.47848622299531,
+          "tflops": 147.86966373751144,
+          "max_abs_error": 0.009014368057250977
+        },
+        "sdpa-flash": {
+          "us": 225.91198728206928,
+          "tflops": 152.16773575223417,
+          "max_abs_error": 0.009014368057250977
+        },
+        "sdpa-cudnn": {
+          "us": 198.41967754440222,
+          "tflops": 173.2515444508131,
+          "max_abs_error": 0.009014368057250977
+        }
+      }
+    },
+    {
+      "key": "b1_sq4096_sk4096_hq28_hkv4_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Qwen2-7B GQA 7:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 1430.742787361145,
+          "tflops": 84.0741225317371,
+          "max_abs_error": 0.011678218841552734
+        },
+        "flash-attn": {
+          "us": 426.2592541806213,
+          "tflops": 282.19550247002843,
+          "max_abs_error": 0.007873058319091797
+        },
+        "sdpa-flash": {
+          "us": 458.86856460714483,
+          "tflops": 262.14139231564843,
+          "max_abs_error": 0.007873058319091797
+        },
+        "sdpa-cudnn": {
+          "us": 236.08394813117377,
+          "tflops": 509.5155573608288,
+          "max_abs_error": 0.007873058319091797
+        }
+      }
+    },
+    {
+      "key": "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Llama-3-8B GQA 4:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 1449.695727582705,
+          "tflops": 94.82852524731415,
+          "max_abs_error": 0.014030933380126953
+        },
+        "flash-attn": {
+          "us": 471.3681206062121,
+          "tflops": 291.6457475469508,
+          "max_abs_error": 0.008115291595458984
+        },
+        "sdpa-flash": {
+          "us": 509.5031777953795,
+          "tflops": 269.8167821029961,
+          "max_abs_error": 0.008115291595458984
+        },
+        "sdpa-cudnn": {
+          "us": 268.5224136422137,
+          "tflops": 511.9591546915409,
+          "max_abs_error": 0.008115291595458984
+        }
+      }
+    },
+    {
+      "key": "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=64 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "vLLM chunked-prefill causal alignment",
+      "implementations": {
+        "helion-attention": {
+          "us": 27.69322946001097,
+          "tflops": 2.7309398533387967,
+          "max_abs_error": 0.0017712116241455078
+        },
+        "flash-attn": {
+          "us": 221.6623304978661,
+          "tflops": 0.34118807571017606,
+          "max_abs_error": 0.0017712116241455078
+        },
+        "sdpa-cudnn": {
+          "us": 331.3530400994258,
+          "tflops": 0.2282415878161459,
+          "max_abs_error": 0.0017712116241455078
+        }
+      }
+    },
+    {
+      "key": "b1_sq8192_sk8192_hq28_hkv4_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Qwen2-7B GQA 7:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 5190.512008137172,
+          "tflops": 92.68739897986686,
+          "max_abs_error": 0.012372970581054688
+        },
+        "flash-attn": {
+          "us": 1479.4373946596486,
+          "tflops": 325.187844476973,
+          "max_abs_error": 0.00818490982055664
+        },
+        "sdpa-flash": {
+          "us": 1600.0031640937736,
+          "tflops": 300.6838162601307,
+          "max_abs_error": 0.00818490982055664
+        },
+        "sdpa-cudnn": {
+          "us": 873.3564380785865,
+          "tflops": 550.8576297512907,
+          "max_abs_error": 0.00818490982055664
+        }
+      }
+    },
+    {
+      "key": "b1_sq8192_sk8192_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Llama-3-8B GQA 4:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 5476.814485365345,
+          "tflops": 100.39100725817677,
+          "max_abs_error": 0.012697696685791016
+        },
+        "flash-attn": {
+          "us": 1674.6849623219719,
+          "tflops": 328.3142412586446,
+          "max_abs_error": 0.00836324691772461
+        },
+        "sdpa-flash": {
+          "us": 1802.3424017429352,
+          "tflops": 305.06019401213655,
+          "max_abs_error": 0.00836324691772461
+        },
+        "sdpa-cudnn": {
+          "us": 1000.5776816292813,
+          "tflops": 549.5054835289759,
+          "max_abs_error": 0.00836324691772461
         }
       }
     },
     {
       "key": "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal",
       "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True",
+      "varlen": false,
       "note": "GPT-2 medium style, causal",
       "implementations": {
         "helion-attention": {
-          "us": 92.09041426704509,
-          "tflops": 93.27718482285015,
+          "us": 118.65806885481138,
+          "tflops": 72.46302997329923,
           "max_abs_error": 0.01050710678100586
         },
         "flash-attn": {
-          "us": 197.77253301243147,
-          "tflops": 43.433405342793776,
+          "us": 202.68702217141148,
+          "tflops": 42.42167607913464,
           "max_abs_error": 0.007910013198852539
         },
         "sdpa-flash": {
-          "us": 199.56553860352588,
-          "tflops": 43.0431759516632,
+          "us": 201.6127804612241,
+          "tflops": 42.64770904071581,
           "max_abs_error": 0.007910013198852539
         },
         "sdpa-cudnn": {
-          "us": 195.1155835147357,
-          "tflops": 44.02485151244346,
+          "us": 202.1487554068167,
+          "tflops": 42.534633382709686,
           "max_abs_error": 0.007910013198852539
         }
       }
@@ -88,26 +366,27 @@
     {
       "key": "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_noncausal",
       "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False",
+      "varlen": false,
       "note": "GPT-2 medium style prefill",
       "implementations": {
         "helion-attention": {
-          "us": 99.53011979736836,
-          "tflops": 172.6097508872309,
+          "us": 116.05569700593927,
+          "tflops": 148.03124385286148,
           "max_abs_error": 0.003585129976272583
         },
         "flash-attn": {
-          "us": 198.32164480864444,
-          "tflops": 86.62629437435547,
+          "us": 205.04043266674674,
+          "tflops": 83.78771425986274,
           "max_abs_error": 0.0010672807693481445
         },
         "sdpa-flash": {
-          "us": 199.9283277165365,
-          "tflops": 85.93013996674877,
+          "us": 206.76650221907641,
+          "tflops": 83.08826139447541,
           "max_abs_error": 0.0010672807693481445
         },
         "sdpa-cudnn": {
-          "us": 197.70524046160168,
-          "tflops": 86.89637737415805,
+          "us": 199.46863528188888,
+          "tflops": 86.12817328258863,
           "max_abs_error": 0.001183927059173584
         }
       }
@@ -115,26 +394,27 @@
     {
       "key": "b2_sq1024_sk1024_hq32_hkv32_d64_fp16_noncausal",
       "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=fp16 causal=False",
+      "varlen": false,
       "note": "fp16 coverage",
       "implementations": {
         "helion-attention": {
-          "us": 102.15569440180546,
-          "tflops": 168.17338753948474,
+          "us": 131.1371676972138,
+          "tflops": 131.006864687417,
           "max_abs_error": 0.00047531723976135254
         },
         "flash-attn": {
-          "us": 202.10900949169172,
-          "tflops": 85.00298540479577,
+          "us": 204.6936163664236,
+          "tflops": 83.92967738303174,
           "max_abs_error": 0.0001392662525177002
         },
         "sdpa-flash": {
-          "us": 200.04229272556742,
-          "tflops": 85.88118517302036,
+          "us": 204.20007693310515,
+          "tflops": 84.13253041833099,
           "max_abs_error": 0.0001392662525177002
         },
         "sdpa-cudnn": {
-          "us": 196.69842855496842,
-          "tflops": 87.3411613413017,
+          "us": 198.54491293519825,
+          "tflops": 86.52888119882086,
           "max_abs_error": 0.00013208389282226562
         }
       }
@@ -142,53 +422,139 @@
     {
       "key": "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
       "description": "batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
       "note": "long-context causal",
       "implementations": {
         "helion-attention": {
-          "us": 5730.523250721119,
-          "tflops": 95.93466247935032,
+          "us": 5746.690223956931,
+          "tflops": 95.67645050013066,
           "max_abs_error": 0.013725638389587402
         },
         "flash-attn": {
-          "us": 1682.3519961587315,
-          "tflops": 326.7781148910825,
+          "us": 1695.116685382251,
+          "tflops": 324.35697642136904,
           "max_abs_error": 0.00937962532043457
         },
         "sdpa-flash": {
-          "us": 1809.721476823381,
-          "tflops": 303.7792394733531,
+          "us": 1818.5803901915456,
+          "tflops": 302.3363309741225,
           "max_abs_error": 0.00937962532043457
         },
         "sdpa-cudnn": {
-          "us": 998.5148310661316,
-          "tflops": 550.5735085587223,
+          "us": 1005.856506408207,
+          "tflops": 546.6216296749442,
           "max_abs_error": 0.00937962532043457
+        }
+      }
+    },
+    {
+      "key": "b4_sq2048_sk2048_hq28_hkv4_d128_bf16_causal",
+      "description": "batch=4 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Qwen2-7B GQA 7:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 397.37259903136004,
+          "tflops": 302.78334449151265,
+          "max_abs_error": 0.014467954635620117
+        },
+        "flash-attn": {
+          "us": 404.1516112314688,
+          "tflops": 297.70462668053216,
+          "max_abs_error": 0.008772134780883789
+        },
+        "sdpa-flash": {
+          "us": 437.08296639195987,
+          "tflops": 275.27452176231327,
+          "max_abs_error": 0.008772134780883789
+        },
+        "sdpa-cudnn": {
+          "us": 244.43185329437256,
+          "tflops": 492.2345550401717,
+          "max_abs_error": 0.008772134780883789
+        }
+      }
+    },
+    {
+      "key": "b4_sq2048_sk2048_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=4 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Llama-3-8B GQA 4:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 423.7152378828752,
+          "tflops": 324.5247044289917,
+          "max_abs_error": 0.016986846923828125
+        },
+        "flash-attn": {
+          "us": 460.0742927245927,
+          "tflops": 298.8779519100694,
+          "max_abs_error": 0.008740425109863281
+        },
+        "sdpa-flash": {
+          "us": 490.40745309791214,
+          "tflops": 280.39146115617103,
+          "max_abs_error": 0.008740425109863281
+        },
+        "sdpa-cudnn": {
+          "us": 290.44161230443495,
+          "tflops": 473.43788393472,
+          "max_abs_error": 0.008740425109863281
+        }
+      }
+    },
+    {
+      "key": "b4_sq4096_sk4096_hq28_hkv4_d128_bf16_causal",
+      "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Qwen2-7B GQA 7:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 1462.5295681111954,
+          "tflops": 328.98738470319813,
+          "max_abs_error": 0.013400554656982422
+        },
+        "flash-attn": {
+          "us": 1487.7916223319,
+          "tflops": 323.40132209499905,
+          "max_abs_error": 0.009270429611206055
+        },
+        "sdpa-flash": {
+          "us": 1588.850857956069,
+          "tflops": 302.8313043069167,
+          "max_abs_error": 0.009270429611206055
+        },
+        "sdpa-cudnn": {
+          "us": 959.8626804004596,
+          "tflops": 501.27355452892516,
+          "max_abs_error": 0.009270429611206055
         }
       }
     },
     {
       "key": "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
       "note": "7B-class prefill, causal",
       "implementations": {
         "helion-attention": {
-          "us": 1809.0209837229747,
-          "tflops": 303.89686954133595,
+          "us": 1832.052329007317,
+          "tflops": 300.149740763111,
           "max_abs_error": 0.01401054859161377
         },
         "flash-attn": {
-          "us": 1701.1651460613523,
-          "tflops": 323.1642825276724,
+          "us": 1704.121880945952,
+          "tflops": 322.68233731659967,
           "max_abs_error": 0.008622884750366211
         },
         "sdpa-flash": {
-          "us": 1818.1791695037691,
-          "tflops": 302.36613811720406,
+          "us": 1833.9282427683916,
+          "tflops": 299.8427194653581,
           "max_abs_error": 0.008622884750366211
         },
         "sdpa-cudnn": {
-          "us": 1112.5944109373195,
-          "tflops": 494.12059640390527,
+          "us": 1123.6677765846252,
+          "tflops": 489.3706512501268,
           "max_abs_error": 0.008622884750366211
         }
       }
@@ -196,26 +562,27 @@
     {
       "key": "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_noncausal",
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=False",
+      "varlen": false,
       "note": "7B-class prefill, bidirectional",
       "implementations": {
         "helion-attention": {
-          "us": 2560.600348372958,
-          "tflops": 429.39603147154355,
+          "us": 2593.492070240761,
+          "tflops": 423.950256255817,
           "max_abs_error": 0.0035891830921173096
         },
         "flash-attn": {
-          "us": 3033.797787838295,
-          "tflops": 362.4208680564195,
+          "us": 3041.1957383155823,
+          "tflops": 361.53925047421745,
           "max_abs_error": 0.0006209760904312134
         },
         "sdpa-flash": {
-          "us": 3303.661243668918,
-          "tflops": 332.81609301894554,
+          "us": 3368.7434673309326,
+          "tflops": 326.38627382545906,
           "max_abs_error": 0.0006209760904312134
         },
         "sdpa-cudnn": {
-          "us": 2018.513234762045,
-          "tflops": 544.7136084325042,
+          "us": 2040.4756115932091,
+          "tflops": 538.8506588998132,
           "max_abs_error": 0.000578463077545166
         }
       }
@@ -223,26 +590,27 @@
     {
       "key": "b4_sq4096_sk4096_hq32_hkv32_d128_fp16_causal",
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=fp16 causal=True",
+      "varlen": false,
       "note": "fp16 causal coverage",
       "implementations": {
         "helion-attention": {
-          "us": 1689.3346102341363,
-          "tflops": 325.4274260158594,
+          "us": 1709.0993877184592,
+          "tflops": 321.74257130246167,
           "max_abs_error": 0.0018554925918579102
         },
         "flash-attn": {
-          "us": 1725.3241494849876,
-          "tflops": 318.639146187169,
+          "us": 1738.5247054501115,
+          "tflops": 316.29693261887303,
           "max_abs_error": 0.0012814998626708984
         },
         "sdpa-flash": {
-          "us": 1852.3413412498705,
-          "tflops": 296.78969077969793,
+          "us": 1858.8646399974823,
+          "tflops": 295.8203732450066,
           "max_abs_error": 0.0012814998626708984
         },
         "sdpa-cudnn": {
-          "us": 1142.4468465931507,
-          "tflops": 481.20909565937956,
+          "us": 1148.7234505740078,
+          "tflops": 478.6966187042011,
           "max_abs_error": 0.0012814998626708984
         }
       }
@@ -250,53 +618,111 @@
     {
       "key": "b4_sq4096_sk4096_hq32_hkv8_d128_bf16_causal",
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
       "note": "Llama-3-8B GQA 4:1",
       "implementations": {
         "helion-attention": {
-          "us": 1522.4145757089746,
-          "tflops": 361.1078234928115,
+          "us": 1544.105142638797,
+          "tflops": 356.1221424832936,
           "max_abs_error": 0.013426065444946289
         },
         "flash-attn": {
-          "us": 1686.3426788993504,
-          "tflops": 326.0048036303138,
+          "us": 1677.6232719421387,
+          "tflops": 327.7792105133397,
           "max_abs_error": 0.009511709213256836
         },
         "sdpa-flash": {
-          "us": 1812.4100999924744,
-          "tflops": 303.32859758963093,
+          "us": 1819.3882388227128,
+          "tflops": 302.2389723546977,
           "max_abs_error": 0.009511709213256836
         },
         "sdpa-cudnn": {
-          "us": 1101.636641128089,
-          "tflops": 499.03551984712817,
+          "us": 1116.5279116334214,
+          "tflops": 492.5000314694685,
           "max_abs_error": 0.009511709213256836
+        }
+      }
+    },
+    {
+      "key": "b4_sq8192_sk8192_hq28_hkv4_d128_bf16_causal",
+      "description": "batch=4 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Qwen2-7B GQA 7:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 5648.940102807406,
+          "tflops": 340.66217637457737,
+          "max_abs_error": 0.013122916221618652
+        },
+        "flash-attn": {
+          "us": 5589.362546017296,
+          "tflops": 344.2933275107049,
+          "max_abs_error": 0.010365724563598633
+        },
+        "sdpa-flash": {
+          "us": 6311.549007892609,
+          "tflops": 304.89824720136966,
+          "max_abs_error": 0.010365724563598633
+        },
+        "sdpa-cudnn": {
+          "us": 3597.0213254292808,
+          "tflops": 534.9927219022917,
+          "max_abs_error": 0.010365724563598633
+        }
+      }
+    },
+    {
+      "key": "b4_sq8192_sk8192_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=4 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "varlen": false,
+      "note": "Llama-3-8B GQA 4:1",
+      "implementations": {
+        "helion-attention": {
+          "us": 5918.523724873861,
+          "tflops": 371.5946396843873,
+          "max_abs_error": 0.01282191276550293
+        },
+        "flash-attn": {
+          "us": 6273.59482549852,
+          "tflops": 350.5632340279861,
+          "max_abs_error": 0.009353160858154297
+        },
+        "sdpa-flash": {
+          "us": 7165.450678931342,
+          "tflops": 306.92998801521344,
+          "max_abs_error": 0.009353160858154297
+        },
+        "sdpa-cudnn": {
+          "us": 3998.0329297623543,
+          "tflops": 550.0934408608604,
+          "max_abs_error": 0.009353160858154297
         }
       }
     },
     {
       "key": "b8_sq2048_sk2048_hq16_hkv16_d64_bf16_causal",
       "description": "batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True",
+      "varlen": false,
       "note": "small decoder, long batch",
       "implementations": {
         "helion-attention": {
-          "us": 295.2675996348262,
-          "tflops": 232.73625965391795,
+          "us": 295.4430469186791,
+          "tflops": 232.71162372937587,
           "max_abs_error": 0.013665199279785156
         },
         "flash-attn": {
-          "us": 273.31591728317295,
-          "tflops": 251.42874011542543,
+          "us": 276.4231334825989,
+          "tflops": 248.7238687362903,
           "max_abs_error": 0.009153127670288086
         },
         "sdpa-flash": {
-          "us": 287.8297553116963,
-          "tflops": 238.75042613847333,
+          "us": 290.22655416937437,
+          "tflops": 236.89435091413506,
           "max_abs_error": 0.009153127670288086
         },
         "sdpa-cudnn": {
-          "us": 219.62912016911127,
-          "tflops": 312.8887311622748,
+          "us": 274.2961972853694,
+          "tflops": 250.65251304403412,
           "max_abs_error": 0.009153127670288086
         }
       }
@@ -304,26 +730,27 @@
     {
       "key": "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
       "description": "batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False",
+      "varlen": false,
       "note": "short-sequence encoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 40.65980715713953,
-          "tflops": 211.26353498928677,
-          "max_abs_error": 0.005711734294891357
+          "us": 53.41649418370254,
+          "tflops": 160.810527221399,
+          "max_abs_error": 0.0022808313369750977
         },
         "flash-attn": {
-          "us": 194.52795028224475,
-          "tflops": 44.1578425081675,
+          "us": 202.56209599609954,
+          "tflops": 42.40642628503116,
           "max_abs_error": 0.0019145607948303223
         },
         "sdpa-flash": {
-          "us": 195.0457522201034,
-          "tflops": 44.04061351875283,
+          "us": 201.5495936306872,
+          "tflops": 42.619458750881485,
           "max_abs_error": 0.0019145607948303223
         },
         "sdpa-cudnn": {
-          "us": 190.3000776454116,
-          "tflops": 45.1388916824602,
+          "us": 195.99535152179385,
+          "tflops": 43.82723633649462,
           "max_abs_error": 0.0019145607948303223
         }
       }
@@ -335,13 +762,13 @@
       "note": "ragged decoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 85.37823579759217,
-          "tflops": 11.820979791532105,
+          "us": 78.80512233019518,
+          "tflops": 12.806964447960656,
           "max_abs_error": 0.007879257202148438
         },
         "flash-attn": {
-          "us": 214.69221765630485,
-          "tflops": 4.700936116909878,
+          "us": 206.87402268922656,
+          "tflops": 4.878594165088275,
           "max_abs_error": 0.007879257202148438
         }
       }
@@ -353,13 +780,13 @@
       "note": "ragged encoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 83.70457839378169,
-          "tflops": 24.052040624692555,
+          "us": 81.48210986603712,
+          "tflops": 24.708073015168175,
           "max_abs_error": 0.003950834274291992
         },
         "flash-attn": {
-          "us": 213.67461140394622,
-          "tflops": 9.422111063040493,
+          "us": 209.94479087222146,
+          "tflops": 9.58950165724918,
           "max_abs_error": 0.003924250602722168
         }
       }

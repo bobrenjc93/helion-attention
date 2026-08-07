@@ -58,10 +58,12 @@ def benchmark_table() -> str:
         "",
         "| shape | "
         + " | ".join(f"{name} µs" for name in names)
-        + " | helion TFLOP/s | speedup vs flash-attn |",
+        + " | helion TFLOP/s | comparison vs flash-attn |",
         "| --- | " + " | ".join("---:" for _ in names) + " | ---: | ---: |",
     ]
     speedups = []
+    faster = 0
+    slower = 0
     for row in report["results"]:
         impls = row["implementations"]
         cells = [
@@ -72,7 +74,12 @@ def benchmark_table() -> str:
         if helion is not None and flash is not None:
             speedup = flash["us"] / helion["us"]
             speedups.append(speedup)
-            speedup_cell = f"**{speedup:.2f}x**" if speedup >= 1 else f"{speedup:.2f}x"
+            if speedup >= 1:
+                faster += 1
+                speedup_cell = f"**{speedup:.2f}x faster**"
+            else:
+                slower += 1
+                speedup_cell = f"**{1 / speedup:.2f}x slower**"
         else:
             speedup_cell = "n/a"
         tflops = "n/a" if helion is None else f"{helion['tflops']:.0f}"
@@ -81,6 +88,10 @@ def benchmark_table() -> str:
         )
     if speedups:
         geomean = __import__("math").exp(sum(map(__import__("math").log, speedups)) / len(speedups))
+        lines.append("")
+        lines.append(
+            f"Helion is faster than flash-attn on {faster} shapes and slower on {slower} shapes."
+        )
         lines.append("")
         lines.append(
             f"Geomean speedup over flash-attn across all {len(speedups)} shapes: **{geomean:.2f}x**."
