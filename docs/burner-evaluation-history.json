@@ -208,6 +208,36 @@
         "eval_5b403bea": 76,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:64425653b855f1bce0dd1d7e6f379c2ee8ace114",
+      "commit": "64425653b855f1bce0dd1d7e6f379c2ee8ace114",
+      "recordedAt": "2026-08-07T19:07:01.529Z",
+      "label": "base 6442565",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 53,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 72,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:8",
+      "recordedAt": "2026-08-07T19:07:01.529Z",
+      "label": "PR #8",
+      "kind": "leaf",
+      "prNumber": 8,
+      "title": "Paged KV attention: block_table plus seqused_k",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 53,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 70,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

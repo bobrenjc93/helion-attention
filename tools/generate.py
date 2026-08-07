@@ -178,6 +178,101 @@ def build_varlen_inputs(
     )
 
 
+def build_paged_inputs(
+    spec: "AttnShape", page_size: int
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    float,
+    bool,
+]:
+    """Packed-query/paged-cache inputs with deliberately reordered pages."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    lengths_q = varlen_lengths(spec.batch, spec.seqlen_q, reverse=True)
+    lengths_k = varlen_lengths(spec.batch, spec.seqlen_k)
+
+    def cumulative(lengths: list[int]) -> torch.Tensor:
+        values = [0]
+        for length in lengths:
+            values.append(values[-1] + length)
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    # vLLM splits Q from a packed projection, so its token stride can exceed
+    # heads * head_dim even though the two trailing dimensions are dense.
+    q_storage = torch.randn(
+        (
+            sum(lengths_q),
+            (spec.nheads_q + 2 * spec.nheads_kv) * spec.head_dim,
+        ),
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    q = q_storage[:, : spec.nheads_q * spec.head_dim].view(
+        sum(lengths_q), spec.nheads_q, spec.head_dim
+    )
+    blocks_per_request = [
+        (length + page_size - 1) // page_size for length in lengths_k
+    ]
+    total_blocks = sum(blocks_per_request) + 3
+    # This is vLLM's real cache contract: logical [blocks, heads, page, 2*dim]
+    # followed by transpose(1, 2) and a K/V split of the content dimension.
+    kv_cache = torch.zeros(
+        (total_blocks, spec.nheads_kv, page_size, 2 * spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    k, v = kv_cache.transpose(1, 2).split(spec.head_dim, dim=-1)
+    block_table = torch.zeros(
+        (spec.batch, (spec.seqlen_k + page_size - 1) // page_size),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    next_physical = total_blocks - 1
+    for request, (length, request_blocks) in enumerate(
+        zip(lengths_k, blocks_per_request)
+    ):
+        contiguous_k = torch.randn(
+            (length, spec.nheads_kv, spec.head_dim),
+            device="cuda",
+            dtype=spec.dtype,
+            generator=generator,
+        )
+        contiguous_v = torch.randn(
+            contiguous_k.shape,
+            device="cuda",
+            dtype=spec.dtype,
+            generator=generator,
+        )
+        for logical_block in range(request_blocks):
+            physical_block = next_physical
+            next_physical -= 1
+            block_table[request, logical_block] = physical_block
+            start = logical_block * page_size
+            stop = min(start + page_size, length)
+            k[physical_block, : stop - start] = contiguous_k[start:stop]
+            v[physical_block, : stop - start] = contiguous_v[start:stop]
+
+    return (
+        q,
+        k,
+        v,
+        cumulative(lengths_q),
+        torch.tensor(lengths_k, dtype=torch.int32, device="cuda"),
+        block_table,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        1.0 / math.sqrt(spec.head_dim),
+        spec.causal,
+    )
+
+
 def reference(q, k, v, sm_scale, causal):  # noqa: ANN001, ANN201
     # PyTorch's is_causal mask is top-left aligned for unequal sequence
     # lengths. FlashAttention's is bottom-right aligned, which means a single
@@ -317,10 +412,22 @@ def main() -> int:
         action="store_true",
         help="also generate the non-causal MHA backward specialization",
     )
-    parser.add_argument(
+    layout = parser.add_mutually_exclusive_group()
+    layout.add_argument(
         "--varlen",
         action="store_true",
         help="generate a packed [total, heads, dim] forward specialization",
+    )
+    layout.add_argument(
+        "--paged",
+        action="store_true",
+        help="generate packed-query attention over a paged KV cache",
+    )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=16,
+        help="KV cache page size for --paged (vLLM defaults to 16)",
     )
     parser.add_argument("--label", default="", help="human note stored in the manifest")
     args = parser.parse_args()
@@ -338,7 +445,7 @@ def main() -> int:
         causal=args.causal,
     )
     if (
-        not args.varlen
+        not (args.varlen or args.paged)
         and spec.causal
         and spec.seqlen_q != spec.seqlen_k
         and not spec.is_decode
@@ -355,12 +462,25 @@ def main() -> int:
             "backward generation currently supports only non-causal MHA with "
             "equal query/key sequence lengths"
         )
-    if args.backward and args.varlen:
-        raise SystemExit("--backward and --varlen cannot be combined")
+    if args.backward and (args.varlen or args.paged):
+        raise SystemExit("--backward cannot be combined with --varlen or --paged")
+    if args.page_size <= 0:
+        raise SystemExit("--page-size must be positive")
 
     import helion_kernels
 
-    if args.varlen:
+    if args.paged:
+        kernel = helion_kernels.paged_attention_thd
+        forward_args = build_paged_inputs(spec, args.page_size)
+        q, k, v = forward_args[:3]
+        sm_scale = forward_args[-2]
+        print(
+            f"autotuning paged page_size={args.page_size} {spec.describe()}",
+            flush=True,
+        )
+        got = kernel(*forward_args)
+        expected = helion_kernels._paged_sdpa_reference(*forward_args)
+    elif args.varlen:
         kernel = helion_kernels.varlen_attention_thd
         forward_args = build_varlen_inputs(spec)
         q, k, v = forward_args[:3]
@@ -419,7 +539,13 @@ def main() -> int:
     bound = kernel.bind(forward_args)
     code = strip_helion(bound.to_triton_code())
     code = rename_entry_point(
-        code, kernel.name, "attention_varlen" if args.varlen else "attention"
+        code,
+        kernel.name,
+        (
+            "attention_paged"
+            if args.paged
+            else "attention_varlen" if args.varlen else "attention"
+        ),
     )
 
     command = " ".join(
@@ -431,8 +557,18 @@ def main() -> int:
         + (["--causal"] if spec.causal else [])
         + (["--backward"] if args.backward else [])
         + (["--varlen"] if args.varlen else [])
+        + ([f"--paged --page-size {args.page_size}"] if args.paged else [])
     )
-    kernel_key = f"varlen_{spec.key}" if args.varlen else spec.key
+    kernel_key = (
+        f"paged_{spec.key}_ps{args.page_size}"
+        if args.paged
+        else f"varlen_{spec.key}" if args.varlen else spec.key
+    )
+    description = (
+        f"paged page_size={args.page_size} {spec.describe()}"
+        if args.paged
+        else f"varlen {spec.describe()}" if args.varlen else spec.describe()
+    )
     spec_fields = {
         "key": kernel_key,
         "batch": spec.batch,
@@ -446,10 +582,12 @@ def main() -> int:
         "backward": args.backward,
         "varlen": args.varlen,
     }
+    if args.paged:
+        spec_fields.update({"paged": True, "page_size": args.page_size})
     module = build_module(
         code,
         command=command,
-        description=f"varlen {spec.describe()}" if args.varlen else spec.describe(),
+        description=description,
         spec_fields=spec_fields,
     )
 
@@ -476,9 +614,11 @@ def main() -> int:
         "causal": spec.causal,
         "backward": args.backward,
         "varlen": args.varlen,
-        "description": f"varlen {spec.describe()}" if args.varlen else spec.describe(),
+        "description": description,
         "note": args.label,
     }
+    if args.paged:
+        manifest_entry.update({"paged": True, "page_size": args.page_size})
 
     def verify_generated_kernel() -> int:
         return subprocess.run(
@@ -494,7 +634,11 @@ def main() -> int:
             backward_module=backward_module,
             manifest_entry=manifest_entry,
             verify=verify_generated_kernel,
-            manifest_section="varlen_kernels" if args.varlen else "kernels",
+            manifest_section=(
+                "paged_kernels"
+                if args.paged
+                else "varlen_kernels" if args.varlen else "kernels"
+            ),
         )
     except GenerationVerificationError as exc:
         raise SystemExit(f"{exc}; restored previous artifacts") from exc

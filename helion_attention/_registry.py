@@ -36,6 +36,21 @@ VarlenAttnKernel = Callable[
     ],
     torch.Tensor,
 ]
+PagedAttnKernel = Callable[
+    [
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        float,
+        bool,
+    ],
+    torch.Tensor,
+]
 
 
 class KernelModule(Protocol):
@@ -52,7 +67,7 @@ class UnsupportedShapeError(NotImplementedError):
 @lru_cache(maxsize=1)
 def _manifest_payload() -> dict[str, list[dict[str, object]]]:
     if not _MANIFEST_PATH.exists():
-        return {"kernels": [], "varlen_kernels": []}
+        return {"kernels": [], "varlen_kernels": [], "paged_kernels": []}
     with _MANIFEST_PATH.open() as handle:
         return json.load(handle)
 
@@ -69,6 +84,12 @@ def _varlen_manifest() -> dict[str, dict[str, object]]:
     return {entry["key"]: entry for entry in entries}
 
 
+@lru_cache(maxsize=1)
+def _paged_manifest() -> dict[str, dict[str, object]]:
+    entries = _manifest_payload().get("paged_kernels", [])
+    return {entry["key"]: entry for entry in entries}
+
+
 def available_shapes() -> list[dict[str, object]]:
     """Every shape this build ships a kernel for, in manifest order."""
     return list(_manifest().values())
@@ -77,6 +98,11 @@ def available_shapes() -> list[dict[str, object]]:
 def available_varlen_shapes() -> list[dict[str, object]]:
     """Every packed-sequence specialization shipped by this build."""
     return list(_varlen_manifest().values())
+
+
+def available_paged_shapes() -> list[dict[str, object]]:
+    """Every packed-query/paged-KV specialization shipped by this build."""
+    return list(_paged_manifest().values())
 
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
@@ -114,6 +140,12 @@ def _load_varlen(key: str) -> VarlenAttnKernel:
     return module.attention_varlen
 
 
+@lru_cache(maxsize=None)
+def _load_paged(key: str) -> PagedAttnKernel:
+    module = importlib.import_module(f"{KERNELS_PACKAGE}.{key}")
+    return module.attention_paged
+
+
 def _entry_for_spec(spec: AttnShape) -> dict[str, object] | None:
     entry = _manifest().get(spec.key)
     if entry is None and spec.is_decode:
@@ -133,6 +165,26 @@ def has_kernel(spec: AttnShape) -> bool:
 def has_varlen_kernel(spec: AttnShape) -> bool:
     """Whether packed metadata exists for ``spec``, without importing Triton."""
     return f"varlen_{spec.key}" in _varlen_manifest()
+
+
+def paged_kernel_key(spec: AttnShape, page_size: int) -> str:
+    """Stable generated-module key for a paged specialization."""
+    return f"paged_{spec.key}_ps{page_size}"
+
+
+def _paged_entry_for_spec(
+    spec: AttnShape, page_size: int
+) -> dict[str, object] | None:
+    entry = _paged_manifest().get(paged_kernel_key(spec, page_size))
+    if entry is None and spec.is_decode:
+        equivalent = replace(spec, causal=not spec.causal)
+        entry = _paged_manifest().get(paged_kernel_key(equivalent, page_size))
+    return entry
+
+
+def has_paged_kernel(spec: AttnShape, page_size: int) -> bool:
+    """Whether paged metadata exists for ``spec`` and ``page_size``."""
+    return _paged_entry_for_spec(spec, page_size) is not None
 
 
 def _nearest(spec: AttnShape, limit: int = 8) -> list[str]:
@@ -197,6 +249,37 @@ def lookup_varlen(spec: AttnShape) -> VarlenAttnKernel:
             "shape above and it can be generated and added."
         )
     return _load_varlen(str(entry["key"]))
+
+
+def lookup_paged(spec: AttnShape, page_size: int) -> PagedAttnKernel:
+    """Return a generated block-table-addressed kernel for ``spec``."""
+    entry = _paged_entry_for_spec(spec, page_size)
+    if entry is None:
+        fields = (
+            "batch",
+            "seqlen_q",
+            "seqlen_k",
+            "nheads_q",
+            "nheads_kv",
+            "head_dim",
+        )
+        scored = []
+        for candidate in _paged_manifest().values():
+            distance = sum(
+                candidate[field] != getattr(spec, field) for field in fields
+            )
+            distance += candidate["dtype"] != spec.dtype_name
+            distance += candidate["causal"] != spec.causal
+            distance += candidate.get("page_size") != page_size
+            scored.append((distance, candidate["description"]))
+        scored.sort(key=lambda item: item[0])
+        listing = "\n".join(f"    {description}" for _, description in scored[:8])
+        raise UnsupportedShapeError(
+            "no helion-attention paged kernel is checked in for:\n"
+            f"    {spec.describe()}, page_size={page_size}\n"
+            f"closest available paged shapes:\n{listing or '    (none)'}"
+        )
+    return _load_paged(str(entry["key"]))
 
 
 def has_backward(spec: AttnShape) -> bool:

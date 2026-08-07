@@ -3,9 +3,9 @@
 vLLM calls FlashAttention through a varlen API that does not carry
 ``helion_attention``'s explicit ``shape`` argument.  This module infers the
 specialization from the packed tensors and maximum sequence lengths.  Calls
-matching a checked-in varlen kernel use it, other packed and paged CUDA calls
-use a generic single-launch Triton kernel, and remaining calls use a
-correctness fallback implemented with PyTorch operations.
+matching a checked-in packed-varlen or paged-cache kernel use it, other packed
+and paged CUDA calls use a generic single-launch Triton kernel, and remaining
+calls use a correctness fallback implemented with PyTorch operations.
 
 Both generic paths keep sequence metadata on-device and carry tiled online
 softmax state rather than materializing a quadratic attention matrix.  The
@@ -21,7 +21,9 @@ from typing import Any
 import torch
 
 from . import flash_attn_varlen_func as _specialized_varlen_func
+from ._registry import has_paged_kernel
 from ._registry import has_varlen_kernel
+from ._registry import lookup_paged
 from ._shape import AttnShape
 
 __all__ = [
@@ -395,6 +397,92 @@ def _try_specialized(
     return _copy_or_return(result, out)
 
 
+def _try_paged_specialized(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    softcap: float,
+    alibi_slopes: torch.Tensor | None,
+    return_softmax_lse: bool,
+    out: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    s_aux: torch.Tensor | None,
+    q_v: torch.Tensor | None,
+    cp_world_size: int,
+    cp_tot_seqused_k: torch.Tensor | None,
+    dynamic_max_seqlen_q: torch.Tensor | None,
+    dynamic_max_seqlen_k: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Use a generated block-table kernel when its lean contract fits."""
+    if (
+        k.ndim != 4
+        or v.shape[-1] != q.shape[-1]
+        or window_size != (-1, -1)
+        or softcap > 0.0
+        or alibi_slopes is not None
+        or return_softmax_lse
+        or q_v is not None
+        or cp_world_size != 1
+        or cp_tot_seqused_k is not None
+        or dynamic_max_seqlen_q is not None
+        or dynamic_max_seqlen_k is not None
+        or q_descale is not None
+        or s_aux is not None
+        # vLLM passes expanded K/V scale buffers for every cache dtype.  They
+        # are inert for fp16/bf16 and only participate in FP8 attention.
+        or (
+            q.dtype in _FP8_DTYPES
+            and (k_descale is not None or v_descale is not None)
+        )
+        or block_table.dtype != torch.int32
+        or not q.is_cuda
+        or (torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)))
+    ):
+        return None
+
+    try:
+        spec = AttnShape(
+            batch=cu_seqlens_q.numel() - 1,
+            seqlen_q=max_seqlen_q,
+            seqlen_k=max_seqlen_k,
+            nheads_q=q.shape[1],
+            nheads_kv=k.shape[2],
+            head_dim=q.shape[2],
+            dtype=q.dtype,
+            causal=causal,
+        )
+    except ValueError:
+        return None
+    page_size = k.shape[1]
+    if not has_paged_kernel(spec, page_size):
+        return None
+
+    kernel = lookup_paged(spec, page_size)
+    result = kernel(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        max_seqlen_q,
+        max_seqlen_k,
+        softmax_scale,
+        causal,
+    )
+    return _copy_or_return(result, out)
+
+
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -677,6 +765,37 @@ def flash_attn_varlen_func(
 
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
+
+    if block_table is not None:
+        assert seqused_k is not None
+        paged_specialized = _try_paged_specialized(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            bool(causal),
+            real_window,
+            cap,
+            alibi_slopes,
+            bool(return_softmax_lse),
+            out,
+            q_descale,
+            k_descale,
+            v_descale,
+            s_aux,
+            q_v,
+            cp_world_size,
+            cp_tot_seqused_k,
+            dynamic_max_seqlen_q,
+            dynamic_max_seqlen_k,
+        )
+        if paged_specialized is not None:
+            return paged_specialized
 
     differentiable_inputs = (q, k, v) if q_v is None else (q, k, v, q_v)
     use_generic_cuda = (

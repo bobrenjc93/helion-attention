@@ -73,6 +73,13 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
+vLLM's unified paged-cache path is available through
+`helion_attention.vllm_flash_attn`. It accepts packed queries plus
+`k`/`v` caches in `[num_blocks, page_size, heads_kv, head_dim]` layout,
+`block_table`, and per-request `seqused_k`. Generated page-size-16 kernels cover
+the common decode and chunked-prefill profiles below; other compatible CUDA
+shapes retain the generic single-launch path.
+
 Single-token decode reads a dense KV cache through the matching FlashAttention
 entry point. The six-field shape remains required and describes the query and
 the cache separately:
@@ -115,6 +122,10 @@ helion_attention.is_shape_supported((2, 1024, 32, 64), torch.bfloat16, causal=Tr
 helion_attention.available_shapes()   # every shape this build ships
 helion_attention.is_varlen_shape_supported((8, 512, 16, 64), causal=True)
 helion_attention.available_varlen_shapes()
+helion_attention.is_paged_shape_supported(
+    (4, 1, 1024, 8, 2, 128), causal=True, page_size=16
+)
+helion_attention.available_paged_shapes()
 ```
 
 A shape with no kernel raises `UnsupportedShapeError`, which names the closest
@@ -164,6 +175,14 @@ accepting dynamic packed token totals:
 | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
 | 8 | 512 | 512 | 16 | 64 | bf16 | yes | ragged decoder batch |
 | 8 | 512 | 512 | 16 | 64 | bf16 | no | ragged encoder batch |
+
+Paged KV kernels specialize the maximum request lengths and page size while
+reading actual query/cache lengths and physical page assignments on-device:
+
+| batch | max seqlen q | max seqlen k | heads q | heads kv | head dim | page size | dtype | causal | note |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 2 | 200 | 320 | 8 | 2 | 128 | 16 | bf16 | yes | vLLM paged chunked prefill |
+| 4 | 1 | 1024 | 8 | 2 | 128 | 16 | bf16 | yes | vLLM paged ragged decode |
 
 ## Benchmarks
 
@@ -232,11 +251,13 @@ python tools/generate.py --batch 1 --seqlen 1 --seqlen-k 4096 --nheads 32 \
     --nheads-kv 8 --head-dim 128 --dtype bf16 --causal
 python tools/generate.py --batch 8 --seqlen 512 --nheads 16 --head-dim 64 \
     --dtype bf16 --causal --varlen
+python tools/generate.py --batch 4 --seqlen 1 --seqlen-k 1024 --nheads 8 \
+    --nheads-kv 2 --head-dim 128 --dtype bf16 --causal --paged --page-size 16
 python tools/generate_all.py --gpus 8    # the whole catalogue, one job per GPU
 ```
 
-`tools/helion_kernels.py` holds the prefill, decode, packed-varlen, and backward
-Helion kernels
+`tools/helion_kernels.py` holds the prefill, decode, packed-varlen, paged-KV,
+and backward Helion kernels
 that everything is generated from — it is the only file in the repository that
 imports Helion. `tools/generate.py` autotunes one shape (plus its backward when
 requested), takes Helion's emitted Triton, and removes its build-time Helion

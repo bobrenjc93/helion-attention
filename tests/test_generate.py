@@ -185,3 +185,32 @@ def test_varlen_artifact_uses_separate_manifest_section(
     assert payload["varlen_kernels"] == [
         {"key": "varlen_shape", "varlen": True}
     ]
+
+
+def test_paged_artifact_uses_separate_manifest_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel_dir = tmp_path / "kernels"
+    kernel_dir.mkdir()
+    target = kernel_dir / "paged_shape.py"
+    backward_target = kernel_dir / "paged_shape_backward.py"
+    manifest = kernel_dir / "manifest.json"
+    dense_entry = {"key": "dense_shape"}
+    manifest.write_text(json.dumps({"kernels": [dense_entry]}) + "\n")
+    monkeypatch.setattr(generate, "MANIFEST", manifest)
+
+    generate.install_generated_artifacts(
+        target=target,
+        module="generated paged forward\n",
+        backward_target=backward_target,
+        backward_module=None,
+        manifest_entry={"key": "paged_shape", "paged": True, "page_size": 16},
+        manifest_section="paged_kernels",
+        verify=lambda: 0,
+    )
+
+    payload = json.loads(manifest.read_text())
+    assert payload["kernels"] == [dense_entry]
+    assert payload["paged_kernels"] == [
+        {"key": "paged_shape", "paged": True, "page_size": 16}
+    ]

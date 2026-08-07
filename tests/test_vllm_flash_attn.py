@@ -1247,3 +1247,191 @@ def test_exact_shape_dispatch_infers_specialization(
     assert spec.dtype == torch.bfloat16
     assert spec.causal is True
     torch.testing.assert_close(result, torch.full_like(q, 7))
+
+
+@requires_cuda
+def test_exact_paged_shape_dispatch_infers_specialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qkv = torch.zeros(4, 12 * 128, device="cuda", dtype=torch.bfloat16)
+    q = qkv[:, : 8 * 128].view(4, 8, 128)
+    kv_cache = torch.zeros(
+        64, 2, 16, 2 * 128, device="cuda", dtype=torch.bfloat16
+    )
+    k, v = kv_cache.transpose(1, 2).split(128, dim=-1)
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+    cumulative = torch.arange(5, device="cuda", dtype=torch.int32)
+    seqused_k = torch.ones(4, device="cuda", dtype=torch.int32)
+    block_table = torch.arange(
+        256, device="cuda", dtype=torch.int32
+    ).reshape(4, 64) % 64
+    k_descale = torch.ones(1, device="cuda").expand(4, 2)
+    v_descale = torch.ones(1, device="cuda").expand(4, 2)
+    seen: dict[str, object] = {}
+
+    def fake_has_kernel(spec: object, page_size: int) -> bool:
+        seen["spec"] = spec
+        seen["page_size"] = page_size
+        return True
+
+    def fake_kernel(*args: object) -> torch.Tensor:
+        seen["kernel_args"] = args
+        return torch.full_like(q, 9)
+
+    def fake_lookup(spec: object, page_size: int) -> object:
+        assert spec is seen["spec"]
+        assert page_size == 16
+        return fake_kernel
+
+    monkeypatch.setattr(compat, "has_paged_kernel", fake_has_kernel)
+    monkeypatch.setattr(compat, "lookup_paged", fake_lookup)
+
+    def reject_generic(*args: object, **kwargs: object) -> object:
+        raise AssertionError("vLLM-shaped inputs missed the paged specialization")
+
+    monkeypatch.setattr(compat, "_paged_attention", reject_generic)
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=1,
+        cu_seqlens_q=cumulative,
+        max_seqlen_k=1024,
+        seqused_k=seqused_k,
+        block_table=block_table,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        causal=True,
+        fa_version=3,
+    )
+
+    spec = seen["spec"]
+    assert isinstance(spec, AttnShape)
+    assert spec.batch == 4
+    assert spec.seqlen_q == 1
+    assert spec.seqlen_k == 1024
+    assert spec.nheads_q == 8
+    assert spec.nheads_kv == 2
+    assert spec.head_dim == 128
+    assert spec.causal is True
+    assert seen["page_size"] == 16
+    kernel_args = seen["kernel_args"]
+    assert isinstance(kernel_args, tuple)
+    assert kernel_args[4] is seqused_k
+    assert kernel_args[5] is block_table
+    torch.testing.assert_close(result, torch.full_like(q, 9))
+
+
+@requires_cuda
+def test_generated_paged_kernel_accepts_vllm_cache_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch, nheads_q, nheads_kv, head_dim, page_size = 4, 8, 2, 128, 16
+    lengths_k = [37, 128, 1024, 5]
+    generator = torch.Generator(device="cuda").manual_seed(2026)
+
+    qkv = torch.randn(
+        batch,
+        (nheads_q + 2 * nheads_kv) * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    q = qkv[:, : nheads_q * head_dim].view(batch, nheads_q, head_dim)
+    request_kv = [
+        (
+            torch.randn(
+                length,
+                nheads_kv,
+                head_dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            ),
+            torch.randn(
+                length,
+                nheads_kv,
+                head_dim,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            ),
+        )
+        for length in lengths_k
+    ]
+    blocks_per_request = [
+        (length + page_size - 1) // page_size for length in lengths_k
+    ]
+    total_blocks = sum(blocks_per_request) + 3
+    raw_cache = torch.zeros(
+        total_blocks,
+        nheads_kv,
+        page_size,
+        2 * head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k, v = raw_cache.transpose(1, 2).split(head_dim, dim=-1)
+    block_table = torch.zeros(
+        batch,
+        1024 // page_size,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    physical = total_blocks - 1
+    for request, ((key, value), request_blocks) in enumerate(
+        zip(request_kv, blocks_per_request)
+    ):
+        for logical in range(request_blocks):
+            block_table[request, logical] = physical
+            start = logical * page_size
+            stop = min(start + page_size, key.shape[0])
+            k[physical, : stop - start] = key[start:stop]
+            v[physical, : stop - start] = value[start:stop]
+            physical -= 1
+
+    assert not q.is_contiguous()
+    assert not k.is_contiguous()
+    assert not v.is_contiguous()
+    descale = torch.ones(1, device="cuda").expand(batch, nheads_kv)
+
+    def reject_generic(*args: object, **kwargs: object) -> object:
+        raise AssertionError("real vLLM cache views selected the generic path")
+
+    monkeypatch.setattr(compat, "_paged_attention", reject_generic)
+    out = torch.empty_like(q)
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        max_seqlen_q=1,
+        cu_seqlens_q=torch.arange(5, device="cuda", dtype=torch.int32),
+        max_seqlen_k=1024,
+        seqused_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
+        block_table=block_table,
+        k_descale=descale,
+        v_descale=descale,
+        causal=True,
+        fa_version=3,
+    )
+
+    scale = 1.0 / math.sqrt(head_dim)
+    expected = torch.cat(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                query.float().transpose(0, 1).unsqueeze(0),
+                key.float().transpose(0, 1).unsqueeze(0),
+                value.float().transpose(0, 1).unsqueeze(0),
+                scale=scale,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+            for query, (key, value) in zip(q.split(1), request_kv)
+        ]
+    )
+    assert result.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(result.float(), expected, atol=5e-2, rtol=2e-2)
