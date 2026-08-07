@@ -19,7 +19,7 @@ _MANIFEST_PATH = Path(__file__).parent / "kernels" / "manifest.json"
 
 AttnKernel = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, float], torch.Tensor]
 AttnBackwardKernel = Callable[
-    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float],
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ]
 

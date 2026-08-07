@@ -117,7 +117,9 @@ def test_matches_fp32_sdpa(entry: dict[str, object]) -> None:
     "entry", BACKWARD_SHAPES, ids=[str(entry["key"]) for entry in BACKWARD_SHAPES]
 )
 @pytest.mark.parametrize(
-    "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
+    "softmax_scale",
+    [None, 0.137, 1.0],
+    ids=["default-scale", "near-default-scale", "large-scale"],
 )
 def test_gradients_match_fp32_sdpa(
     entry: dict[str, object], softmax_scale: float | None

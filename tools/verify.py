@@ -21,6 +21,7 @@ from helion_attention._shape import AttnShape  # noqa: E402
 
 TOLERANCE = 5e-2
 GRAD_TOLERANCE = 5e-2
+GRAD_RTOL = 2e-2
 
 
 def check(spec: AttnShape) -> float:
@@ -55,7 +56,9 @@ def check(spec: AttnShape) -> float:
     return (got.float() - expected).abs().max().item()
 
 
-def check_gradients(spec: AttnShape) -> list[float]:
+def check_gradients(
+    spec: AttnShape, softmax_scale: float | None = None
+) -> tuple[list[float], list[int]]:
     """Compare the public autograd path with fp32 SDPA."""
     generator = torch.Generator(device="cuda").manual_seed(4321)
 
@@ -71,9 +74,18 @@ def check_gradients(spec: AttnShape) -> list[float]:
     k = rand(spec.seqlen_k, spec.nheads_kv).requires_grad_()
     v = rand(spec.seqlen_k, spec.nheads_kv).requires_grad_()
     grad_out = rand(spec.seqlen_q, spec.nheads_q)
-    scale = 1.0 / math.sqrt(spec.head_dim)
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
     got = helion_attention.flash_attn_func(
-        q, k, v, causal=spec.causal, shape=spec
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        shape=spec,
     )
     got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
 
@@ -91,10 +103,17 @@ def check_gradients(spec: AttnShape) -> list[float]:
     expected_grads = torch.autograd.grad(
         expected, (q_ref, k_ref, v_ref), grad_out.float()
     )
-    return [
+    errors = [
         (actual.float() - reference).abs().max().item()
         for actual, reference in zip(got_grads, expected_grads)
     ]
+    mismatches = [
+        (~torch.isclose(actual.float(), reference, atol=GRAD_TOLERANCE, rtol=GRAD_RTOL))
+        .sum()
+        .item()
+        for actual, reference in zip(got_grads, expected_grads)
+    ]
+    return errors, mismatches
 
 
 def main(argv: list[str]) -> int:
@@ -117,15 +136,20 @@ def main(argv: list[str]) -> int:
         failures += error > TOLERANCE
         print(f"[{status}] {key}: max abs error {error:.4g}")
         if entry.get("backward", False):
-            grad_errors = check_gradients(spec)
-            grad_ok = max(grad_errors) <= GRAD_TOLERANCE
-            failures += not grad_ok
-            status = "ok " if grad_ok else "FAIL"
-            details = ", ".join(
-                f"{name}={error:.4g}"
-                for name, error in zip(("dq", "dk", "dv"), grad_errors)
-            )
-            print(f"[{status}] {key} backward: {details}")
+            for scale_name, softmax_scale in (("default", None), ("1.0", 1.0)):
+                grad_errors, mismatches = check_gradients(spec, softmax_scale)
+                grad_ok = not any(mismatches)
+                failures += not grad_ok
+                status = "ok " if grad_ok else "FAIL"
+                details = ", ".join(
+                    f"{name}={error:.4g} ({mismatch} mismatches)"
+                    for name, error, mismatch in zip(
+                        ("dq", "dk", "dv"), grad_errors, mismatches
+                    )
+                )
+                print(
+                    f"[{status}] {key} backward scale={scale_name}: {details}"
+                )
     if "helion" in sys.modules:
         print("FAIL: importing helion_attention pulled in Helion")
         failures += 1

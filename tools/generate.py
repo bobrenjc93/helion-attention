@@ -246,7 +246,7 @@ def main() -> int:
             generator=grad_generator,
         )
         print(f"autotuning backward for {spec.describe()}", flush=True)
-        got_grads = backward_kernel(q, k, v, got, grad_out, sm_scale)
+        got_grads = backward_kernel(q, k, v, grad_out, sm_scale)
         expected_grads = reference_gradients(q, k, v, grad_out, sm_scale)
         grad_errors = [
             (actual.float() - expected).abs().max().item()
@@ -263,7 +263,7 @@ def main() -> int:
             raise SystemExit(
                 f"autotuned backward kernel is not accurate enough: {grad_errors}"
             )
-        backward_bound = backward_kernel.bind((q, k, v, got, grad_out, sm_scale))
+        backward_bound = backward_kernel.bind((q, k, v, grad_out, sm_scale))
         backward_code = strip_helion(backward_bound.to_triton_code())
         backward_code = rename_entry_point(
             backward_code, backward_kernel.name, "attention_backward"

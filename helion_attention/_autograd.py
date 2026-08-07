@@ -22,7 +22,7 @@ class _Attention(torch.autograd.Function):
         spec: AttnShape,
     ) -> torch.Tensor:
         out = lookup(spec)(q, k, v, softmax_scale)
-        ctx.save_for_backward(q, k, v, out)
+        ctx.save_for_backward(q, k, v)
         ctx.softmax_scale = softmax_scale
         ctx.spec = spec
         return out
@@ -38,12 +38,11 @@ class _Attention(torch.autograd.Function):
         None,
         None,
     ]:
-        q, k, v, out = ctx.saved_tensors
+        q, k, v = ctx.saved_tensors
         dq, dk, dv = lookup_backward(ctx.spec)(
             q,
             k,
             v,
-            out,
             grad_out.contiguous(),
             ctx.softmax_scale,
         )

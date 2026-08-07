@@ -56,12 +56,10 @@ def _attention_backward_reference(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
     grad_out: torch.Tensor,
     sm_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """fp32 SDPA gradients used while autotuning the backward kernel."""
-    del out
     with torch.enable_grad():
         q_ref = q.float().detach().requires_grad_()
         k_ref = k.float().detach().requires_grad_()
@@ -101,6 +99,8 @@ def attention_bshd(
     group = nheads_q // nheads_kv
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
+    # Scale the fp32 accumulator, not bf16 q: large runtime scales otherwise
+    # lose enough precision to change the softmax distribution materially.
     for b, h in hl.grid([batch, nheads_q]):
         h_kv = h // group
         for tile_m in hl.tile(m_dim):
@@ -110,7 +110,7 @@ def attention_bshd(
             q_blk = q[b, tile_m, h, :]
             for tile_n in hl.tile(n_dim):
                 k_blk = k[b, tile_n, h_kv, :]
-                qk = hl.dot(q_blk * qk_scale, k_blk.T, out_dtype=torch.float32)
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                 m_ij = torch.maximum(m_i, torch.amax(qk, -1))
                 qk = qk - m_ij[:, None]
                 p = torch.exp2(qk)
@@ -226,6 +226,7 @@ def decode_attention_bshd(
 
 @helion.kernel(
     static_shapes=True,
+    dot_precision="ieee",
     autotune_effort="quick",
     autotune_baseline_fn=_attention_backward_reference,
     autotune_baseline_atol=5e-2,
@@ -235,7 +236,6 @@ def attention_backward_bshd(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    out: torch.Tensor,
     grad_out: torch.Tensor,
     sm_scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -243,9 +243,9 @@ def attention_backward_bshd(
 
     This follows the recompute strategy used by FlashAttention backward.  A
     first pass recreates the per-query log-sum-exp values that the existing
-    forward-only modules do not expose.  The following two passes recompute
-    probabilities blockwise and produce dQ, then dK/dV, without materializing
-    the quadratic attention matrix.
+    forward-only modules do not expose.  A second pass computes the softmax
+    Jacobian's row correction in fp32, and the final two passes produce dQ,
+    then dK/dV, without materializing the quadratic attention matrix.
 
     The first checked-in specialization intentionally covers MHA with equal
     query/key lengths only.  The generator rejects causal, cross-attention, and
@@ -264,7 +264,13 @@ def attention_backward_bshd(
         dtype=torch.float32,
         device=q.device,
     )
+    delta = torch.empty(
+        (batch, m_dim, nheads),
+        dtype=torch.float32,
+        device=q.device,
+    )
     qk_scale = sm_scale * 1.44269504088896340736
+    # Keep the same fp32 logit scaling used by the matching forward kernel.
 
     # Recreate the forward log-sum-exp in base 2 once.  Both gradient passes
     # can then reconstruct each probability tile independently.
@@ -275,7 +281,7 @@ def attention_backward_bshd(
             q_blk = q[b, tile_m, h, :]
             for tile_n in hl.tile(n_dim):
                 k_blk = k[b, tile_n, h, :]
-                qk = hl.dot(q_blk * qk_scale, k_blk.T, out_dtype=torch.float32)
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                 m_ij = torch.maximum(m_i, torch.amax(qk, -1))
                 p = torch.exp2(qk - m_ij[:, None])
                 alpha = torch.exp2(m_i - m_ij)
@@ -285,25 +291,41 @@ def attention_backward_bshd(
 
     hl.barrier()
 
+    # Recompute delta = sum(p * dP) in fp32.  Deriving it from the bf16 forward
+    # output (sum(out * grad_out)) amplifies output rounding at larger scales.
+    for b, h in hl.grid([batch, nheads]):
+        for tile_m in hl.tile(m_dim):
+            q_blk = q[b, tile_m, h, :]
+            grad_out_blk = grad_out[b, tile_m, h, :]
+            lse_blk = lse[b, tile_m, h]
+            delta_acc = hl.zeros([tile_m], dtype=torch.float32)
+            for tile_n in hl.tile(n_dim):
+                k_blk = k[b, tile_n, h, :]
+                v_blk = v[b, tile_n, h, :]
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                p = torch.exp2(qk - lse_blk[:, None])
+                dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                delta_acc = delta_acc + torch.sum(p * dp, -1)
+            delta[b, tile_m, h] = delta_acc
+
+    hl.barrier()
+
     # dQ owns query-row tiles, so no atomics are needed.
     for b, h in hl.grid([batch, nheads]):
         for tile_m in hl.tile(m_dim):
             q_blk = q[b, tile_m, h, :]
-            out_blk = out[b, tile_m, h, :]
             grad_out_blk = grad_out[b, tile_m, h, :]
-            delta = torch.sum(
-                out_blk.to(torch.float32) * grad_out_blk.to(torch.float32), -1
-            )
+            delta_blk = delta[b, tile_m, h]
             lse_blk = lse[b, tile_m, h]
             dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
             for tile_n in hl.tile(n_dim):
                 k_blk = k[b, tile_n, h, :]
                 v_blk = v[b, tile_n, h, :]
-                qk = hl.dot(q_blk * qk_scale, k_blk.T, out_dtype=torch.float32)
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                 p = torch.exp2(qk - lse_blk[:, None])
                 dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
-                ds = p * (dp - delta[:, None])
-                dq_acc = hl.dot(ds.to(k_blk.dtype), k_blk, acc=dq_acc)
+                ds = p * (dp - delta_blk[:, None])
+                dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
             dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
 
     hl.barrier()
@@ -317,17 +339,14 @@ def attention_backward_bshd(
             dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
             for tile_m in hl.tile(m_dim):
                 q_blk = q[b, tile_m, h, :]
-                out_blk = out[b, tile_m, h, :]
                 grad_out_blk = grad_out[b, tile_m, h, :]
-                delta = torch.sum(
-                    out_blk.to(torch.float32) * grad_out_blk.to(torch.float32), -1
-                )
+                delta_blk = delta[b, tile_m, h]
                 lse_blk = lse[b, tile_m, h]
-                qk = hl.dot(q_blk * qk_scale, k_blk.T, out_dtype=torch.float32)
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                 p = torch.exp2(qk - lse_blk[:, None])
                 dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
-                ds = p * (dp - delta[:, None])
-                dk_acc = hl.dot(ds.T.to(q_blk.dtype), q_blk, acc=dk_acc)
+                ds = p * (dp - delta_blk[:, None])
+                dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
                 dv_acc = hl.dot(
                     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
                 )
