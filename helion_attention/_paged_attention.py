@@ -84,13 +84,18 @@ def _varlen_attention_kernel(
     INPUT_FP16: tl.constexpr,
     CP_WORLD_SIZE: tl.constexpr,
     CP_RANK: tl.constexpr,
+    QUERY_BLOCKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_DV: tl.constexpr,
 ):
-    query_block = tl.program_id(0)
-    batch_head = tl.program_id(1)
+    # Keep all logical work in CUDA's large X grid dimension.  The Y and Z
+    # dimensions are limited to 65,535, which valid large batches can exceed
+    # once multiplied by the number of query heads.
+    work_id = tl.program_id(0)
+    query_block = work_id % QUERY_BLOCKS
+    batch_head = work_id // QUERY_BLOCKS
     batch = batch_head // NHEADS_Q
     head_q = batch_head % NHEADS_Q
     group_size = NHEADS_Q // NHEADS_KV
@@ -462,7 +467,8 @@ def _attention(
     block_dv = max(16, triton.next_power_of_2(value_dim))
     block_m = 16
     block_n = 64
-    grid = (triton.cdiv(max_seqlen_q, block_m), batch * nheads_q)
+    query_blocks = triton.cdiv(max_seqlen_q, block_m)
+    grid = (query_blocks * batch * nheads_q,)
     with torch.cuda.device(q.device):
         _varlen_attention_kernel[grid](
             q,
@@ -526,6 +532,7 @@ def _attention(
             INPUT_FP16=q.dtype == torch.float16,
             CP_WORLD_SIZE=cp_world_size,
             CP_RANK=cp_rank,
+            QUERY_BLOCKS=query_blocks,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,

@@ -856,6 +856,36 @@ def test_nonpaged_2048_has_bounded_launch_and_memory_cost(
 
 
 @requires_cuda
+def test_large_batch_uses_flattened_cuda_grid() -> None:
+    batch, nheads_q, nheads_kv, head_dim = 1024, 64, 1, 16
+    q = torch.zeros(
+        batch, nheads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.zeros(
+        batch, nheads_kv, head_dim, device=q.device, dtype=q.dtype
+    )
+    v = torch.arange(batch * head_dim, device=q.device, dtype=q.dtype).reshape(
+        batch, nheads_kv, head_dim
+    )
+    cumulative = torch.arange(batch + 1, device=q.device, dtype=torch.int32)
+
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=1,
+        cu_seqlens_q=cumulative,
+        max_seqlen_k=1,
+        cu_seqlens_k=cumulative,
+        causal=True,
+        fa_version=3,
+    )
+
+    assert isinstance(result, torch.Tensor)
+    torch.testing.assert_close(result, v.expand(-1, nheads_q, -1))
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     "window", [(-1, -1), (5, 0)], ids=["unbounded", "effective-global"]
 )
