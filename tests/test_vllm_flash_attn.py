@@ -486,6 +486,80 @@ def test_paged_nonfinite_cache_tail_is_masked() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(
+    ("fa_version", "positive_infinity"), [(2, True), (3, False)]
+)
+def test_zero_key_lse_uses_version_specific_sentinel(
+    fa_version: int, positive_infinity: bool
+) -> None:
+    q = torch.zeros(2, 2, 4)
+    k = torch.empty(0, 1, 4)
+    v = torch.empty_like(k)
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=2,
+        cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+        max_seqlen_k=0,
+        cu_seqlens_k=torch.tensor([0, 0], dtype=torch.int32),
+        causal=True,
+        return_softmax_lse=True,
+        fa_version=fa_version,
+    )
+    assert isinstance(result, tuple)
+    output, lse = result
+    torch.testing.assert_close(output, torch.zeros_like(output))
+    assert torch.isposinf(lse).all() if positive_infinity else torch.isneginf(lse).all()
+
+
+@requires_cuda
+@pytest.mark.parametrize("paged", [False, True], ids=["packed", "paged"])
+@pytest.mark.parametrize(
+    ("fa_version", "positive_infinity"), [(2, True), (3, False)]
+)
+def test_cuda_fully_masked_lse_uses_version_specific_sentinel(
+    paged: bool, fa_version: int, positive_infinity: bool
+) -> None:
+    q = torch.zeros(3, 2, 16, device="cuda", dtype=torch.bfloat16)
+    if paged:
+        k = torch.zeros(1, 4, 1, 16, device="cuda", dtype=torch.bfloat16)
+        v = torch.zeros_like(k)
+        key_kwargs = {
+            "seqused_k": torch.tensor([1], device="cuda", dtype=torch.int32),
+            "block_table": torch.tensor([[0]], device="cuda", dtype=torch.int32),
+        }
+    else:
+        k = torch.zeros(1, 1, 16, device="cuda", dtype=torch.bfloat16)
+        v = torch.zeros_like(k)
+        key_kwargs = {
+            "cu_seqlens_k": torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+        }
+
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=3,
+        cu_seqlens_q=torch.tensor([0, 3], device="cuda", dtype=torch.int32),
+        max_seqlen_k=1,
+        causal=True,
+        return_softmax_lse=True,
+        fa_version=fa_version,
+        **key_kwargs,
+    )
+    assert isinstance(result, tuple)
+    output, lse = result
+    torch.testing.assert_close(output[:2], torch.zeros_like(output[:2]))
+    empty_lse = lse[:, :2]
+    assert (
+        torch.isposinf(empty_lse).all()
+        if positive_infinity
+        else torch.isneginf(empty_lse).all()
+    )
+    assert torch.isfinite(lse[:, 2:]).all()
+
+
 @pytest.mark.parametrize("fa_version", [4, 999])
 def test_unsupported_fa_version_is_rejected(fa_version: int) -> None:
     tensor = torch.zeros(1, 1, 1)
@@ -591,6 +665,54 @@ def test_paged_fallback_supports_cuda_graph_capture() -> None:
 
 
 @requires_cuda
+def test_fa2_effective_global_alibi_lse_is_stable_during_capture() -> None:
+    tokens, nheads, head_dim, page_size = 5, 2, 16, 4
+    q = torch.zeros(tokens, nheads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(2, page_size, nheads, head_dim, device=q.device, dtype=q.dtype)
+    v = torch.randn(
+        k.shape,
+        device=k.device,
+        dtype=k.dtype,
+        generator=torch.Generator(device="cuda").manual_seed(505),
+    )
+    max_seqlen_k = torch.tensor(tokens, device="cuda", dtype=torch.int32)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "max_seqlen_q": torch.tensor(tokens, device="cuda", dtype=torch.int32),
+        "cu_seqlens_q": torch.tensor(
+            [0, tokens], device="cuda", dtype=torch.int32
+        ),
+        "max_seqlen_k": max_seqlen_k,
+        "seqused_k": torch.tensor([tokens], device="cuda", dtype=torch.int32),
+        "block_table": torch.tensor([[0, 1]], device="cuda", dtype=torch.int32),
+        "causal": True,
+        "window_size": (tokens, 0),
+        "alibi_slopes": torch.tensor([0.2, 0.4], device="cuda"),
+        "return_softmax_lse": True,
+        "fa_version": 2,
+    }
+
+    eager_result = compat.flash_attn_varlen_func(**kwargs)
+    assert isinstance(eager_result, tuple)
+    eager_out, eager_lse = (tensor.clone() for tensor in eager_result)
+    captured_out = torch.empty_like(eager_out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_result = compat.flash_attn_varlen_func(**kwargs, out=captured_out)
+    assert isinstance(captured_result, tuple)
+    returned_out, captured_lse = captured_result
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert returned_out.data_ptr() == captured_out.data_ptr()
+    torch.testing.assert_close(captured_out, eager_out)
+    torch.testing.assert_close(captured_lse, eager_lse)
+
+
+@requires_cuda
 def test_paged_2048_has_bounded_launch_and_memory_cost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -649,6 +771,73 @@ def test_paged_2048_has_bounded_launch_and_memory_cost(
         return original(*args, **call_kwargs)
 
     monkeypatch.setattr(compat, "_paged_attention", counted)
+    compat.flash_attn_varlen_func(**kwargs)
+    torch.cuda.synchronize()
+    calls = 0
+    torch.cuda.reset_peak_memory_stats()
+    starting_memory = torch.cuda.memory_allocated()
+    started = time.perf_counter()
+    result = compat.flash_attn_varlen_func(**kwargs)
+    torch.cuda.synchronize()
+    elapsed = time.perf_counter() - started
+    extra_peak_memory = torch.cuda.max_memory_allocated() - starting_memory
+
+    assert isinstance(result, torch.Tensor)
+    assert calls == 1
+    assert elapsed < 2.0
+    assert extra_peak_memory < 128 * 1024 * 1024
+
+
+@requires_cuda
+def test_nonpaged_2048_has_bounded_launch_and_memory_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tokens, nheads_q, nheads_kv, head_dim = 2048, 4, 2, 64
+    generator = torch.Generator(device="cuda").manual_seed(2049)
+    q = torch.randn(
+        tokens,
+        nheads_q,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    k = torch.randn(
+        tokens,
+        nheads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    v = torch.randn(
+        k.shape,
+        device=k.device,
+        dtype=k.dtype,
+        generator=generator,
+    )
+    cumulative = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "max_seqlen_q": tokens,
+        "cu_seqlens_q": cumulative,
+        "max_seqlen_k": tokens,
+        "cu_seqlens_k": cumulative,
+        "causal": True,
+        "fa_version": 3,
+    }
+
+    original = compat._packed_attention
+    calls = 0
+
+    def counted(*args: object, **call_kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original(*args, **call_kwargs)
+
+    monkeypatch.setattr(compat, "_packed_attention", counted)
     compat.flash_attn_varlen_func(**kwargs)
     torch.cuda.synchronize()
     calls = 0

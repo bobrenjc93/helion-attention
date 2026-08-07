@@ -1,4 +1,4 @@
-"""Single-launch generic paged attention used by the vLLM adapter."""
+"""Single-launch generic packed and paged attention for the vLLM adapter."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _paged_attention_kernel(
+def _varlen_attention_kernel(
     q,
     k,
     v,
@@ -16,8 +16,10 @@ def _paged_attention_kernel(
     out,
     lse_out,
     cu_seqlens_q,
+    cu_seqlens_k,
     seqused_k,
     block_table,
+    max_seqlen_k_tensor,
     q_descale,
     k_descale,
     v_descale,
@@ -65,6 +67,7 @@ def _paged_attention_kernel(
     VALUE_DIM: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     NUM_BLOCKS: tl.constexpr,
+    PAGED: tl.constexpr,
     CAUSAL: tl.constexpr,
     HAS_Q_V: tl.constexpr,
     HAS_Q_DESCALE: tl.constexpr,
@@ -76,6 +79,8 @@ def _paged_attention_kernel(
     HAS_SOFTCAP: tl.constexpr,
     STORE_LSE: tl.constexpr,
     SHIFT_FA2_LSE: tl.constexpr,
+    HAS_DYNAMIC_FA2_MAX: tl.constexpr,
+    FA_VERSION_2: tl.constexpr,
     INPUT_FP16: tl.constexpr,
     CP_WORLD_SIZE: tl.constexpr,
     CP_RANK: tl.constexpr,
@@ -94,7 +99,13 @@ def _paged_attention_kernel(
     q_start = tl.load(cu_seqlens_q + batch)
     q_stop = tl.load(cu_seqlens_q + batch + 1)
     seqlen_q = q_stop - q_start
-    seqlen_k = tl.load(seqused_k + batch)
+    if PAGED:
+        packed_k_start = 0
+        seqlen_k = tl.load(seqused_k + batch)
+    else:
+        packed_k_start = tl.load(cu_seqlens_k + batch)
+        packed_k_stop = tl.load(cu_seqlens_k + batch + 1)
+        seqlen_k = packed_k_stop - packed_k_start
     if HAS_CP_TOTAL:
         total_seqlen_k = tl.load(cp_tot_seqused_k + batch)
     else:
@@ -145,21 +156,32 @@ def _paged_attention_kernel(
         valid_n = offs_n < seqlen_k
         global_key_positions = offs_n * CP_WORLD_SIZE + CP_RANK
         valid_storage = valid_n & (global_key_positions < total_seqlen_k)
-        logical_blocks = offs_n // PAGE_SIZE
-        physical_blocks = tl.load(
-            block_table
-            + batch * stride_bt_b
-            + logical_blocks * stride_bt_block,
-            mask=valid_storage,
-            other=0,
-        )
-        physical_blocks = tl.maximum(0, tl.minimum(physical_blocks, NUM_BLOCKS - 1))
-        page_offsets = offs_n % PAGE_SIZE
+        if PAGED:
+            logical_blocks = offs_n // PAGE_SIZE
+            physical_blocks = tl.load(
+                block_table
+                + batch * stride_bt_b
+                + logical_blocks * stride_bt_block,
+                mask=valid_storage,
+                other=0,
+            )
+            physical_blocks = tl.maximum(
+                0, tl.minimum(physical_blocks, NUM_BLOCKS - 1)
+            )
+            page_offsets = offs_n % PAGE_SIZE
+            key_row_offsets = (
+                physical_blocks * stride_kb + page_offsets * stride_ks
+            )
+            value_row_offsets = (
+                physical_blocks * stride_vb + page_offsets * stride_vs
+            )
+        else:
+            key_row_offsets = (packed_k_start + offs_n) * stride_ks
+            value_row_offsets = (packed_k_start + offs_n) * stride_vs
 
         key_values = tl.load(
             k
-            + physical_blocks[:, None] * stride_kb
-            + page_offsets[:, None] * stride_ks
+            + key_row_offsets[:, None]
             + head_kv * stride_kh
             + offs_d[None, :] * stride_kd,
             mask=valid_storage[:, None] & (offs_d[None, :] < HEAD_DIM),
@@ -186,8 +208,7 @@ def _paged_attention_kernel(
 
         value_values = tl.load(
             v
-            + physical_blocks[:, None] * stride_vb
-            + page_offsets[:, None] * stride_vs
+            + value_row_offsets[:, None]
             + head_kv * stride_vh
             + offs_dv[None, :] * stride_vd,
             mask=valid_storage[:, None] & (offs_dv[None, :] < VALUE_DIM),
@@ -275,12 +296,21 @@ def _paged_attention_kernel(
         mask=valid_m[:, None] & (offs_dv[None, :] < VALUE_DIM),
     )
     if STORE_LSE:
-        lse = tl.where(has_mass, running_max + tl.log(safe_sum), float("-inf"))
+        empty_lse = float("inf") if FA_VERSION_2 else float("-inf")
+        lse = tl.where(has_mass, running_max + tl.log(safe_sum), empty_lse)
         if SHIFT_FA2_LSE and HAS_ALIBI:
             slope = tl.load(
                 alibi_slopes + batch * stride_alibi_b + head_q * stride_alibi_h
             )
-            lse += slope * aligned_query
+            shifted_lse = lse + slope * aligned_query
+            if HAS_DYNAMIC_FA2_MAX:
+                real_max_seqlen_k = tl.load(max_seqlen_k_tensor)
+                effective_global = (window_left < 0) | (
+                    window_left >= real_max_seqlen_k
+                )
+                lse = tl.where(effective_global, shifted_lse, lse)
+            else:
+                lse = shifted_lse
         tl.store(
             lse_out + head_q * stride_lseh + q_indices * stride_lset,
             lse,
@@ -328,14 +358,15 @@ def _head_metadata_strides(
     raise ValueError("head metadata must be scalar, [heads], or [batch, heads]")
 
 
-def paged_attention(
+def _attention(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
-    seqused_k: torch.Tensor,
-    block_table: torch.Tensor,
     *,
+    cu_seqlens_k: torch.Tensor | None,
+    seqused_k: torch.Tensor | None,
+    block_table: torch.Tensor | None,
     max_seqlen_q: int,
     softmax_scale: float,
     causal: bool,
@@ -353,13 +384,20 @@ def paged_attention(
     out: torch.Tensor | None,
     return_softmax_lse: bool,
     shift_fa2_lse: bool,
+    fa2_lse_max: torch.Tensor | None,
+    fa_version: int,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Launch generic paged attention in one GPU kernel."""
+    """Launch packed or paged varlen attention in one GPU kernel."""
+    paged = block_table is not None
+    if paged:
+        assert seqused_k is not None
+    else:
+        assert cu_seqlens_k is not None
     batch = cu_seqlens_q.numel() - 1
     nheads_q = q.shape[1]
-    nheads_kv = k.shape[2]
+    nheads_kv = k.shape[-2]
     head_dim = q.shape[2]
-    value_dim = v.shape[3]
+    value_dim = v.shape[-1]
     if out is None:
         output_dtype = (
             torch.bfloat16 if str(q.dtype).startswith("torch.float8_") else q.dtype
@@ -400,6 +438,25 @@ def paged_attention(
         if cp_tot_seqused_k is None
         else cp_tot_seqused_k
     )
+    cu_k_arg = cu_seqlens_q if cu_seqlens_k is None else cu_seqlens_k
+    seqused_arg = cu_seqlens_q if seqused_k is None else seqused_k
+    block_table_arg = (
+        cu_seqlens_q.reshape(1, -1) if block_table is None else block_table
+    )
+    max_seqlen_k_arg = (
+        cu_seqlens_q if fa2_lse_max is None else fa2_lse_max
+    )
+
+    if paged:
+        k_strides = k.stride()
+        v_strides = v.stride()
+        page_size = k.shape[1]
+        num_blocks = max(1, k.shape[0])
+    else:
+        k_strides = (0, k.stride(0), k.stride(1), k.stride(2))
+        v_strides = (0, v.stride(0), v.stride(1), v.stride(2))
+        page_size = 1
+        num_blocks = 1
 
     block_d = max(16, triton.next_power_of_2(head_dim))
     block_dv = max(16, triton.next_power_of_2(value_dim))
@@ -407,7 +464,7 @@ def paged_attention(
     block_n = 64
     grid = (triton.cdiv(max_seqlen_q, block_m), batch * nheads_q)
     with torch.cuda.device(q.device):
-        _paged_attention_kernel[grid](
+        _varlen_attention_kernel[grid](
             q,
             k,
             v,
@@ -415,8 +472,10 @@ def paged_attention(
             out,
             lse,
             cu_seqlens_q,
-            seqused_k,
-            block_table,
+            cu_k_arg,
+            seqused_arg,
+            block_table_arg,
+            max_seqlen_k_arg,
             q_scale,
             k_scale,
             v_scale,
@@ -424,12 +483,12 @@ def paged_attention(
             sinks,
             cp_tot_arg,
             *q.stride(),
-            *k.stride(),
-            *v.stride(),
+            *k_strides,
+            *v_strides,
             *q_v_arg.stride(),
             *out.stride(),
             *lse.stride() if lse.ndim == 2 else (0, 0),
-            *block_table.stride(),
+            *block_table_arg.stride(),
             qsb,
             qsh,
             ksb,
@@ -448,8 +507,9 @@ def paged_attention(
             NHEADS_KV=nheads_kv,
             HEAD_DIM=head_dim,
             VALUE_DIM=value_dim,
-            PAGE_SIZE=k.shape[1],
-            NUM_BLOCKS=k.shape[0],
+            PAGE_SIZE=page_size,
+            NUM_BLOCKS=num_blocks,
+            PAGED=paged,
             CAUSAL=causal,
             HAS_Q_V=q_v is not None,
             HAS_Q_DESCALE=q_descale is not None,
@@ -461,6 +521,8 @@ def paged_attention(
             HAS_SOFTCAP=softcap > 0.0,
             STORE_LSE=return_softmax_lse,
             SHIFT_FA2_LSE=shift_fa2_lse,
+            HAS_DYNAMIC_FA2_MAX=fa2_lse_max is not None,
+            FA_VERSION_2=fa_version == 2,
             INPUT_FP16=q.dtype == torch.float16,
             CP_WORLD_SIZE=cp_world_size,
             CP_RANK=cp_rank,
@@ -472,3 +534,120 @@ def paged_attention(
             num_stages=2,
         )
     return (out, lse) if return_softmax_lse else out
+
+
+def paged_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    block_table: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    softcap: float,
+    alibi_slopes: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    s_aux: torch.Tensor | None,
+    q_v: torch.Tensor | None,
+    cp_world_size: int,
+    cp_rank: int,
+    cp_tot_seqused_k: torch.Tensor | None,
+    out: torch.Tensor | None,
+    return_softmax_lse: bool,
+    shift_fa2_lse: bool,
+    fa2_lse_max: torch.Tensor | None,
+    fa_version: int,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Launch generic paged attention in one GPU kernel."""
+    return _attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k=None,
+        seqused_k=seqused_k,
+        block_table=block_table,
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        s_aux=s_aux,
+        q_v=q_v,
+        cp_world_size=cp_world_size,
+        cp_rank=cp_rank,
+        cp_tot_seqused_k=cp_tot_seqused_k,
+        out=out,
+        return_softmax_lse=return_softmax_lse,
+        shift_fa2_lse=shift_fa2_lse,
+        fa2_lse_max=fa2_lse_max,
+        fa_version=fa_version,
+    )
+
+
+def packed_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    softmax_scale: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    softcap: float,
+    alibi_slopes: torch.Tensor | None,
+    q_descale: torch.Tensor | None,
+    k_descale: torch.Tensor | None,
+    v_descale: torch.Tensor | None,
+    s_aux: torch.Tensor | None,
+    q_v: torch.Tensor | None,
+    cp_world_size: int,
+    cp_rank: int,
+    cp_tot_seqused_k: torch.Tensor | None,
+    out: torch.Tensor | None,
+    return_softmax_lse: bool,
+    shift_fa2_lse: bool,
+    fa2_lse_max: torch.Tensor | None,
+    fa_version: int,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Launch generic packed varlen attention in one GPU kernel."""
+    return _attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=None,
+        block_table=None,
+        max_seqlen_q=max_seqlen_q,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        s_aux=s_aux,
+        q_v=q_v,
+        cp_world_size=cp_world_size,
+        cp_rank=cp_rank,
+        cp_tot_seqused_k=cp_tot_seqused_k,
+        out=out,
+        return_softmax_lse=return_softmax_lse,
+        shift_fa2_lse=shift_fa2_lse,
+        fa2_lse_max=fa2_lse_max,
+        fa_version=fa_version,
+    )

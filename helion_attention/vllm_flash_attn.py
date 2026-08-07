@@ -3,9 +3,9 @@
 vLLM calls FlashAttention through a varlen API that does not carry
 ``helion_attention``'s explicit ``shape`` argument.  This module infers the
 specialization from the packed tensors and maximum sequence lengths.  Calls
-matching a checked-in varlen kernel use it, paged CUDA calls use a generic
-single-launch Triton kernel, and remaining calls use a correctness fallback
-implemented with PyTorch operations.
+matching a checked-in varlen kernel use it, other packed and paged CUDA calls
+use a generic single-launch Triton kernel, and remaining calls use a
+correctness fallback implemented with PyTorch operations.
 
 Both generic paths keep sequence metadata on-device and carry tiled online
 softmax state rather than materializing a quadratic attention matrix.  The
@@ -49,7 +49,7 @@ _FP8_DTYPES: frozenset[torch.dtype] = frozenset(
     )
     if hasattr(torch, name)
 )
-_PAGED_DTYPES: frozenset[torch.dtype] = _FP8_DTYPES | {
+_GENERIC_CUDA_DTYPES: frozenset[torch.dtype] = _FP8_DTYPES | {
     torch.float16,
     torch.bfloat16,
 }
@@ -66,6 +66,13 @@ def _paged_attention(*args: Any, **kwargs: Any) -> Any:
     from ._paged_attention import paged_attention
 
     return paged_attention(*args, **kwargs)
+
+
+def _packed_attention(*args: Any, **kwargs: Any) -> Any:
+    """Import Triton only when a CUDA packed call reaches the fast path."""
+    from ._paged_attention import packed_attention
+
+    return packed_attention(*args, **kwargs)
 
 
 def is_fa_version_supported(fa_version: int) -> bool:
@@ -489,6 +496,7 @@ def flash_attn_varlen_func(
             )
         if q_v.device != q.device or q_v.dtype != q.dtype:
             raise ValueError("q_v must have the same device and dtype as q")
+    original_max_seqlen_k = max_seqlen_k
     max_k_storage = k.shape[0]
     if k.ndim == 4:
         max_k_storage = k.shape[1]
@@ -623,23 +631,37 @@ def flash_attn_varlen_func(
         scale = 1.0 / math.sqrt(q.shape[-1])
 
     differentiable_inputs = (q, k, v) if q_v is None else (q, k, v, q_v)
-    if (
-        block_table is not None
-        and q.is_cuda
-        and q.dtype in _PAGED_DTYPES
+    use_generic_cuda = (
+        q.is_cuda
+        and q.dtype in _GENERIC_CUDA_DTYPES
         and not (
             torch.is_grad_enabled()
             and any(tensor.requires_grad for tensor in differentiable_inputs)
         )
+    )
+    left_window, right_window = real_window
+    fa2_one_sided_alibi = (
+        fa_version == 2
+        and alibi_slopes is not None
+        and (causal or right_window == 0)
+    )
+    fa2_lse_max: torch.Tensor | None = None
+    if not fa2_one_sided_alibi:
+        shift_fa2_lse = False
+    elif left_window < 0:
+        shift_fa2_lse = True
+    elif (
+        isinstance(original_max_seqlen_k, torch.Tensor)
+        and original_max_seqlen_k.is_cuda
     ):
-        left_window, right_window = real_window
-        fa2_global_left = left_window < 0 or left_window >= max_seqlen_k
-        shift_fa2_lse = (
-            fa_version == 2
-            and alibi_slopes is not None
-            and fa2_global_left
-            and (causal or right_window == 0)
-        )
+        # The kernel must compare the real scalar on-device. During graph
+        # capture the normalized launch bound may be the larger cache capacity.
+        shift_fa2_lse = True
+        fa2_lse_max = original_max_seqlen_k
+    else:
+        shift_fa2_lse = left_window >= max_seqlen_k
+
+    if use_generic_cuda and block_table is not None:
         assert seqused_k is not None
         return _paged_attention(
             q,
@@ -665,6 +687,36 @@ def flash_attn_varlen_func(
             out=out,
             return_softmax_lse=bool(return_softmax_lse),
             shift_fa2_lse=shift_fa2_lse,
+            fa2_lse_max=fa2_lse_max,
+            fa_version=fa_version,
+        )
+
+    if use_generic_cuda and cu_seqlens_k is not None and k.ndim == 3:
+        return _packed_attention(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=scale,
+            causal=bool(causal),
+            window_size=real_window,
+            softcap=cap,
+            alibi_slopes=alibi_slopes,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            s_aux=s_aux,
+            q_v=q_v,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
+            cp_tot_seqused_k=cp_tot_seqused_k,
+            out=out,
+            return_softmax_lse=bool(return_softmax_lse),
+            shift_fa2_lse=shift_fa2_lse,
+            fa2_lse_max=fa2_lse_max,
+            fa_version=fa_version,
         )
 
     output_dtype = torch.bfloat16 if out is None and q.dtype in _FP8_DTYPES else q.dtype
@@ -840,7 +892,9 @@ def flash_attn_varlen_func(
         lse_tile = torch.where(
             has_mass,
             running_max + torch.log(safe_sum),
-            torch.full_like(running_max, float("-inf")),
+            torch.full_like(
+                running_max, float("inf") if fa_version == 2 else float("-inf")
+            ),
         )
         fa2_global_left = left_window < 0 or left_window >= max_seqlen_k
         fa2_one_sided_alibi = fa2_global_left and (causal or right_window == 0)
