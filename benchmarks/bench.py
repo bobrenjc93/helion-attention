@@ -70,6 +70,19 @@ def flops(spec: AttnShape) -> float:
     )
 
 
+def sdpa_causal_options(
+    spec: AttnShape, causal_mask: torch.Tensor | None
+) -> tuple[torch.Tensor | None, bool]:
+    """Choose fused-SDPA mask arguments without changing causal semantics."""
+    is_causal = spec.causal and spec.seqlen_q == spec.seqlen_k
+    mask = (
+        causal_mask
+        if spec.causal and not (is_causal or spec.is_decode)
+        else None
+    )
+    return mask, is_causal
+
+
 def build_candidates(
     spec: AttnShape,
 ) -> tuple[dict[str, Callable[[], torch.Tensor]], torch.Tensor]:
@@ -96,9 +109,9 @@ def build_candidates(
         causal_mask = col <= row + spec.seqlen_k - spec.seqlen_q
 
     # Fused SDPA can represent equal-length triangular masks through
-    # is_causal. Unequal lengths need the explicit bottom-right mask.
-    sdpa_is_causal = spec.causal and spec.seqlen_q == spec.seqlen_k
-    sdpa_mask = causal_mask if spec.causal and not sdpa_is_causal else None
+    # is_causal. Unequal lengths need the explicit bottom-right mask, except
+    # single-token decode where that mask is entirely true and can be omitted.
+    sdpa_mask, sdpa_is_causal = sdpa_causal_options(spec, causal_mask)
 
     def sdpa(backend: SDPBackend) -> Callable[[], torch.Tensor]:
         def run() -> torch.Tensor:
