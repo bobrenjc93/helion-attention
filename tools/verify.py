@@ -250,6 +250,7 @@ def check_paged(spec: AttnShape, page_size: int) -> float:
             max_seqlen_k=spec.seqlen_k,
             softmax_scale=scale,
             causal=spec.causal,
+            q_descale=descale,
             k_descale=descale,
             v_descale=descale,
             fa_version=3,

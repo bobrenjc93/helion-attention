@@ -18,6 +18,9 @@ dependencies = [
 Homepage = "https://github.com/bobrenjc93/helion-attention"
 Issues = "https://github.com/bobrenjc93/helion-attention/issues"
 
+[project.entry-points."vllm.general_plugins"]
+helion_attention = "helion_attention.vllm_plugin:load_vllm_plugin"
+
 [project.optional-dependencies]
 # Only needed to regenerate kernels; the runtime package never imports Helion.
 generate = ["helion>=1.4.0"]

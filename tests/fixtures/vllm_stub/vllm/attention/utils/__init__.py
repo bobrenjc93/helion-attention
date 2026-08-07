@@ -1,0 +1,1 @@
+"""Stub attention utilities package."""

@@ -1214,6 +1214,7 @@ def test_exact_shape_dispatch_infers_specialization(
     k = torch.zeros_like(q)
     v = torch.zeros_like(q)
     cumulative = torch.arange(9, device="cuda", dtype=torch.int32)
+    descale = torch.ones(8, 16, device="cuda")
     seen: dict[str, object] = {}
 
     def fake_has_kernel(spec: object) -> bool:
@@ -1235,6 +1236,9 @@ def test_exact_shape_dispatch_infers_specialization(
         max_seqlen_k=512,
         cu_seqlens_k=cumulative,
         causal=True,
+        q_descale=descale,
+        k_descale=descale,
+        v_descale=descale,
     )
 
     spec = seen["spec"]
@@ -1301,6 +1305,7 @@ def test_exact_paged_shape_dispatch_infers_specialization(
         max_seqlen_k=1024,
         seqused_k=seqused_k,
         block_table=block_table,
+        q_descale=k_descale,
         k_descale=k_descale,
         v_descale=v_descale,
         causal=True,
@@ -1412,6 +1417,7 @@ def test_generated_paged_kernel_accepts_vllm_cache_views(
         max_seqlen_k=1024,
         seqused_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
         block_table=block_table,
+        q_descale=descale,
         k_descale=descale,
         v_descale=descale,
         causal=True,
