@@ -61,6 +61,7 @@ def _varlen_attention_kernel(
     softcap,
     window_left,
     window_right,
+    query_blocks,
     NHEADS_Q: tl.constexpr,
     NHEADS_KV: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -84,7 +85,6 @@ def _varlen_attention_kernel(
     INPUT_FP16: tl.constexpr,
     CP_WORLD_SIZE: tl.constexpr,
     CP_RANK: tl.constexpr,
-    QUERY_BLOCKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -94,8 +94,8 @@ def _varlen_attention_kernel(
     # dimensions are limited to 65,535, which valid large batches can exceed
     # once multiplied by the number of query heads.
     work_id = tl.program_id(0)
-    query_block = work_id % QUERY_BLOCKS
-    batch_head = work_id // QUERY_BLOCKS
+    query_block = work_id % query_blocks
+    batch_head = work_id // query_blocks
     batch = batch_head // NHEADS_Q
     head_q = batch_head % NHEADS_Q
     group_size = NHEADS_Q // NHEADS_KV
@@ -509,6 +509,7 @@ def _attention(
             softcap,
             window_size[0],
             window_size[1],
+            query_blocks,
             NHEADS_Q=nheads_q,
             NHEADS_KV=nheads_kv,
             HEAD_DIM=head_dim,
@@ -532,7 +533,6 @@ def _attention(
             INPUT_FP16=q.dtype == torch.float16,
             CP_WORLD_SIZE=cp_world_size,
             CP_RANK=cp_rank,
-            QUERY_BLOCKS=query_blocks,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,

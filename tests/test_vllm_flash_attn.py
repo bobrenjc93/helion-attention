@@ -886,6 +886,78 @@ def test_large_batch_uses_flattened_cuda_grid() -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize("paged", [False, True], ids=["packed", "paged"])
+def test_changing_query_maximum_reuses_triton_specialization(
+    paged: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    nheads_q, nheads_kv, head_dim, key_tokens = 3, 1, 16, 33
+    k_packed = torch.zeros(
+        key_tokens, nheads_kv, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v_packed = torch.randn_like(k_packed)
+    if paged:
+        k = k_packed.reshape(1, key_tokens, nheads_kv, head_dim)
+        v = v_packed.reshape_as(k)
+        key_kwargs = {
+            "seqused_k": torch.tensor(
+                [key_tokens], device="cuda", dtype=torch.int32
+            ),
+            "block_table": torch.tensor([[0]], device="cuda", dtype=torch.int32),
+        }
+    else:
+        k = k_packed
+        v = v_packed
+        key_kwargs = {
+            "cu_seqlens_k": torch.tensor(
+                [0, key_tokens], device="cuda", dtype=torch.int32
+            )
+        }
+
+    kernel = generic_attention._varlen_attention_kernel
+    original_compile = kernel._do_compile
+    compile_count = 0
+
+    def counted_compile(*args: object, **kwargs: object) -> object:
+        nonlocal compile_count
+        compile_count += 1
+        return original_compile(*args, **kwargs)
+
+    monkeypatch.setattr(kernel, "_do_compile", counted_compile)
+
+    def run(query_tokens: int) -> None:
+        q = torch.zeros(
+            query_tokens,
+            nheads_q,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        result = compat.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            max_seqlen_q=query_tokens,
+            cu_seqlens_q=torch.tensor(
+                [0, query_tokens], device="cuda", dtype=torch.int32
+            ),
+            max_seqlen_k=key_tokens,
+            causal=False,
+            fa_version=3,
+            **key_kwargs,
+        )
+        assert isinstance(result, torch.Tensor)
+        assert torch.isfinite(result).all()
+
+    run(17)
+    compile_count_after_first_bucket = compile_count
+    run(33)
+
+    assert compile_count == compile_count_after_first_bucket
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     "window", [(-1, -1), (5, 0)], ids=["unbounded", "effective-global"]
 )
