@@ -195,7 +195,9 @@ def install_generated_artifacts(
     }
     try:
         target.write_text(module)
-        if backward_module is not None:
+        if backward_module is None:
+            backward_target.unlink(missing_ok=True)
+        else:
             backward_target.write_text(backward_module)
         upsert_manifest(manifest_entry)
         if verify() != 0:

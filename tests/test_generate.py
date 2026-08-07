@@ -56,6 +56,45 @@ def test_failed_upgrade_restores_existing_kernel_and_manifest(
     assert {path: path.read_bytes() for path in previous} == previous
 
 
+def test_forward_only_upgrade_removes_stale_backward_artifact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel_dir = tmp_path / "kernels"
+    kernel_dir.mkdir()
+    target = kernel_dir / "shape.py"
+    backward_target = kernel_dir / "shape_backward.py"
+    manifest = kernel_dir / "manifest.json"
+    target.write_text("existing forward\n")
+    backward_target.write_text("existing backward\n")
+    manifest.write_text(
+        json.dumps({"kernels": [{"key": "shape", "backward": True}]}) + "\n"
+    )
+    monkeypatch.setattr(generate, "MANIFEST", manifest)
+
+    def verify_forward_only_candidate() -> int:
+        assert target.read_text() == "candidate forward\n"
+        assert not backward_target.exists()
+        assert json.loads(manifest.read_text())["kernels"] == [
+            {"key": "shape", "backward": False}
+        ]
+        return 0
+
+    generate.install_generated_artifacts(
+        target=target,
+        module="candidate forward\n",
+        backward_target=backward_target,
+        backward_module=None,
+        manifest_entry={"key": "shape", "backward": False},
+        verify=verify_forward_only_candidate,
+    )
+
+    assert target.read_text() == "candidate forward\n"
+    assert not backward_target.exists()
+    assert json.loads(manifest.read_text())["kernels"] == [
+        {"key": "shape", "backward": False}
+    ]
+
+
 def test_generator_rejects_multi_cta_cooperative_grid() -> None:
     unsafe = (
         "_launcher(kernel, (_NUM_SM * 4,), launch_cooperative_grid=True)"
