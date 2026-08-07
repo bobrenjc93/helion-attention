@@ -186,7 +186,11 @@ def flash_attn_with_kvcache(
         )
     if cache_seqlens is not None:
         if isinstance(cache_seqlens, int):
-            is_full_cache = cache_seqlens == spec.seqlen_k
+            if cache_seqlens != spec.seqlen_k:
+                raise NotImplementedError(
+                    "partial or ragged KV caches are not implemented; cache_seqlens "
+                    "must equal the cache length declared by shape"
+                )
         elif isinstance(cache_seqlens, torch.Tensor):
             if tuple(cache_seqlens.shape) != (spec.batch,):
                 raise ValueError(
@@ -199,14 +203,17 @@ def flash_attn_with_kvcache(
                 raise ValueError("cache_seqlens must be on the same device as the KV cache")
             if not cache_seqlens.is_contiguous():
                 raise ValueError("cache_seqlens must be contiguous")
-            is_full_cache = bool(torch.all(cache_seqlens == spec.seqlen_k).item())
+            # Keep validation on the device: converting this predicate with
+            # .item() synchronizes every decode and is illegal during CUDA
+            # graph capture. The asynchronous assertion is captured and also
+            # checks the invariant on every graph replay.
+            torch._assert_async(
+                torch.all(cache_seqlens == spec.seqlen_k),
+                "partial or ragged KV caches are not implemented; cache_seqlens "
+                "must equal the cache length declared by shape",
+            )
         else:
             raise TypeError("cache_seqlens must be an int, a torch.Tensor, or None")
-        if not is_full_cache:
-            raise NotImplementedError(
-                "partial or ragged KV caches are not implemented; cache_seqlens "
-                "must equal the cache length declared by shape"
-            )
     return flash_attn_func(
         q,
         k_cache,

@@ -299,6 +299,51 @@ def test_kvcache_default_noncausal_flag_reuses_equivalent_decode_kernel(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES[:1],
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+)
+def test_kvcache_tensor_lengths_support_cuda_graph_capture(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec)
+    cache_seqlens = torch.full(
+        (spec.batch,),
+        spec.seqlen_k,
+        dtype=torch.int32,
+        device=q.device,
+    )
+
+    # Warm up Triton's JIT and the allocator before capture.
+    expected = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        causal=spec.causal,
+        shape=spec,
+    )
+    torch.cuda.synchronize(q.device)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            causal=spec.causal,
+            shape=spec,
+        )
+    graph.replay()
+    torch.cuda.synchronize(q.device)
+
+    torch.testing.assert_close(captured, expected)
+
+
+@requires_cuda
 @pytest.mark.parametrize("entry", SHAPES[:1], ids=IDS[:1])
 def test_qkvpacked_matches_unpacked(entry: dict[str, object]) -> None:
     spec = spec_from_manifest_entry(entry)
