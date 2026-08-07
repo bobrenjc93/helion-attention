@@ -22,7 +22,7 @@ def _alloc_fn(size: int, alignment: int, stream: int | None) -> torch.Tensor:
 
 
 def set_triton_allocator() -> None:
-    """Install ``_alloc_fn`` unless the process already set its own allocator."""
+    """Install ``_alloc_fn`` in this context unless one is already configured."""
     try:
         from triton import set_allocator
         from triton.runtime._allocation import NullAllocator
