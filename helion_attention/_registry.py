@@ -22,6 +22,20 @@ AttnBackwardKernel = Callable[
     [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float],
     tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ]
+VarlenAttnKernel = Callable[
+    [
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        int,
+        int,
+        float,
+        bool,
+    ],
+    torch.Tensor,
+]
 
 
 class KernelModule(Protocol):
@@ -36,17 +50,33 @@ class UnsupportedShapeError(NotImplementedError):
 
 
 @lru_cache(maxsize=1)
-def _manifest() -> dict[str, dict[str, object]]:
+def _manifest_payload() -> dict[str, list[dict[str, object]]]:
     if not _MANIFEST_PATH.exists():
-        return {}
+        return {"kernels": [], "varlen_kernels": []}
     with _MANIFEST_PATH.open() as handle:
-        entries = json.load(handle)["kernels"]
+        return json.load(handle)
+
+
+@lru_cache(maxsize=1)
+def _manifest() -> dict[str, dict[str, object]]:
+    entries = _manifest_payload().get("kernels", [])
+    return {entry["key"]: entry for entry in entries}
+
+
+@lru_cache(maxsize=1)
+def _varlen_manifest() -> dict[str, dict[str, object]]:
+    entries = _manifest_payload().get("varlen_kernels", [])
     return {entry["key"]: entry for entry in entries}
 
 
 def available_shapes() -> list[dict[str, object]]:
     """Every shape this build ships a kernel for, in manifest order."""
     return list(_manifest().values())
+
+
+def available_varlen_shapes() -> list[dict[str, object]]:
+    """Every packed-sequence specialization shipped by this build."""
+    return list(_varlen_manifest().values())
 
 
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
@@ -78,6 +108,12 @@ def _load_backward(key: str) -> AttnBackwardKernel:
     return module.attention_backward
 
 
+@lru_cache(maxsize=None)
+def _load_varlen(key: str) -> VarlenAttnKernel:
+    module = importlib.import_module(f"{KERNELS_PACKAGE}.{key}")
+    return module.attention_varlen
+
+
 def _entry_for_spec(spec: AttnShape) -> dict[str, object] | None:
     entry = _manifest().get(spec.key)
     if entry is None and spec.is_decode:
@@ -87,6 +123,16 @@ def _entry_for_spec(spec: AttnShape) -> dict[str, object] | None:
         equivalent = replace(spec, causal=not spec.causal)
         entry = _manifest().get(equivalent.key)
     return entry
+
+
+def has_kernel(spec: AttnShape) -> bool:
+    """Whether dense metadata exists for ``spec``, without importing Triton."""
+    return _entry_for_spec(spec) is not None
+
+
+def has_varlen_kernel(spec: AttnShape) -> bool:
+    """Whether packed metadata exists for ``spec``, without importing Triton."""
+    return f"varlen_{spec.key}" in _varlen_manifest()
 
 
 def _nearest(spec: AttnShape, limit: int = 8) -> list[str]:
@@ -116,6 +162,41 @@ def lookup(spec: AttnShape) -> AttnKernel:
             "above and it can be generated and added."
         )
     return _load(str(entry["key"]))
+
+
+def lookup_varlen(spec: AttnShape) -> VarlenAttnKernel:
+    """Return the generated packed-sequence kernel for ``spec``."""
+    key = f"varlen_{spec.key}"
+    entry = _varlen_manifest().get(key)
+    if entry is None:
+        fields = (
+            "batch",
+            "seqlen_q",
+            "seqlen_k",
+            "nheads_q",
+            "nheads_kv",
+            "head_dim",
+        )
+        scored = []
+        for candidate in _varlen_manifest().values():
+            distance = sum(
+                candidate[field] != getattr(spec, field) for field in fields
+            )
+            distance += candidate["dtype"] != spec.dtype_name
+            distance += candidate["causal"] != spec.causal
+            scored.append((distance, candidate["description"]))
+        scored.sort(key=lambda item: item[0])
+        listing = "\n".join(f"    {description}" for _, description in scored[:8])
+        raise UnsupportedShapeError(
+            "no helion-attention varlen kernel is checked in for:\n"
+            f"    {spec.describe()}\n"
+            f"closest available varlen shapes:\n{listing or '    (none)'}\n"
+            "Packed kernels are generated and autotuned per maximum shape. "
+            "Please file an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues with the "
+            "shape above and it can be generated and added."
+        )
+    return _load_varlen(str(entry["key"]))
 
 
 def has_backward(spec: AttnShape) -> bool:

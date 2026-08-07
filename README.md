@@ -42,6 +42,37 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
 
+Packed variable-length batches use FlashAttention's THD layout and cumulative
+sequence lengths. The sequence dimensions in `shape` are the declared maxima;
+the packed totals and individual lengths can change on every call:
+
+```python
+B, MAX_S, H, D = 8, 512, 16, 64
+lengths = torch.tensor([512, 450, 384, 300, 256, 128, 64, 17], device="cuda")
+cu_seqlens = torch.nn.functional.pad(lengths.cumsum(0), (1, 0)).to(torch.int32)
+total = int(lengths.sum())
+q, k, v = [
+    torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16)
+    for _ in range(3)
+]
+
+out = helion_attention.flash_attn_varlen_func(
+    q,
+    k,
+    v,
+    cu_seqlens,
+    cu_seqlens,
+    MAX_S,
+    MAX_S,
+    causal=True,
+    shape=(B, MAX_S, H, D),
+)
+```
+
+`cu_seqlens_q` and `cu_seqlens_k` remain on the GPU and may describe different
+query and key lengths. Causal masking follows FlashAttention's bottom-right
+alignment, including zero output for fully masked query rows.
+
 Single-token decode reads a dense KV cache through the matching FlashAttention
 entry point. The six-field shape remains required and describes the query and
 the cache separately:
@@ -82,6 +113,8 @@ Ask before you call:
 ```python
 helion_attention.is_shape_supported((2, 1024, 32, 64), torch.bfloat16, causal=True)
 helion_attention.available_shapes()   # every shape this build ships
+helion_attention.is_varlen_shape_supported((8, 512, 16, 64), causal=True)
+helion_attention.available_varlen_shapes()
 ```
 
 A shape with no kernel raises `UnsupportedShapeError`, which names the closest
@@ -124,6 +157,14 @@ one is an autotuning run, not a code change.
 26 kernels.
 <!-- SHAPES:END -->
 
+Packed varlen kernels specialize the batch size and maximum lengths while
+accepting dynamic packed token totals:
+
+| batch | max seqlen q | max seqlen k | heads | head dim | dtype | causal | note |
+| ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 8 | 512 | 512 | 16 | 64 | bf16 | yes | ragged decoder batch |
+| 8 | 512 | 512 | 16 | 64 | bf16 | no | ragged encoder batch |
+
 ## Benchmarks
 
 <!-- BENCHMARKS:START -->
@@ -143,8 +184,10 @@ Measured on NVIDIA H100 (torch 2.14.0a0+git774d172, triton 3.6.0). Times are the
 | batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1522 | 1686 | 1812 | 1102 | 361 | **1.11x** |
 | batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True | 295 | 273 | 288 | 220 | 233 | 0.93x |
 | batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 41 | 195 | 195 | 190 | 211 | **4.78x** |
+| varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=True | 85 | 215 | n/a | n/a | 12 | **2.51x** |
+| varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 84 | 214 | n/a | n/a | 24 | **2.55x** |
 
-Geomean speedup over flash-attn across all 12 shapes: **1.02x**.
+Geomean speedup over flash-attn across all 14 shapes: **1.16x**.
 <!-- BENCHMARKS:END -->
 
 Reproduce with:
@@ -152,6 +195,7 @@ Reproduce with:
 ```bash
 pip install flash-attn --no-build-isolation
 python benchmarks/bench.py
+python benchmarks/bench.py --only varlen
 ```
 
 `sdpa-flash` and `sdpa-cudnn` are PyTorch's `scaled_dot_product_attention` pinned
@@ -159,21 +203,21 @@ to its FlashAttention-2 and cuDNN backends, included for context; the headline
 comparison is against the `flash-attn` package itself.
 
 Decode rows are dispatched through `flash_attn_with_kvcache` for both
-implementations; prefill rows continue to use `flash_attn_func`.
+implementations, packed rows use `flash_attn_varlen_func`, and other prefill
+rows continue to use `flash_attn_func`.
 
 ## What is not implemented
 
 Backward/training is implemented for the non-causal bf16
 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape. Other shapes remain
-forward-only and reject grad-enabled calls at the call site. These unsupported
-FlashAttention features also raise `NotImplementedError` rather than silently
-doing something else:
+forward-only, including packed varlen kernels, and reject grad-enabled calls at
+the call site. These unsupported FlashAttention features also raise
+`NotImplementedError` rather than silently doing something else:
 
-- backward for causal, cross-attention, GQA, fp16, and other shapes
+- backward for varlen, causal, cross-attention, GQA, fp16, and other shapes
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes
-- variable-length (`flash_attn_varlen_func`)
 - KV-cache mutation, partial/ragged caches, paged caches, and fused rotary embeddings
 - `return_attn_probs` and KV-cache `return_softmax_lse`
 
@@ -186,14 +230,17 @@ python tools/generate.py --batch 8 --seqlen 512 --nheads 16 --head-dim 64 \
     --dtype bf16 --backward
 python tools/generate.py --batch 1 --seqlen 1 --seqlen-k 4096 --nheads 32 \
     --nheads-kv 8 --head-dim 128 --dtype bf16 --causal
+python tools/generate.py --batch 8 --seqlen 512 --nheads 16 --head-dim 64 \
+    --dtype bf16 --causal --varlen
 python tools/generate_all.py --gpus 8    # the whole catalogue, one job per GPU
 ```
 
-`tools/helion_kernels.py` holds the prefill, decode, and backward Helion kernels
+`tools/helion_kernels.py` holds the prefill, decode, packed-varlen, and backward
+Helion kernels
 that everything is generated from — it is the only file in the repository that
 imports Helion. `tools/generate.py` autotunes one shape (plus its backward when
-requested), takes Helion's emitted Triton, and rewrites its four references to
-`helion.runtime` to point at the vendored `helion_attention/_launcher.py` and
+requested), takes Helion's emitted Triton, and removes its build-time Helion
+imports while pointing runtime hooks at the vendored `helion_attention/_launcher.py` and
 `helion_attention/_runtime.py`. The result is verified in a subprocess that
 asserts Helion was never imported, then recorded in
 `helion_attention/kernels/manifest.json`.
@@ -205,7 +252,7 @@ To add a shape permanently, append it to `tools/shapes.py` and rerun
 
 ```
 helion_attention/          runtime package: torch + triton only
-  __init__.py              flash_attn_func and friends
+  __init__.py              flash_attn_func, flash_attn_varlen_func, and friends
   _shape.py                shape specification and validation
   _registry.py             shape -> generated kernel lookup
   _launcher.py             vendored Triton launcher

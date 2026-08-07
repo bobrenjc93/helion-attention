@@ -20,6 +20,7 @@ class ShapeRequest(NamedTuple):
     label: str = ""
     seqlen_k: int | None = None
     backward: bool = False
+    varlen: bool = False
 
     @property
     def args(self) -> list[str]:
@@ -38,6 +39,8 @@ class ShapeRequest(NamedTuple):
             argv.append("--causal")
         if self.backward:
             argv.append("--backward")
+        if self.varlen:
+            argv.append("--varlen")
         if self.label:
             argv += ["--label", self.label]
         return argv
@@ -46,7 +49,8 @@ class ShapeRequest(NamedTuple):
     def name(self) -> str:
         kv = "" if self.nheads_kv is None else f"_hkv{self.nheads_kv}"
         sk = "" if self.seqlen_k is None else f"_sk{self.seqlen_k}"
-        return (
+        prefix = "varlen_" if self.varlen else ""
+        return prefix + (
             f"b{self.batch}_s{self.seqlen}{sk}_h{self.nheads}{kv}_d{self.head_dim}"
             f"_{self.dtype}_{'causal' if self.causal else 'noncausal'}"
         )
@@ -112,5 +116,22 @@ CATALOGUE: list[ShapeRequest] = [
         nheads_kv=8,
         label="Llama-3-8B single-token decode, 16k KV cache",
         seqlen_k=16384,
+    ),
+    ShapeRequest(
+        8,
+        512,
+        16,
+        64,
+        label="ragged encoder batch",
+        varlen=True,
+    ),
+    ShapeRequest(
+        8,
+        512,
+        16,
+        64,
+        causal=True,
+        label="ragged decoder batch",
+        varlen=True,
     ),
 ]

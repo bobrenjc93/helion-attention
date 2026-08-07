@@ -20,22 +20,30 @@ import torch
 from ._autograd import attention_autograd
 from ._registry import UnsupportedShapeError
 from ._registry import available_shapes
+from ._registry import available_varlen_shapes
+from ._registry import has_kernel
+from ._registry import has_varlen_kernel
 from ._registry import lookup
 from ._registry import lookup_backward
+from ._registry import lookup_varlen
 from ._shape import AttnShape
 from ._shape import ShapeLike
 from ._shape import check_tensors
+from ._shape import check_varlen_tensors
 from ._shape import normalize_shape
 
 __all__ = [
     "AttnShape",
     "UnsupportedShapeError",
     "available_shapes",
+    "available_varlen_shapes",
     "flash_attn_func",
     "flash_attn_kvpacked_func",
     "flash_attn_qkvpacked_func",
+    "flash_attn_varlen_func",
     "flash_attn_with_kvcache",
     "is_shape_supported",
+    "is_varlen_shape_supported",
 ]
 
 __version__ = "0.1.0"
@@ -64,11 +72,14 @@ def is_shape_supported(
     shape: ShapeLike, dtype: torch.dtype = torch.bfloat16, causal: bool = False
 ) -> bool:
     """True when a kernel for this exact shape is checked in."""
-    try:
-        lookup(normalize_shape(shape, dtype, causal))
-    except UnsupportedShapeError:
-        return False
-    return True
+    return has_kernel(normalize_shape(shape, dtype, causal))
+
+
+def is_varlen_shape_supported(
+    shape: ShapeLike, dtype: torch.dtype = torch.bfloat16, causal: bool = False
+) -> bool:
+    """True when a packed-sequence kernel for this maximum shape is checked in."""
+    return has_varlen_kernel(normalize_shape(shape, dtype, causal))
 
 
 def flash_attn_func(
@@ -126,6 +137,76 @@ def flash_attn_func(
         lookup_backward(spec)
         return attention_autograd(q, k, v, scale, spec)
     return kernel(q, k, v, scale)
+
+
+def flash_attn_varlen_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor | None = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    block_table: torch.Tensor | None = None,
+    *,
+    shape: ShapeLike,
+) -> torch.Tensor:
+    """Drop-in replacement for ``flash_attn.flash_attn_varlen_func``.
+
+    ``q`` is ``[total_q, nheads_q, head_dim]`` and ``k``/``v`` are
+    ``[total_k, nheads_kv, head_dim]``.  The int32 CUDA cumulative-length
+    tensors contain ``batch + 1`` offsets.  ``shape`` uses the same forms as
+    :func:`flash_attn_func`, but its sequence dimensions are the maximum query
+    and key lengths rather than dense tensor dimensions.
+
+    The packed token totals and individual sequence lengths may change between
+    calls to the same specialization.  The batch size, maxima, head geometry,
+    dtype, and causal mode must continue to match ``shape``.
+    """
+    del deterministic  # This option affects backward only.
+    if block_table is not None:
+        raise NotImplementedError("paged KV block tables are not implemented")
+    _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
+    if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
+        raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
+
+    spec = normalize_shape(shape, q.dtype, causal)
+    if max_seqlen_q != spec.seqlen_q or max_seqlen_k != spec.seqlen_k:
+        raise ValueError(
+            "max_seqlen_q/max_seqlen_k must match the maximum sequence lengths "
+            f"declared by shape ({spec.seqlen_q}, {spec.seqlen_k}); got "
+            f"({max_seqlen_q}, {max_seqlen_k})"
+        )
+    check_varlen_tensors(q, k, v, cu_seqlens_q, cu_seqlens_k, spec)
+    kernel = lookup_varlen(spec)
+    if torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (q, k, v)
+    ):
+        raise NotImplementedError(
+            "flash_attn_varlen_func is currently forward-only; no packed-sequence "
+            "backward kernel is checked in"
+        )
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(spec.head_dim)
+    return kernel(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        float(softmax_scale),
+        causal,
+    )
 
 
 def flash_attn_with_kvcache(

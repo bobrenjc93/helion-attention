@@ -40,10 +40,16 @@ jobs:
           python - <<'PY'
           import json, pathlib, sys
           root = pathlib.Path("helion_attention/kernels")
-          entries = json.loads((root / "manifest.json").read_text())["kernels"]
+          payload = json.loads((root / "manifest.json").read_text())
+          sections = ("kernels", "varlen_kernels")
+          entries = [
+              entry
+              for section in sections
+              for entry in payload.get(section, [])
+          ]
           manifest = {entry["key"]: entry for entry in entries}
           if len(manifest) != len(entries):
-              print("manifest contains duplicate kernel keys")
+              print("manifest sections contain duplicate kernel keys")
               sys.exit(1)
           module_stems = {
               path.stem for path in root.glob("*.py") if path.stem != "__init__"

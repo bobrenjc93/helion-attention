@@ -339,5 +339,37 @@
       "seqlen_k": 512,
       "seqlen_q": 512
     }
+  ],
+  "varlen_kernels": [
+    {
+      "backward": false,
+      "batch": 8,
+      "causal": true,
+      "description": "varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 64,
+      "key": "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
+      "nheads_kv": 16,
+      "nheads_q": 16,
+      "note": "ragged decoder batch",
+      "seqlen_k": 512,
+      "seqlen_q": 512,
+      "varlen": true
+    },
+    {
+      "backward": false,
+      "batch": 8,
+      "causal": false,
+      "description": "varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False",
+      "dtype": "bf16",
+      "head_dim": 64,
+      "key": "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
+      "nheads_kv": 16,
+      "nheads_q": 16,
+      "note": "ragged encoder batch",
+      "seqlen_k": 512,
+      "seqlen_q": 512,
+      "varlen": true
+    }
   ]
 }

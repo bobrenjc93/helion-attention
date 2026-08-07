@@ -29,6 +29,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 import helion_attention  # noqa: E402
 from helion_attention._registry import available_shapes  # noqa: E402
+from helion_attention._registry import available_varlen_shapes  # noqa: E402
 from helion_attention._registry import spec_from_manifest_entry  # noqa: E402
 from helion_attention._shape import AttnShape  # noqa: E402
 
@@ -36,6 +37,11 @@ try:
     from flash_attn import flash_attn_func as _flash_attn_func
 except ImportError:  # pragma: no cover - benchmark-only dependency
     _flash_attn_func = None
+
+try:
+    from flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
+except ImportError:  # pragma: no cover - benchmark-only dependency
+    _flash_attn_varlen_func = None
 
 try:
     from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
@@ -125,6 +131,94 @@ def build_candidates(
     return candidates, reference
 
 
+def build_varlen_candidates(
+    spec: AttnShape,
+) -> tuple[dict[str, Callable[[], torch.Tensor]], torch.Tensor, float]:
+    """Build a deterministic ragged workload for one maximum-shape kernel."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    lengths_q = [
+        max(1, spec.seqlen_q * (spec.batch - index) // spec.batch)
+        for index in range(spec.batch)
+    ]
+    lengths_k = list(
+        reversed(
+            [
+                max(1, spec.seqlen_k * (spec.batch - index) // spec.batch)
+                for index in range(spec.batch)
+            ]
+        )
+    )
+
+    def cumulative(lengths: list[int]) -> torch.Tensor:
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        return torch.tensor(offsets, device="cuda", dtype=torch.int32)
+
+    q = torch.randn(
+        (sum(lengths_q), spec.nheads_q, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    k = torch.randn(
+        (sum(lengths_k), spec.nheads_kv, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    v = torch.randn(
+        k.shape,
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    cu_q = cumulative(lengths_q)
+    cu_k = cumulative(lengths_k)
+    args = (q, k, v, cu_q, cu_k, spec.seqlen_q, spec.seqlen_k)
+    candidates: dict[str, Callable[[], torch.Tensor]] = {
+        "helion-attention": lambda: helion_attention.flash_attn_varlen_func(
+            *args, causal=spec.causal, shape=spec
+        )
+    }
+    if _flash_attn_varlen_func is not None:
+        candidates["flash-attn"] = lambda: _flash_attn_varlen_func(
+            *args, causal=spec.causal
+        )
+
+    reference = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+    q_start = 0
+    k_start = 0
+    attended_pairs = 0
+    for seqlen_q, seqlen_k in zip(lengths_q, lengths_k):
+        q_seq = q[q_start : q_start + seqlen_q].float().transpose(0, 1)[None]
+        k_seq = k[k_start : k_start + seqlen_k].float().transpose(0, 1)[None]
+        v_seq = v[k_start : k_start + seqlen_k].float().transpose(0, 1)[None]
+        mask = None
+        if spec.causal:
+            row = torch.arange(seqlen_q, device=q.device)[:, None]
+            col = torch.arange(seqlen_k, device=q.device)[None, :]
+            mask = col <= row + seqlen_k - seqlen_q
+            attended_pairs += int(mask.sum().item())
+        else:
+            attended_pairs += seqlen_q * seqlen_k
+        result = torch.nn.functional.scaled_dot_product_attention(
+            q_seq,
+            k_seq,
+            v_seq,
+            attn_mask=mask,
+            scale=1.0 / math.sqrt(spec.head_dim),
+            enable_gqa=spec.nheads_q != spec.nheads_kv,
+        )
+        reference[q_start : q_start + seqlen_q] = result[0].transpose(0, 1)
+        q_start += seqlen_q
+        k_start += seqlen_k
+    operation_count = (
+        4.0 * spec.nheads_q * spec.head_dim * attended_pairs
+    )
+    return candidates, reference, operation_count
+
+
 def measure(
     candidates: dict[str, Callable[[], torch.Tensor]],
     reference: torch.Tensor,
@@ -159,7 +253,15 @@ def main() -> int:
     parser.add_argument("--only", default="", help="substring filter on the kernel key")
     args = parser.parse_args()
 
-    entries = [e for e in available_shapes() if args.only in str(e["key"])]
+    entries = [
+        (entry, False)
+        for entry in available_shapes()
+        if args.only in str(entry["key"])
+    ] + [
+        (entry, True)
+        for entry in available_varlen_shapes()
+        if args.only in str(entry["key"])
+    ]
     if not entries:
         print("no kernels to benchmark", file=sys.stderr)
         return 1
@@ -172,15 +274,19 @@ def main() -> int:
         "python": platform.python_version(),
         "results": [],
     }
-    for entry in entries:
+    for entry, is_varlen in entries:
         spec = spec_from_manifest_entry(entry)
         print(f"benchmarking {spec.describe()}", file=sys.stderr)
-        candidates, reference = build_candidates(spec)
+        if is_varlen:
+            candidates, reference, scale = build_varlen_candidates(spec)
+        else:
+            candidates, reference = build_candidates(spec)
+            scale = flops(spec)
         measured = measure(candidates, reference, args.rounds)
-        scale = flops(spec)
         row = {
             "key": entry["key"],
             "description": entry["description"],
+            "varlen": is_varlen,
             "note": entry.get("note", ""),
             "implementations": {
                 name: {
