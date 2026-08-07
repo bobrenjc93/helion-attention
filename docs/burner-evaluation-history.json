@@ -16,6 +16,10 @@
     "eval_5b403bea": {
       "name": "README documents every kernel and benchmark",
       "color": "#e6a700"
+    },
+    "eval_1d780d3a": {
+      "name": "vLLM drop-in compatibility",
+      "color": "#d94f8a"
     }
   },
   "points": [
@@ -143,6 +147,36 @@
         "eval_24dff610": 63,
         "eval_1afd133e": 52,
         "eval_5b403bea": 77
+      }
+    },
+    {
+      "key": "base:e7e2dc7d0af5a794d9572e180124e3be0653a250",
+      "commit": "e7e2dc7d0af5a794d9572e180124e3be0653a250",
+      "recordedAt": "2026-08-07T17:08:30.211Z",
+      "label": "base e7e2dc7",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 48,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 76,
+        "eval_1d780d3a": 0
+      }
+    },
+    {
+      "key": "pr:6",
+      "recordedAt": "2026-08-07T17:08:30.211Z",
+      "label": "PR #6",
+      "kind": "leaf",
+      "prNumber": 6,
+      "title": "Create the helion_attention.vllm_flash_attn compatibility module",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 48,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 69,
+        "eval_1d780d3a": 100
       }
     }
   ]
