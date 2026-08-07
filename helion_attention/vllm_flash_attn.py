@@ -7,8 +7,9 @@ matching a checked-in varlen kernel use it; all other calls use a correctness
 fallback implemented with PyTorch operations.
 
 The fallback deliberately favors coverage and correctness over performance.
-In particular, it supports vLLM's paged KV-cache layout and synchronizes once
-to read the per-request sequence metadata before evaluating each request.
+It keeps sequence metadata on-device for CUDA-graph capture and evaluates
+paged attention with fixed-size tiles and online softmax state, rather than
+materializing a quadratic attention matrix.
 """
 
 from __future__ import annotations
@@ -38,6 +39,12 @@ __all__ = [
 compile_flash_attn_varlen_func_from_specs = None
 
 _SUPPORTED_FA_VERSIONS = frozenset({2, 3})
+
+# Bound the largest temporary tensors used by the correctness fallback.  The
+# online-softmax state is carried across key tiles, so these constants affect
+# launch count but not numerical semantics.
+_QUERY_TILE_SIZE = 16
+_KEY_TILE_SIZE = 128
 
 
 def is_fa_version_supported(fa_version: int) -> bool:
@@ -99,14 +106,14 @@ def _normalize_window(window_size: Sequence[int] | None) -> tuple[int, int]:
     return left, right
 
 
-def _check_cumulative(
+def _validate_cumulative(
     name: str,
     cumulative: torch.Tensor,
     *,
     device: torch.device,
-    expected_size: int | None,
-    total: int,
-) -> list[int]:
+    expected_size: int,
+) -> None:
+    """Validate only static metadata properties, without synchronizing CUDA."""
     if not isinstance(cumulative, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor")
     if cumulative.ndim != 1:
@@ -115,31 +122,18 @@ def _check_cumulative(
         raise ValueError(f"{name} must have dtype torch.int32")
     if cumulative.device != device:
         raise ValueError(f"{name} must be on device {device}")
-    if expected_size is not None and cumulative.numel() != expected_size:
+    if cumulative.numel() != expected_size:
         raise ValueError(
             f"{name} must contain {expected_size} offsets, got {cumulative.numel()}"
         )
 
-    offsets = [int(value) for value in cumulative.detach().cpu().tolist()]
-    if len(offsets) < 2:
-        raise ValueError(f"{name} must contain at least two offsets")
-    if offsets[0] != 0:
-        raise ValueError(f"{name} must start at zero")
-    if any(stop < start for start, stop in zip(offsets, offsets[1:])):
-        raise ValueError(f"{name} must be monotonically nondecreasing")
-    if offsets[-1] != total:
-        raise ValueError(
-            f"{name} ends at {offsets[-1]}, but the packed tensor has {total} tokens"
-        )
-    return offsets
 
-
-def _check_lengths(
+def _validate_lengths(
     seqused_k: torch.Tensor,
     *,
     batch: int,
     device: torch.device,
-) -> list[int]:
+) -> None:
     if not isinstance(seqused_k, torch.Tensor):
         raise TypeError("seqused_k must be a torch.Tensor")
     if tuple(seqused_k.shape) != (batch,):
@@ -150,46 +144,48 @@ def _check_lengths(
         raise ValueError("seqused_k must have dtype torch.int32")
     if seqused_k.device != device:
         raise ValueError(f"seqused_k must be on device {device}")
-    lengths = [int(value) for value in seqused_k.detach().cpu().tolist()]
-    if any(length < 0 for length in lengths):
-        raise ValueError("seqused_k cannot contain negative lengths")
-    return lengths
 
 
-def _head_values(
+def _head_values_for_requests(
     value: torch.Tensor | None,
     *,
     name: str,
-    request: int,
+    request_ids: torch.Tensor,
     batch: int,
     target_heads: int,
     repeat_from: int | None = None,
 ) -> torch.Tensor | None:
-    """Select one request's scalar-per-head values and expand GQA values."""
+    """Select scalar-per-head values without reading request IDs on the host."""
     if value is None:
         return None
     if not isinstance(value, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor or None")
+    if value.device != request_ids.device:
+        raise ValueError(f"{name} must be on device {request_ids.device}")
 
     if value.ndim == 0:
-        selected = value.reshape(1)
+        selected = value.reshape(1, 1).expand(request_ids.numel(), -1)
     elif value.ndim == 1:
-        selected = value
+        selected = value[None].expand(request_ids.numel(), -1)
     elif value.ndim == 2 and value.shape[0] in (1, batch):
-        selected = value[0 if value.shape[0] == 1 else request]
+        selected = (
+            value.expand(request_ids.numel(), -1)
+            if value.shape[0] == 1
+            else value.index_select(0, request_ids)
+        )
     else:
         raise ValueError(
             f"{name} must be scalar, [heads], or [batch, heads]; got "
             f"{tuple(value.shape)}"
         )
 
-    count = selected.numel()
+    count = selected.shape[1]
     if count == 1:
-        return selected.float().expand(target_heads)
+        return selected.float().expand(-1, target_heads)
     if count == target_heads:
         return selected.float()
     if repeat_from is not None and count == repeat_from and target_heads % count == 0:
-        return selected.float().repeat_interleave(target_heads // count)
+        return selected.float().repeat_interleave(target_heads // count, dim=1)
     raise ValueError(
         f"{name} supplies {count} values, but this call needs {target_heads} heads"
     )
@@ -200,6 +196,45 @@ def _copy_or_return(result: torch.Tensor, out: torch.Tensor | None) -> torch.Ten
         return result
     out.copy_(result)
     return out
+
+
+def _gather_kv_tile(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    request_ids: torch.Tensor,
+    key_positions: torch.Tensor,
+    *,
+    block_table: torch.Tensor | None,
+    key_offsets: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather one fixed-size key tile for every packed query row."""
+    if block_table is not None:
+        page_size = k.shape[1]
+        logical_blocks = torch.div(key_positions, page_size, rounding_mode="floor")
+        physical_blocks = block_table[
+            request_ids[:, None], logical_blocks[None, :]
+        ].long()
+        physical_blocks = physical_blocks.clamp(0, k.shape[0] - 1)
+        page_offsets = (key_positions % page_size)[None, :].expand(
+            request_ids.numel(), -1
+        )
+        return (
+            k[physical_blocks, page_offsets],
+            v[physical_blocks, page_offsets],
+        )
+
+    if k.ndim == 4:
+        dense_positions = key_positions.clamp(0, k.shape[1] - 1)
+        return (
+            k[request_ids[:, None], dense_positions[None, :]],
+            v[request_ids[:, None], dense_positions[None, :]],
+        )
+
+    assert key_offsets is not None
+    packed_positions = key_offsets.index_select(0, request_ids)[:, None]
+    packed_positions = packed_positions + key_positions[None, :]
+    packed_positions = packed_positions.clamp(0, k.shape[0] - 1)
+    return k[packed_positions], v[packed_positions]
 
 
 def _try_specialized(
@@ -230,6 +265,7 @@ def _try_specialized(
         or seqused_k is not None
         or block_table is not None
         or k.ndim != 3
+        or v.shape[-1] != q.shape[-1]
         or window_size != (-1, -1)
         or softcap > 0.0
         or alibi_slopes is not None
@@ -308,7 +344,10 @@ def flash_attn_varlen_func(
     GQA/MQA, local windows, softcap, ALiBi, FP8 descales, attention sinks,
     optional LSE output, and ``out=`` semantics.
     """
-    del scheduler_metadata, num_splits, fa_version  # Optimization selectors only.
+    if not is_fa_version_supported(fa_version):
+        reason = fa_version_unsupported_reason(fa_version)
+        raise ValueError(f"unsupported fa_version={fa_version}: {reason}")
+    del scheduler_metadata, num_splits  # Optimization selectors only.
 
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if not isinstance(tensor, torch.Tensor):
@@ -321,6 +360,10 @@ def flash_attn_varlen_func(
         raise ValueError("k and v must both use packed rank-3 or cache rank-4 layout")
     if k.shape[:-1] != v.shape[:-1]:
         raise ValueError("k and v must have matching token and head dimensions")
+    if q.shape[1] == 0 or k.shape[-2] == 0:
+        raise ValueError("q, k, and v must have at least one attention head")
+    if q.shape[-1] == 0 or v.shape[-1] == 0:
+        raise ValueError("q, k, and v head dimensions must be nonzero")
     if q.shape[-1] != k.shape[-1]:
         raise ValueError("q and k must have the same head dimension")
     if q.shape[1] % k.shape[-2] != 0:
@@ -381,17 +424,9 @@ def flash_attn_varlen_func(
     if specialized is not None:
         return specialized
 
-    q_offsets = _check_cumulative(
-        "cu_seqlens_q",
-        cu_seqlens_q,
-        device=q.device,
-        expected_size=batch + 1,
-        total=q.shape[0],
+    _validate_cumulative(
+        "cu_seqlens_q", cu_seqlens_q, device=q.device, expected_size=batch + 1
     )
-    query_lengths = [stop - start for start, stop in zip(q_offsets, q_offsets[1:])]
-    if max(query_lengths, default=0) > max_seqlen_q:
-        raise ValueError("max_seqlen_q is smaller than an actual query sequence")
-
     if cu_seqlens_k is not None and seqused_k is not None:
         raise ValueError("cu_seqlens_k and seqused_k cannot both be provided")
     if cu_seqlens_k is None and seqused_k is None:
@@ -399,24 +434,23 @@ def flash_attn_varlen_func(
     if block_table is not None and seqused_k is None:
         raise ValueError("seqused_k is required with a block_table")
 
-    k_offsets: list[int] | None = None
+    key_offsets: torch.Tensor | None = None
     if cu_seqlens_k is not None:
         if k.ndim != 3 or block_table is not None:
             raise ValueError("cu_seqlens_k is only valid with non-paged rank-3 K/V")
-        k_offsets = _check_cumulative(
-            "cu_seqlens_k",
-            cu_seqlens_k,
-            device=q.device,
-            expected_size=batch + 1,
-            total=k.shape[0],
+        _validate_cumulative(
+            "cu_seqlens_k", cu_seqlens_k, device=q.device, expected_size=batch + 1
         )
-        key_lengths = [stop - start for start, stop in zip(k_offsets, k_offsets[1:])]
+        key_lengths = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        key_offsets = cu_seqlens_k[:-1]
     else:
         assert seqused_k is not None
-        key_lengths = _check_lengths(seqused_k, batch=batch, device=q.device)
-
-    if max(key_lengths, default=0) > max_seqlen_k:
-        raise ValueError("max_seqlen_k is smaller than an actual key sequence")
+        _validate_lengths(seqused_k, batch=batch, device=q.device)
+        key_lengths = seqused_k
+        if k.ndim == 3:
+            key_offsets = torch.cat(
+                (torch.zeros_like(seqused_k[:1]), torch.cumsum(seqused_k, dim=0)[:-1])
+            )
 
     if block_table is not None:
         if k.ndim != 4:
@@ -429,12 +463,16 @@ def flash_attn_varlen_func(
             raise ValueError("block_table must have dtype torch.int32 or torch.int64")
         if block_table.device != q.device:
             raise ValueError("block_table must be on the same device as q")
+        if max_seqlen_k > block_table.shape[1] * k.shape[1]:
+            raise ValueError("block_table does not have capacity for max_seqlen_k")
+        if max_seqlen_k > 0 and (k.shape[0] == 0 or k.shape[1] == 0):
+            raise ValueError("paged K/V cache cannot be empty when max_seqlen_k > 0")
     elif k.ndim == 4 and k.shape[0] < batch:
         raise ValueError("dense rank-4 K/V must have one cache row per request")
-    elif k.ndim == 3 and k_offsets is None and sum(key_lengths) != k.shape[0]:
-        raise ValueError(
-            "rank-3 K/V with seqused_k must be tightly packed to sum(seqused_k)"
-        )
+    elif max_seqlen_k > 0 and (
+        (k.ndim == 4 and k.shape[1] == 0) or (k.ndim == 3 and k.shape[0] == 0)
+    ):
+        raise ValueError("K/V storage cannot be empty when max_seqlen_k > 0")
 
     if scale is None:
         scale = 1.0 / math.sqrt(q.shape[-1])
@@ -442,127 +480,156 @@ def flash_attn_varlen_func(
     output_dtype = q.dtype if out is None else out.dtype
     outputs: list[torch.Tensor] = []
     lse_parts: list[torch.Tensor] = []
-    packed_k_start = 0
-    page_size = k.shape[1] if k.ndim == 4 else 0
     left_window, right_window = real_window
+    nheads_q = q.shape[1]
+    nheads_kv = k.shape[-2]
+    group_size = nheads_q // nheads_kv
 
-    for request, (q_start, q_stop, key_length) in enumerate(
-        zip(q_offsets, q_offsets[1:], key_lengths)
-    ):
-        query = q[q_start:q_stop]
-        if block_table is not None:
-            blocks_needed = (key_length + page_size - 1) // page_size
-            if blocks_needed > block_table.shape[1]:
-                raise ValueError(
-                    "block_table does not contain enough pages for seqused_k"
-                )
-            block_ids = block_table[request, :blocks_needed].to(torch.long)
-            key = k.index_select(0, block_ids).flatten(0, 1)[:key_length]
-            value = v.index_select(0, block_ids).flatten(0, 1)[:key_length]
-        elif k.ndim == 4:
-            if key_length > k.shape[1]:
-                raise ValueError("seqused_k exceeds the dense cache capacity")
-            key = k[request, :key_length]
-            value = v[request, :key_length]
-        elif k_offsets is not None:
-            key = k[k_offsets[request] : k_offsets[request + 1]]
-            value = v[k_offsets[request] : k_offsets[request + 1]]
-        else:
-            key = k[packed_k_start : packed_k_start + key_length]
-            value = v[packed_k_start : packed_k_start + key_length]
-            packed_k_start += key_length
+    for q_start in range(0, q.shape[0], _QUERY_TILE_SIZE):
+        q_stop = min(q_start + _QUERY_TILE_SIZE, q.shape[0])
+        token_positions = torch.arange(q_start, q_stop, device=q.device)
+        request_ids = torch.sum(
+            token_positions[:, None] >= cu_seqlens_q[None, 1:], dim=1
+        ).long()
+        query_starts = cu_seqlens_q.index_select(0, request_ids)
+        query_stops = cu_seqlens_q.index_select(0, request_ids + 1)
+        query_lengths = query_stops - query_starts
+        local_query_positions = token_positions - query_starts
+        tile_key_lengths = key_lengths.index_select(0, request_ids)
+        aligned_query_positions = (
+            local_query_positions + tile_key_lengths - query_lengths
+        )
 
-        nheads_q = q.shape[1]
-        nheads_kv = k.shape[-2]
-        query_f = query.float().transpose(0, 1)
-        key_f = key.float().transpose(0, 1)
-        value_f = value.float().transpose(0, 1)
-
-        query_descale = _head_values(
+        query_f = (
+            q[q_start:q_stop]
+            .float()
+            .reshape(q_stop - q_start, nheads_kv, group_size, q.shape[-1])
+        )
+        query_descale = _head_values_for_requests(
             q_descale,
             name="q_descale",
-            request=request,
+            request_ids=request_ids,
             batch=batch,
             target_heads=nheads_q,
             repeat_from=nheads_kv,
         )
-        key_descale = _head_values(
+        key_descale = _head_values_for_requests(
             k_descale,
             name="k_descale",
-            request=request,
+            request_ids=request_ids,
             batch=batch,
             target_heads=nheads_kv,
         )
-        value_descale = _head_values(
+        value_descale = _head_values_for_requests(
             v_descale,
             name="v_descale",
-            request=request,
+            request_ids=request_ids,
             batch=batch,
             target_heads=nheads_kv,
         )
-        if query_descale is not None:
-            query_f = query_f * query_descale[:, None, None]
-        if key_descale is not None:
-            key_f = key_f * key_descale[:, None, None]
-        if value_descale is not None:
-            value_f = value_f * value_descale[:, None, None]
-
-        group_size = nheads_q // nheads_kv
-        if group_size != 1:
-            key_f = key_f.repeat_interleave(group_size, dim=0)
-            value_f = value_f.repeat_interleave(group_size, dim=0)
-
-        scores = torch.matmul(query_f, key_f.transpose(-1, -2)) * scale
-        if cap > 0.0:
-            scores = cap * torch.tanh(scores / cap)
-
-        seqlen_q = query.shape[0]
-        rows = torch.arange(seqlen_q, device=q.device)[:, None]
-        columns = torch.arange(key_length, device=q.device)[None, :]
-        aligned_rows = rows + key_length - seqlen_q
-
-        slopes = _head_values(
+        slopes = _head_values_for_requests(
             alibi_slopes,
             name="alibi_slopes",
-            request=request,
+            request_ids=request_ids,
             batch=batch,
             target_heads=nheads_q,
         )
-        if slopes is not None:
-            distance = (aligned_rows - columns).abs().float()
-            scores = scores - slopes[:, None, None] * distance[None]
-
-        keep = torch.ones((seqlen_q, key_length), device=q.device, dtype=torch.bool)
-        if causal:
-            keep &= columns <= aligned_rows
-        if left_window >= 0:
-            keep &= columns >= aligned_rows - left_window
-        if right_window >= 0:
-            keep &= columns <= aligned_rows + right_window
-        scores = scores.masked_fill(~keep[None], float("-inf"))
-
-        sink = _head_values(
+        sink = _head_values_for_requests(
             s_aux,
             name="s_aux",
-            request=request,
+            request_ids=request_ids,
             batch=batch,
             target_heads=nheads_q,
         )
-        if sink is not None:
-            sink_scores = sink[:, None, None].expand(-1, seqlen_q, 1)
-            scores_for_softmax = torch.cat((sink_scores, scores), dim=-1)
-            lse = torch.logsumexp(scores_for_softmax, dim=-1)
-            probabilities = torch.softmax(scores_for_softmax, dim=-1)[..., 1:]
-        else:
-            lse = torch.logsumexp(scores, dim=-1)
-            probabilities = torch.softmax(scores, dim=-1)
-        probabilities = torch.nan_to_num(probabilities, nan=0.0)
-        result = torch.matmul(probabilities, value_f).transpose(0, 1)
-        outputs.append(result.to(output_dtype))
-        lse_parts.append(lse)
+        if query_descale is not None:
+            query_f = query_f * query_descale.reshape(
+                q_stop - q_start, nheads_kv, group_size, 1
+            )
 
-    result = torch.cat(outputs, dim=0)
+        state_shape = (q_stop - q_start, nheads_kv, group_size)
+        if sink is None:
+            running_max = torch.full(
+                state_shape, float("-inf"), device=q.device, dtype=torch.float32
+            )
+            running_sum = torch.zeros(state_shape, device=q.device, dtype=torch.float32)
+        else:
+            running_max = sink.reshape(state_shape)
+            running_sum = torch.ones(state_shape, device=q.device, dtype=torch.float32)
+        accumulator = torch.zeros(
+            (*state_shape, v.shape[-1]), device=q.device, dtype=torch.float32
+        )
+
+        for key_start in range(0, max_seqlen_k, _KEY_TILE_SIZE):
+            key_stop = min(key_start + _KEY_TILE_SIZE, max_seqlen_k)
+            key_positions = torch.arange(key_start, key_stop, device=q.device)
+            key_tile, value_tile = _gather_kv_tile(
+                k,
+                v,
+                request_ids,
+                key_positions,
+                block_table=block_table,
+                key_offsets=key_offsets,
+            )
+            key_f = key_tile.float()
+            value_f = value_tile.float()
+            if key_descale is not None:
+                key_f = key_f * key_descale[:, None, :, None]
+            if value_descale is not None:
+                value_f = value_f * value_descale[:, None, :, None]
+
+            scores = torch.einsum("qhgd,qkhd->qhgk", query_f, key_f) * scale
+            if cap > 0.0:
+                scores = cap * torch.tanh(scores / cap)
+
+            columns = key_positions[None, :]
+            keep = columns < tile_key_lengths[:, None]
+            if causal:
+                keep &= columns <= aligned_query_positions[:, None]
+            if left_window >= 0:
+                keep &= columns >= aligned_query_positions[:, None] - left_window
+            if right_window >= 0:
+                keep &= columns <= aligned_query_positions[:, None] + right_window
+
+            if slopes is not None:
+                distance = (aligned_query_positions[:, None] - columns).abs().float()
+                scores = (
+                    scores
+                    - slopes.reshape(q_stop - q_start, nheads_kv, group_size, 1)
+                    * distance[:, None, None, :]
+                )
+            scores = scores.masked_fill(~keep[:, None, None, :], float("-inf"))
+
+            tile_max = scores.amax(dim=-1)
+            next_max = torch.maximum(running_max, tile_max)
+            old_weight = torch.exp(running_max - next_max)
+            old_weight = torch.nan_to_num(old_weight, nan=0.0)
+            tile_weights = torch.exp(scores - next_max[..., None])
+            tile_weights = torch.nan_to_num(tile_weights, nan=0.0)
+            accumulator = accumulator * old_weight[..., None] + torch.einsum(
+                "qhgk,qkhd->qhgd", tile_weights, value_f
+            )
+            running_sum = old_weight * running_sum + tile_weights.sum(dim=-1)
+            running_max = next_max
+
+        has_mass = running_sum > 0
+        safe_sum = torch.where(has_mass, running_sum, torch.ones_like(running_sum))
+        result_tile = accumulator / safe_sum[..., None]
+        result_tile = result_tile.reshape(q_stop - q_start, nheads_q, v.shape[-1])
+        lse_tile = torch.where(
+            has_mass,
+            running_max + torch.log(safe_sum),
+            torch.full_like(running_max, float("-inf")),
+        )
+        outputs.append(result_tile.to(output_dtype))
+        lse_parts.append(lse_tile.reshape(q_stop - q_start, nheads_q).transpose(0, 1))
+
+    if outputs:
+        result = torch.cat(outputs, dim=0)
+        softmax_lse = torch.cat(lse_parts, dim=1)
+    else:
+        result = torch.empty(expected_out_shape, device=q.device, dtype=output_dtype)
+        softmax_lse = torch.empty((nheads_q, 0), device=q.device, dtype=torch.float32)
     result = _copy_or_return(result, out)
     if return_softmax_lse:
-        return result, torch.cat(lse_parts, dim=1)
+        return result, softmax_lse
     return result

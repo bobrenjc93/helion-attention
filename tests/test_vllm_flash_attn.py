@@ -104,7 +104,12 @@ def test_vllm_surface_has_no_shape_argument() -> None:
     )
 
 
-def test_nonpaged_fallback_features_and_out_parameter() -> None:
+def test_nonpaged_fallback_features_and_out_parameter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Force both loops to cross tile boundaries with a small test problem.
+    monkeypatch.setattr(compat, "_QUERY_TILE_SIZE", 1)
+    monkeypatch.setattr(compat, "_KEY_TILE_SIZE", 2)
     generator = torch.Generator().manual_seed(123)
     query_lengths = [2, 1]
     key_lengths = [3, 2]
@@ -170,6 +175,100 @@ def test_nonpaged_fallback_features_and_out_parameter() -> None:
     assert returned.data_ptr() == out.data_ptr()
     torch.testing.assert_close(out, torch.cat(expected_outputs))
     torch.testing.assert_close(lse, torch.cat(expected_lse, dim=1))
+
+
+@pytest.mark.parametrize("fa_version", [4, 999])
+def test_unsupported_fa_version_is_rejected(fa_version: int) -> None:
+    tensor = torch.zeros(1, 1, 1)
+    cumulative = torch.tensor([0, 1], dtype=torch.int32)
+    with pytest.raises(ValueError, match=rf"unsupported fa_version={fa_version}"):
+        compat.flash_attn_varlen_func(
+            q=tensor,
+            k=tensor,
+            v=tensor,
+            max_seqlen_q=1,
+            cu_seqlens_q=cumulative,
+            max_seqlen_k=1,
+            cu_seqlens_k=cumulative,
+            fa_version=fa_version,
+        )
+
+
+@requires_cuda
+def test_paged_fallback_supports_cuda_graph_capture() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(321)
+    query_lengths = [2, 1]
+    key_lengths = [5, 3]
+    nheads_q, nheads_kv, head_dim, page_size = 4, 2, 8, 2
+    q = torch.randn(
+        sum(query_lengths),
+        nheads_q,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    per_request_k = [
+        torch.randn(
+            length,
+            nheads_kv,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        for length in key_lengths
+    ]
+    per_request_v = [
+        torch.randn_like(key, generator=generator) for key in per_request_k
+    ]
+    k_cache = torch.zeros(
+        7,
+        page_size,
+        nheads_kv,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.zeros_like(k_cache)
+    block_table = torch.tensor([[3, 0, 5], [2, 4, 6]], device="cuda", dtype=torch.int32)
+    for request, (key, value) in enumerate(zip(per_request_k, per_request_v)):
+        for logical_block in range((key_lengths[request] + page_size - 1) // page_size):
+            physical_block = int(block_table[request, logical_block])
+            start = logical_block * page_size
+            stop = min(start + page_size, key_lengths[request])
+            k_cache[physical_block, : stop - start] = key[start:stop]
+            v_cache[physical_block, : stop - start] = value[start:stop]
+
+    cu_q = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
+    seqused_k = torch.tensor(key_lengths, device="cuda", dtype=torch.int32)
+    kwargs = {
+        "q": q,
+        "k": k_cache,
+        "v": v_cache,
+        "max_seqlen_q": max(query_lengths),
+        "cu_seqlens_q": cu_q,
+        "max_seqlen_k": max(key_lengths),
+        "seqused_k": seqused_k,
+        "block_table": block_table,
+        "causal": True,
+        "fa_version": 3,
+    }
+
+    expected_result = compat.flash_attn_varlen_func(**kwargs)
+    assert isinstance(expected_result, torch.Tensor)
+    expected = expected_result.clone()
+    captured_out = torch.empty_like(q)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        returned = compat.flash_attn_varlen_func(**kwargs, out=captured_out)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert isinstance(returned, torch.Tensor)
+    assert returned.data_ptr() == captured_out.data_ptr()
+    torch.testing.assert_close(captured_out, expected)
 
 
 @requires_cuda
