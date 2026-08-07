@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
 
 import pytest
+import torch
+
+from helion_attention._shape import AttnShape
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GENERATE_PATH = REPO_ROOT / "tools" / "generate.py"
@@ -14,6 +18,41 @@ SPEC = importlib.util.spec_from_file_location("helion_attention_generate", GENER
 assert SPEC is not None and SPEC.loader is not None
 generate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(generate)
+
+
+def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None:
+    exact = AttnShape(
+        batch=1,
+        seqlen_q=16384,
+        seqlen_k=16384,
+        nheads_q=16,
+        nheads_kv=16,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        causal=True,
+    )
+    assert generate.select_dense_kernel_name(exact) == "causal_attention_bshd_16k"
+
+    incompatible = [
+        replace(exact, batch=2),
+        replace(exact, seqlen_q=8192, seqlen_k=8192),
+        replace(exact, nheads_q=32, nheads_kv=32),
+        replace(exact, nheads_kv=8),
+        replace(exact, head_dim=256),
+        replace(exact, nheads_q=1, nheads_kv=1, head_dim=256),
+        replace(exact, dtype=torch.float16),
+    ]
+    for candidate in incompatible:
+        assert generate.select_dense_kernel_name(candidate) == "causal_attention_bshd"
+
+    assert (
+        generate.select_dense_kernel_name(replace(exact, causal=False))
+        == "attention_bshd"
+    )
+    assert (
+        generate.select_dense_kernel_name(replace(exact, seqlen_q=1))
+        == "decode_attention_bshd"
+    )
 
 
 def test_failed_upgrade_restores_existing_kernel_and_manifest(
