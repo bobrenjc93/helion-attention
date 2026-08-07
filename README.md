@@ -70,19 +70,30 @@ one is an autotuning run, not a code change.
 | batch | seqlen q | seqlen k | heads q | heads kv | head dim | dtype | causal | note |
 | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
 | 1 | 16384 | 16384 | 16 | 16 | 128 | bf16 | yes | 16k context, single sequence |
+| 1 | 2048 | 2048 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
 | 1 | 2048 | 2048 | 32 | 32 | 128 | bf16 | yes | single-sequence 7B prefill |
+| 1 | 2048 | 2048 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
+| 1 | 4096 | 4096 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
+| 1 | 4096 | 4096 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
+| 1 | 8192 | 8192 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
+| 1 | 8192 | 8192 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | bf16 | yes | GPT-2 medium style, causal |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | bf16 | no | GPT-2 medium style prefill |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | fp16 | no | fp16 coverage |
 | 2 | 8192 | 8192 | 16 | 16 | 128 | bf16 | yes | long-context causal |
+| 4 | 2048 | 2048 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
+| 4 | 2048 | 2048 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
+| 4 | 4096 | 4096 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
 | 4 | 4096 | 4096 | 32 | 32 | 128 | bf16 | yes | 7B-class prefill, causal |
 | 4 | 4096 | 4096 | 32 | 32 | 128 | bf16 | no | 7B-class prefill, bidirectional |
 | 4 | 4096 | 4096 | 32 | 32 | 128 | fp16 | yes | fp16 causal coverage |
 | 4 | 4096 | 4096 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
+| 4 | 8192 | 8192 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
+| 4 | 8192 | 8192 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
 | 8 | 2048 | 2048 | 16 | 16 | 64 | bf16 | yes | small decoder, long batch |
 | 8 | 512 | 512 | 16 | 16 | 64 | bf16 | no | short-sequence encoder batch |
 
-12 kernels.
+23 kernels.
 <!-- SHAPES:END -->
 
 ## Benchmarks
