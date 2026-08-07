@@ -10,6 +10,10 @@ from __future__ import annotations
 from typing import Any
 from typing import Protocol
 
+import torch
+
+from ._runtime import set_triton_allocator
+
 
 class TritonKernel(Protocol):
     """Structural type for the ``triton.jit`` wrapper object we launch."""
@@ -27,7 +31,7 @@ def default_launcher(
     launch_cooperative_grid: bool = False,
     **kwargs: Any,
 ) -> object:
-    """Launch ``triton_kernel`` immediately on the current CUDA stream."""
+    """Launch ``triton_kernel`` on the device of its CUDA tensor arguments."""
     run_kwargs: dict[str, object] = {
         "grid": grid,
         "warmup": False,
@@ -38,4 +42,18 @@ def default_launcher(
     }
     if ptx_options is not None:
         run_kwargs["ptx_options"] = ptx_options
-    return triton_kernel.run(*args, **run_kwargs)
+    try:
+        device = next(
+            arg.device
+            for arg in args
+            if isinstance(arg, torch.Tensor) and arg.is_cuda
+        )
+    except StopIteration as exc:
+        raise ValueError("Triton kernel launch requires a CUDA tensor argument") from exc
+
+    # Triton's allocator is context-local, so imports performed by a setup
+    # thread do not configure worker threads. Install it in the invocation
+    # context, while the input device is current for allocation and launch.
+    with torch.cuda.device(device):
+        set_triton_allocator()
+        return triton_kernel.run(*args, **run_kwargs)

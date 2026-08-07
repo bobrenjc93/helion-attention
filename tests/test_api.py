@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import sys
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import torch
@@ -15,18 +16,33 @@ from helion_attention import available_shapes
 from helion_attention._registry import spec_from_manifest_entry
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+requires_two_cuda_devices = pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="needs two GPUs"
+)
 
 SHAPES = [entry for entry in available_shapes()]
 IDS = [str(entry["key"]) for entry in SHAPES]
+QWEN_PREFILL = AttnShape(
+    batch=1,
+    seqlen_q=2048,
+    seqlen_k=2048,
+    nheads_q=28,
+    nheads_kv=4,
+    head_dim=128,
+    dtype=torch.bfloat16,
+    causal=True,
+)
 
 
-def make_inputs(spec: AttnShape) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    generator = torch.Generator(device="cuda").manual_seed(7)
+def make_inputs(
+    spec: AttnShape, device: torch.device | str = "cuda"
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device=device).manual_seed(7)
 
     def rand(seqlen: int, nheads: int) -> torch.Tensor:
         return torch.randn(
             (spec.batch, seqlen, nheads, spec.head_dim),
-            device="cuda",
+            device=device,
             dtype=spec.dtype,
             generator=generator,
         )
@@ -81,6 +97,45 @@ def test_custom_softmax_scale(entry: dict[str, object]) -> None:
         enable_gqa=spec.nheads_q != spec.nheads_kv,
     ).transpose(1, 2)
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_preloaded_kernel_launches_in_worker_thread() -> None:
+    assert helion_attention.is_shape_supported(
+        QWEN_PREFILL, dtype=QWEN_PREFILL.dtype, causal=QWEN_PREFILL.causal
+    )
+    q, k, v = make_inputs(QWEN_PREFILL)
+
+    def invoke() -> torch.Tensor:
+        out = helion_attention.flash_attn_func(
+            q, k, v, causal=QWEN_PREFILL.causal, shape=QWEN_PREFILL
+        )
+        torch.cuda.synchronize(q.device)
+        return out
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        out = pool.submit(invoke).result()
+    assert out.device == q.device
+
+
+@requires_two_cuda_devices
+def test_launches_on_tensor_device_when_it_is_not_current() -> None:
+    original_device = torch.cuda.current_device()
+    target_device = torch.device("cuda", 1)
+    try:
+        torch.cuda.set_device(0)
+        q, k, v = make_inputs(QWEN_PREFILL, device=target_device)
+        assert torch.cuda.current_device() == 0
+
+        out = helion_attention.flash_attn_func(
+            q, k, v, causal=QWEN_PREFILL.causal, shape=QWEN_PREFILL
+        )
+        torch.cuda.synchronize(target_device)
+
+        assert out.device == target_device
+        assert torch.cuda.current_device() == 0
+    finally:
+        torch.cuda.set_device(original_device)
 
 
 @requires_cuda
