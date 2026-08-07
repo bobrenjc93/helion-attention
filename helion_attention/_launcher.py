@@ -7,6 +7,8 @@ Vendoring the launcher here is what lets the generated kernels run with only
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from typing import Protocol
 
@@ -21,6 +23,30 @@ class TritonKernel(Protocol):
     def run(self, *args: object, **kwargs: object) -> object: ...
 
 
+def _direct_launcher(
+    triton_kernel: TritonKernel,
+    grid: tuple[int, ...],
+    *args: object,
+    num_warps: int,
+    num_stages: int,
+    ptx_options: str | None = None,
+    launch_cooperative_grid: bool = False,
+    **kwargs: Any,
+) -> object:
+    """Launch with the CUDA device and Triton allocator already configured."""
+    run_kwargs: dict[str, object] = {
+        "grid": grid,
+        "warmup": False,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "launch_cooperative_grid": launch_cooperative_grid,
+        **kwargs,
+    }
+    if ptx_options is not None:
+        run_kwargs["ptx_options"] = ptx_options
+    return triton_kernel.run(*args, **run_kwargs)
+
+
 def default_launcher(
     triton_kernel: TritonKernel,
     grid: tuple[int, ...],
@@ -32,16 +58,6 @@ def default_launcher(
     **kwargs: Any,
 ) -> object:
     """Launch ``triton_kernel`` on the device of its CUDA tensor arguments."""
-    run_kwargs: dict[str, object] = {
-        "grid": grid,
-        "warmup": False,
-        "num_warps": num_warps,
-        "num_stages": num_stages,
-        "launch_cooperative_grid": launch_cooperative_grid,
-        **kwargs,
-    }
-    if ptx_options is not None:
-        run_kwargs["ptx_options"] = ptx_options
     try:
         device = next(
             arg.device
@@ -56,4 +72,27 @@ def default_launcher(
     # context, while the input device is current for allocation and launch.
     with torch.cuda.device(device):
         set_triton_allocator()
-        return triton_kernel.run(*args, **run_kwargs)
+        return _direct_launcher(
+            triton_kernel,
+            grid,
+            *args,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            ptx_options=ptx_options,
+            launch_cooperative_grid=launch_cooperative_grid,
+            **kwargs,
+        )
+
+
+@contextmanager
+def launcher_context(
+    device: torch.device,
+    launcher: Any,
+) -> Iterator[Any]:
+    """Amortize device and allocator setup across adjacent generated launches."""
+    if launcher is not default_launcher:
+        yield launcher
+        return
+    with torch.cuda.device(device):
+        set_triton_allocator()
+        yield _direct_launcher

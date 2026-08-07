@@ -268,6 +268,36 @@
         "eval_5b403bea": 71,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:b2fe55353d8caa49cc80ddad1ab5a8f7ee9b4427",
+      "commit": "b2fe55353d8caa49cc80ddad1ab5a8f7ee9b4427",
+      "recordedAt": "2026-08-07T21:52:56.434Z",
+      "label": "base b2fe553",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 54,
+        "eval_1afd133e": 43,
+        "eval_5b403bea": 71,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:10",
+      "recordedAt": "2026-08-07T21:52:56.434Z",
+      "label": "PR #10",
+      "kind": "leaf",
+      "prNumber": 10,
+      "title": "Split the KV dimension for long-cache decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 57,
+        "eval_1afd133e": 43,
+        "eval_5b403bea": 71,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
