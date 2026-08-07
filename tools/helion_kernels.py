@@ -219,6 +219,74 @@ def causal_attention_bshd(
 
 
 @helion.kernel(
+    config=helion.Config(
+        block_sizes=[128, 128],
+        num_warps=8,
+        num_stages=3,
+        pid_type="persistent_interleaved",
+        num_sm_multiplier=1,
+        # Use Hopper's descriptor path for K while retaining a masked block
+        # pointer for V; making both descriptor loads exceeds shared memory.
+        indexing=[
+            "pointer",
+            "tensor_descriptor",
+            "block_ptr",
+            "pointer",
+            "pointer",
+        ],
+    ),
+    static_shapes=True,
+    autotune_baseline_fn=_causal_sdpa_reference,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def causal_attention_bshd_16k(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
+) -> torch.Tensor:
+    """Persistent causal attention for B1/S16K/H16/D128 bf16 only."""
+    batch = q.size(0)
+    m_dim = q.size(1)
+    nheads_q = hl.specialize(q.size(2))
+    head_dim = hl.specialize(q.size(3))
+    n_dim = k.size(1)
+    nheads_kv = hl.specialize(k.size(2))
+    group = nheads_q // nheads_kv
+    out = torch.empty_like(q)
+    qk_scale = sm_scale * 1.44269504088896340736
+    # A one-CTA-per-SM persistent grid interleaves short and long causal rows
+    # instead of assigning all query tiles to only sixteen batch/head CTAs.
+    for tile_b, tile_h, tile_m in hl.tile(
+        [batch, nheads_q, m_dim], block_size=[1, 1, None]
+    ):
+        b = tile_b.begin
+        h = tile_h.begin
+        h_kv = h // group
+        m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+        l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+        acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+        q_blk = q[b, tile_m, h, :] * qk_scale
+        for tile_n in hl.tile(0, tile_m.end):
+            k_blk = k[b, tile_n, h_kv, :]
+            qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32)
+            qk = torch.where(
+                tile_m.index[:, None] >= tile_n.index[None, :], qk, float("-inf")
+            )
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            qk = qk - m_ij[:, None]
+            p = torch.exp2(qk)
+            l_ij = torch.sum(p, -1)
+            alpha = torch.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            acc = acc * alpha[:, None]
+            v_blk = v[b, tile_n, h_kv, :]
+            acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
+            m_i = m_ij
+        acc = acc / l_i[:, None]
+        out[b, tile_m, h, :] = acc.to(out.dtype)
+    return out
+
+
+@helion.kernel(
     static_shapes=True,
     autotune_baseline_fn=_decode_sdpa_reference,
     autotune_baseline_atol=5e-2,
@@ -503,20 +571,3 @@ def attention_backward_bshd(
             dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
             dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
     return dq, dk, dv
-
-
-KERNELS: dict[bool, object] = {
-    False: attention_bshd,
-    True: causal_attention_bshd,
-}
-
-
-def select_kernel(*, causal: bool, seqlen_q: int, seqlen_k: int) -> object:
-    """Select the source kernel whose masking matches the requested shape."""
-    if causal and seqlen_q != seqlen_k:
-        if seqlen_q != 1:
-            raise ValueError(
-                "unequal causal lengths are supported only for seqlen_q=1 decode"
-            )
-        return decode_attention_bshd
-    return KERNELS[causal]
