@@ -27,6 +27,12 @@ DECODE_SHAPES = [
     for entry in SHAPES
     if int(entry["seqlen_q"]) == 1 and int(entry["seqlen_k"]) > 1
 ]
+GRAPH_DECODE_SHAPES = [
+    entry for entry in DECODE_SHAPES if int(entry["seqlen_k"]) in (1024, 16384)
+]
+LONG_DECODE = next(
+    entry for entry in DECODE_SHAPES if int(entry["seqlen_k"]) == 16384
+)
 BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
 QWEN_PREFILL = AttnShape(
     batch=1,
@@ -268,6 +274,30 @@ def test_launches_on_tensor_device_when_it_is_not_current() -> None:
         torch.cuda.set_device(original_device)
 
 
+@requires_two_cuda_devices
+def test_split_decode_launches_on_tensor_device_when_it_is_not_current() -> None:
+    original_device = torch.cuda.current_device()
+    target_device = torch.device("cuda", 1)
+    try:
+        torch.cuda.set_device(0)
+        spec = spec_from_manifest_entry(LONG_DECODE)
+        q, k_cache, v_cache = make_inputs(spec, device=target_device)
+
+        out = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            causal=spec.causal,
+            shape=spec,
+        )
+        torch.cuda.synchronize(target_device)
+
+        assert out.device == target_device
+        assert torch.cuda.current_device() == 0
+    finally:
+        torch.cuda.set_device(original_device)
+
+
 @requires_cuda
 def test_unsupported_shape_names_the_shape_and_the_issue_tracker() -> None:
     q = torch.randn(3, 77, 5, 64, device="cuda", dtype=torch.bfloat16)
@@ -411,8 +441,8 @@ def test_kvcache_default_noncausal_flag_reuses_equivalent_decode_kernel(
 @requires_cuda
 @pytest.mark.parametrize(
     "entry",
-    DECODE_SHAPES[:1],
-    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+    GRAPH_DECODE_SHAPES,
+    ids=[str(entry["key"]) for entry in GRAPH_DECODE_SHAPES],
 )
 def test_kvcache_full_length_supports_cuda_graph_capture(
     entry: dict[str, object],

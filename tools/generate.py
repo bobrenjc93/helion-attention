@@ -35,6 +35,8 @@ DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 PERSISTENT_CAUSAL_16K_KEY = (
     "b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal"
 )
+SPLIT_KV_DECODE_MIN_CACHE = 16384
+SPLIT_KV_DECODE_SPLITS = 8
 
 if TYPE_CHECKING:
     from helion_attention._shape import AttnShape
@@ -44,6 +46,8 @@ def select_dense_kernel_name(spec: "AttnShape") -> str:
     """Choose a Helion source without applying shape-specific configs broadly."""
     if spec.key == PERSISTENT_CAUSAL_16K_KEY:
         return "causal_attention_bshd_16k"
+    if spec.is_decode and spec.seqlen_k >= SPLIT_KV_DECODE_MIN_CACHE:
+        return "decode_attention_bshd_split_kv"
     return "causal_attention_bshd" if spec.causal else "attention_bshd"
 
 
@@ -98,6 +102,51 @@ def rename_entry_point(
     return re.sub(
         pattern, f"def {stable_name}(", code, count=1, flags=re.MULTILINE
     )
+
+
+def namespace_generated_constants(code: str, prefix: str) -> str:
+    """Keep module-level constexpr names distinct when composing two kernels."""
+    names = re.findall(r"^(_[A-Z][A-Z0-9_]*)\s*=", code, flags=re.MULTILINE)
+    for name in names:
+        code = re.sub(rf"\b{re.escape(name)}\b", f"_{prefix}{name}", code)
+    return code
+
+
+def merge_generated_modules(*modules: str) -> str:
+    """Combine standalone Helion outputs under one future import."""
+    bodies = []
+    for module in modules:
+        first, body = module.split("\n", 1)
+        if first != "from __future__ import annotations":
+            raise RuntimeError("generated module has an unexpected header")
+        bodies.append(body)
+    return "from __future__ import annotations\n" + "\n".join(bodies)
+
+
+_SPLIT_KV_DECODE_ENTRY_POINT = f'''
+from .._launcher import launcher_context as _launcher_context
+
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):
+    num_splits = {SPLIT_KV_DECODE_SPLITS}
+    partial_acc = torch.empty(
+        (q.size(0), q.size(2), num_splits, 1, q.size(3)),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    partial_stats = torch.empty(
+        (q.size(0), q.size(2), 2, num_splits, 1),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    out = torch.empty_like(q)
+    with _launcher_context(q.device, _launcher) as launch:
+        _attention_split_kv_partials(
+            q, k, v, partial_acc, partial_stats, sm_scale, _launcher=launch
+        )
+        return _attention_split_kv_combine(
+            partial_acc, partial_stats, out, _launcher=launch
+        )
+'''
 
 
 def build_inputs(spec: "AttnShape") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
@@ -461,6 +510,7 @@ def main() -> int:
 
     import helion_kernels
 
+    split_kv_decode = False
     if args.paged:
         kernel = helion_kernels.paged_attention_thd
         forward_args = build_paged_inputs(spec, args.page_size)
@@ -481,8 +531,10 @@ def main() -> int:
         got = kernel(*forward_args)
         expected = helion_kernels._varlen_sdpa_reference(*forward_args)
     else:
-        kernel = getattr(helion_kernels, select_dense_kernel_name(spec))
-        if spec.is_decode:
+        kernel_name = select_dense_kernel_name(spec)
+        kernel = getattr(helion_kernels, kernel_name)
+        split_kv_decode = kernel_name == "decode_attention_bshd_split_kv"
+        if spec.is_decode and not split_kv_decode:
             # Decode has only batch * heads independent programs. A persistent
             # grid adds scheduler overhead without exposing more parallelism.
             kernel.settings.autotune_config_filter = nonpersistent_decode_config
@@ -532,17 +584,61 @@ def main() -> int:
         )
         require_portable_cooperative_grid(backward_code)
 
-    bound = kernel.bind(forward_args)
-    code = strip_helion(bound.to_triton_code())
-    code = rename_entry_point(
-        code,
-        kernel.name,
-        (
-            "attention_paged"
-            if args.paged
-            else "attention_varlen" if args.varlen else "attention"
-        ),
-    )
+    if not (args.paged or args.varlen) and split_kv_decode:
+        partial_kernel = helion_kernels.decode_attention_bshd_split_kv_partials
+        partial_acc = torch.empty(
+            (
+                spec.batch,
+                spec.nheads_q,
+                SPLIT_KV_DECODE_SPLITS,
+                1,
+                spec.head_dim,
+            ),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_stats = torch.empty(
+            (spec.batch, spec.nheads_q, 2, SPLIT_KV_DECODE_SPLITS, 1),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        partial_args = (q, k, v, partial_acc, partial_stats, sm_scale)
+        partial_bound = partial_kernel.bind(partial_args)
+        partial_code = strip_helion(partial_bound.to_triton_code())
+        partial_code = rename_entry_point(
+            partial_code,
+            partial_kernel.name,
+            "_attention_split_kv_partials",
+        )
+        partial_code = namespace_generated_constants(partial_code, "PARTIAL")
+
+        partial_kernel(*partial_args)
+        combine_kernel = helion_kernels.decode_attention_bshd_split_kv_combine
+        combine_args = (partial_acc, partial_stats, torch.empty_like(q))
+        combine_bound = combine_kernel.bind(combine_args)
+        combine_code = strip_helion(combine_bound.to_triton_code())
+        combine_code = rename_entry_point(
+            combine_code,
+            combine_kernel.name,
+            "_attention_split_kv_combine",
+        )
+        combine_code = namespace_generated_constants(combine_code, "COMBINE")
+        code = (
+            merge_generated_modules(partial_code, combine_code)
+            + _SPLIT_KV_DECODE_ENTRY_POINT
+        )
+    else:
+        bound = kernel.bind(forward_args)
+        code = strip_helion(bound.to_triton_code())
+        code = rename_entry_point(
+            code,
+            kernel.name,
+            (
+                "attention_paged"
+                if args.paged
+                else "attention_varlen" if args.varlen else "attention"
+            ),
+        )
 
     command = " ".join(
         ["python tools/generate.py", f"--batch {spec.batch}", f"--seqlen {spec.seqlen_q}"]

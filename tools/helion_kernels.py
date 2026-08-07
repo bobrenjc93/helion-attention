@@ -273,6 +273,137 @@ def causal_attention_bshd(
 
 @helion.kernel(
     config=helion.Config(
+        block_sizes=[128],
+        num_warps=4,
+        num_stages=3,
+        pid_type="flat",
+        loop_orders=[[1, 2, 0]],
+    ),
+    static_shapes=True,
+)
+def decode_attention_bshd_split_kv_partials(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    partial_acc: torch.Tensor,
+    partial_stats: torch.Tensor,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute independent online-softmax partials for each GQA head group."""
+    batch = q.size(0)
+    nheads_q = hl.specialize(q.size(2))
+    head_dim = hl.specialize(q.size(3))
+    n_dim = hl.specialize(k.size(1))
+    nheads_kv = hl.specialize(k.size(2))
+    group = nheads_q // nheads_kv
+    num_splits = hl.specialize(partial_acc.size(2))
+    split_size = (n_dim + num_splits - 1) // num_splits
+    qk_scale = sm_scale * 1.44269504088896340736
+
+    for b, h_kv, split in hl.grid([batch, nheads_kv, num_splits]):
+        # Process the complete GQA group together so its query heads share each
+        # K/V load. More KV splits preserve a full launch grid for small batches.
+        for tile_h in hl.tile(
+            h_kv * group,
+            (h_kv + 1) * group,
+            block_size=group,
+        ):
+            m_i = hl.full([tile_h], float("-inf"), dtype=torch.float32)
+            l_i = hl.zeros([tile_h], dtype=torch.float32)
+            acc = hl.zeros([tile_h, head_dim], dtype=torch.float32)
+            q_rows = q[b, 0, tile_h, :]
+            for tile_n in hl.tile(
+                split * split_size,
+                min((split + 1) * split_size, n_dim),
+            ):
+                k_blk = k[b, tile_n, h_kv, :]
+                qk = hl.dot(q_rows, k_blk.T, out_dtype=torch.float32) * qk_scale
+                m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                p = torch.exp2(qk - m_ij[:, None])
+                alpha = torch.exp2(m_i - m_ij)
+                l_i = l_i * alpha + torch.sum(p, -1)
+                acc = acc * alpha[:, None]
+                v_blk = v[b, tile_n, h_kv, :]
+                acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
+                m_i = m_ij
+            partial_acc[b, tile_h, split, :, :] = acc[:, None, :]
+            partial_stats[b, tile_h, 0, split, :] = m_i[:, None]
+            partial_stats[b, tile_h, 1, split, :] = l_i[:, None]
+    return partial_acc, partial_stats
+
+
+@helion.kernel(
+    config=helion.Config(
+        num_warps=1,
+        num_stages=3,
+        pid_type="flat",
+    ),
+    static_shapes=True,
+)
+def decode_attention_bshd_split_kv_combine(
+    partial_acc: torch.Tensor,
+    partial_stats: torch.Tensor,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Renormalize and combine the per-split softmax numerators."""
+    batch = out.size(0)
+    nheads_q = hl.specialize(out.size(2))
+    for b, h in hl.grid([batch, nheads_q]):
+        split_max = partial_stats[b, h, 0, :, :]
+        global_max = torch.amax(split_max, 0)
+        renormalize = torch.exp2(split_max - global_max)
+        denominator = torch.sum(
+            partial_stats[b, h, 1, :, :] * renormalize,
+            0,
+        )
+        numerator = torch.sum(
+            partial_acc[b, h, :, :, :] * renormalize[:, :, None],
+            0,
+        )
+        out[b, :, h, :] = (numerator / denominator[:, None]).to(out.dtype)
+    return out
+
+
+def decode_attention_bshd_split_kv(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
+) -> torch.Tensor:
+    """Single-query decode with eight KV-sequence programs per GQA head group.
+
+    Long-cache decode otherwise exposes only ``batch * nheads_q`` programs.
+    Each split computes an online-softmax numerator and statistics for its KV
+    range, then a small second kernel renormalizes and combines the partials.
+    A single bottom-right-aligned query can see the entire cache, so causal and
+    non-causal decode have the same unmasked computation here.
+    """
+    num_splits = 8
+    partial_acc = torch.empty(
+        (q.size(0), q.size(2), num_splits, 1, q.size(3)),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    partial_stats = torch.empty(
+        (q.size(0), q.size(2), 2, num_splits, 1),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    out = torch.empty_like(q)
+    decode_attention_bshd_split_kv_partials(
+        q,
+        k,
+        v,
+        partial_acc,
+        partial_stats,
+        sm_scale,
+    )
+    return decode_attention_bshd_split_kv_combine(
+        partial_acc,
+        partial_stats,
+        out,
+    )
+
+
+@helion.kernel(
+    config=helion.Config(
         block_sizes=[128, 128],
         num_warps=8,
         num_stages=3,

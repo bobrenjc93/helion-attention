@@ -52,7 +52,7 @@ def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None
     )
     assert (
         generate.select_dense_kernel_name(replace(exact, seqlen_q=1))
-        == "causal_attention_bshd"
+        == "decode_attention_bshd_split_kv"
     )
     assert (
         generate.select_dense_kernel_name(
@@ -60,6 +60,34 @@ def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None
         )
         == "causal_attention_bshd"
     )
+
+
+def test_split_kv_decode_is_selected_only_for_long_caches() -> None:
+    long_decode = AttnShape(
+        batch=1,
+        seqlen_q=1,
+        seqlen_k=16384,
+        nheads_q=32,
+        nheads_kv=8,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        causal=True,
+    )
+    assert (
+        generate.select_dense_kernel_name(long_decode)
+        == "decode_attention_bshd_split_kv"
+    )
+    assert (
+        generate.select_dense_kernel_name(replace(long_decode, causal=False))
+        == "decode_attention_bshd_split_kv"
+    )
+    for cache_length in (1024, 4096):
+        assert (
+            generate.select_dense_kernel_name(
+                replace(long_decode, seqlen_k=cache_length)
+            )
+            == "causal_attention_bshd"
+        )
 
 
 def test_decode_autotuning_rejects_persistent_launches() -> None:
@@ -173,6 +201,29 @@ def test_strip_helion_removes_varlen_constexpr_annotations() -> None:
     assert "helion" not in rewritten
     assert "hl.constexpr" not in rewritten
     assert "def varlen_attention(max_seqlen, causal):" in rewritten
+
+
+def test_split_kv_modules_are_composed_without_constexpr_collisions() -> None:
+    partial = (
+        "from __future__ import annotations\n"
+        "_BLOCK_SIZE = 128\n"
+        "def partial(): return _BLOCK_SIZE\n"
+    )
+    combine = (
+        "from __future__ import annotations\n"
+        "_BLOCK_SIZE = 8\n"
+        "def combine(): return _BLOCK_SIZE\n"
+    )
+    partial = generate.namespace_generated_constants(partial, "PARTIAL")
+    combine = generate.namespace_generated_constants(combine, "COMBINE")
+    merged = generate.merge_generated_modules(partial, combine)
+
+    assert merged.count("from __future__ import annotations") == 1
+    assert "_PARTIAL_BLOCK_SIZE = 128" in merged
+    assert "_COMBINE_BLOCK_SIZE = 8" in merged
+    assert f"num_splits = {generate.SPLIT_KV_DECODE_SPLITS}" in (
+        generate._SPLIT_KV_DECODE_ENTRY_POINT
+    )
 
 
 def test_varlen_artifact_uses_separate_manifest_section(

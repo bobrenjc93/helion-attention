@@ -300,14 +300,21 @@ def flash_attn_with_kvcache(
             )
         else:
             raise TypeError("cache_seqlens must be an int, a torch.Tensor, or None")
-    return flash_attn_func(
-        q,
-        k_cache,
-        v_cache,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        shape=spec,
+    # Dispatch directly after the KV-cache-specific checks. Routing back
+    # through flash_attn_func would repeat normalization and validation on
+    # every latency-sensitive decode step.
+    check_tensors(q, k_cache, v_cache, spec)
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(spec.head_dim)
+    kernel = lookup(spec)
+    scale = float(softmax_scale)
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (q, k_cache, v_cache)
     )
+    if needs_backward:
+        lookup_backward(spec)
+        return attention_autograd(q, k_cache, v_cache, scale, spec)
+    return kernel(q, k_cache, v_cache, scale)
 
 
 def flash_attn_qkvpacked_func(
