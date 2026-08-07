@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import math
 import time
 
 import pytest
@@ -713,6 +714,49 @@ def test_fa2_effective_global_alibi_lse_is_stable_during_capture() -> None:
 
 
 @requires_cuda
+def test_finite_window_normalization_uses_device_max_during_capture() -> None:
+    q = torch.zeros(5, 1, 16, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(2, 4, 1, 16, device=q.device, dtype=q.dtype)
+    v = torch.zeros_like(k)
+    v[0, 0] = 1.0
+    v[0, 1] = 3.0
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "max_seqlen_q": torch.tensor(5, device=q.device, dtype=torch.int32),
+        "cu_seqlens_q": torch.tensor([0, 5], device=q.device, dtype=torch.int32),
+        "max_seqlen_k": torch.tensor(2, device=q.device, dtype=torch.int32),
+        "seqused_k": torch.tensor([2], device=q.device, dtype=torch.int32),
+        "block_table": torch.tensor([[0, 1]], device=q.device, dtype=torch.int32),
+        "causal": False,
+        "window_size": (-1, 2),
+        "return_softmax_lse": True,
+        "fa_version": 2,
+    }
+
+    eager_result = compat.flash_attn_varlen_func(**kwargs)
+    assert isinstance(eager_result, tuple)
+    expected_output = torch.full_like(eager_result[0], 2.0)
+    expected_lse = torch.full_like(eager_result[1], math.log(2.0))
+    torch.testing.assert_close(eager_result[0], expected_output)
+    torch.testing.assert_close(eager_result[1], expected_lse)
+
+    captured_output = torch.empty_like(eager_result[0])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_result = compat.flash_attn_varlen_func(
+            **kwargs, out=captured_output
+        )
+    assert isinstance(captured_result, tuple)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured_output, expected_output)
+    torch.testing.assert_close(captured_result[1], expected_lse)
+
+
+@requires_cuda
 def test_paged_2048_has_bounded_launch_and_memory_cost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -955,6 +999,99 @@ def test_changing_query_maximum_reuses_triton_specialization(
     run(33)
 
     assert compile_count == compile_count_after_first_bucket
+
+
+@pytest.mark.parametrize("fa_version", [2, 3])
+def test_finite_window_normalization_matches_fa_version_fallback(
+    fa_version: int,
+) -> None:
+    q = torch.zeros(5, 1, 16)
+    k = torch.zeros(2, 1, 16)
+    v = torch.stack((torch.ones_like(k[0]), torch.full_like(k[0], 3.0)))
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=5,
+        cu_seqlens_q=torch.tensor([0, 5], dtype=torch.int32),
+        max_seqlen_k=2,
+        cu_seqlens_k=torch.tensor([0, 2], dtype=torch.int32),
+        causal=False,
+        window_size=(-1, 2),
+        return_softmax_lse=True,
+        fa_version=fa_version,
+    )
+    assert isinstance(result, tuple)
+    output, lse = result
+
+    if fa_version == 2:
+        expected_output = torch.full_like(output, 2.0)
+        expected_lse = torch.full_like(lse, math.log(2.0))
+    else:
+        expected_output = torch.tensor([0.0, 1.0, 2.0, 2.0, 2.0]).reshape(5, 1, 1)
+        expected_output = expected_output.expand_as(output)
+        expected_lse = torch.tensor(
+            [[float("-inf"), 0.0, math.log(2.0), math.log(2.0), math.log(2.0)]]
+        )
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(lse, expected_lse)
+
+
+@requires_cuda
+@pytest.mark.parametrize("paged", [False, True], ids=["packed", "paged"])
+@pytest.mark.parametrize("fa_version", [2, 3])
+def test_finite_window_normalization_matches_fa_version_cuda(
+    paged: bool, fa_version: int
+) -> None:
+    q = torch.zeros(5, 1, 16, device="cuda", dtype=torch.bfloat16)
+    k_packed = torch.zeros(2, 1, 16, device=q.device, dtype=q.dtype)
+    v_packed = torch.stack(
+        (torch.ones_like(k_packed[0]), torch.full_like(k_packed[0], 3.0))
+    )
+    if paged:
+        k = k_packed.reshape(1, 2, 1, 16)
+        v = v_packed.reshape_as(k)
+        key_kwargs = {
+            "seqused_k": torch.tensor([2], device=q.device, dtype=torch.int32),
+            "block_table": torch.tensor([[0]], device=q.device, dtype=torch.int32),
+        }
+    else:
+        k = k_packed
+        v = v_packed
+        key_kwargs = {
+            "cu_seqlens_k": torch.tensor(
+                [0, 2], device=q.device, dtype=torch.int32
+            )
+        }
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=5,
+        cu_seqlens_q=torch.tensor([0, 5], device=q.device, dtype=torch.int32),
+        max_seqlen_k=2,
+        causal=False,
+        window_size=(-1, 2),
+        return_softmax_lse=True,
+        fa_version=fa_version,
+        **key_kwargs,
+    )
+    assert isinstance(result, tuple)
+    output, lse = result
+
+    if fa_version == 2:
+        expected_output = torch.full_like(output, 2.0)
+        expected_lse = torch.full_like(lse, math.log(2.0))
+    else:
+        expected_output = torch.tensor(
+            [0.0, 1.0, 2.0, 2.0, 2.0], device=q.device, dtype=q.dtype
+        ).reshape(5, 1, 1).expand_as(output)
+        expected_lse = torch.tensor(
+            [[float("-inf"), 0.0, math.log(2.0), math.log(2.0), math.log(2.0)]],
+            device=q.device,
+        )
+    torch.testing.assert_close(output, expected_output)
+    torch.testing.assert_close(lse, expected_lse)
 
 
 @requires_cuda

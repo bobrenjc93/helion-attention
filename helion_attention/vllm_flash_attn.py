@@ -134,6 +134,28 @@ def _normalize_window(window_size: Sequence[int] | None) -> tuple[int, int]:
     return left, right
 
 
+def _normalize_fa_window(
+    window_size: tuple[int, int],
+    *,
+    fa_version: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+) -> tuple[int, int]:
+    """Apply the selected FlashAttention version's global-window sentinels."""
+    left, right = window_size
+    if fa_version == 2:
+        left_limit = right_limit = max_seqlen_k
+    else:
+        # FA3's Hopper API uses the last valid position on each corresponding
+        # axis, rather than FA2's key-length threshold for both endpoints.
+        left_limit = max_seqlen_k - 1
+        right_limit = max_seqlen_q - 1
+    return (
+        -1 if left >= left_limit else left,
+        -1 if right >= right_limit else right,
+    )
+
+
 def _normalize_maximum(
     value: int | torch.Tensor,
     name: str,
@@ -496,6 +518,7 @@ def flash_attn_varlen_func(
             )
         if q_v.device != q.device or q_v.dtype != q.dtype:
             raise ValueError("q_v must have the same device and dtype as q")
+    original_max_seqlen_q = max_seqlen_q
     original_max_seqlen_k = max_seqlen_k
     max_k_storage = k.shape[0]
     if k.ndim == 4:
@@ -530,7 +553,32 @@ def flash_attn_varlen_func(
         if out.device != q.device:
             raise ValueError("out must be on the same device as q")
 
-    real_window = _normalize_window(window_size)
+    raw_window = _normalize_window(window_size)
+    real_window = _normalize_fa_window(
+        raw_window,
+        fa_version=fa_version,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+    )
+    dynamic_max_seqlen_q = (
+        original_max_seqlen_q
+        if isinstance(original_max_seqlen_q, torch.Tensor)
+        and original_max_seqlen_q.is_cuda
+        and original_max_seqlen_q.device == q.device
+        else None
+    )
+    dynamic_max_seqlen_k = (
+        original_max_seqlen_k
+        if isinstance(original_max_seqlen_k, torch.Tensor)
+        and original_max_seqlen_k.is_cuda
+        and original_max_seqlen_k.device == q.device
+        else None
+    )
+    kernel_window = (
+        raw_window
+        if dynamic_max_seqlen_q is not None or dynamic_max_seqlen_k is not None
+        else real_window
+    )
     if cp_world_size > 1 and real_window != (-1, -1):
         raise NotImplementedError(
             "local attention is not supported with context parallelism"
@@ -645,19 +693,14 @@ def flash_attn_varlen_func(
         and alibi_slopes is not None
         and (causal or right_window == 0)
     )
-    fa2_lse_max: torch.Tensor | None = None
     if not fa2_one_sided_alibi:
         shift_fa2_lse = False
     elif left_window < 0:
         shift_fa2_lse = True
-    elif (
-        isinstance(original_max_seqlen_k, torch.Tensor)
-        and original_max_seqlen_k.is_cuda
-    ):
+    elif dynamic_max_seqlen_k is not None:
         # The kernel must compare the real scalar on-device. During graph
         # capture the normalized launch bound may be the larger cache capacity.
         shift_fa2_lse = True
-        fa2_lse_max = original_max_seqlen_k
     else:
         shift_fa2_lse = left_window >= max_seqlen_k
 
@@ -671,9 +714,12 @@ def flash_attn_varlen_func(
             seqused_k,
             block_table,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dynamic_max_seqlen_q=dynamic_max_seqlen_q,
+            dynamic_max_seqlen_k=dynamic_max_seqlen_k,
             softmax_scale=scale,
             causal=bool(causal),
-            window_size=real_window,
+            window_size=kernel_window,
             softcap=cap,
             alibi_slopes=alibi_slopes,
             q_descale=q_descale,
@@ -687,7 +733,6 @@ def flash_attn_varlen_func(
             out=out,
             return_softmax_lse=bool(return_softmax_lse),
             shift_fa2_lse=shift_fa2_lse,
-            fa2_lse_max=fa2_lse_max,
             fa_version=fa_version,
         )
 
@@ -699,9 +744,12 @@ def flash_attn_varlen_func(
             cu_seqlens_q,
             cu_seqlens_k,
             max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dynamic_max_seqlen_q=dynamic_max_seqlen_q,
+            dynamic_max_seqlen_k=dynamic_max_seqlen_k,
             softmax_scale=scale,
             causal=bool(causal),
-            window_size=real_window,
+            window_size=kernel_window,
             softcap=cap,
             alibi_slopes=alibi_slopes,
             q_descale=q_descale,
@@ -715,7 +763,6 @@ def flash_attn_varlen_func(
             out=out,
             return_softmax_lse=bool(return_softmax_lse),
             shift_fa2_lse=shift_fa2_lse,
-            fa2_lse_max=fa2_lse_max,
             fa_version=fa_version,
         )
 

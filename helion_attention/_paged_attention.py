@@ -19,6 +19,7 @@ def _varlen_attention_kernel(
     cu_seqlens_k,
     seqused_k,
     block_table,
+    max_seqlen_q_tensor,
     max_seqlen_k_tensor,
     q_descale,
     k_descale,
@@ -61,6 +62,8 @@ def _varlen_attention_kernel(
     softcap,
     window_left,
     window_right,
+    max_seqlen_q_value,
+    max_seqlen_k_value,
     query_blocks,
     NHEADS_Q: tl.constexpr,
     NHEADS_KV: tl.constexpr,
@@ -80,7 +83,8 @@ def _varlen_attention_kernel(
     HAS_SOFTCAP: tl.constexpr,
     STORE_LSE: tl.constexpr,
     SHIFT_FA2_LSE: tl.constexpr,
-    HAS_DYNAMIC_FA2_MAX: tl.constexpr,
+    HAS_DYNAMIC_MAX_Q: tl.constexpr,
+    HAS_DYNAMIC_MAX_K: tl.constexpr,
     FA_VERSION_2: tl.constexpr,
     INPUT_FP16: tl.constexpr,
     CP_WORLD_SIZE: tl.constexpr,
@@ -100,6 +104,29 @@ def _varlen_attention_kernel(
     head_q = batch_head % NHEADS_Q
     group_size = NHEADS_Q // NHEADS_KV
     head_kv = head_q // group_size
+
+    if HAS_DYNAMIC_MAX_Q:
+        real_max_seqlen_q = tl.load(max_seqlen_q_tensor)
+    else:
+        real_max_seqlen_q = max_seqlen_q_value
+    if HAS_DYNAMIC_MAX_K:
+        real_max_seqlen_k = tl.load(max_seqlen_k_tensor)
+    else:
+        real_max_seqlen_k = max_seqlen_k_value
+    if FA_VERSION_2:
+        window_left = tl.where(
+            window_left >= real_max_seqlen_k, -1, window_left
+        )
+        window_right = tl.where(
+            window_right >= real_max_seqlen_k, -1, window_right
+        )
+    else:
+        window_left = tl.where(
+            window_left >= real_max_seqlen_k - 1, -1, window_left
+        )
+        window_right = tl.where(
+            window_right >= real_max_seqlen_q - 1, -1, window_right
+        )
 
     q_start = tl.load(cu_seqlens_q + batch)
     q_stop = tl.load(cu_seqlens_q + batch + 1)
@@ -308,14 +335,7 @@ def _varlen_attention_kernel(
                 alibi_slopes + batch * stride_alibi_b + head_q * stride_alibi_h
             )
             shifted_lse = lse + slope * aligned_query
-            if HAS_DYNAMIC_FA2_MAX:
-                real_max_seqlen_k = tl.load(max_seqlen_k_tensor)
-                effective_global = (window_left < 0) | (
-                    window_left >= real_max_seqlen_k
-                )
-                lse = tl.where(effective_global, shifted_lse, lse)
-            else:
-                lse = shifted_lse
+            lse = tl.where(window_left < 0, shifted_lse, lse)
         tl.store(
             lse_out + head_q * stride_lseh + q_indices * stride_lset,
             lse,
@@ -373,6 +393,9 @@ def _attention(
     seqused_k: torch.Tensor | None,
     block_table: torch.Tensor | None,
     max_seqlen_q: int,
+    max_seqlen_k: int,
+    dynamic_max_seqlen_q: torch.Tensor | None,
+    dynamic_max_seqlen_k: torch.Tensor | None,
     softmax_scale: float,
     causal: bool,
     window_size: tuple[int, int],
@@ -389,7 +412,6 @@ def _attention(
     out: torch.Tensor | None,
     return_softmax_lse: bool,
     shift_fa2_lse: bool,
-    fa2_lse_max: torch.Tensor | None,
     fa_version: int,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch packed or paged varlen attention in one GPU kernel."""
@@ -448,8 +470,15 @@ def _attention(
     block_table_arg = (
         cu_seqlens_q.reshape(1, -1) if block_table is None else block_table
     )
+    max_seqlen_q_arg = (
+        cu_seqlens_q
+        if dynamic_max_seqlen_q is None
+        else dynamic_max_seqlen_q
+    )
     max_seqlen_k_arg = (
-        cu_seqlens_q if fa2_lse_max is None else fa2_lse_max
+        cu_seqlens_q
+        if dynamic_max_seqlen_k is None
+        else dynamic_max_seqlen_k
     )
 
     if paged:
@@ -481,6 +510,7 @@ def _attention(
             cu_k_arg,
             seqused_arg,
             block_table_arg,
+            max_seqlen_q_arg,
             max_seqlen_k_arg,
             q_scale,
             k_scale,
@@ -509,6 +539,8 @@ def _attention(
             softcap,
             window_size[0],
             window_size[1],
+            max_seqlen_q,
+            max_seqlen_k,
             query_blocks,
             NHEADS_Q=nheads_q,
             NHEADS_KV=nheads_kv,
@@ -528,7 +560,8 @@ def _attention(
             HAS_SOFTCAP=softcap > 0.0,
             STORE_LSE=return_softmax_lse,
             SHIFT_FA2_LSE=shift_fa2_lse,
-            HAS_DYNAMIC_FA2_MAX=fa2_lse_max is not None,
+            HAS_DYNAMIC_MAX_Q=dynamic_max_seqlen_q is not None,
+            HAS_DYNAMIC_MAX_K=dynamic_max_seqlen_k is not None,
             FA_VERSION_2=fa_version == 2,
             INPUT_FP16=q.dtype == torch.float16,
             CP_WORLD_SIZE=cp_world_size,
@@ -552,6 +585,9 @@ def paged_attention(
     block_table: torch.Tensor,
     *,
     max_seqlen_q: int,
+    max_seqlen_k: int,
+    dynamic_max_seqlen_q: torch.Tensor | None,
+    dynamic_max_seqlen_k: torch.Tensor | None,
     softmax_scale: float,
     causal: bool,
     window_size: tuple[int, int],
@@ -568,7 +604,6 @@ def paged_attention(
     out: torch.Tensor | None,
     return_softmax_lse: bool,
     shift_fa2_lse: bool,
-    fa2_lse_max: torch.Tensor | None,
     fa_version: int,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch generic paged attention in one GPU kernel."""
@@ -581,6 +616,9 @@ def paged_attention(
         seqused_k=seqused_k,
         block_table=block_table,
         max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dynamic_max_seqlen_q=dynamic_max_seqlen_q,
+        dynamic_max_seqlen_k=dynamic_max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=causal,
         window_size=window_size,
@@ -597,7 +635,6 @@ def paged_attention(
         out=out,
         return_softmax_lse=return_softmax_lse,
         shift_fa2_lse=shift_fa2_lse,
-        fa2_lse_max=fa2_lse_max,
         fa_version=fa_version,
     )
 
@@ -610,6 +647,9 @@ def packed_attention(
     cu_seqlens_k: torch.Tensor,
     *,
     max_seqlen_q: int,
+    max_seqlen_k: int,
+    dynamic_max_seqlen_q: torch.Tensor | None,
+    dynamic_max_seqlen_k: torch.Tensor | None,
     softmax_scale: float,
     causal: bool,
     window_size: tuple[int, int],
@@ -626,7 +666,6 @@ def packed_attention(
     out: torch.Tensor | None,
     return_softmax_lse: bool,
     shift_fa2_lse: bool,
-    fa2_lse_max: torch.Tensor | None,
     fa_version: int,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Launch generic packed varlen attention in one GPU kernel."""
@@ -639,6 +678,9 @@ def packed_attention(
         seqused_k=None,
         block_table=None,
         max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        dynamic_max_seqlen_q=dynamic_max_seqlen_q,
+        dynamic_max_seqlen_k=dynamic_max_seqlen_k,
         softmax_scale=softmax_scale,
         causal=causal,
         window_size=window_size,
@@ -655,6 +697,5 @@ def packed_attention(
         out=out,
         return_softmax_lse=return_softmax_lse,
         shift_fa2_lse=shift_fa2_lse,
-        fa2_lse_max=fa2_lse_max,
         fa_version=fa_version,
     )
