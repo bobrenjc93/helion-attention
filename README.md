@@ -163,10 +163,13 @@ implementations; prefill rows continue to use `flash_attn_func`.
 
 ## What is not implemented
 
-Forward only, and these FlashAttention features raise `NotImplementedError`
-rather than silently doing something else:
+Backward/training is implemented for the non-causal bf16
+`(batch=8, seqlen=512, nheads=16, head_dim=64)` shape. Other shapes remain
+forward-only and reject grad-enabled calls at the call site. These unsupported
+FlashAttention features also raise `NotImplementedError` rather than silently
+doing something else:
 
-- backward / training (`requires_grad` inputs are rejected)
+- backward for causal, cross-attention, GQA, fp16, and other shapes
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes
@@ -179,18 +182,21 @@ rather than silently doing something else:
 ```bash
 pip install helion                       # build-time only
 python tools/generate.py --batch 2 --seqlen 1024 --nheads 32 --head-dim 64 --dtype bf16
+python tools/generate.py --batch 8 --seqlen 512 --nheads 16 --head-dim 64 \
+    --dtype bf16 --backward
 python tools/generate.py --batch 1 --seqlen 1 --seqlen-k 4096 --nheads 32 \
     --nheads-kv 8 --head-dim 128 --dtype bf16 --causal
 python tools/generate_all.py --gpus 8    # the whole catalogue, one job per GPU
 ```
 
-`tools/helion_kernels.py` holds the prefill and single-token decode Helion kernels
+`tools/helion_kernels.py` holds the prefill, decode, and backward Helion kernels
 that everything is generated from — it is the only file in the repository that
-imports Helion. `tools/generate.py` autotunes one shape, takes Helion's emitted
-Triton, and rewrites its four references to `helion.runtime` to point at the
-vendored `helion_attention/_launcher.py` and `helion_attention/_runtime.py`. The
-result is verified in a subprocess that asserts Helion was never imported, then
-recorded in `helion_attention/kernels/manifest.json`.
+imports Helion. `tools/generate.py` autotunes one shape (plus its backward when
+requested), takes Helion's emitted Triton, and rewrites its four references to
+`helion.runtime` to point at the vendored `helion_attention/_launcher.py` and
+`helion_attention/_runtime.py`. The result is verified in a subprocess that
+asserts Helion was never imported, then recorded in
+`helion_attention/kernels/manifest.json`.
 
 To add a shape permanently, append it to `tools/shapes.py` and rerun
 `tools/generate_all.py`.

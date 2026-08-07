@@ -40,13 +40,36 @@ jobs:
           python - <<'PY'
           import json, pathlib, sys
           root = pathlib.Path("helion_attention/kernels")
-          manifest = {e["key"] for e in json.loads((root / "manifest.json").read_text())["kernels"]}
-          modules = {p.stem for p in root.glob("*.py") if p.stem != "__init__"}
-          if manifest != modules:
-              print("manifest only:", sorted(manifest - modules))
-              print("modules only:", sorted(modules - manifest))
+          entries = json.loads((root / "manifest.json").read_text())["kernels"]
+          manifest = {entry["key"]: entry for entry in entries}
+          if len(manifest) != len(entries):
+              print("manifest contains duplicate kernel keys")
               sys.exit(1)
-          print(f"{len(manifest)} kernels, manifest and modules agree")
+          module_stems = {
+              path.stem for path in root.glob("*.py") if path.stem != "__init__"
+          }
+          forward_modules = {
+              stem for stem in module_stems if not stem.endswith("_backward")
+          }
+          backward_modules = {
+              stem.removesuffix("_backward")
+              for stem in module_stems
+              if stem.endswith("_backward")
+          }
+          manifest_keys = set(manifest)
+          expected_backward = {
+              key for key, entry in manifest.items() if entry.get("backward", False)
+          }
+          if manifest_keys != forward_modules or expected_backward != backward_modules:
+              print("manifest only:", sorted(manifest_keys - forward_modules))
+              print("forward modules only:", sorted(forward_modules - manifest_keys))
+              print("backward flag only:", sorted(expected_backward - backward_modules))
+              print("backward modules only:", sorted(backward_modules - expected_backward))
+              sys.exit(1)
+          print(
+              f"{len(manifest)} forward kernels and {len(backward_modules)} "
+              "backward kernels agree with the manifest"
+          )
           PY
       - name: CPU-only tests
         run: python -m pytest -q tests

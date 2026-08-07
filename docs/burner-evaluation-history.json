@@ -102,6 +102,34 @@
         "eval_1afd133e": 45,
         "eval_5b403bea": 74
       }
+    },
+    {
+      "key": "base:a10d6c12b493b59731bb908cd4d88a51348f773c",
+      "commit": "a10d6c12b493b59731bb908cd4d88a51348f773c",
+      "recordedAt": "2026-08-07T11:28:08.455Z",
+      "label": "base a10d6c1",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 61,
+        "eval_1afd133e": 40,
+        "eval_5b403bea": 74
+      }
+    },
+    {
+      "key": "pr:4",
+      "recordedAt": "2026-08-07T11:28:08.455Z",
+      "label": "PR #4",
+      "kind": "leaf",
+      "prNumber": 4,
+      "title": "Add backward kernels so training works",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 61,
+        "eval_1afd133e": 44,
+        "eval_5b403bea": 74
+      }
     }
   ]
 }

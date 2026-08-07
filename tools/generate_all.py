@@ -25,11 +25,12 @@ from shapes import CATALOGUE  # noqa: E402
 from shapes import ShapeRequest  # noqa: E402
 
 
-def existing_keys() -> set[str]:
+def existing_entries() -> dict[str, dict[str, object]]:
     if not MANIFEST.exists():
-        return set()
+        return {}
     with MANIFEST.open() as handle:
-        return {entry["key"] for entry in json.load(handle)["kernels"]}
+        entries = json.load(handle)["kernels"]
+    return {str(entry["key"]): entry for entry in entries}
 
 
 def expected_key(request: ShapeRequest) -> str:
@@ -50,11 +51,15 @@ def main() -> int:
     args = parser.parse_args()
 
     LOG_DIR.mkdir(exist_ok=True)
-    have = set() if args.force else existing_keys()
+    have = {} if args.force else existing_entries()
     pending = [
         request
         for request in CATALOGUE
-        if args.only in request.name and expected_key(request) not in have
+        if args.only in request.name
+        and (
+            expected_key(request) not in have
+            or (request.backward and not have[expected_key(request)].get("backward"))
+        )
     ]
     if not pending:
         print("nothing to do")

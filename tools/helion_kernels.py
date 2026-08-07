@@ -52,6 +52,30 @@ def _decode_sdpa_reference(
     ).transpose(1, 2)
 
 
+def _attention_backward_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    grad_out: torch.Tensor,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """fp32 SDPA gradients used while autotuning the backward kernel."""
+    with torch.enable_grad():
+        q_ref = q.float().detach().requires_grad_()
+        k_ref = k.float().detach().requires_grad_()
+        v_ref = v.float().detach().requires_grad_()
+        out_ref = _sdpa_reference(q_ref, k_ref, v_ref, sm_scale)
+        grads = torch.autograd.grad(
+            out_ref,
+            (q_ref, k_ref, v_ref),
+            grad_out.float(),
+        )
+        return (
+            grads[0].to(q.dtype),
+            grads[1].to(k.dtype), grads[2].to(v.dtype),
+        )
+
+
 @helion.kernel(
     static_shapes=True,
     autotune_baseline_fn=_sdpa_reference,
@@ -75,6 +99,8 @@ def attention_bshd(
     group = nheads_q // nheads_kv
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
+    # Scale the fp32 accumulator, not bf16 q: large runtime scales otherwise
+    # lose enough precision to change the softmax distribution materially.
     for b, h in hl.grid([batch, nheads_q]):
         h_kv = h // group
         for tile_m in hl.tile(m_dim):
@@ -84,7 +110,7 @@ def attention_bshd(
             q_blk = q[b, tile_m, h, :]
             for tile_n in hl.tile(n_dim):
                 k_blk = k[b, tile_n, h_kv, :]
-                qk = hl.dot(q_blk * qk_scale, k_blk.T, out_dtype=torch.float32)
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                 m_ij = torch.maximum(m_i, torch.amax(qk, -1))
                 qk = qk - m_ij[:, None]
                 p = torch.exp2(qk)
@@ -196,6 +222,141 @@ def decode_attention_bshd(
             m_i = m_ij
         out[b, :, h, :] = (acc / l_i[:, None]).to(out.dtype)
     return out
+
+
+@helion.kernel(
+    static_shapes=True,
+    dot_precision="ieee",
+    autotune_effort="quick",
+    # Grid-wide barriers require every CTA to be resident at once.  One CTA
+    # per SM is portable to Ampere/Ada as well as Hopper; allowing Helion to
+    # tune this above 1 can produce a cooperative grid that those GPUs reject.
+    autotune_config_overrides={"num_sm_multiplier": 1},
+    autotune_baseline_fn=_attention_backward_reference,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def attention_backward_bshd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    grad_out: torch.Tensor,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Non-causal MHA backward over ``[batch, seq, heads, dim]`` tensors.
+
+    This follows the recompute strategy used by FlashAttention backward.  A
+    first pass recreates the per-query log-sum-exp values that the existing
+    forward-only modules do not expose.  A second pass computes the softmax
+    Jacobian's row correction in fp32, and the final two passes produce dQ,
+    then dK/dV, without materializing the quadratic attention matrix.
+
+    The first checked-in specialization intentionally covers MHA with equal
+    query/key lengths only.  The generator rejects causal, cross-attention, and
+    GQA shapes until their masking and reduction rules are implemented here.
+    """
+    batch = q.size(0)
+    m_dim = q.size(1)
+    n_dim = k.size(1)
+    nheads = hl.specialize(q.size(2))
+    head_dim = hl.specialize(q.size(3))
+    dq = torch.empty_like(q)
+    dk = torch.empty_like(k)
+    dv = torch.empty_like(v)
+    lse = torch.empty(
+        (batch, m_dim, nheads),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    delta = torch.empty(
+        (batch, m_dim, nheads),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    qk_scale = sm_scale * 1.44269504088896340736
+    # Keep the same fp32 logit scaling used by the matching forward kernel.
+
+    # Recreate the forward log-sum-exp in base 2 once.  Both gradient passes
+    # can then reconstruct each probability tile independently.
+    for b, h in hl.grid([batch, nheads]):
+        for tile_m in hl.tile(m_dim):
+            m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+            l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+            q_blk = q[b, tile_m, h, :]
+            for tile_n in hl.tile(n_dim):
+                k_blk = k[b, tile_n, h, :]
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                p = torch.exp2(qk - m_ij[:, None])
+                alpha = torch.exp2(m_i - m_ij)
+                l_i = l_i * alpha + torch.sum(p, -1)
+                m_i = m_ij
+            lse[b, tile_m, h] = m_i + torch.log2(l_i)
+
+    hl.barrier()
+
+    # Recompute delta = sum(p * dP) in fp32.  Deriving it from the bf16 forward
+    # output (sum(out * grad_out)) amplifies output rounding at larger scales.
+    for b, h in hl.grid([batch, nheads]):
+        for tile_m in hl.tile(m_dim):
+            q_blk = q[b, tile_m, h, :]
+            grad_out_blk = grad_out[b, tile_m, h, :]
+            lse_blk = lse[b, tile_m, h]
+            delta_acc = hl.zeros([tile_m], dtype=torch.float32)
+            for tile_n in hl.tile(n_dim):
+                k_blk = k[b, tile_n, h, :]
+                v_blk = v[b, tile_n, h, :]
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                p = torch.exp2(qk - lse_blk[:, None])
+                dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                delta_acc = delta_acc + torch.sum(p * dp, -1)
+            delta[b, tile_m, h] = delta_acc
+
+    hl.barrier()
+
+    # dQ owns query-row tiles, so no atomics are needed.
+    for b, h in hl.grid([batch, nheads]):
+        for tile_m in hl.tile(m_dim):
+            q_blk = q[b, tile_m, h, :]
+            grad_out_blk = grad_out[b, tile_m, h, :]
+            delta_blk = delta[b, tile_m, h]
+            lse_blk = lse[b, tile_m, h]
+            dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+            for tile_n in hl.tile(n_dim):
+                k_blk = k[b, tile_n, h, :]
+                v_blk = v[b, tile_n, h, :]
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                p = torch.exp2(qk - lse_blk[:, None])
+                dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                ds = p * (dp - delta_blk[:, None])
+                dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
+            dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
+
+    hl.barrier()
+
+    # dK and dV own key-row tiles and stream over all query rows.
+    for b, h in hl.grid([batch, nheads]):
+        for tile_n in hl.tile(n_dim):
+            k_blk = k[b, tile_n, h, :]
+            v_blk = v[b, tile_n, h, :]
+            dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+            dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+            for tile_m in hl.tile(m_dim):
+                q_blk = q[b, tile_m, h, :]
+                grad_out_blk = grad_out[b, tile_m, h, :]
+                delta_blk = delta[b, tile_m, h]
+                lse_blk = lse[b, tile_m, h]
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                p = torch.exp2(qk - lse_blk[:, None])
+                dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                ds = p * (dp - delta_blk[:, None])
+                dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
+                dv_acc = hl.dot(
+                    p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                )
+            dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
+            dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
+    return dq, dk, dv
 
 
 KERNELS: dict[bool, object] = {

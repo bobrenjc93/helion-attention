@@ -1,8 +1,8 @@
-"""Autotune a Helion attention kernel for one shape and check in the Triton.
+"""Autotune Helion attention kernels for one shape and check in the Triton.
 
 Usage:
     python tools/generate.py --batch 2 --seqlen 1024 --nheads 32 --head-dim 64 \
-        --dtype bf16 [--causal] [--nheads-kv 8] [--seqlen-k 1024]
+        --dtype bf16 [--causal] [--nheads-kv 8] [--seqlen-k 1024] [--backward]
 
 The emitted module under ``helion_attention/kernels/`` is Helion's own output
 with four mechanical substitutions applied, so that the runtime package needs
@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -64,12 +65,16 @@ def strip_helion(code: str) -> str:
     return code
 
 
-def rename_entry_point(code: str, generated_name: str) -> str:
-    """Expose the host wrapper under the stable name ``attention``."""
+def rename_entry_point(
+    code: str, generated_name: str, stable_name: str = "attention"
+) -> str:
+    """Expose a generated host wrapper under a stable runtime name."""
     pattern = rf"^def {re.escape(generated_name)}\("
     if not re.search(pattern, code, flags=re.MULTILINE):
         raise RuntimeError(f"generated code has no `def {generated_name}(`")
-    return re.sub(pattern, "def attention(", code, count=1, flags=re.MULTILINE)
+    return re.sub(
+        pattern, f"def {stable_name}(", code, count=1, flags=re.MULTILINE
+    )
 
 
 def build_inputs(spec: "AttnShape") -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
@@ -104,6 +109,46 @@ def reference(q, k, v, sm_scale, causal):  # noqa: ANN001, ANN201
     ).transpose(1, 2)
 
 
+def reference_gradients(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    grad_out: torch.Tensor,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute the generation-time backward oracle with fp32 SDPA."""
+    with torch.enable_grad():
+        q_ref = q.float().detach().requires_grad_()
+        k_ref = k.float().detach().requires_grad_()
+        v_ref = v.float().detach().requires_grad_()
+        out_ref = reference(q_ref, k_ref, v_ref, sm_scale, False)
+        grads = torch.autograd.grad(
+            out_ref,
+            (q_ref, k_ref, v_ref),
+            grad_out.float(),
+        )
+        return grads[0], grads[1], grads[2]
+
+
+def build_module(
+    code: str,
+    *,
+    command: str,
+    description: str,
+    spec_fields: dict[str, object],
+) -> str:
+    """Add the checked-in module header and shape metadata to Helion output."""
+    spec_block = (
+        "KERNEL_SPEC = {\n"
+        + "".join(f"    {name!r}: {value!r},\n" for name, value in spec_fields.items())
+        + "}\n\n"
+    )
+    header = _HEADER.format(command=command, description=description)
+    body = code.split("\n", 1)
+    assert body[0] == "from __future__ import annotations"
+    return header + body[0] + "\n\n" + spec_block + body[1]
+
+
 def upsert_manifest(entry: dict[str, object]) -> None:
     payload = {"kernels": []}
     if MANIFEST.exists():
@@ -118,15 +163,54 @@ def upsert_manifest(entry: dict[str, object]) -> None:
         handle.write("\n")
 
 
-def remove_from_manifest(key: str) -> None:
-    if not MANIFEST.exists():
+class GenerationVerificationError(RuntimeError):
+    """Raised after a candidate kernel fails standalone verification."""
+
+
+def require_portable_cooperative_grid(code: str) -> None:
+    """Reject generated cooperative kernels that launch multiple CTAs per SM."""
+    if "launch_cooperative_grid=True" not in code:
         return
-    with MANIFEST.open() as handle:
-        payload = json.load(handle)
-    payload["kernels"] = [item for item in payload["kernels"] if item["key"] != key]
-    with MANIFEST.open("w") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    multiplier = re.search(r"_NUM_SM\s*\*\s*(\d+)", code)
+    if multiplier is not None:
+        raise RuntimeError(
+            "cooperative backward grid is not portable: generated code launches "
+            f"{multiplier.group(1)} CTAs per SM"
+        )
+
+
+def install_generated_artifacts(
+    *,
+    target: Path,
+    module: str,
+    backward_target: Path,
+    backward_module: str | None,
+    manifest_entry: dict[str, object],
+    verify: Callable[[], int],
+) -> None:
+    """Install and verify generated files, restoring their exact prior state on error."""
+    paths = (target, backward_target, MANIFEST)
+    previous = {
+        path: path.read_bytes() if path.exists() else None for path in paths
+    }
+    try:
+        target.write_text(module)
+        if backward_module is None:
+            backward_target.unlink(missing_ok=True)
+        else:
+            backward_target.write_text(backward_module)
+        upsert_manifest(manifest_entry)
+        if verify() != 0:
+            raise GenerationVerificationError(
+                "generated kernel failed standalone verification"
+            )
+    except BaseException:
+        for path, contents in previous.items():
+            if contents is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(contents)
+        raise
 
 
 def main() -> int:
@@ -139,6 +223,11 @@ def main() -> int:
     parser.add_argument("--head-dim", type=int, required=True)
     parser.add_argument("--dtype", choices=sorted(DTYPES), default="bf16")
     parser.add_argument("--causal", action="store_true")
+    parser.add_argument(
+        "--backward",
+        action="store_true",
+        help="also generate the non-causal MHA backward specialization",
+    )
     parser.add_argument("--label", default="", help="human note stored in the manifest")
     args = parser.parse_args()
 
@@ -158,6 +247,15 @@ def main() -> int:
         raise SystemExit(
             "unequal causal lengths are supported only for seqlen_q=1 decode"
         )
+    if args.backward and (
+        spec.causal
+        or spec.seqlen_q != spec.seqlen_k
+        or spec.nheads_q != spec.nheads_kv
+    ):
+        raise SystemExit(
+            "backward generation currently supports only non-causal MHA with "
+            "equal query/key sequence lengths"
+        )
 
     import helion_kernels
 
@@ -176,6 +274,42 @@ def main() -> int:
     if error > 5e-2:
         raise SystemExit(f"autotuned kernel is not accurate enough: {error}")
 
+    backward_kernel = None
+    backward_code = None
+    if args.backward:
+        backward_kernel = helion_kernels.attention_backward_bshd
+        grad_generator = torch.Generator(device="cuda").manual_seed(1)
+        grad_out = torch.randn(
+            q.shape,
+            device=q.device,
+            dtype=q.dtype,
+            generator=grad_generator,
+        )
+        print(f"autotuning backward for {spec.describe()}", flush=True)
+        got_grads = backward_kernel(q, k, v, grad_out, sm_scale)
+        expected_grads = reference_gradients(q, k, v, grad_out, sm_scale)
+        grad_errors = [
+            (actual.float() - expected).abs().max().item()
+            for actual, expected in zip(got_grads, expected_grads)
+        ]
+        print(
+            "max abs gradient errors vs fp32 SDPA: "
+            + ", ".join(
+                f"{name}={error:.4g}"
+                for name, error in zip(("dq", "dk", "dv"), grad_errors)
+            )
+        )
+        if max(grad_errors) > 5e-2:
+            raise SystemExit(
+                f"autotuned backward kernel is not accurate enough: {grad_errors}"
+            )
+        backward_bound = backward_kernel.bind((q, k, v, grad_out, sm_scale))
+        backward_code = strip_helion(backward_bound.to_triton_code())
+        backward_code = rename_entry_point(
+            backward_code, backward_kernel.name, "attention_backward"
+        )
+        require_portable_cooperative_grid(backward_code)
+
     bound = kernel.bind((q, k, v, sm_scale))
     code = strip_helion(bound.to_triton_code())
     code = rename_entry_point(code, kernel.name)
@@ -187,6 +321,7 @@ def main() -> int:
         + ([f"--nheads-kv {spec.nheads_kv}"] if spec.nheads_kv != spec.nheads_q else [])
         + [f"--head-dim {spec.head_dim}", f"--dtype {spec.dtype_name}"]
         + (["--causal"] if spec.causal else [])
+        + (["--backward"] if args.backward else [])
     )
     spec_fields = {
         "key": spec.key,
@@ -198,46 +333,65 @@ def main() -> int:
         "head_dim": spec.head_dim,
         "dtype": spec.dtype_name,
         "causal": spec.causal,
+        "backward": args.backward,
     }
-    spec_block = (
-        "KERNEL_SPEC = {\n"
-        + "".join(f"    {name!r}: {value!r},\n" for name, value in spec_fields.items())
-        + "}\n\n"
+    module = build_module(
+        code,
+        command=command,
+        description=spec.describe(),
+        spec_fields=spec_fields,
     )
-    header = _HEADER.format(command=command, description=spec.describe())
-    body = code.split("\n", 1)
-    assert body[0] == "from __future__ import annotations"
-    module = header + body[0] + "\n\n" + spec_block + body[1]
 
     KERNELS_DIR.mkdir(parents=True, exist_ok=True)
     target = KERNELS_DIR / f"{spec.key}.py"
-    target.write_text(module)
+    backward_target = KERNELS_DIR / f"{spec.key}_backward.py"
+    backward_module = None
+    if backward_code is not None:
+        backward_module = build_module(
+            backward_code,
+            command=command,
+            description=f"{spec.describe()} backward",
+            spec_fields=spec_fields,
+        )
+    manifest_entry = {
+        "key": spec.key,
+        "batch": spec.batch,
+        "seqlen_q": spec.seqlen_q,
+        "seqlen_k": spec.seqlen_k,
+        "nheads_q": spec.nheads_q,
+        "nheads_kv": spec.nheads_kv,
+        "head_dim": spec.head_dim,
+        "dtype": spec.dtype_name,
+        "causal": spec.causal,
+        "backward": args.backward,
+        "description": spec.describe(),
+        "note": args.label,
+    }
+
+    def verify_generated_kernel() -> int:
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tools" / "verify.py"), spec.key],
+            cwd=REPO_ROOT,
+        ).returncode
+
+    try:
+        install_generated_artifacts(
+            target=target,
+            module=module,
+            backward_target=backward_target,
+            backward_module=backward_module,
+            manifest_entry=manifest_entry,
+            verify=verify_generated_kernel,
+        )
+    except GenerationVerificationError as exc:
+        raise SystemExit(f"{exc}; restored previous artifacts") from exc
+
     print(f"wrote {target.relative_to(REPO_ROOT)} ({len(module.splitlines())} lines)")
-
-    upsert_manifest(
-        {
-            "key": spec.key,
-            "batch": spec.batch,
-            "seqlen_q": spec.seqlen_q,
-            "seqlen_k": spec.seqlen_k,
-            "nheads_q": spec.nheads_q,
-            "nheads_kv": spec.nheads_kv,
-            "head_dim": spec.head_dim,
-            "dtype": spec.dtype_name,
-            "causal": spec.causal,
-            "description": spec.describe(),
-            "note": args.label,
-        }
-    )
-
-    check = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "tools" / "verify.py"), spec.key],
-        cwd=REPO_ROOT,
-    )
-    if check.returncode != 0:
-        target.unlink()
-        remove_from_manifest(spec.key)
-        raise SystemExit("generated kernel failed standalone verification; rolled back")
+    if backward_module is not None:
+        print(
+            f"wrote {backward_target.relative_to(REPO_ROOT)} "
+            f"({len(backward_module.splitlines())} lines)"
+        )
     print("manifest updated")
     return 0
 
