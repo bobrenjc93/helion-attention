@@ -326,6 +326,7 @@
       "seqlen_q": 2048
     },
     {
+      "backward": true,
       "batch": 8,
       "causal": false,
       "description": "batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False",

@@ -19,6 +19,7 @@ class ShapeRequest(NamedTuple):
     nheads_kv: int | None = None
     label: str = ""
     seqlen_k: int | None = None
+    backward: bool = False
 
     @property
     def args(self) -> list[str]:
@@ -35,6 +36,8 @@ class ShapeRequest(NamedTuple):
             argv += ["--seqlen-k", str(self.seqlen_k)]
         if self.causal:
             argv.append("--causal")
+        if self.backward:
+            argv.append("--backward")
         if self.label:
             argv += ["--label", self.label]
         return argv
@@ -52,7 +55,14 @@ class ShapeRequest(NamedTuple):
 CATALOGUE: list[ShapeRequest] = [
     ShapeRequest(2, 1024, 32, 64, label="GPT-2 medium style prefill"),
     ShapeRequest(2, 1024, 32, 64, causal=True, label="GPT-2 medium style, causal"),
-    ShapeRequest(8, 512, 16, 64, label="short-sequence encoder batch"),
+    ShapeRequest(
+        8,
+        512,
+        16,
+        64,
+        label="short-sequence encoder batch",
+        backward=True,
+    ),
     ShapeRequest(8, 2048, 16, 64, causal=True, label="small decoder, long batch"),
     ShapeRequest(4, 4096, 32, 128, label="7B-class prefill, bidirectional"),
     ShapeRequest(4, 4096, 32, 128, causal=True, label="7B-class prefill, causal"),

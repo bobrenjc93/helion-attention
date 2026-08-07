@@ -27,6 +27,7 @@ DECODE_SHAPES = [
     for entry in SHAPES
     if int(entry["seqlen_q"]) == 1 and int(entry["seqlen_k"]) > 1
 ]
+BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
 QWEN_PREFILL = AttnShape(
     batch=1,
     seqlen_q=2048,
@@ -87,6 +88,11 @@ def test_manifest_is_not_empty() -> None:
     assert SHAPES, "no kernels are checked in"
 
 
+def test_backward_catalogue_is_scoped_to_one_noncausal_shape() -> None:
+    assert len(BACKWARD_SHAPES) == 1
+    assert BACKWARD_SHAPES[0]["causal"] is False
+
+
 def test_decode_cache_lengths_are_checked_in() -> None:
     lengths = {
         int(entry["seqlen_k"])
@@ -104,6 +110,62 @@ def test_matches_fp32_sdpa(entry: dict[str, object]) -> None:
     got = helion_attention.flash_attn_func(q, k, v, causal=spec.causal, shape=spec)
     expected = reference_attention(q, k, v, spec, 1.0 / math.sqrt(spec.head_dim))
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry", BACKWARD_SHAPES, ids=[str(entry["key"]) for entry in BACKWARD_SHAPES]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
+)
+def test_gradients_match_fp32_sdpa(
+    entry: dict[str, object], softmax_scale: float | None
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k, v = make_inputs(spec, seed=123)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    grad_out = make_inputs(spec, seed=456)[0]
+
+    got = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=False,
+        shape=spec,
+    )
+    got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
+
+    q_ref = q.float().detach().requires_grad_()
+    k_ref = k.float().detach().requires_grad_()
+    v_ref = v.float().detach().requires_grad_()
+    scale = 1.0 / math.sqrt(spec.head_dim) if softmax_scale is None else softmax_scale
+    expected = reference_attention(
+        q_ref, k_ref, v_ref, spec, scale
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=5e-2, rtol=2e-2
+        )
+
+
+@requires_cuda
+def test_requires_grad_rejects_shape_without_backward() -> None:
+    entry = next(item for item in SHAPES if not item.get("backward", False))
+    spec = spec_from_manifest_entry(entry)
+    q, k, v = make_inputs(spec)
+    q.requires_grad_()
+    with pytest.raises(NotImplementedError, match="backward kernel"):
+        helion_attention.flash_attn_func(
+            q, k, v, causal=spec.causal, shape=spec
+        )
 
 
 @requires_cuda

@@ -18,6 +18,10 @@ KERNELS_PACKAGE = "helion_attention.kernels"
 _MANIFEST_PATH = Path(__file__).parent / "kernels" / "manifest.json"
 
 AttnKernel = Callable[[torch.Tensor, torch.Tensor, torch.Tensor, float], torch.Tensor]
+AttnBackwardKernel = Callable[
+    [torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
 
 
 class KernelModule(Protocol):
@@ -68,6 +72,23 @@ def _load(key: str) -> AttnKernel:
     return module.attention
 
 
+@lru_cache(maxsize=None)
+def _load_backward(key: str) -> AttnBackwardKernel:
+    module = importlib.import_module(f"{KERNELS_PACKAGE}.{key}_backward")
+    return module.attention_backward
+
+
+def _entry_for_spec(spec: AttnShape) -> dict[str, object] | None:
+    entry = _manifest().get(spec.key)
+    if entry is None and spec.is_decode:
+        # With a single bottom-right-aligned query, causal and non-causal both
+        # expose the entire cache. Reuse the one generated specialization so
+        # the FlashAttention-compatible default (causal=False) also works.
+        equivalent = replace(spec, causal=not spec.causal)
+        entry = _manifest().get(equivalent.key)
+    return entry
+
+
 def _nearest(spec: AttnShape, limit: int = 8) -> list[str]:
     """Shapes that differ from ``spec`` in the fewest fields, for the error text."""
     fields = ("batch", "seqlen_q", "seqlen_k", "nheads_q", "nheads_kv", "head_dim")
@@ -83,13 +104,7 @@ def _nearest(spec: AttnShape, limit: int = 8) -> list[str]:
 
 def lookup(spec: AttnShape) -> AttnKernel:
     """Return the generated kernel for ``spec`` or explain how to get one."""
-    entry = _manifest().get(spec.key)
-    if entry is None and spec.is_decode:
-        # With a single bottom-right-aligned query, causal and non-causal both
-        # expose the entire cache. Reuse the one generated specialization so
-        # the FlashAttention-compatible default (causal=False) also works.
-        equivalent = replace(spec, causal=not spec.causal)
-        entry = _manifest().get(equivalent.key)
+    entry = _entry_for_spec(spec)
     if entry is None:
         nearest = _nearest(spec)
         listing = "\n".join(f"    {item}" for item in nearest)
@@ -101,3 +116,27 @@ def lookup(spec: AttnShape) -> AttnKernel:
             "above and it can be generated and added."
         )
     return _load(str(entry["key"]))
+
+
+def has_backward(spec: AttnShape) -> bool:
+    """Whether this forward specialization also ships generated gradients."""
+    entry = _entry_for_spec(spec)
+    return entry is not None and bool(entry.get("backward", False))
+
+
+def lookup_backward(spec: AttnShape) -> AttnBackwardKernel:
+    """Return the generated backward kernel for ``spec``."""
+    entry = _entry_for_spec(spec)
+    if entry is None or not entry.get("backward", False):
+        supported = [
+            str(item["description"])
+            for item in _manifest().values()
+            if item.get("backward", False)
+        ]
+        listing = "\n".join(f"    {item}" for item in supported)
+        raise NotImplementedError(
+            "no helion-attention backward kernel is checked in for:\n"
+            f"    {spec.describe()}\n"
+            f"training-enabled shapes:\n{listing or '    (none)'}"
+        )
+    return _load_backward(str(entry["key"]))

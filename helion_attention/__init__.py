@@ -17,9 +17,11 @@ import math
 
 import torch
 
+from ._autograd import attention_autograd
 from ._registry import UnsupportedShapeError
 from ._registry import available_shapes
 from ._registry import lookup
+from ._registry import lookup_backward
 from ._shape import AttnShape
 from ._shape import ShapeLike
 from ._shape import check_tensors
@@ -84,7 +86,7 @@ def flash_attn_func(
     *,
     shape: ShapeLike,
 ) -> torch.Tensor:
-    """Drop-in replacement for ``flash_attn.flash_attn_func`` (forward only).
+    """Drop-in replacement for ``flash_attn.flash_attn_func``.
 
     Args:
         q: ``[batch, seqlen_q, nheads_q, head_dim]``, contiguous, fp16 or bf16.
@@ -111,14 +113,19 @@ def flash_attn_func(
             "causal attention with unequal sequence lengths is implemented only "
             "for single-token decode (seqlen_q=1)"
         )
-    if q.requires_grad or k.requires_grad or v.requires_grad:
-        raise NotImplementedError(
-            "helion-attention ships forward-only kernels; run under torch.no_grad() "
-            "or detach the inputs"
-        )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
-    return lookup(spec)(q, k, v, float(softmax_scale))
+    kernel = lookup(spec)
+    scale = float(softmax_scale)
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (q, k, v)
+    )
+    if needs_backward:
+        # Resolve this before launching the forward so unsupported training
+        # shapes fail at the call site rather than later during loss.backward().
+        lookup_backward(spec)
+        return attention_autograd(q, k, v, scale, spec)
+    return kernel(q, k, v, scale)
 
 
 def flash_attn_with_kvcache(
