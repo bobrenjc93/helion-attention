@@ -31,59 +31,59 @@ from .._launcher import default_launcher as _default_launcher
 from .._runtime import get_num_sm
 from .._runtime import set_triton_allocator
 
-_BLOCK_SIZE_2 = tl.constexpr(256)
-_BLOCK_SIZE_4 = tl.constexpr(32)
-_BLOCK_SIZE_7 = tl.constexpr(64)
-_BLOCK_SIZE_8 = tl.constexpr(16)
+_BLOCK_SIZE_2 = tl.constexpr(32)
+_BLOCK_SIZE_4 = tl.constexpr(64)
+_BLOCK_SIZE_7 = tl.constexpr(16)
+_BLOCK_SIZE_8 = tl.constexpr(64)
 _BLOCK_SIZE_11 = tl.constexpr(64)
-_BLOCK_SIZE_12 = tl.constexpr(16)
-_BLOCK_SIZE_15 = tl.constexpr(32)
+_BLOCK_SIZE_12 = tl.constexpr(32)
+_BLOCK_SIZE_15 = tl.constexpr(64)
 _BLOCK_SIZE_16 = tl.constexpr(16)
 
 @triton.jit
 def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x_grid_sem, qk_scale, sm_scale, _NUM_SM: tl.constexpr, _RDIM_SIZE_3: tl.constexpr):
-    # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
-    # src[helion_kernels.py:335]:     for tile_n in hl.tile(n_dim):
-    # src[helion_kernels.py:336]:         k_blk = k[b, tile_n, h, :]
-    # src[helion_kernels.py:334-354]: ...
+    # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
+    # src[helion_kernels.py:339]:     for tile_n in hl.tile(n_dim):
+    # src[helion_kernels.py:340]:         k_blk = k[b, tile_n, h, :]
+    # src[helion_kernels.py:338-358]: ...
     total_pids = 8 * 16 + 8 * 16 + 8 * 16 + 8 * 16
-    block_size = tl.cdiv(total_pids, _NUM_SM * 4)
+    block_size = tl.cdiv(total_pids, _NUM_SM)
     start_pid = tl.program_id(0) * block_size
     end_pid = start_pid + block_size
     if end_pid > total_pids:
         end_pid = total_pids
-    for virtual_pid in tl.range(start_pid, end_pid):
+    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=2):
         if virtual_pid >= 0 and virtual_pid < 0 + 8 * 16:
             pid_shared = virtual_pid
-            # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
-            # src[helion_kernels.py:278]:     for tile_m in hl.tile(m_dim):
-            # src[helion_kernels.py:279]:         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-            # src[helion_kernels.py:277-290]: ...
+            # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
+            # src[helion_kernels.py:282]:     for tile_m in hl.tile(m_dim):
+            # src[helion_kernels.py:283]:         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+            # src[helion_kernels.py:281-294]: ...
             if pid_shared < 8 * 16:
-                # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
                 num_blocks_0 = 8
                 pid_0 = pid_shared % num_blocks_0
                 pid_1 = pid_shared // num_blocks_0
                 offset_0 = pid_0
                 offset_1 = pid_1
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:278]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:279]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-                # src[helion_kernels.py:280]:     l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
-                # src[helion_kernels.py:278-290]: ...
+                # src[helion_kernels.py:282]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:283]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                # src[helion_kernels.py:284]:     l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+                # src[helion_kernels.py:282-294]: ...
                 for offset_2 in tl.range(0, 512, _BLOCK_SIZE_2):
                     indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-                    # src[helion_kernels.py:279]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                    # src[helion_kernels.py:283]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
                     m_i = tl.full([_BLOCK_SIZE_2], float('-inf'), tl.float32)
-                    # src[helion_kernels.py:280]: l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+                    # src[helion_kernels.py:284]: l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
                     l_i = tl.full([_BLOCK_SIZE_2], 1.0, tl.float32)
-                    # src[helion_kernels.py:281]: q_blk = q[b, tile_m, h, :]
-                    q_blk = tl.load(q + (offset_0 * 524288 + indices_2[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-                    # src[helion_kernels.py:282]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:283]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:284]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
-                    # src[helion_kernels.py:282-289]: ...
-                    for offset_4 in tl.range(0, 512, _BLOCK_SIZE_4):
+                    # src[helion_kernels.py:285]: q_blk = q[b, tile_m, h, :]
+                    q_blk = tl.load(q + (offset_0 * 524288 + indices_2[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None)
+                    # src[helion_kernels.py:286]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:287]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:288]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                    # src[helion_kernels.py:286-293]: ...
+                    for offset_4 in tl.range(0, 512, _BLOCK_SIZE_4, disallow_acc_multi_buffer=False):
                         indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                         q_blk_copy = q_blk
                         m_i_copy = m_i
@@ -91,34 +91,34 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         q_blk_copy_0 = q_blk_copy
                         m_i_copy_0 = m_i_copy
                         l_i_copy_0 = l_i_copy
-                        # src[helion_kernels.py:283]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:287]: k_blk = k[b, tile_n, h, :]
                         k_blk = tl.load(k + (offset_0 * 524288 + indices_4[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:284]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:288]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute = tl.permute(k_blk, [1, 0])
                         dot = tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_0 = dot * qk_scale
-                        # src[helion_kernels.py:285]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                        # src[helion_kernels.py:289]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
                         amax = tl.cast(tl.max(v_0, 1), tl.float32)
                         v_1 = tl.maximum(m_i_copy_0, amax, tl.PropagateNan.ALL)
-                        # src[helion_kernels.py:286]: p = torch.exp2(qk - m_ij[:, None])
+                        # src[helion_kernels.py:290]: p = torch.exp2(qk - m_ij[:, None])
                         subscript = v_1[:, None]
                         v_2 = v_0 - subscript
                         v_3 = libdevice.exp2(v_2)
-                        # src[helion_kernels.py:287]: alpha = torch.exp2(m_i - m_ij)
+                        # src[helion_kernels.py:291]: alpha = torch.exp2(m_i - m_ij)
                         v_4 = m_i_copy_0 - v_1
                         v_5 = libdevice.exp2(v_4)
-                        # src[helion_kernels.py:288]: l_i = l_i * alpha + torch.sum(p, -1)
+                        # src[helion_kernels.py:292]: l_i = l_i * alpha + torch.sum(p, -1)
                         v_6 = l_i_copy_0 * v_5
                         sum_1 = tl.cast(tl.sum(v_3, 1), tl.float32)
                         l_i = v_6 + sum_1
-                        # src[helion_kernels.py:289]: m_i = m_ij
+                        # src[helion_kernels.py:293]: m_i = m_ij
                         m_i = v_1
-                    # src[helion_kernels.py:290]: lse[b, tile_m, h] = m_i + torch.log2(l_i)
+                    # src[helion_kernels.py:294]: lse[b, tile_m, h] = m_i + torch.log2(l_i)
                     v_8 = libdevice.log2(l_i)
                     v_9 = m_i + v_8
                     tl.store(lse + (offset_0 * 8192 + indices_2 * 16 + offset_1 * 1), v_9, None)
             elif pid_shared < 8 * 16 + 8 * 16:
-                # src[helion_kernels.py:296]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:300]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16, tl.int32)
                 num_blocks_1 = 8
                 pid_2 = pid_shared % num_blocks_1
@@ -126,25 +126,25 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_5 = pid_2
                 offset_6 = pid_3
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:297]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:298]:     q_blk = q[b, tile_m, h, :]
-                # src[helion_kernels.py:299]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                # src[helion_kernels.py:297-309]: ...
+                # src[helion_kernels.py:301]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:302]:     q_blk = q[b, tile_m, h, :]
+                # src[helion_kernels.py:303]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                # src[helion_kernels.py:301-313]: ...
                 for offset_7 in tl.range(0, 512, _BLOCK_SIZE_7):
                     indices_7 = offset_7 + tl.arange(0, _BLOCK_SIZE_7).to(tl.int32)
-                    # src[helion_kernels.py:298]: q_blk = q[b, tile_m, h, :]
-                    q_blk_1 = tl.load(q + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-                    # src[helion_kernels.py:299]: grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:302]: q_blk = q[b, tile_m, h, :]
+                    q_blk_1 = tl.load(q + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
+                    # src[helion_kernels.py:303]: grad_out_blk = grad_out[b, tile_m, h, :]
                     grad_out_blk = tl.load(grad_out + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:300]: lse_blk = lse[b, tile_m, h]
+                    # src[helion_kernels.py:304]: lse_blk = lse[b, tile_m, h]
                     lse_blk = tl.load(lse + (offset_5 * 8192 + indices_7 * 16 + offset_6 * 1), None)
-                    # src[helion_kernels.py:301]: delta_acc = hl.zeros([tile_m], dtype=torch.float32)
+                    # src[helion_kernels.py:305]: delta_acc = hl.zeros([tile_m], dtype=torch.float32)
                     delta_acc = tl.full([_BLOCK_SIZE_7], 0.0, tl.float32)
-                    # src[helion_kernels.py:302]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:303]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:304]:     v_blk = v[b, tile_n, h, :]
-                    # src[helion_kernels.py:302-308]: ...
-                    for offset_8 in tl.range(0, 512, _BLOCK_SIZE_8, loop_unroll_factor=1):
+                    # src[helion_kernels.py:306]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:307]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:308]:     v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:306-312]: ...
+                    for offset_8 in tl.range(0, 512, _BLOCK_SIZE_8):
                         indices_8 = offset_8 + tl.arange(0, _BLOCK_SIZE_8).to(tl.int32)
                         q_blk_1_copy = q_blk_1
                         lse_blk_copy = lse_blk
@@ -154,29 +154,29 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         lse_blk_copy_0 = lse_blk_copy
                         grad_out_blk_copy_0 = grad_out_blk_copy
                         delta_acc_copy_0 = delta_acc_copy
-                        # src[helion_kernels.py:303]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:307]: k_blk = k[b, tile_n, h, :]
                         k_blk_1 = tl.load(k + (offset_5 * 524288 + indices_8[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:304]: v_blk = v[b, tile_n, h, :]
+                        # src[helion_kernels.py:308]: v_blk = v[b, tile_n, h, :]
                         v_blk = tl.load(v + (offset_5 * 524288 + indices_8[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:305]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:309]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_1 = tl.permute(k_blk_1, [1, 0])
                         dot_1 = tl.dot(tl.cast(q_blk_1_copy_0, tl.bfloat16), tl.cast(permute_1, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_10 = dot_1 * qk_scale
-                        # src[helion_kernels.py:306]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:310]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_1 = lse_blk_copy_0[:, None]
                         v_11 = v_10 - subscript_1
                         v_12 = libdevice.exp2(v_11)
-                        # src[helion_kernels.py:307]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:311]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_2 = tl.permute(v_blk, [1, 0])
                         dp = tl.dot(tl.cast(grad_out_blk_copy_0, tl.bfloat16), tl.cast(permute_2, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:308]: delta_acc = delta_acc + torch.sum(p * dp, -1)
+                        # src[helion_kernels.py:312]: delta_acc = delta_acc + torch.sum(p * dp, -1)
                         v_13 = v_12 * dp
                         sum_2 = tl.cast(tl.sum(v_13, 1), tl.float32)
                         delta_acc = delta_acc_copy_0 + sum_2
-                    # src[helion_kernels.py:309]: delta[b, tile_m, h] = delta_acc
+                    # src[helion_kernels.py:313]: delta[b, tile_m, h] = delta_acc
                     tl.store(delta + (offset_5 * 8192 + indices_7 * 16 + offset_6 * 1), delta_acc, None)
             elif pid_shared < 8 * 16 + 8 * 16 + 8 * 16:
-                # src[helion_kernels.py:314]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:318]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16 + 8 * 16, tl.int32)
                 num_blocks_2 = 8
                 pid_4 = pid_shared % num_blocks_2
@@ -184,26 +184,26 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_9 = pid_4
                 offset_10 = pid_5
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:315]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:316]:     q_blk = q[b, tile_m, h, :]
-                # src[helion_kernels.py:317]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                # src[helion_kernels.py:315-329]: ...
-                for offset_11 in tl.range(0, 512, _BLOCK_SIZE_11):
+                # src[helion_kernels.py:319]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:320]:     q_blk = q[b, tile_m, h, :]
+                # src[helion_kernels.py:321]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                # src[helion_kernels.py:319-333]: ...
+                for offset_11 in tl.range(0, 512, _BLOCK_SIZE_11, num_stages=1):
                     indices_11 = offset_11 + tl.arange(0, _BLOCK_SIZE_11).to(tl.int32)
-                    # src[helion_kernels.py:316]: q_blk = q[b, tile_m, h, :]
+                    # src[helion_kernels.py:320]: q_blk = q[b, tile_m, h, :]
                     q_blk_2 = tl.load(q + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:317]: grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:321]: grad_out_blk = grad_out[b, tile_m, h, :]
                     grad_out_blk_1 = tl.load(grad_out + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:318]: delta_blk = delta[b, tile_m, h]
+                    # src[helion_kernels.py:322]: delta_blk = delta[b, tile_m, h]
                     delta_blk = tl.load(delta + (offset_9 * 8192 + indices_11 * 16 + offset_10 * 1), None)
-                    # src[helion_kernels.py:319]: lse_blk = lse[b, tile_m, h]
+                    # src[helion_kernels.py:323]: lse_blk = lse[b, tile_m, h]
                     lse_blk_1 = tl.load(lse + (offset_9 * 8192 + indices_11 * 16 + offset_10 * 1), None)
-                    # src[helion_kernels.py:320]: dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:324]: dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
                     dq_acc = tl.full([_BLOCK_SIZE_11, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:321]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:322]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:323]:     v_blk = v[b, tile_n, h, :]
-                    # src[helion_kernels.py:321-328]: ...
+                    # src[helion_kernels.py:325]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:326]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:327]:     v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:325-332]: ...
                     for offset_12 in tl.range(0, 512, _BLOCK_SIZE_12):
                         indices_12 = offset_12 + tl.arange(0, _BLOCK_SIZE_12).to(tl.int32)
                         q_blk_2_copy = q_blk_2
@@ -216,34 +216,34 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         grad_out_blk_1_copy_0 = grad_out_blk_1_copy
                         delta_blk_copy_0 = delta_blk_copy
                         dq_acc_copy_0 = dq_acc_copy
-                        # src[helion_kernels.py:322]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:326]: k_blk = k[b, tile_n, h, :]
                         k_blk_2 = tl.load(k + (offset_9 * 524288 + indices_12[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:323]: v_blk = v[b, tile_n, h, :]
+                        # src[helion_kernels.py:327]: v_blk = v[b, tile_n, h, :]
                         v_blk_1 = tl.load(v + (offset_9 * 524288 + indices_12[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:324]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:328]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_3 = tl.permute(k_blk_2, [1, 0])
                         dot_2 = tl.dot(tl.cast(q_blk_2_copy_0, tl.bfloat16), tl.cast(permute_3, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_15 = dot_2 * qk_scale
-                        # src[helion_kernels.py:325]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:329]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_2 = lse_blk_1_copy_0[:, None]
                         v_16 = v_15 - subscript_2
                         v_17 = libdevice.exp2(v_16)
-                        # src[helion_kernels.py:326]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:330]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_4 = tl.permute(v_blk_1, [1, 0])
                         dp_1 = tl.dot(tl.cast(grad_out_blk_1_copy_0, tl.bfloat16), tl.cast(permute_4, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:327]: ds = p * (dp - delta_blk[:, None])
+                        # src[helion_kernels.py:331]: ds = p * (dp - delta_blk[:, None])
                         subscript_3 = delta_blk_copy_0[:, None]
                         v_18 = dp_1 - subscript_3
                         v_19 = v_17 * v_18
-                        # src[helion_kernels.py:328]: dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
+                        # src[helion_kernels.py:332]: dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
                         v_20 = tl.cast(k_blk_2, tl.float32)
                         dq_acc = tl.dot(tl.cast(v_19, tl.float32), tl.cast(v_20, tl.float32), acc=dq_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                    # src[helion_kernels.py:329]: dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
+                    # src[helion_kernels.py:333]: dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
                     v_21 = dq_acc * sm_scale
                     v_22 = tl.cast(v_21, tl.bfloat16)
                     tl.store(dq + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), v_22, None)
             else:
-                # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16 + 8 * 16 + 8 * 16, tl.int32)
                 num_blocks_3 = 8
                 pid_6 = pid_shared % num_blocks_3
@@ -251,25 +251,25 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_13 = pid_6
                 offset_14 = pid_7
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:335]: for tile_n in hl.tile(n_dim):
-                # src[helion_kernels.py:336]:     k_blk = k[b, tile_n, h, :]
-                # src[helion_kernels.py:337]:     v_blk = v[b, tile_n, h, :]
-                # src[helion_kernels.py:335-354]: ...
+                # src[helion_kernels.py:339]: for tile_n in hl.tile(n_dim):
+                # src[helion_kernels.py:340]:     k_blk = k[b, tile_n, h, :]
+                # src[helion_kernels.py:341]:     v_blk = v[b, tile_n, h, :]
+                # src[helion_kernels.py:339-358]: ...
                 for offset_15 in tl.range(0, 512, _BLOCK_SIZE_15):
                     indices_15 = offset_15 + tl.arange(0, _BLOCK_SIZE_15).to(tl.int32)
-                    # src[helion_kernels.py:336]: k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:340]: k_blk = k[b, tile_n, h, :]
                     k_blk_3 = tl.load(k + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:337]: v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:341]: v_blk = v[b, tile_n, h, :]
                     v_blk_2 = tl.load(v + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:338]: dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:342]: dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
                     dk_acc = tl.full([_BLOCK_SIZE_15, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:339]: dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:343]: dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
                     dv_acc = tl.full([_BLOCK_SIZE_15, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:340]: for tile_m in hl.tile(m_dim):
-                    # src[helion_kernels.py:341]:     q_blk = q[b, tile_m, h, :]
-                    # src[helion_kernels.py:342]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                    # src[helion_kernels.py:340-352]: ...
-                    for offset_16 in tl.range(0, 512, _BLOCK_SIZE_16):
+                    # src[helion_kernels.py:344]: for tile_m in hl.tile(m_dim):
+                    # src[helion_kernels.py:345]:     q_blk = q[b, tile_m, h, :]
+                    # src[helion_kernels.py:346]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:344-356]: ...
+                    for offset_16 in tl.range(0, 512, _BLOCK_SIZE_16, num_stages=2):
                         indices_16 = offset_16 + tl.arange(0, _BLOCK_SIZE_16).to(tl.int32)
                         k_blk_3_copy = k_blk_3
                         v_blk_2_copy = v_blk_2
@@ -279,84 +279,84 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         v_blk_2_copy_0 = v_blk_2_copy
                         dk_acc_copy_0 = dk_acc_copy
                         dv_acc_copy_0 = dv_acc_copy
-                        # src[helion_kernels.py:341]: q_blk = q[b, tile_m, h, :]
+                        # src[helion_kernels.py:345]: q_blk = q[b, tile_m, h, :]
                         q_blk_3 = tl.load(q + (offset_13 * 524288 + indices_16[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:342]: grad_out_blk = grad_out[b, tile_m, h, :]
+                        # src[helion_kernels.py:346]: grad_out_blk = grad_out[b, tile_m, h, :]
                         grad_out_blk_2 = tl.load(grad_out + (offset_13 * 524288 + indices_16[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:343]: delta_blk = delta[b, tile_m, h]
+                        # src[helion_kernels.py:347]: delta_blk = delta[b, tile_m, h]
                         delta_blk_1 = tl.load(delta + (offset_13 * 8192 + indices_16 * 16 + offset_14 * 1), None)
-                        # src[helion_kernels.py:344]: lse_blk = lse[b, tile_m, h]
+                        # src[helion_kernels.py:348]: lse_blk = lse[b, tile_m, h]
                         lse_blk_2 = tl.load(lse + (offset_13 * 8192 + indices_16 * 16 + offset_14 * 1), None)
-                        # src[helion_kernels.py:345]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:349]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_5 = tl.permute(k_blk_3_copy_0, [1, 0])
                         dot_3 = tl.dot(tl.cast(q_blk_3, tl.bfloat16), tl.cast(permute_5, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_23 = dot_3 * qk_scale
-                        # src[helion_kernels.py:346]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:350]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_4 = lse_blk_2[:, None]
                         v_24 = v_23 - subscript_4
                         v_25 = libdevice.exp2(v_24)
-                        # src[helion_kernels.py:347]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:351]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_6 = tl.permute(v_blk_2_copy_0, [1, 0])
                         dp_2 = tl.dot(tl.cast(grad_out_blk_2, tl.bfloat16), tl.cast(permute_6, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:348]: ds = p * (dp - delta_blk[:, None])
+                        # src[helion_kernels.py:352]: ds = p * (dp - delta_blk[:, None])
                         subscript_5 = delta_blk_1[:, None]
                         v_26 = dp_2 - subscript_5
                         v_27 = v_25 * v_26
-                        # src[helion_kernels.py:349]: dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
+                        # src[helion_kernels.py:353]: dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
                         permute_7 = tl.permute(v_27, [1, 0])
                         v_28 = tl.cast(q_blk_3, tl.float32)
                         dk_acc = tl.dot(tl.cast(permute_7, tl.float32), tl.cast(v_28, tl.float32), acc=dk_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:351]: p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                        # src[helion_kernels.py:355]: p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
                         permute_8 = tl.permute(v_25, [1, 0])
                         v_29 = tl.cast(permute_8, tl.bfloat16)
-                        # src[helion_kernels.py:350]: dv_acc = hl.dot(
-                        # src[helion_kernels.py:351]:     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
-                        # src[helion_kernels.py:352]: )
+                        # src[helion_kernels.py:354]: dv_acc = hl.dot(
+                        # src[helion_kernels.py:355]:     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                        # src[helion_kernels.py:356]: )
                         dv_acc = tl.dot(tl.cast(v_29, tl.bfloat16), tl.cast(grad_out_blk_2, tl.bfloat16), acc=dv_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                    # src[helion_kernels.py:353]: dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
+                    # src[helion_kernels.py:357]: dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
                     v_30 = dk_acc * sm_scale
                     v_31 = tl.cast(v_30, tl.bfloat16)
                     tl.store(dk + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), v_31, None)
-                    # src[helion_kernels.py:354]: dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
+                    # src[helion_kernels.py:358]: dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
                     v_32 = tl.cast(dv_acc, tl.bfloat16)
                     tl.store(dv + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), v_32, None)
-    # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
-    # src[helion_kernels.py:335]:     for tile_n in hl.tile(n_dim):
-    # src[helion_kernels.py:336]:         k_blk = k[b, tile_n, h, :]
-    # src[helion_kernels.py:334-354]: ...
+    # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
+    # src[helion_kernels.py:339]:     for tile_n in hl.tile(n_dim):
+    # src[helion_kernels.py:340]:         k_blk = k[b, tile_n, h, :]
+    # src[helion_kernels.py:338-358]: ...
     triton_helpers.x_grid_barrier(x_grid_sem)
-    for virtual_pid in tl.range(start_pid, end_pid):
+    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=2):
         if virtual_pid >= 0 + 8 * 16 and virtual_pid < 0 + 8 * 16 + 8 * 16:
             pid_shared = virtual_pid
-            # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
-            # src[helion_kernels.py:278]:     for tile_m in hl.tile(m_dim):
-            # src[helion_kernels.py:279]:         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-            # src[helion_kernels.py:277-290]: ...
+            # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
+            # src[helion_kernels.py:282]:     for tile_m in hl.tile(m_dim):
+            # src[helion_kernels.py:283]:         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+            # src[helion_kernels.py:281-294]: ...
             if pid_shared < 8 * 16:
-                # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
                 num_blocks_0 = 8
                 pid_0 = pid_shared % num_blocks_0
                 pid_1 = pid_shared // num_blocks_0
                 offset_0 = pid_0
                 offset_1 = pid_1
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:278]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:279]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-                # src[helion_kernels.py:280]:     l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
-                # src[helion_kernels.py:278-290]: ...
+                # src[helion_kernels.py:282]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:283]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                # src[helion_kernels.py:284]:     l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+                # src[helion_kernels.py:282-294]: ...
                 for offset_2 in tl.range(0, 512, _BLOCK_SIZE_2):
                     indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-                    # src[helion_kernels.py:279]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                    # src[helion_kernels.py:283]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
                     m_i = tl.full([_BLOCK_SIZE_2], float('-inf'), tl.float32)
-                    # src[helion_kernels.py:280]: l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+                    # src[helion_kernels.py:284]: l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
                     l_i = tl.full([_BLOCK_SIZE_2], 1.0, tl.float32)
-                    # src[helion_kernels.py:281]: q_blk = q[b, tile_m, h, :]
-                    q_blk = tl.load(q + (offset_0 * 524288 + indices_2[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-                    # src[helion_kernels.py:282]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:283]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:284]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
-                    # src[helion_kernels.py:282-289]: ...
-                    for offset_4 in tl.range(0, 512, _BLOCK_SIZE_4):
+                    # src[helion_kernels.py:285]: q_blk = q[b, tile_m, h, :]
+                    q_blk = tl.load(q + (offset_0 * 524288 + indices_2[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None)
+                    # src[helion_kernels.py:286]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:287]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:288]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                    # src[helion_kernels.py:286-293]: ...
+                    for offset_4 in tl.range(0, 512, _BLOCK_SIZE_4, disallow_acc_multi_buffer=False):
                         indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                         q_blk_copy = q_blk
                         m_i_copy = m_i
@@ -364,34 +364,34 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         q_blk_copy_0 = q_blk_copy
                         m_i_copy_0 = m_i_copy
                         l_i_copy_0 = l_i_copy
-                        # src[helion_kernels.py:283]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:287]: k_blk = k[b, tile_n, h, :]
                         k_blk = tl.load(k + (offset_0 * 524288 + indices_4[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:284]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:288]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute = tl.permute(k_blk, [1, 0])
                         dot = tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_0 = dot * qk_scale
-                        # src[helion_kernels.py:285]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                        # src[helion_kernels.py:289]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
                         amax = tl.cast(tl.max(v_0, 1), tl.float32)
                         v_1 = tl.maximum(m_i_copy_0, amax, tl.PropagateNan.ALL)
-                        # src[helion_kernels.py:286]: p = torch.exp2(qk - m_ij[:, None])
+                        # src[helion_kernels.py:290]: p = torch.exp2(qk - m_ij[:, None])
                         subscript = v_1[:, None]
                         v_2 = v_0 - subscript
                         v_3 = libdevice.exp2(v_2)
-                        # src[helion_kernels.py:287]: alpha = torch.exp2(m_i - m_ij)
+                        # src[helion_kernels.py:291]: alpha = torch.exp2(m_i - m_ij)
                         v_4 = m_i_copy_0 - v_1
                         v_5 = libdevice.exp2(v_4)
-                        # src[helion_kernels.py:288]: l_i = l_i * alpha + torch.sum(p, -1)
+                        # src[helion_kernels.py:292]: l_i = l_i * alpha + torch.sum(p, -1)
                         v_6 = l_i_copy_0 * v_5
                         sum_1 = tl.cast(tl.sum(v_3, 1), tl.float32)
                         l_i = v_6 + sum_1
-                        # src[helion_kernels.py:289]: m_i = m_ij
+                        # src[helion_kernels.py:293]: m_i = m_ij
                         m_i = v_1
-                    # src[helion_kernels.py:290]: lse[b, tile_m, h] = m_i + torch.log2(l_i)
+                    # src[helion_kernels.py:294]: lse[b, tile_m, h] = m_i + torch.log2(l_i)
                     v_8 = libdevice.log2(l_i)
                     v_9 = m_i + v_8
                     tl.store(lse + (offset_0 * 8192 + indices_2 * 16 + offset_1 * 1), v_9, None)
             elif pid_shared < 8 * 16 + 8 * 16:
-                # src[helion_kernels.py:296]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:300]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16, tl.int32)
                 num_blocks_1 = 8
                 pid_2 = pid_shared % num_blocks_1
@@ -399,25 +399,25 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_5 = pid_2
                 offset_6 = pid_3
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:297]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:298]:     q_blk = q[b, tile_m, h, :]
-                # src[helion_kernels.py:299]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                # src[helion_kernels.py:297-309]: ...
+                # src[helion_kernels.py:301]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:302]:     q_blk = q[b, tile_m, h, :]
+                # src[helion_kernels.py:303]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                # src[helion_kernels.py:301-313]: ...
                 for offset_7 in tl.range(0, 512, _BLOCK_SIZE_7):
                     indices_7 = offset_7 + tl.arange(0, _BLOCK_SIZE_7).to(tl.int32)
-                    # src[helion_kernels.py:298]: q_blk = q[b, tile_m, h, :]
-                    q_blk_1 = tl.load(q + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-                    # src[helion_kernels.py:299]: grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:302]: q_blk = q[b, tile_m, h, :]
+                    q_blk_1 = tl.load(q + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
+                    # src[helion_kernels.py:303]: grad_out_blk = grad_out[b, tile_m, h, :]
                     grad_out_blk = tl.load(grad_out + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:300]: lse_blk = lse[b, tile_m, h]
+                    # src[helion_kernels.py:304]: lse_blk = lse[b, tile_m, h]
                     lse_blk = tl.load(lse + (offset_5 * 8192 + indices_7 * 16 + offset_6 * 1), None)
-                    # src[helion_kernels.py:301]: delta_acc = hl.zeros([tile_m], dtype=torch.float32)
+                    # src[helion_kernels.py:305]: delta_acc = hl.zeros([tile_m], dtype=torch.float32)
                     delta_acc = tl.full([_BLOCK_SIZE_7], 0.0, tl.float32)
-                    # src[helion_kernels.py:302]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:303]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:304]:     v_blk = v[b, tile_n, h, :]
-                    # src[helion_kernels.py:302-308]: ...
-                    for offset_8 in tl.range(0, 512, _BLOCK_SIZE_8, loop_unroll_factor=1):
+                    # src[helion_kernels.py:306]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:307]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:308]:     v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:306-312]: ...
+                    for offset_8 in tl.range(0, 512, _BLOCK_SIZE_8):
                         indices_8 = offset_8 + tl.arange(0, _BLOCK_SIZE_8).to(tl.int32)
                         q_blk_1_copy = q_blk_1
                         lse_blk_copy = lse_blk
@@ -427,29 +427,29 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         lse_blk_copy_0 = lse_blk_copy
                         grad_out_blk_copy_0 = grad_out_blk_copy
                         delta_acc_copy_0 = delta_acc_copy
-                        # src[helion_kernels.py:303]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:307]: k_blk = k[b, tile_n, h, :]
                         k_blk_1 = tl.load(k + (offset_5 * 524288 + indices_8[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:304]: v_blk = v[b, tile_n, h, :]
+                        # src[helion_kernels.py:308]: v_blk = v[b, tile_n, h, :]
                         v_blk = tl.load(v + (offset_5 * 524288 + indices_8[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:305]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:309]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_1 = tl.permute(k_blk_1, [1, 0])
                         dot_1 = tl.dot(tl.cast(q_blk_1_copy_0, tl.bfloat16), tl.cast(permute_1, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_10 = dot_1 * qk_scale
-                        # src[helion_kernels.py:306]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:310]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_1 = lse_blk_copy_0[:, None]
                         v_11 = v_10 - subscript_1
                         v_12 = libdevice.exp2(v_11)
-                        # src[helion_kernels.py:307]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:311]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_2 = tl.permute(v_blk, [1, 0])
                         dp = tl.dot(tl.cast(grad_out_blk_copy_0, tl.bfloat16), tl.cast(permute_2, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:308]: delta_acc = delta_acc + torch.sum(p * dp, -1)
+                        # src[helion_kernels.py:312]: delta_acc = delta_acc + torch.sum(p * dp, -1)
                         v_13 = v_12 * dp
                         sum_2 = tl.cast(tl.sum(v_13, 1), tl.float32)
                         delta_acc = delta_acc_copy_0 + sum_2
-                    # src[helion_kernels.py:309]: delta[b, tile_m, h] = delta_acc
+                    # src[helion_kernels.py:313]: delta[b, tile_m, h] = delta_acc
                     tl.store(delta + (offset_5 * 8192 + indices_7 * 16 + offset_6 * 1), delta_acc, None)
             elif pid_shared < 8 * 16 + 8 * 16 + 8 * 16:
-                # src[helion_kernels.py:314]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:318]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16 + 8 * 16, tl.int32)
                 num_blocks_2 = 8
                 pid_4 = pid_shared % num_blocks_2
@@ -457,26 +457,26 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_9 = pid_4
                 offset_10 = pid_5
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:315]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:316]:     q_blk = q[b, tile_m, h, :]
-                # src[helion_kernels.py:317]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                # src[helion_kernels.py:315-329]: ...
-                for offset_11 in tl.range(0, 512, _BLOCK_SIZE_11):
+                # src[helion_kernels.py:319]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:320]:     q_blk = q[b, tile_m, h, :]
+                # src[helion_kernels.py:321]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                # src[helion_kernels.py:319-333]: ...
+                for offset_11 in tl.range(0, 512, _BLOCK_SIZE_11, num_stages=1):
                     indices_11 = offset_11 + tl.arange(0, _BLOCK_SIZE_11).to(tl.int32)
-                    # src[helion_kernels.py:316]: q_blk = q[b, tile_m, h, :]
+                    # src[helion_kernels.py:320]: q_blk = q[b, tile_m, h, :]
                     q_blk_2 = tl.load(q + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:317]: grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:321]: grad_out_blk = grad_out[b, tile_m, h, :]
                     grad_out_blk_1 = tl.load(grad_out + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:318]: delta_blk = delta[b, tile_m, h]
+                    # src[helion_kernels.py:322]: delta_blk = delta[b, tile_m, h]
                     delta_blk = tl.load(delta + (offset_9 * 8192 + indices_11 * 16 + offset_10 * 1), None)
-                    # src[helion_kernels.py:319]: lse_blk = lse[b, tile_m, h]
+                    # src[helion_kernels.py:323]: lse_blk = lse[b, tile_m, h]
                     lse_blk_1 = tl.load(lse + (offset_9 * 8192 + indices_11 * 16 + offset_10 * 1), None)
-                    # src[helion_kernels.py:320]: dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:324]: dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
                     dq_acc = tl.full([_BLOCK_SIZE_11, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:321]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:322]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:323]:     v_blk = v[b, tile_n, h, :]
-                    # src[helion_kernels.py:321-328]: ...
+                    # src[helion_kernels.py:325]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:326]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:327]:     v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:325-332]: ...
                     for offset_12 in tl.range(0, 512, _BLOCK_SIZE_12):
                         indices_12 = offset_12 + tl.arange(0, _BLOCK_SIZE_12).to(tl.int32)
                         q_blk_2_copy = q_blk_2
@@ -489,34 +489,34 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         grad_out_blk_1_copy_0 = grad_out_blk_1_copy
                         delta_blk_copy_0 = delta_blk_copy
                         dq_acc_copy_0 = dq_acc_copy
-                        # src[helion_kernels.py:322]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:326]: k_blk = k[b, tile_n, h, :]
                         k_blk_2 = tl.load(k + (offset_9 * 524288 + indices_12[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:323]: v_blk = v[b, tile_n, h, :]
+                        # src[helion_kernels.py:327]: v_blk = v[b, tile_n, h, :]
                         v_blk_1 = tl.load(v + (offset_9 * 524288 + indices_12[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:324]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:328]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_3 = tl.permute(k_blk_2, [1, 0])
                         dot_2 = tl.dot(tl.cast(q_blk_2_copy_0, tl.bfloat16), tl.cast(permute_3, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_15 = dot_2 * qk_scale
-                        # src[helion_kernels.py:325]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:329]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_2 = lse_blk_1_copy_0[:, None]
                         v_16 = v_15 - subscript_2
                         v_17 = libdevice.exp2(v_16)
-                        # src[helion_kernels.py:326]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:330]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_4 = tl.permute(v_blk_1, [1, 0])
                         dp_1 = tl.dot(tl.cast(grad_out_blk_1_copy_0, tl.bfloat16), tl.cast(permute_4, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:327]: ds = p * (dp - delta_blk[:, None])
+                        # src[helion_kernels.py:331]: ds = p * (dp - delta_blk[:, None])
                         subscript_3 = delta_blk_copy_0[:, None]
                         v_18 = dp_1 - subscript_3
                         v_19 = v_17 * v_18
-                        # src[helion_kernels.py:328]: dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
+                        # src[helion_kernels.py:332]: dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
                         v_20 = tl.cast(k_blk_2, tl.float32)
                         dq_acc = tl.dot(tl.cast(v_19, tl.float32), tl.cast(v_20, tl.float32), acc=dq_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                    # src[helion_kernels.py:329]: dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
+                    # src[helion_kernels.py:333]: dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
                     v_21 = dq_acc * sm_scale
                     v_22 = tl.cast(v_21, tl.bfloat16)
                     tl.store(dq + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), v_22, None)
             else:
-                # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16 + 8 * 16 + 8 * 16, tl.int32)
                 num_blocks_3 = 8
                 pid_6 = pid_shared % num_blocks_3
@@ -524,25 +524,25 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_13 = pid_6
                 offset_14 = pid_7
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:335]: for tile_n in hl.tile(n_dim):
-                # src[helion_kernels.py:336]:     k_blk = k[b, tile_n, h, :]
-                # src[helion_kernels.py:337]:     v_blk = v[b, tile_n, h, :]
-                # src[helion_kernels.py:335-354]: ...
+                # src[helion_kernels.py:339]: for tile_n in hl.tile(n_dim):
+                # src[helion_kernels.py:340]:     k_blk = k[b, tile_n, h, :]
+                # src[helion_kernels.py:341]:     v_blk = v[b, tile_n, h, :]
+                # src[helion_kernels.py:339-358]: ...
                 for offset_15 in tl.range(0, 512, _BLOCK_SIZE_15):
                     indices_15 = offset_15 + tl.arange(0, _BLOCK_SIZE_15).to(tl.int32)
-                    # src[helion_kernels.py:336]: k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:340]: k_blk = k[b, tile_n, h, :]
                     k_blk_3 = tl.load(k + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:337]: v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:341]: v_blk = v[b, tile_n, h, :]
                     v_blk_2 = tl.load(v + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:338]: dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:342]: dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
                     dk_acc = tl.full([_BLOCK_SIZE_15, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:339]: dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:343]: dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
                     dv_acc = tl.full([_BLOCK_SIZE_15, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:340]: for tile_m in hl.tile(m_dim):
-                    # src[helion_kernels.py:341]:     q_blk = q[b, tile_m, h, :]
-                    # src[helion_kernels.py:342]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                    # src[helion_kernels.py:340-352]: ...
-                    for offset_16 in tl.range(0, 512, _BLOCK_SIZE_16):
+                    # src[helion_kernels.py:344]: for tile_m in hl.tile(m_dim):
+                    # src[helion_kernels.py:345]:     q_blk = q[b, tile_m, h, :]
+                    # src[helion_kernels.py:346]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:344-356]: ...
+                    for offset_16 in tl.range(0, 512, _BLOCK_SIZE_16, num_stages=2):
                         indices_16 = offset_16 + tl.arange(0, _BLOCK_SIZE_16).to(tl.int32)
                         k_blk_3_copy = k_blk_3
                         v_blk_2_copy = v_blk_2
@@ -552,84 +552,84 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         v_blk_2_copy_0 = v_blk_2_copy
                         dk_acc_copy_0 = dk_acc_copy
                         dv_acc_copy_0 = dv_acc_copy
-                        # src[helion_kernels.py:341]: q_blk = q[b, tile_m, h, :]
+                        # src[helion_kernels.py:345]: q_blk = q[b, tile_m, h, :]
                         q_blk_3 = tl.load(q + (offset_13 * 524288 + indices_16[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:342]: grad_out_blk = grad_out[b, tile_m, h, :]
+                        # src[helion_kernels.py:346]: grad_out_blk = grad_out[b, tile_m, h, :]
                         grad_out_blk_2 = tl.load(grad_out + (offset_13 * 524288 + indices_16[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:343]: delta_blk = delta[b, tile_m, h]
+                        # src[helion_kernels.py:347]: delta_blk = delta[b, tile_m, h]
                         delta_blk_1 = tl.load(delta + (offset_13 * 8192 + indices_16 * 16 + offset_14 * 1), None)
-                        # src[helion_kernels.py:344]: lse_blk = lse[b, tile_m, h]
+                        # src[helion_kernels.py:348]: lse_blk = lse[b, tile_m, h]
                         lse_blk_2 = tl.load(lse + (offset_13 * 8192 + indices_16 * 16 + offset_14 * 1), None)
-                        # src[helion_kernels.py:345]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:349]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_5 = tl.permute(k_blk_3_copy_0, [1, 0])
                         dot_3 = tl.dot(tl.cast(q_blk_3, tl.bfloat16), tl.cast(permute_5, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_23 = dot_3 * qk_scale
-                        # src[helion_kernels.py:346]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:350]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_4 = lse_blk_2[:, None]
                         v_24 = v_23 - subscript_4
                         v_25 = libdevice.exp2(v_24)
-                        # src[helion_kernels.py:347]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:351]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_6 = tl.permute(v_blk_2_copy_0, [1, 0])
                         dp_2 = tl.dot(tl.cast(grad_out_blk_2, tl.bfloat16), tl.cast(permute_6, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:348]: ds = p * (dp - delta_blk[:, None])
+                        # src[helion_kernels.py:352]: ds = p * (dp - delta_blk[:, None])
                         subscript_5 = delta_blk_1[:, None]
                         v_26 = dp_2 - subscript_5
                         v_27 = v_25 * v_26
-                        # src[helion_kernels.py:349]: dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
+                        # src[helion_kernels.py:353]: dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
                         permute_7 = tl.permute(v_27, [1, 0])
                         v_28 = tl.cast(q_blk_3, tl.float32)
                         dk_acc = tl.dot(tl.cast(permute_7, tl.float32), tl.cast(v_28, tl.float32), acc=dk_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:351]: p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                        # src[helion_kernels.py:355]: p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
                         permute_8 = tl.permute(v_25, [1, 0])
                         v_29 = tl.cast(permute_8, tl.bfloat16)
-                        # src[helion_kernels.py:350]: dv_acc = hl.dot(
-                        # src[helion_kernels.py:351]:     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
-                        # src[helion_kernels.py:352]: )
+                        # src[helion_kernels.py:354]: dv_acc = hl.dot(
+                        # src[helion_kernels.py:355]:     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                        # src[helion_kernels.py:356]: )
                         dv_acc = tl.dot(tl.cast(v_29, tl.bfloat16), tl.cast(grad_out_blk_2, tl.bfloat16), acc=dv_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                    # src[helion_kernels.py:353]: dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
+                    # src[helion_kernels.py:357]: dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
                     v_30 = dk_acc * sm_scale
                     v_31 = tl.cast(v_30, tl.bfloat16)
                     tl.store(dk + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), v_31, None)
-                    # src[helion_kernels.py:354]: dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
+                    # src[helion_kernels.py:358]: dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
                     v_32 = tl.cast(dv_acc, tl.bfloat16)
                     tl.store(dv + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), v_32, None)
-    # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
-    # src[helion_kernels.py:335]:     for tile_n in hl.tile(n_dim):
-    # src[helion_kernels.py:336]:         k_blk = k[b, tile_n, h, :]
-    # src[helion_kernels.py:334-354]: ...
+    # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
+    # src[helion_kernels.py:339]:     for tile_n in hl.tile(n_dim):
+    # src[helion_kernels.py:340]:         k_blk = k[b, tile_n, h, :]
+    # src[helion_kernels.py:338-358]: ...
     triton_helpers.x_grid_barrier(x_grid_sem)
-    for virtual_pid in tl.range(start_pid, end_pid):
+    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=2):
         if virtual_pid >= 0 + 8 * 16 + 8 * 16 and virtual_pid < 0 + 8 * 16 + 8 * 16 + 8 * 16:
             pid_shared = virtual_pid
-            # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
-            # src[helion_kernels.py:278]:     for tile_m in hl.tile(m_dim):
-            # src[helion_kernels.py:279]:         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-            # src[helion_kernels.py:277-290]: ...
+            # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
+            # src[helion_kernels.py:282]:     for tile_m in hl.tile(m_dim):
+            # src[helion_kernels.py:283]:         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+            # src[helion_kernels.py:281-294]: ...
             if pid_shared < 8 * 16:
-                # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
                 num_blocks_0 = 8
                 pid_0 = pid_shared % num_blocks_0
                 pid_1 = pid_shared // num_blocks_0
                 offset_0 = pid_0
                 offset_1 = pid_1
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:278]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:279]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-                # src[helion_kernels.py:280]:     l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
-                # src[helion_kernels.py:278-290]: ...
+                # src[helion_kernels.py:282]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:283]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                # src[helion_kernels.py:284]:     l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+                # src[helion_kernels.py:282-294]: ...
                 for offset_2 in tl.range(0, 512, _BLOCK_SIZE_2):
                     indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-                    # src[helion_kernels.py:279]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                    # src[helion_kernels.py:283]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
                     m_i = tl.full([_BLOCK_SIZE_2], float('-inf'), tl.float32)
-                    # src[helion_kernels.py:280]: l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+                    # src[helion_kernels.py:284]: l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
                     l_i = tl.full([_BLOCK_SIZE_2], 1.0, tl.float32)
-                    # src[helion_kernels.py:281]: q_blk = q[b, tile_m, h, :]
-                    q_blk = tl.load(q + (offset_0 * 524288 + indices_2[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-                    # src[helion_kernels.py:282]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:283]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:284]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
-                    # src[helion_kernels.py:282-289]: ...
-                    for offset_4 in tl.range(0, 512, _BLOCK_SIZE_4):
+                    # src[helion_kernels.py:285]: q_blk = q[b, tile_m, h, :]
+                    q_blk = tl.load(q + (offset_0 * 524288 + indices_2[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None)
+                    # src[helion_kernels.py:286]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:287]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:288]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                    # src[helion_kernels.py:286-293]: ...
+                    for offset_4 in tl.range(0, 512, _BLOCK_SIZE_4, disallow_acc_multi_buffer=False):
                         indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                         q_blk_copy = q_blk
                         m_i_copy = m_i
@@ -637,34 +637,34 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         q_blk_copy_0 = q_blk_copy
                         m_i_copy_0 = m_i_copy
                         l_i_copy_0 = l_i_copy
-                        # src[helion_kernels.py:283]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:287]: k_blk = k[b, tile_n, h, :]
                         k_blk = tl.load(k + (offset_0 * 524288 + indices_4[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:284]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:288]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute = tl.permute(k_blk, [1, 0])
                         dot = tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_0 = dot * qk_scale
-                        # src[helion_kernels.py:285]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                        # src[helion_kernels.py:289]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
                         amax = tl.cast(tl.max(v_0, 1), tl.float32)
                         v_1 = tl.maximum(m_i_copy_0, amax, tl.PropagateNan.ALL)
-                        # src[helion_kernels.py:286]: p = torch.exp2(qk - m_ij[:, None])
+                        # src[helion_kernels.py:290]: p = torch.exp2(qk - m_ij[:, None])
                         subscript = v_1[:, None]
                         v_2 = v_0 - subscript
                         v_3 = libdevice.exp2(v_2)
-                        # src[helion_kernels.py:287]: alpha = torch.exp2(m_i - m_ij)
+                        # src[helion_kernels.py:291]: alpha = torch.exp2(m_i - m_ij)
                         v_4 = m_i_copy_0 - v_1
                         v_5 = libdevice.exp2(v_4)
-                        # src[helion_kernels.py:288]: l_i = l_i * alpha + torch.sum(p, -1)
+                        # src[helion_kernels.py:292]: l_i = l_i * alpha + torch.sum(p, -1)
                         v_6 = l_i_copy_0 * v_5
                         sum_1 = tl.cast(tl.sum(v_3, 1), tl.float32)
                         l_i = v_6 + sum_1
-                        # src[helion_kernels.py:289]: m_i = m_ij
+                        # src[helion_kernels.py:293]: m_i = m_ij
                         m_i = v_1
-                    # src[helion_kernels.py:290]: lse[b, tile_m, h] = m_i + torch.log2(l_i)
+                    # src[helion_kernels.py:294]: lse[b, tile_m, h] = m_i + torch.log2(l_i)
                     v_8 = libdevice.log2(l_i)
                     v_9 = m_i + v_8
                     tl.store(lse + (offset_0 * 8192 + indices_2 * 16 + offset_1 * 1), v_9, None)
             elif pid_shared < 8 * 16 + 8 * 16:
-                # src[helion_kernels.py:296]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:300]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16, tl.int32)
                 num_blocks_1 = 8
                 pid_2 = pid_shared % num_blocks_1
@@ -672,25 +672,25 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_5 = pid_2
                 offset_6 = pid_3
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:297]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:298]:     q_blk = q[b, tile_m, h, :]
-                # src[helion_kernels.py:299]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                # src[helion_kernels.py:297-309]: ...
+                # src[helion_kernels.py:301]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:302]:     q_blk = q[b, tile_m, h, :]
+                # src[helion_kernels.py:303]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                # src[helion_kernels.py:301-313]: ...
                 for offset_7 in tl.range(0, 512, _BLOCK_SIZE_7):
                     indices_7 = offset_7 + tl.arange(0, _BLOCK_SIZE_7).to(tl.int32)
-                    # src[helion_kernels.py:298]: q_blk = q[b, tile_m, h, :]
-                    q_blk_1 = tl.load(q + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-                    # src[helion_kernels.py:299]: grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:302]: q_blk = q[b, tile_m, h, :]
+                    q_blk_1 = tl.load(q + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
+                    # src[helion_kernels.py:303]: grad_out_blk = grad_out[b, tile_m, h, :]
                     grad_out_blk = tl.load(grad_out + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:300]: lse_blk = lse[b, tile_m, h]
+                    # src[helion_kernels.py:304]: lse_blk = lse[b, tile_m, h]
                     lse_blk = tl.load(lse + (offset_5 * 8192 + indices_7 * 16 + offset_6 * 1), None)
-                    # src[helion_kernels.py:301]: delta_acc = hl.zeros([tile_m], dtype=torch.float32)
+                    # src[helion_kernels.py:305]: delta_acc = hl.zeros([tile_m], dtype=torch.float32)
                     delta_acc = tl.full([_BLOCK_SIZE_7], 0.0, tl.float32)
-                    # src[helion_kernels.py:302]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:303]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:304]:     v_blk = v[b, tile_n, h, :]
-                    # src[helion_kernels.py:302-308]: ...
-                    for offset_8 in tl.range(0, 512, _BLOCK_SIZE_8, loop_unroll_factor=1):
+                    # src[helion_kernels.py:306]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:307]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:308]:     v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:306-312]: ...
+                    for offset_8 in tl.range(0, 512, _BLOCK_SIZE_8):
                         indices_8 = offset_8 + tl.arange(0, _BLOCK_SIZE_8).to(tl.int32)
                         q_blk_1_copy = q_blk_1
                         lse_blk_copy = lse_blk
@@ -700,29 +700,29 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         lse_blk_copy_0 = lse_blk_copy
                         grad_out_blk_copy_0 = grad_out_blk_copy
                         delta_acc_copy_0 = delta_acc_copy
-                        # src[helion_kernels.py:303]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:307]: k_blk = k[b, tile_n, h, :]
                         k_blk_1 = tl.load(k + (offset_5 * 524288 + indices_8[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:304]: v_blk = v[b, tile_n, h, :]
+                        # src[helion_kernels.py:308]: v_blk = v[b, tile_n, h, :]
                         v_blk = tl.load(v + (offset_5 * 524288 + indices_8[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:305]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:309]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_1 = tl.permute(k_blk_1, [1, 0])
                         dot_1 = tl.dot(tl.cast(q_blk_1_copy_0, tl.bfloat16), tl.cast(permute_1, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_10 = dot_1 * qk_scale
-                        # src[helion_kernels.py:306]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:310]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_1 = lse_blk_copy_0[:, None]
                         v_11 = v_10 - subscript_1
                         v_12 = libdevice.exp2(v_11)
-                        # src[helion_kernels.py:307]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:311]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_2 = tl.permute(v_blk, [1, 0])
                         dp = tl.dot(tl.cast(grad_out_blk_copy_0, tl.bfloat16), tl.cast(permute_2, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:308]: delta_acc = delta_acc + torch.sum(p * dp, -1)
+                        # src[helion_kernels.py:312]: delta_acc = delta_acc + torch.sum(p * dp, -1)
                         v_13 = v_12 * dp
                         sum_2 = tl.cast(tl.sum(v_13, 1), tl.float32)
                         delta_acc = delta_acc_copy_0 + sum_2
-                    # src[helion_kernels.py:309]: delta[b, tile_m, h] = delta_acc
+                    # src[helion_kernels.py:313]: delta[b, tile_m, h] = delta_acc
                     tl.store(delta + (offset_5 * 8192 + indices_7 * 16 + offset_6 * 1), delta_acc, None)
             elif pid_shared < 8 * 16 + 8 * 16 + 8 * 16:
-                # src[helion_kernels.py:314]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:318]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16 + 8 * 16, tl.int32)
                 num_blocks_2 = 8
                 pid_4 = pid_shared % num_blocks_2
@@ -730,26 +730,26 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_9 = pid_4
                 offset_10 = pid_5
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:315]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:316]:     q_blk = q[b, tile_m, h, :]
-                # src[helion_kernels.py:317]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                # src[helion_kernels.py:315-329]: ...
-                for offset_11 in tl.range(0, 512, _BLOCK_SIZE_11):
+                # src[helion_kernels.py:319]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:320]:     q_blk = q[b, tile_m, h, :]
+                # src[helion_kernels.py:321]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                # src[helion_kernels.py:319-333]: ...
+                for offset_11 in tl.range(0, 512, _BLOCK_SIZE_11, num_stages=1):
                     indices_11 = offset_11 + tl.arange(0, _BLOCK_SIZE_11).to(tl.int32)
-                    # src[helion_kernels.py:316]: q_blk = q[b, tile_m, h, :]
+                    # src[helion_kernels.py:320]: q_blk = q[b, tile_m, h, :]
                     q_blk_2 = tl.load(q + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:317]: grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:321]: grad_out_blk = grad_out[b, tile_m, h, :]
                     grad_out_blk_1 = tl.load(grad_out + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:318]: delta_blk = delta[b, tile_m, h]
+                    # src[helion_kernels.py:322]: delta_blk = delta[b, tile_m, h]
                     delta_blk = tl.load(delta + (offset_9 * 8192 + indices_11 * 16 + offset_10 * 1), None)
-                    # src[helion_kernels.py:319]: lse_blk = lse[b, tile_m, h]
+                    # src[helion_kernels.py:323]: lse_blk = lse[b, tile_m, h]
                     lse_blk_1 = tl.load(lse + (offset_9 * 8192 + indices_11 * 16 + offset_10 * 1), None)
-                    # src[helion_kernels.py:320]: dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:324]: dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
                     dq_acc = tl.full([_BLOCK_SIZE_11, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:321]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:322]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:323]:     v_blk = v[b, tile_n, h, :]
-                    # src[helion_kernels.py:321-328]: ...
+                    # src[helion_kernels.py:325]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:326]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:327]:     v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:325-332]: ...
                     for offset_12 in tl.range(0, 512, _BLOCK_SIZE_12):
                         indices_12 = offset_12 + tl.arange(0, _BLOCK_SIZE_12).to(tl.int32)
                         q_blk_2_copy = q_blk_2
@@ -762,34 +762,34 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         grad_out_blk_1_copy_0 = grad_out_blk_1_copy
                         delta_blk_copy_0 = delta_blk_copy
                         dq_acc_copy_0 = dq_acc_copy
-                        # src[helion_kernels.py:322]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:326]: k_blk = k[b, tile_n, h, :]
                         k_blk_2 = tl.load(k + (offset_9 * 524288 + indices_12[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:323]: v_blk = v[b, tile_n, h, :]
+                        # src[helion_kernels.py:327]: v_blk = v[b, tile_n, h, :]
                         v_blk_1 = tl.load(v + (offset_9 * 524288 + indices_12[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:324]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:328]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_3 = tl.permute(k_blk_2, [1, 0])
                         dot_2 = tl.dot(tl.cast(q_blk_2_copy_0, tl.bfloat16), tl.cast(permute_3, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_15 = dot_2 * qk_scale
-                        # src[helion_kernels.py:325]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:329]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_2 = lse_blk_1_copy_0[:, None]
                         v_16 = v_15 - subscript_2
                         v_17 = libdevice.exp2(v_16)
-                        # src[helion_kernels.py:326]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:330]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_4 = tl.permute(v_blk_1, [1, 0])
                         dp_1 = tl.dot(tl.cast(grad_out_blk_1_copy_0, tl.bfloat16), tl.cast(permute_4, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:327]: ds = p * (dp - delta_blk[:, None])
+                        # src[helion_kernels.py:331]: ds = p * (dp - delta_blk[:, None])
                         subscript_3 = delta_blk_copy_0[:, None]
                         v_18 = dp_1 - subscript_3
                         v_19 = v_17 * v_18
-                        # src[helion_kernels.py:328]: dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
+                        # src[helion_kernels.py:332]: dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
                         v_20 = tl.cast(k_blk_2, tl.float32)
                         dq_acc = tl.dot(tl.cast(v_19, tl.float32), tl.cast(v_20, tl.float32), acc=dq_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                    # src[helion_kernels.py:329]: dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
+                    # src[helion_kernels.py:333]: dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
                     v_21 = dq_acc * sm_scale
                     v_22 = tl.cast(v_21, tl.bfloat16)
                     tl.store(dq + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), v_22, None)
             else:
-                # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16 + 8 * 16 + 8 * 16, tl.int32)
                 num_blocks_3 = 8
                 pid_6 = pid_shared % num_blocks_3
@@ -797,25 +797,25 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_13 = pid_6
                 offset_14 = pid_7
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:335]: for tile_n in hl.tile(n_dim):
-                # src[helion_kernels.py:336]:     k_blk = k[b, tile_n, h, :]
-                # src[helion_kernels.py:337]:     v_blk = v[b, tile_n, h, :]
-                # src[helion_kernels.py:335-354]: ...
+                # src[helion_kernels.py:339]: for tile_n in hl.tile(n_dim):
+                # src[helion_kernels.py:340]:     k_blk = k[b, tile_n, h, :]
+                # src[helion_kernels.py:341]:     v_blk = v[b, tile_n, h, :]
+                # src[helion_kernels.py:339-358]: ...
                 for offset_15 in tl.range(0, 512, _BLOCK_SIZE_15):
                     indices_15 = offset_15 + tl.arange(0, _BLOCK_SIZE_15).to(tl.int32)
-                    # src[helion_kernels.py:336]: k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:340]: k_blk = k[b, tile_n, h, :]
                     k_blk_3 = tl.load(k + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:337]: v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:341]: v_blk = v[b, tile_n, h, :]
                     v_blk_2 = tl.load(v + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:338]: dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:342]: dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
                     dk_acc = tl.full([_BLOCK_SIZE_15, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:339]: dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:343]: dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
                     dv_acc = tl.full([_BLOCK_SIZE_15, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:340]: for tile_m in hl.tile(m_dim):
-                    # src[helion_kernels.py:341]:     q_blk = q[b, tile_m, h, :]
-                    # src[helion_kernels.py:342]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                    # src[helion_kernels.py:340-352]: ...
-                    for offset_16 in tl.range(0, 512, _BLOCK_SIZE_16):
+                    # src[helion_kernels.py:344]: for tile_m in hl.tile(m_dim):
+                    # src[helion_kernels.py:345]:     q_blk = q[b, tile_m, h, :]
+                    # src[helion_kernels.py:346]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:344-356]: ...
+                    for offset_16 in tl.range(0, 512, _BLOCK_SIZE_16, num_stages=2):
                         indices_16 = offset_16 + tl.arange(0, _BLOCK_SIZE_16).to(tl.int32)
                         k_blk_3_copy = k_blk_3
                         v_blk_2_copy = v_blk_2
@@ -825,84 +825,84 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         v_blk_2_copy_0 = v_blk_2_copy
                         dk_acc_copy_0 = dk_acc_copy
                         dv_acc_copy_0 = dv_acc_copy
-                        # src[helion_kernels.py:341]: q_blk = q[b, tile_m, h, :]
+                        # src[helion_kernels.py:345]: q_blk = q[b, tile_m, h, :]
                         q_blk_3 = tl.load(q + (offset_13 * 524288 + indices_16[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:342]: grad_out_blk = grad_out[b, tile_m, h, :]
+                        # src[helion_kernels.py:346]: grad_out_blk = grad_out[b, tile_m, h, :]
                         grad_out_blk_2 = tl.load(grad_out + (offset_13 * 524288 + indices_16[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:343]: delta_blk = delta[b, tile_m, h]
+                        # src[helion_kernels.py:347]: delta_blk = delta[b, tile_m, h]
                         delta_blk_1 = tl.load(delta + (offset_13 * 8192 + indices_16 * 16 + offset_14 * 1), None)
-                        # src[helion_kernels.py:344]: lse_blk = lse[b, tile_m, h]
+                        # src[helion_kernels.py:348]: lse_blk = lse[b, tile_m, h]
                         lse_blk_2 = tl.load(lse + (offset_13 * 8192 + indices_16 * 16 + offset_14 * 1), None)
-                        # src[helion_kernels.py:345]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:349]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_5 = tl.permute(k_blk_3_copy_0, [1, 0])
                         dot_3 = tl.dot(tl.cast(q_blk_3, tl.bfloat16), tl.cast(permute_5, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_23 = dot_3 * qk_scale
-                        # src[helion_kernels.py:346]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:350]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_4 = lse_blk_2[:, None]
                         v_24 = v_23 - subscript_4
                         v_25 = libdevice.exp2(v_24)
-                        # src[helion_kernels.py:347]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:351]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_6 = tl.permute(v_blk_2_copy_0, [1, 0])
                         dp_2 = tl.dot(tl.cast(grad_out_blk_2, tl.bfloat16), tl.cast(permute_6, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:348]: ds = p * (dp - delta_blk[:, None])
+                        # src[helion_kernels.py:352]: ds = p * (dp - delta_blk[:, None])
                         subscript_5 = delta_blk_1[:, None]
                         v_26 = dp_2 - subscript_5
                         v_27 = v_25 * v_26
-                        # src[helion_kernels.py:349]: dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
+                        # src[helion_kernels.py:353]: dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
                         permute_7 = tl.permute(v_27, [1, 0])
                         v_28 = tl.cast(q_blk_3, tl.float32)
                         dk_acc = tl.dot(tl.cast(permute_7, tl.float32), tl.cast(v_28, tl.float32), acc=dk_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:351]: p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                        # src[helion_kernels.py:355]: p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
                         permute_8 = tl.permute(v_25, [1, 0])
                         v_29 = tl.cast(permute_8, tl.bfloat16)
-                        # src[helion_kernels.py:350]: dv_acc = hl.dot(
-                        # src[helion_kernels.py:351]:     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
-                        # src[helion_kernels.py:352]: )
+                        # src[helion_kernels.py:354]: dv_acc = hl.dot(
+                        # src[helion_kernels.py:355]:     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                        # src[helion_kernels.py:356]: )
                         dv_acc = tl.dot(tl.cast(v_29, tl.bfloat16), tl.cast(grad_out_blk_2, tl.bfloat16), acc=dv_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                    # src[helion_kernels.py:353]: dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
+                    # src[helion_kernels.py:357]: dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
                     v_30 = dk_acc * sm_scale
                     v_31 = tl.cast(v_30, tl.bfloat16)
                     tl.store(dk + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), v_31, None)
-                    # src[helion_kernels.py:354]: dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
+                    # src[helion_kernels.py:358]: dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
                     v_32 = tl.cast(dv_acc, tl.bfloat16)
                     tl.store(dv + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), v_32, None)
-    # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
-    # src[helion_kernels.py:335]:     for tile_n in hl.tile(n_dim):
-    # src[helion_kernels.py:336]:         k_blk = k[b, tile_n, h, :]
-    # src[helion_kernels.py:334-354]: ...
+    # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
+    # src[helion_kernels.py:339]:     for tile_n in hl.tile(n_dim):
+    # src[helion_kernels.py:340]:         k_blk = k[b, tile_n, h, :]
+    # src[helion_kernels.py:338-358]: ...
     triton_helpers.x_grid_barrier(x_grid_sem)
-    for virtual_pid in tl.range(start_pid, end_pid):
+    for virtual_pid in tl.range(start_pid, end_pid, loop_unroll_factor=2):
         if virtual_pid >= 0 + 8 * 16 + 8 * 16 + 8 * 16 and virtual_pid < 0 + 8 * 16 + 8 * 16 + 8 * 16 + 8 * 16:
             pid_shared = virtual_pid
-            # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
-            # src[helion_kernels.py:278]:     for tile_m in hl.tile(m_dim):
-            # src[helion_kernels.py:279]:         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-            # src[helion_kernels.py:277-290]: ...
+            # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
+            # src[helion_kernels.py:282]:     for tile_m in hl.tile(m_dim):
+            # src[helion_kernels.py:283]:         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+            # src[helion_kernels.py:281-294]: ...
             if pid_shared < 8 * 16:
-                # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
                 num_blocks_0 = 8
                 pid_0 = pid_shared % num_blocks_0
                 pid_1 = pid_shared // num_blocks_0
                 offset_0 = pid_0
                 offset_1 = pid_1
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:278]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:279]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-                # src[helion_kernels.py:280]:     l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
-                # src[helion_kernels.py:278-290]: ...
+                # src[helion_kernels.py:282]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:283]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                # src[helion_kernels.py:284]:     l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+                # src[helion_kernels.py:282-294]: ...
                 for offset_2 in tl.range(0, 512, _BLOCK_SIZE_2):
                     indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-                    # src[helion_kernels.py:279]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+                    # src[helion_kernels.py:283]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
                     m_i = tl.full([_BLOCK_SIZE_2], float('-inf'), tl.float32)
-                    # src[helion_kernels.py:280]: l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+                    # src[helion_kernels.py:284]: l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
                     l_i = tl.full([_BLOCK_SIZE_2], 1.0, tl.float32)
-                    # src[helion_kernels.py:281]: q_blk = q[b, tile_m, h, :]
-                    q_blk = tl.load(q + (offset_0 * 524288 + indices_2[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-                    # src[helion_kernels.py:282]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:283]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:284]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
-                    # src[helion_kernels.py:282-289]: ...
-                    for offset_4 in tl.range(0, 512, _BLOCK_SIZE_4):
+                    # src[helion_kernels.py:285]: q_blk = q[b, tile_m, h, :]
+                    q_blk = tl.load(q + (offset_0 * 524288 + indices_2[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None)
+                    # src[helion_kernels.py:286]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:287]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:288]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                    # src[helion_kernels.py:286-293]: ...
+                    for offset_4 in tl.range(0, 512, _BLOCK_SIZE_4, disallow_acc_multi_buffer=False):
                         indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
                         q_blk_copy = q_blk
                         m_i_copy = m_i
@@ -910,34 +910,34 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         q_blk_copy_0 = q_blk_copy
                         m_i_copy_0 = m_i_copy
                         l_i_copy_0 = l_i_copy
-                        # src[helion_kernels.py:283]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:287]: k_blk = k[b, tile_n, h, :]
                         k_blk = tl.load(k + (offset_0 * 524288 + indices_4[:, None] * 1024 + offset_1 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:284]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:288]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute = tl.permute(k_blk, [1, 0])
                         dot = tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_0 = dot * qk_scale
-                        # src[helion_kernels.py:285]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                        # src[helion_kernels.py:289]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
                         amax = tl.cast(tl.max(v_0, 1), tl.float32)
                         v_1 = tl.maximum(m_i_copy_0, amax, tl.PropagateNan.ALL)
-                        # src[helion_kernels.py:286]: p = torch.exp2(qk - m_ij[:, None])
+                        # src[helion_kernels.py:290]: p = torch.exp2(qk - m_ij[:, None])
                         subscript = v_1[:, None]
                         v_2 = v_0 - subscript
                         v_3 = libdevice.exp2(v_2)
-                        # src[helion_kernels.py:287]: alpha = torch.exp2(m_i - m_ij)
+                        # src[helion_kernels.py:291]: alpha = torch.exp2(m_i - m_ij)
                         v_4 = m_i_copy_0 - v_1
                         v_5 = libdevice.exp2(v_4)
-                        # src[helion_kernels.py:288]: l_i = l_i * alpha + torch.sum(p, -1)
+                        # src[helion_kernels.py:292]: l_i = l_i * alpha + torch.sum(p, -1)
                         v_6 = l_i_copy_0 * v_5
                         sum_1 = tl.cast(tl.sum(v_3, 1), tl.float32)
                         l_i = v_6 + sum_1
-                        # src[helion_kernels.py:289]: m_i = m_ij
+                        # src[helion_kernels.py:293]: m_i = m_ij
                         m_i = v_1
-                    # src[helion_kernels.py:290]: lse[b, tile_m, h] = m_i + torch.log2(l_i)
+                    # src[helion_kernels.py:294]: lse[b, tile_m, h] = m_i + torch.log2(l_i)
                     v_8 = libdevice.log2(l_i)
                     v_9 = m_i + v_8
                     tl.store(lse + (offset_0 * 8192 + indices_2 * 16 + offset_1 * 1), v_9, None)
             elif pid_shared < 8 * 16 + 8 * 16:
-                # src[helion_kernels.py:296]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:300]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16, tl.int32)
                 num_blocks_1 = 8
                 pid_2 = pid_shared % num_blocks_1
@@ -945,25 +945,25 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_5 = pid_2
                 offset_6 = pid_3
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:297]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:298]:     q_blk = q[b, tile_m, h, :]
-                # src[helion_kernels.py:299]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                # src[helion_kernels.py:297-309]: ...
+                # src[helion_kernels.py:301]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:302]:     q_blk = q[b, tile_m, h, :]
+                # src[helion_kernels.py:303]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                # src[helion_kernels.py:301-313]: ...
                 for offset_7 in tl.range(0, 512, _BLOCK_SIZE_7):
                     indices_7 = offset_7 + tl.arange(0, _BLOCK_SIZE_7).to(tl.int32)
-                    # src[helion_kernels.py:298]: q_blk = q[b, tile_m, h, :]
-                    q_blk_1 = tl.load(q + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-                    # src[helion_kernels.py:299]: grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:302]: q_blk = q[b, tile_m, h, :]
+                    q_blk_1 = tl.load(q + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
+                    # src[helion_kernels.py:303]: grad_out_blk = grad_out[b, tile_m, h, :]
                     grad_out_blk = tl.load(grad_out + (offset_5 * 524288 + indices_7[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:300]: lse_blk = lse[b, tile_m, h]
+                    # src[helion_kernels.py:304]: lse_blk = lse[b, tile_m, h]
                     lse_blk = tl.load(lse + (offset_5 * 8192 + indices_7 * 16 + offset_6 * 1), None)
-                    # src[helion_kernels.py:301]: delta_acc = hl.zeros([tile_m], dtype=torch.float32)
+                    # src[helion_kernels.py:305]: delta_acc = hl.zeros([tile_m], dtype=torch.float32)
                     delta_acc = tl.full([_BLOCK_SIZE_7], 0.0, tl.float32)
-                    # src[helion_kernels.py:302]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:303]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:304]:     v_blk = v[b, tile_n, h, :]
-                    # src[helion_kernels.py:302-308]: ...
-                    for offset_8 in tl.range(0, 512, _BLOCK_SIZE_8, loop_unroll_factor=1):
+                    # src[helion_kernels.py:306]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:307]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:308]:     v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:306-312]: ...
+                    for offset_8 in tl.range(0, 512, _BLOCK_SIZE_8):
                         indices_8 = offset_8 + tl.arange(0, _BLOCK_SIZE_8).to(tl.int32)
                         q_blk_1_copy = q_blk_1
                         lse_blk_copy = lse_blk
@@ -973,29 +973,29 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         lse_blk_copy_0 = lse_blk_copy
                         grad_out_blk_copy_0 = grad_out_blk_copy
                         delta_acc_copy_0 = delta_acc_copy
-                        # src[helion_kernels.py:303]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:307]: k_blk = k[b, tile_n, h, :]
                         k_blk_1 = tl.load(k + (offset_5 * 524288 + indices_8[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:304]: v_blk = v[b, tile_n, h, :]
+                        # src[helion_kernels.py:308]: v_blk = v[b, tile_n, h, :]
                         v_blk = tl.load(v + (offset_5 * 524288 + indices_8[:, None] * 1024 + offset_6 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:305]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:309]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_1 = tl.permute(k_blk_1, [1, 0])
                         dot_1 = tl.dot(tl.cast(q_blk_1_copy_0, tl.bfloat16), tl.cast(permute_1, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_10 = dot_1 * qk_scale
-                        # src[helion_kernels.py:306]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:310]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_1 = lse_blk_copy_0[:, None]
                         v_11 = v_10 - subscript_1
                         v_12 = libdevice.exp2(v_11)
-                        # src[helion_kernels.py:307]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:311]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_2 = tl.permute(v_blk, [1, 0])
                         dp = tl.dot(tl.cast(grad_out_blk_copy_0, tl.bfloat16), tl.cast(permute_2, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:308]: delta_acc = delta_acc + torch.sum(p * dp, -1)
+                        # src[helion_kernels.py:312]: delta_acc = delta_acc + torch.sum(p * dp, -1)
                         v_13 = v_12 * dp
                         sum_2 = tl.cast(tl.sum(v_13, 1), tl.float32)
                         delta_acc = delta_acc_copy_0 + sum_2
-                    # src[helion_kernels.py:309]: delta[b, tile_m, h] = delta_acc
+                    # src[helion_kernels.py:313]: delta[b, tile_m, h] = delta_acc
                     tl.store(delta + (offset_5 * 8192 + indices_7 * 16 + offset_6 * 1), delta_acc, None)
             elif pid_shared < 8 * 16 + 8 * 16 + 8 * 16:
-                # src[helion_kernels.py:314]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:318]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16 + 8 * 16, tl.int32)
                 num_blocks_2 = 8
                 pid_4 = pid_shared % num_blocks_2
@@ -1003,26 +1003,26 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_9 = pid_4
                 offset_10 = pid_5
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:315]: for tile_m in hl.tile(m_dim):
-                # src[helion_kernels.py:316]:     q_blk = q[b, tile_m, h, :]
-                # src[helion_kernels.py:317]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                # src[helion_kernels.py:315-329]: ...
-                for offset_11 in tl.range(0, 512, _BLOCK_SIZE_11):
+                # src[helion_kernels.py:319]: for tile_m in hl.tile(m_dim):
+                # src[helion_kernels.py:320]:     q_blk = q[b, tile_m, h, :]
+                # src[helion_kernels.py:321]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                # src[helion_kernels.py:319-333]: ...
+                for offset_11 in tl.range(0, 512, _BLOCK_SIZE_11, num_stages=1):
                     indices_11 = offset_11 + tl.arange(0, _BLOCK_SIZE_11).to(tl.int32)
-                    # src[helion_kernels.py:316]: q_blk = q[b, tile_m, h, :]
+                    # src[helion_kernels.py:320]: q_blk = q[b, tile_m, h, :]
                     q_blk_2 = tl.load(q + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:317]: grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:321]: grad_out_blk = grad_out[b, tile_m, h, :]
                     grad_out_blk_1 = tl.load(grad_out + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:318]: delta_blk = delta[b, tile_m, h]
+                    # src[helion_kernels.py:322]: delta_blk = delta[b, tile_m, h]
                     delta_blk = tl.load(delta + (offset_9 * 8192 + indices_11 * 16 + offset_10 * 1), None)
-                    # src[helion_kernels.py:319]: lse_blk = lse[b, tile_m, h]
+                    # src[helion_kernels.py:323]: lse_blk = lse[b, tile_m, h]
                     lse_blk_1 = tl.load(lse + (offset_9 * 8192 + indices_11 * 16 + offset_10 * 1), None)
-                    # src[helion_kernels.py:320]: dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:324]: dq_acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
                     dq_acc = tl.full([_BLOCK_SIZE_11, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:321]: for tile_n in hl.tile(n_dim):
-                    # src[helion_kernels.py:322]:     k_blk = k[b, tile_n, h, :]
-                    # src[helion_kernels.py:323]:     v_blk = v[b, tile_n, h, :]
-                    # src[helion_kernels.py:321-328]: ...
+                    # src[helion_kernels.py:325]: for tile_n in hl.tile(n_dim):
+                    # src[helion_kernels.py:326]:     k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:327]:     v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:325-332]: ...
                     for offset_12 in tl.range(0, 512, _BLOCK_SIZE_12):
                         indices_12 = offset_12 + tl.arange(0, _BLOCK_SIZE_12).to(tl.int32)
                         q_blk_2_copy = q_blk_2
@@ -1035,34 +1035,34 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         grad_out_blk_1_copy_0 = grad_out_blk_1_copy
                         delta_blk_copy_0 = delta_blk_copy
                         dq_acc_copy_0 = dq_acc_copy
-                        # src[helion_kernels.py:322]: k_blk = k[b, tile_n, h, :]
+                        # src[helion_kernels.py:326]: k_blk = k[b, tile_n, h, :]
                         k_blk_2 = tl.load(k + (offset_9 * 524288 + indices_12[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:323]: v_blk = v[b, tile_n, h, :]
+                        # src[helion_kernels.py:327]: v_blk = v[b, tile_n, h, :]
                         v_blk_1 = tl.load(v + (offset_9 * 524288 + indices_12[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:324]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:328]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_3 = tl.permute(k_blk_2, [1, 0])
                         dot_2 = tl.dot(tl.cast(q_blk_2_copy_0, tl.bfloat16), tl.cast(permute_3, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_15 = dot_2 * qk_scale
-                        # src[helion_kernels.py:325]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:329]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_2 = lse_blk_1_copy_0[:, None]
                         v_16 = v_15 - subscript_2
                         v_17 = libdevice.exp2(v_16)
-                        # src[helion_kernels.py:326]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:330]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_4 = tl.permute(v_blk_1, [1, 0])
                         dp_1 = tl.dot(tl.cast(grad_out_blk_1_copy_0, tl.bfloat16), tl.cast(permute_4, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:327]: ds = p * (dp - delta_blk[:, None])
+                        # src[helion_kernels.py:331]: ds = p * (dp - delta_blk[:, None])
                         subscript_3 = delta_blk_copy_0[:, None]
                         v_18 = dp_1 - subscript_3
                         v_19 = v_17 * v_18
-                        # src[helion_kernels.py:328]: dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
+                        # src[helion_kernels.py:332]: dq_acc = hl.dot(ds, k_blk.to(torch.float32), acc=dq_acc)
                         v_20 = tl.cast(k_blk_2, tl.float32)
                         dq_acc = tl.dot(tl.cast(v_19, tl.float32), tl.cast(v_20, tl.float32), acc=dq_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                    # src[helion_kernels.py:329]: dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
+                    # src[helion_kernels.py:333]: dq[b, tile_m, h, :] = (dq_acc * sm_scale).to(dq.dtype)
                     v_21 = dq_acc * sm_scale
                     v_22 = tl.cast(v_21, tl.bfloat16)
                     tl.store(dq + (offset_9 * 524288 + indices_11[:, None] * 1024 + offset_10 * 64 + (0 + indices_3)[None, :] * 1), v_22, None)
             else:
-                # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
+                # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
                 pid_shared -= tl.cast(8 * 16 + 8 * 16 + 8 * 16, tl.int32)
                 num_blocks_3 = 8
                 pid_6 = pid_shared % num_blocks_3
@@ -1070,25 +1070,25 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                 offset_13 = pid_6
                 offset_14 = pid_7
                 indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-                # src[helion_kernels.py:335]: for tile_n in hl.tile(n_dim):
-                # src[helion_kernels.py:336]:     k_blk = k[b, tile_n, h, :]
-                # src[helion_kernels.py:337]:     v_blk = v[b, tile_n, h, :]
-                # src[helion_kernels.py:335-354]: ...
+                # src[helion_kernels.py:339]: for tile_n in hl.tile(n_dim):
+                # src[helion_kernels.py:340]:     k_blk = k[b, tile_n, h, :]
+                # src[helion_kernels.py:341]:     v_blk = v[b, tile_n, h, :]
+                # src[helion_kernels.py:339-358]: ...
                 for offset_15 in tl.range(0, 512, _BLOCK_SIZE_15):
                     indices_15 = offset_15 + tl.arange(0, _BLOCK_SIZE_15).to(tl.int32)
-                    # src[helion_kernels.py:336]: k_blk = k[b, tile_n, h, :]
+                    # src[helion_kernels.py:340]: k_blk = k[b, tile_n, h, :]
                     k_blk_3 = tl.load(k + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:337]: v_blk = v[b, tile_n, h, :]
+                    # src[helion_kernels.py:341]: v_blk = v[b, tile_n, h, :]
                     v_blk_2 = tl.load(v + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                    # src[helion_kernels.py:338]: dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:342]: dk_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
                     dk_acc = tl.full([_BLOCK_SIZE_15, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:339]: dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
+                    # src[helion_kernels.py:343]: dv_acc = hl.zeros([tile_n, head_dim], dtype=torch.float32)
                     dv_acc = tl.full([_BLOCK_SIZE_15, _RDIM_SIZE_3], 0.0, tl.float32)
-                    # src[helion_kernels.py:340]: for tile_m in hl.tile(m_dim):
-                    # src[helion_kernels.py:341]:     q_blk = q[b, tile_m, h, :]
-                    # src[helion_kernels.py:342]:     grad_out_blk = grad_out[b, tile_m, h, :]
-                    # src[helion_kernels.py:340-352]: ...
-                    for offset_16 in tl.range(0, 512, _BLOCK_SIZE_16):
+                    # src[helion_kernels.py:344]: for tile_m in hl.tile(m_dim):
+                    # src[helion_kernels.py:345]:     q_blk = q[b, tile_m, h, :]
+                    # src[helion_kernels.py:346]:     grad_out_blk = grad_out[b, tile_m, h, :]
+                    # src[helion_kernels.py:344-356]: ...
+                    for offset_16 in tl.range(0, 512, _BLOCK_SIZE_16, num_stages=2):
                         indices_16 = offset_16 + tl.arange(0, _BLOCK_SIZE_16).to(tl.int32)
                         k_blk_3_copy = k_blk_3
                         v_blk_2_copy = v_blk_2
@@ -1098,45 +1098,45 @@ def _helion_attention_backward_bshd(q, k, lse, grad_out, v, delta, dq, dk, dv, x
                         v_blk_2_copy_0 = v_blk_2_copy
                         dk_acc_copy_0 = dk_acc_copy
                         dv_acc_copy_0 = dv_acc_copy
-                        # src[helion_kernels.py:341]: q_blk = q[b, tile_m, h, :]
+                        # src[helion_kernels.py:345]: q_blk = q[b, tile_m, h, :]
                         q_blk_3 = tl.load(q + (offset_13 * 524288 + indices_16[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:342]: grad_out_blk = grad_out[b, tile_m, h, :]
+                        # src[helion_kernels.py:346]: grad_out_blk = grad_out[b, tile_m, h, :]
                         grad_out_blk_2 = tl.load(grad_out + (offset_13 * 524288 + indices_16[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), None)
-                        # src[helion_kernels.py:343]: delta_blk = delta[b, tile_m, h]
+                        # src[helion_kernels.py:347]: delta_blk = delta[b, tile_m, h]
                         delta_blk_1 = tl.load(delta + (offset_13 * 8192 + indices_16 * 16 + offset_14 * 1), None)
-                        # src[helion_kernels.py:344]: lse_blk = lse[b, tile_m, h]
+                        # src[helion_kernels.py:348]: lse_blk = lse[b, tile_m, h]
                         lse_blk_2 = tl.load(lse + (offset_13 * 8192 + indices_16 * 16 + offset_14 * 1), None)
-                        # src[helion_kernels.py:345]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                        # src[helion_kernels.py:349]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                         permute_5 = tl.permute(k_blk_3_copy_0, [1, 0])
                         dot_3 = tl.dot(tl.cast(q_blk_3, tl.bfloat16), tl.cast(permute_5, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
                         v_23 = dot_3 * qk_scale
-                        # src[helion_kernels.py:346]: p = torch.exp2(qk - lse_blk[:, None])
+                        # src[helion_kernels.py:350]: p = torch.exp2(qk - lse_blk[:, None])
                         subscript_4 = lse_blk_2[:, None]
                         v_24 = v_23 - subscript_4
                         v_25 = libdevice.exp2(v_24)
-                        # src[helion_kernels.py:347]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
+                        # src[helion_kernels.py:351]: dp = hl.dot(grad_out_blk, v_blk.T, out_dtype=torch.float32)
                         permute_6 = tl.permute(v_blk_2_copy_0, [1, 0])
                         dp_2 = tl.dot(tl.cast(grad_out_blk_2, tl.bfloat16), tl.cast(permute_6, tl.bfloat16), input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:348]: ds = p * (dp - delta_blk[:, None])
+                        # src[helion_kernels.py:352]: ds = p * (dp - delta_blk[:, None])
                         subscript_5 = delta_blk_1[:, None]
                         v_26 = dp_2 - subscript_5
                         v_27 = v_25 * v_26
-                        # src[helion_kernels.py:349]: dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
+                        # src[helion_kernels.py:353]: dk_acc = hl.dot(ds.T, q_blk.to(torch.float32), acc=dk_acc)
                         permute_7 = tl.permute(v_27, [1, 0])
                         v_28 = tl.cast(q_blk_3, tl.float32)
                         dk_acc = tl.dot(tl.cast(permute_7, tl.float32), tl.cast(v_28, tl.float32), acc=dk_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                        # src[helion_kernels.py:351]: p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                        # src[helion_kernels.py:355]: p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
                         permute_8 = tl.permute(v_25, [1, 0])
                         v_29 = tl.cast(permute_8, tl.bfloat16)
-                        # src[helion_kernels.py:350]: dv_acc = hl.dot(
-                        # src[helion_kernels.py:351]:     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
-                        # src[helion_kernels.py:352]: )
+                        # src[helion_kernels.py:354]: dv_acc = hl.dot(
+                        # src[helion_kernels.py:355]:     p.T.to(grad_out_blk.dtype), grad_out_blk, acc=dv_acc
+                        # src[helion_kernels.py:356]: )
                         dv_acc = tl.dot(tl.cast(v_29, tl.bfloat16), tl.cast(grad_out_blk_2, tl.bfloat16), acc=dv_acc_copy_0, input_precision='ieee', out_dtype=tl.float32)
-                    # src[helion_kernels.py:353]: dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
+                    # src[helion_kernels.py:357]: dk[b, tile_n, h, :] = (dk_acc * sm_scale).to(dk.dtype)
                     v_30 = dk_acc * sm_scale
                     v_31 = tl.cast(v_30, tl.bfloat16)
                     tl.store(dk + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), v_31, None)
-                    # src[helion_kernels.py:354]: dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
+                    # src[helion_kernels.py:358]: dv[b, tile_n, h, :] = dv_acc.to(dv.dtype)
                     v_32 = tl.cast(dv_acc, tl.bfloat16)
                     tl.store(dv + (offset_13 * 524288 + indices_15[:, None] * 1024 + offset_14 * 64 + (0 + indices_3)[None, :] * 1), v_32, None)
 
@@ -1153,39 +1153,39 @@ def attention_backward(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, grad_o
     query/key lengths only.  The generator rejects causal, cross-attention, and
     GQA shapes until their masking and reduction rules are implemented here.
     """
-    # src[helion_kernels.py:254]: batch = q.size(0)
+    # src[helion_kernels.py:258]: batch = q.size(0)
     batch = q.size(0)
-    # src[helion_kernels.py:255]: m_dim = q.size(1)
+    # src[helion_kernels.py:259]: m_dim = q.size(1)
     m_dim = q.size(1)
-    # src[helion_kernels.py:256]: n_dim = k.size(1)
+    # src[helion_kernels.py:260]: n_dim = k.size(1)
     n_dim = k.size(1)
-    # src[helion_kernels.py:257]: nheads = hl.specialize(q.size(2))
+    # src[helion_kernels.py:261]: nheads = hl.specialize(q.size(2))
     nheads = 16
-    # src[helion_kernels.py:259]: dq = torch.empty_like(q)
+    # src[helion_kernels.py:263]: dq = torch.empty_like(q)
     dq = torch.empty_like(q)
-    # src[helion_kernels.py:260]: dk = torch.empty_like(k)
+    # src[helion_kernels.py:264]: dk = torch.empty_like(k)
     dk = torch.empty_like(k)
-    # src[helion_kernels.py:261]: dv = torch.empty_like(v)
+    # src[helion_kernels.py:265]: dv = torch.empty_like(v)
     dv = torch.empty_like(v)
-    # src[helion_kernels.py:262]: lse = torch.empty(
-    # src[helion_kernels.py:263]:     (batch, m_dim, nheads),
-    # src[helion_kernels.py:264]:     dtype=torch.float32,
-    # src[helion_kernels.py:262-266]: ...
+    # src[helion_kernels.py:266]: lse = torch.empty(
+    # src[helion_kernels.py:267]:     (batch, m_dim, nheads),
+    # src[helion_kernels.py:268]:     dtype=torch.float32,
+    # src[helion_kernels.py:266-270]: ...
     lse = torch.empty((batch, m_dim, nheads), dtype=torch.float32, device=q.device)
-    # src[helion_kernels.py:267]: delta = torch.empty(
-    # src[helion_kernels.py:268]:     (batch, m_dim, nheads),
-    # src[helion_kernels.py:269]:     dtype=torch.float32,
-    # src[helion_kernels.py:267-271]: ...
+    # src[helion_kernels.py:271]: delta = torch.empty(
+    # src[helion_kernels.py:272]:     (batch, m_dim, nheads),
+    # src[helion_kernels.py:273]:     dtype=torch.float32,
+    # src[helion_kernels.py:271-275]: ...
     delta = torch.empty((batch, m_dim, nheads), dtype=torch.float32, device=q.device)
-    # src[helion_kernels.py:272]: qk_scale = sm_scale * 1.44269504088896340736
+    # src[helion_kernels.py:276]: qk_scale = sm_scale * 1.44269504088896340736
     qk_scale = sm_scale * 1.4426950408889634
-    # src[helion_kernels.py:277]: for b, h in hl.grid([batch, nheads]):
+    # src[helion_kernels.py:281]: for b, h in hl.grid([batch, nheads]):
     _NUM_SM = get_num_sm(q.device)
     _RDIM_SIZE_3 = 64
-    # src[helion_kernels.py:334]: for b, h in hl.grid([batch, nheads]):
-    # src[helion_kernels.py:335]:     for tile_n in hl.tile(n_dim):
-    # src[helion_kernels.py:336]:         k_blk = k[b, tile_n, h, :]
-    # src[helion_kernels.py:334-354]: ...
-    _launcher(_helion_attention_backward_bshd, (_NUM_SM * 4,), q, k, lse, grad_out, v, delta, dq, dk, dv, torch.zeros((1,), device=q.device, dtype=torch.uint32), qk_scale, sm_scale, _NUM_SM, _RDIM_SIZE_3, num_warps=4, num_stages=1, launch_cooperative_grid=True)
-    # src[helion_kernels.py:355]: return dq, dk, dv
+    # src[helion_kernels.py:338]: for b, h in hl.grid([batch, nheads]):
+    # src[helion_kernels.py:339]:     for tile_n in hl.tile(n_dim):
+    # src[helion_kernels.py:340]:         k_blk = k[b, tile_n, h, :]
+    # src[helion_kernels.py:338-358]: ...
+    _launcher(_helion_attention_backward_bshd, (_NUM_SM,), q, k, lse, grad_out, v, delta, dq, dk, dv, torch.zeros((1,), device=q.device, dtype=torch.uint32), qk_scale, sm_scale, _NUM_SM, _RDIM_SIZE_3, num_warps=4, num_stages=1, launch_cooperative_grid=True)
+    # src[helion_kernels.py:359]: return dq, dk, dv
     return (dq, dk, dv)

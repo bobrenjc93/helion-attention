@@ -18,6 +18,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -162,15 +163,52 @@ def upsert_manifest(entry: dict[str, object]) -> None:
         handle.write("\n")
 
 
-def remove_from_manifest(key: str) -> None:
-    if not MANIFEST.exists():
+class GenerationVerificationError(RuntimeError):
+    """Raised after a candidate kernel fails standalone verification."""
+
+
+def require_portable_cooperative_grid(code: str) -> None:
+    """Reject generated cooperative kernels that launch multiple CTAs per SM."""
+    if "launch_cooperative_grid=True" not in code:
         return
-    with MANIFEST.open() as handle:
-        payload = json.load(handle)
-    payload["kernels"] = [item for item in payload["kernels"] if item["key"] != key]
-    with MANIFEST.open("w") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    multiplier = re.search(r"_NUM_SM\s*\*\s*(\d+)", code)
+    if multiplier is not None:
+        raise RuntimeError(
+            "cooperative backward grid is not portable: generated code launches "
+            f"{multiplier.group(1)} CTAs per SM"
+        )
+
+
+def install_generated_artifacts(
+    *,
+    target: Path,
+    module: str,
+    backward_target: Path,
+    backward_module: str | None,
+    manifest_entry: dict[str, object],
+    verify: Callable[[], int],
+) -> None:
+    """Install and verify generated files, restoring their exact prior state on error."""
+    paths = (target, backward_target, MANIFEST)
+    previous = {
+        path: path.read_bytes() if path.exists() else None for path in paths
+    }
+    try:
+        target.write_text(module)
+        if backward_module is not None:
+            backward_target.write_text(backward_module)
+        upsert_manifest(manifest_entry)
+        if verify() != 0:
+            raise GenerationVerificationError(
+                "generated kernel failed standalone verification"
+            )
+    except BaseException:
+        for path, contents in previous.items():
+            if contents is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(contents)
+        raise
 
 
 def main() -> int:
@@ -268,6 +306,7 @@ def main() -> int:
         backward_code = rename_entry_point(
             backward_code, backward_kernel.name, "attention_backward"
         )
+        require_portable_cooperative_grid(backward_code)
 
     bound = kernel.bind((q, k, v, sm_scale))
     code = strip_helion(bound.to_triton_code())
@@ -303,10 +342,8 @@ def main() -> int:
 
     KERNELS_DIR.mkdir(parents=True, exist_ok=True)
     target = KERNELS_DIR / f"{spec.key}.py"
-    target.write_text(module)
-    print(f"wrote {target.relative_to(REPO_ROOT)} ({len(module.splitlines())} lines)")
-
     backward_target = KERNELS_DIR / f"{spec.key}_backward.py"
+    backward_module = None
     if backward_code is not None:
         backward_module = build_module(
             backward_code,
@@ -314,39 +351,45 @@ def main() -> int:
             description=f"{spec.describe()} backward",
             spec_fields=spec_fields,
         )
-        backward_target.write_text(backward_module)
+    manifest_entry = {
+        "key": spec.key,
+        "batch": spec.batch,
+        "seqlen_q": spec.seqlen_q,
+        "seqlen_k": spec.seqlen_k,
+        "nheads_q": spec.nheads_q,
+        "nheads_kv": spec.nheads_kv,
+        "head_dim": spec.head_dim,
+        "dtype": spec.dtype_name,
+        "causal": spec.causal,
+        "backward": args.backward,
+        "description": spec.describe(),
+        "note": args.label,
+    }
+
+    def verify_generated_kernel() -> int:
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tools" / "verify.py"), spec.key],
+            cwd=REPO_ROOT,
+        ).returncode
+
+    try:
+        install_generated_artifacts(
+            target=target,
+            module=module,
+            backward_target=backward_target,
+            backward_module=backward_module,
+            manifest_entry=manifest_entry,
+            verify=verify_generated_kernel,
+        )
+    except GenerationVerificationError as exc:
+        raise SystemExit(f"{exc}; restored previous artifacts") from exc
+
+    print(f"wrote {target.relative_to(REPO_ROOT)} ({len(module.splitlines())} lines)")
+    if backward_module is not None:
         print(
             f"wrote {backward_target.relative_to(REPO_ROOT)} "
             f"({len(backward_module.splitlines())} lines)"
         )
-
-    upsert_manifest(
-        {
-            "key": spec.key,
-            "batch": spec.batch,
-            "seqlen_q": spec.seqlen_q,
-            "seqlen_k": spec.seqlen_k,
-            "nheads_q": spec.nheads_q,
-            "nheads_kv": spec.nheads_kv,
-            "head_dim": spec.head_dim,
-            "dtype": spec.dtype_name,
-            "causal": spec.causal,
-            "backward": args.backward,
-            "description": spec.describe(),
-            "note": args.label,
-        }
-    )
-
-    check = subprocess.run(
-        [sys.executable, str(REPO_ROOT / "tools" / "verify.py"), spec.key],
-        cwd=REPO_ROOT,
-    )
-    if check.returncode != 0:
-        target.unlink()
-        if backward_code is not None:
-            backward_target.unlink()
-        remove_from_manifest(spec.key)
-        raise SystemExit("generated kernel failed standalone verification; rolled back")
     print("manifest updated")
     return 0
 

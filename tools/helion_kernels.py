@@ -228,6 +228,10 @@ def decode_attention_bshd(
     static_shapes=True,
     dot_precision="ieee",
     autotune_effort="quick",
+    # Grid-wide barriers require every CTA to be resident at once.  One CTA
+    # per SM is portable to Ampere/Ada as well as Hopper; allowing Helion to
+    # tune this above 1 can produce a cooperative grid that those GPUs reject.
+    autotune_config_overrides={"num_sm_multiplier": 1},
     autotune_baseline_fn=_attention_backward_reference,
     autotune_baseline_atol=5e-2,
     autotune_baseline_rtol=2e-2,
