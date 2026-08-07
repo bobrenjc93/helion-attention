@@ -55,6 +55,11 @@ class AttnShape:
         return _DTYPE_NAMES[self.dtype]
 
     @property
+    def is_decode(self) -> bool:
+        """Whether this is single-token attention over an existing KV cache."""
+        return self.seqlen_q == 1 and self.seqlen_k > 1
+
+    @property
     def key(self) -> str:
         """Stable identifier used as the generated kernel module name."""
         return (

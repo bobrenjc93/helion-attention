@@ -34,8 +34,9 @@ def existing_keys() -> set[str]:
 
 def expected_key(request: ShapeRequest) -> str:
     heads_kv = request.nheads_kv if request.nheads_kv is not None else request.nheads
+    seqlen_k = request.seqlen_k if request.seqlen_k is not None else request.seqlen
     return (
-        f"b{request.batch}_sq{request.seqlen}_sk{request.seqlen}"
+        f"b{request.batch}_sq{request.seqlen}_sk{seqlen_k}"
         f"_hq{request.nheads}_hkv{heads_kv}_d{request.head_dim}"
         f"_{request.dtype}_{'causal' if request.causal else 'noncausal'}"
     )

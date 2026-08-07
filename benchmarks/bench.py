@@ -37,13 +37,25 @@ try:
 except ImportError:  # pragma: no cover - benchmark-only dependency
     _flash_attn_func = None
 
+try:
+    from flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
+except ImportError:  # pragma: no cover - benchmark-only dependency
+    _flash_attn_with_kvcache = None
+
 from torch.nn.attention import SDPBackend  # noqa: E402
 from torch.nn.attention import sdpa_kernel  # noqa: E402
 
 
 def flops(spec: AttnShape) -> float:
-    total = 4.0 * spec.batch * spec.nheads_q * spec.seqlen_q * spec.seqlen_k * spec.head_dim
-    return total * 0.5 if spec.causal else total
+    total = (
+        4.0
+        * spec.batch
+        * spec.nheads_q
+        * spec.seqlen_q
+        * spec.seqlen_k
+        * spec.head_dim
+    )
+    return total * 0.5 if spec.causal and not spec.is_decode else total
 
 
 def build_candidates(
@@ -65,22 +77,40 @@ def build_candidates(
     qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     gqa = spec.nheads_q != spec.nheads_kv
 
+    # SDPA's unequal-length causal mask is top-left aligned. Single-token
+    # decode uses FlashAttention's bottom-right alignment, where the newest
+    # query can see the complete cache.
+    sdpa_is_causal = spec.causal and not spec.is_decode
+
     def sdpa(backend: SDPBackend) -> Callable[[], torch.Tensor]:
         def run() -> torch.Tensor:
             with sdpa_kernel(backend):
                 return torch.nn.functional.scaled_dot_product_attention(
-                    qt, kt, vt, is_causal=spec.causal, enable_gqa=gqa
+                    qt, kt, vt, is_causal=sdpa_is_causal, enable_gqa=gqa
                 ).transpose(1, 2)
 
         return run
 
-    candidates: dict[str, Callable[[], torch.Tensor]] = {
-        "helion-attention": lambda: helion_attention.flash_attn_func(
-            q, k, v, causal=spec.causal, shape=spec
-        )
-    }
-    if _flash_attn_func is not None:
-        candidates["flash-attn"] = lambda: _flash_attn_func(q, k, v, causal=spec.causal)
+    if spec.is_decode:
+        candidates: dict[str, Callable[[], torch.Tensor]] = {
+            "helion-attention": lambda: helion_attention.flash_attn_with_kvcache(
+                q, k, v, causal=spec.causal, shape=spec
+            )
+        }
+        if _flash_attn_with_kvcache is not None:
+            candidates["flash-attn"] = lambda: _flash_attn_with_kvcache(
+                q, k, v, causal=spec.causal
+            )
+    else:
+        candidates = {
+            "helion-attention": lambda: helion_attention.flash_attn_func(
+                q, k, v, causal=spec.causal, shape=spec
+            )
+        }
+        if _flash_attn_func is not None:
+            candidates["flash-attn"] = lambda: _flash_attn_func(
+                q, k, v, causal=spec.causal
+            )
     candidates["sdpa-flash"] = sdpa(SDPBackend.FLASH_ATTENTION)
     candidates["sdpa-cudnn"] = sdpa(SDPBackend.CUDNN_ATTENTION)
 
@@ -88,7 +118,7 @@ def build_candidates(
         qt.float(),
         kt.float(),
         vt.float(),
-        is_causal=spec.causal,
+        is_causal=sdpa_is_causal,
         scale=1.0 / math.sqrt(spec.head_dim),
         enable_gqa=gqa,
     ).transpose(1, 2)

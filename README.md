@@ -39,7 +39,30 @@ out = helion_attention.flash_attn_func(q, k, v, causal=True, shape=(B, S, H, D))
 
 Everything else matches `flash_attn.flash_attn_func`: the layout is
 `[batch, seqlen, nheads, head_dim]`, `softmax_scale` defaults to
-`1/sqrt(head_dim)`, and `causal=True` masks above the diagonal.
+`1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
+mask alignment.
+
+Single-token decode reads a dense KV cache through the matching FlashAttention
+entry point. The six-field shape remains required and describes the query and
+the cache separately:
+
+```python
+B, S_CACHE, H_Q, H_KV, D = 1, 4096, 32, 8, 128
+q = torch.randn(B, 1, H_Q, D, device="cuda", dtype=torch.bfloat16)
+k_cache = torch.randn(B, S_CACHE, H_KV, D, device="cuda", dtype=torch.bfloat16)
+v_cache = torch.randn_like(k_cache)
+
+out = helion_attention.flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    causal=True,
+    shape=(B, 1, S_CACHE, H_Q, H_KV, D),
+)
+```
+
+This decode path reads a full, contiguous cache. Cache appends and partial,
+ragged, paged, or rotary-embedded caches are rejected explicitly.
 
 `shape` accepts:
 
@@ -70,6 +93,9 @@ one is an autotuning run, not a code change.
 | batch | seqlen q | seqlen k | heads q | heads kv | head dim | dtype | causal | note |
 | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
 | 1 | 16384 | 16384 | 16 | 16 | 128 | bf16 | yes | 16k context, single sequence |
+| 1 | 1 | 1024 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B single-token decode, 1k KV cache |
+| 1 | 1 | 16384 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B single-token decode, 16k KV cache |
+| 1 | 1 | 4096 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B single-token decode, 4k KV cache |
 | 1 | 2048 | 2048 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
 | 1 | 2048 | 2048 | 32 | 32 | 128 | bf16 | yes | single-sequence 7B prefill |
 | 1 | 2048 | 2048 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
@@ -93,7 +119,7 @@ one is an autotuning run, not a code change.
 | 8 | 2048 | 2048 | 16 | 16 | 64 | bf16 | yes | small decoder, long batch |
 | 8 | 512 | 512 | 16 | 16 | 64 | bf16 | no | short-sequence encoder batch |
 
-23 kernels.
+26 kernels.
 <!-- SHAPES:END -->
 
 ## Benchmarks
@@ -130,6 +156,9 @@ python benchmarks/bench.py
 to its FlashAttention-2 and cuDNN backends, included for context; the headline
 comparison is against the `flash-attn` package itself.
 
+Decode rows are dispatched through `flash_attn_with_kvcache` for both
+implementations; prefill rows continue to use `flash_attn_func`.
+
 ## What is not implemented
 
 Forward only, and these FlashAttention features raise `NotImplementedError`
@@ -139,18 +168,21 @@ rather than silently doing something else:
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes
-- variable-length (`flash_attn_varlen_func`) and KV-cache entry points
-- `return_attn_probs`
+- variable-length (`flash_attn_varlen_func`)
+- KV-cache mutation, partial/ragged caches, paged caches, and fused rotary embeddings
+- `return_attn_probs` and KV-cache `return_softmax_lse`
 
 ## How the kernels are made
 
 ```bash
 pip install helion                       # build-time only
 python tools/generate.py --batch 2 --seqlen 1024 --nheads 32 --head-dim 64 --dtype bf16
+python tools/generate.py --batch 1 --seqlen 1 --seqlen-k 4096 --nheads 32 \
+    --nheads-kv 8 --head-dim 128 --dtype bf16 --causal
 python tools/generate_all.py --gpus 8    # the whole catalogue, one job per GPU
 ```
 
-`tools/helion_kernels.py` holds the two Helion kernels (causal and non-causal)
+`tools/helion_kernels.py` holds the prefill and single-token decode Helion kernels
 that everything is generated from — it is the only file in the repository that
 imports Helion. `tools/generate.py` autotunes one shape, takes Helion's emitted
 Triton, and rewrites its four references to `helion.runtime` to point at the
