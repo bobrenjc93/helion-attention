@@ -178,6 +178,36 @@
         "eval_5b403bea": 69,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:cada1f63567ddf47a935a1e28e3750670bcd5bab",
+      "commit": "cada1f63567ddf47a935a1e28e3750670bcd5bab",
+      "recordedAt": "2026-08-07T18:03:25.927Z",
+      "label": "base cada1f6",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 48,
+        "eval_1afd133e": 42,
+        "eval_5b403bea": 76,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:7",
+      "recordedAt": "2026-08-07T18:03:25.927Z",
+      "label": "PR #7",
+      "kind": "leaf",
+      "prNumber": 7,
+      "title": "Fix batch=1 causal kernels that lose to FlashAttention",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 52,
+        "eval_1afd133e": 42,
+        "eval_5b403bea": 76,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
