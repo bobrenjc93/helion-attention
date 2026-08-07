@@ -1,7 +1,7 @@
 """Burner evaluation: how much of the shape space is covered, and how fast is it?
 
-The score rewards two things equally: shipping kernels for more shapes, and
-each kernel beating FlashAttention on the shape it was specialized for.
+Only kernels that beat FlashAttention count toward coverage, so adding a shape
+that loses to the library we are replacing cannot buy a higher score.
 
     python tools/eval_benchmark.py [--quick]
 """
@@ -73,25 +73,34 @@ def main() -> int:
         return 0
 
     geomean = math.exp(statistics.fmean(math.log(value) for value in speedups))
-    coverage = min(1.0, len(speedups) / COVERAGE_TARGET)
+    # Coverage counts only kernels that actually beat FlashAttention. A kernel
+    # that loses on the shape it was specialized for is not coverage; it is a
+    # slower answer than the library it replaces, so it earns nothing here and
+    # still drags the geomean down.
+    wins = sum(1 for value in speedups if value >= 1.0)
+    coverage = min(1.0, wins / COVERAGE_TARGET)
     speed = min(1.0, max(0.0, (geomean - 0.5) / 1.5))
-    score = round(100 * (0.5 * coverage + 0.5 * speed))
+    score = round(100 * (0.6 * coverage + 0.4 * speed))
 
     suggestions = []
     if losses:
-        suggestions.append("shapes still slower than FlashAttention: " + ", ".join(losses))
+        suggestions.append(
+            "these shapes are slower than FlashAttention and count for nothing until "
+            "they are fixed; prefer making them faster over adding new shapes: "
+            + ", ".join(losses)
+        )
     if coverage < 1.0:
         suggestions.append(
-            f"only {len(speedups)} of {COVERAGE_TARGET} target shapes are covered; "
-            "add shapes to tools/shapes.py and autotune them"
+            f"only {wins} of {COVERAGE_TARGET} target shapes beat FlashAttention "
+            f"({len(speedups)} kernels are checked in)"
         )
 
     json.dump(
         {
             "score": score,
             "summary": (
-                f"{len(speedups)} kernels, geomean {geomean:.2f}x vs FlashAttention, "
-                f"{len(losses)} slower than FlashAttention"
+                f"{wins}/{len(speedups)} kernels beat FlashAttention, "
+                f"geomean {geomean:.2f}x, {len(losses)} slower than FlashAttention"
             ),
             "evidence": rows[:8],
             "suggestions": suggestions or ["every kernel beats FlashAttention"],
