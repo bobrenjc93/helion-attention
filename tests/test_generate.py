@@ -51,7 +51,13 @@ def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None
     )
     assert (
         generate.select_dense_kernel_name(replace(exact, seqlen_q=1))
-        == "decode_attention_bshd"
+        == "causal_attention_bshd"
+    )
+    assert (
+        generate.select_dense_kernel_name(
+            replace(exact, seqlen_q=64, seqlen_k=320)
+        )
+        == "causal_attention_bshd"
     )
 
 

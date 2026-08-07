@@ -26,6 +26,17 @@ GRAD_TOLERANCE = 5e-2
 GRAD_RTOL = 2e-2
 
 
+def bottom_right_causal_mask(
+    q: torch.Tensor, k: torch.Tensor, causal: bool
+) -> torch.Tensor | None:
+    """Build FlashAttention's causal mask for dense BSHD tensors."""
+    if not causal:
+        return None
+    row = torch.arange(q.size(1), device=q.device)[:, None]
+    col = torch.arange(k.size(1), device=q.device)[None, :]
+    return col <= row + k.size(1) - q.size(1)
+
+
 def check(spec: AttnShape) -> float:
     generator = torch.Generator(device="cuda").manual_seed(1234)
 
@@ -52,7 +63,7 @@ def check(spec: AttnShape) -> float:
         k.transpose(1, 2).float(),
         v.transpose(1, 2).float(),
         scale=scale,
-        is_causal=spec.causal and not spec.is_decode,
+        attn_mask=bottom_right_causal_mask(q, k, spec.causal),
         enable_gqa=spec.nheads_q != spec.nheads_kv,
     ).transpose(1, 2)
     return (got.float() - expected).abs().max().item()
@@ -311,7 +322,7 @@ def check_gradients(
         k_ref.transpose(1, 2),
         v_ref.transpose(1, 2),
         scale=scale,
-        is_causal=spec.causal and not spec.is_decode,
+        attn_mask=bottom_right_causal_mask(q_ref, k_ref, spec.causal),
         enable_gqa=spec.nheads_q != spec.nheads_kv,
     ).transpose(1, 2)
     expected_grads = torch.autograd.grad(

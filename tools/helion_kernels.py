@@ -29,25 +29,17 @@ def _sdpa_reference(
 def _causal_sdpa_reference(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
 ) -> torch.Tensor:
+    seqlen_q = q.size(1)
+    seqlen_k = k.size(1)
+    row = torch.arange(seqlen_q, device=q.device)[:, None]
+    col = torch.arange(seqlen_k, device=q.device)[None, :]
+    mask = col <= row + seqlen_k - seqlen_q
     return torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2),
         k.transpose(1, 2),
         v.transpose(1, 2),
         scale=sm_scale,
-        is_causal=True,
-        enable_gqa=q.size(2) != k.size(2),
-    ).transpose(1, 2)
-
-
-def _decode_sdpa_reference(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
-) -> torch.Tensor:
-    """Bottom-right causal attention when the single query is the newest token."""
-    return torch.nn.functional.scaled_dot_product_attention(
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        scale=sm_scale,
+        attn_mask=mask,
         enable_gqa=q.size(2) != k.size(2),
     ).transpose(1, 2)
 
@@ -221,45 +213,59 @@ def attention_bshd(
 def causal_attention_bshd(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
 ) -> torch.Tensor:
-    """Causal attention over ``[batch, seq, heads, dim]`` with ``seqlen_q == seqlen_k``.
+    """Bottom-right causal attention over ``[batch, seq, heads, dim]``.
 
-    The key loop stops at the diagonal instead of masking a full row of blocks,
-    so the fully-masked upper triangle is never computed at all.
+    Query row ``i`` attends through key ``i + seqlen_k - seqlen_q``, matching
+    FlashAttention for both equal and unequal sequence lengths. Equal-length
+    specializations retain the triangular key-loop optimization; unequal
+    specializations mask the full key range.
     """
     batch = q.size(0)
-    m_dim = q.size(1)
+    m_dim = hl.specialize(q.size(1))
     nheads_q = hl.specialize(q.size(2))
     head_dim = hl.specialize(q.size(3))
-    n_dim = k.size(1)
+    n_dim = hl.specialize(k.size(1))
     nheads_kv = hl.specialize(k.size(2))
     group = nheads_q // nheads_kv
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
+    causal_offset = n_dim - m_dim
+    # Equal lengths stop at the current query tile. Unequal lengths scan the
+    # full key range so Helion's tile-size choices cannot truncate the offset
+    # boundary; score_mask still skips every disallowed key.
+    unequal_key_padding = min(1, abs(causal_offset)) * n_dim
     for b, h in hl.grid([batch, nheads_q]):
         h_kv = h // group
         for tile_m in hl.tile(m_dim):
             m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-            l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+            l_i = hl.zeros([tile_m], dtype=torch.float32)
             acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
             q_blk = q[b, tile_m, h, :]
-            for tile_n in hl.tile(0, tile_m.end):
+            key_stop = min(n_dim, tile_m.end + unequal_key_padding)
+            for tile_n in hl.tile(0, key_stop):
                 k_blk = k[b, tile_n, h_kv, :]
-                qk = hl.dot(q_blk * qk_scale, k_blk.T, out_dtype=torch.float32)
-                qk = torch.where(
-                    tile_m.index[:, None] >= tile_n.index[None, :], qk, float("-inf")
-                )
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                score_mask = tile_n.index[None, :] <= (
+                    tile_m.index + causal_offset
+                )[:, None]
+                qk = torch.where(score_mask, qk, float("-inf"))
                 m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-                qk = qk - m_ij[:, None]
-                p = torch.exp2(qk)
-                l_ij = torch.sum(p, -1)
-                alpha = torch.exp2(m_i - m_ij)
-                l_i = l_i * alpha + l_ij
+                has_key = m_ij != float("-inf")
+                p = torch.exp2(
+                    torch.where(score_mask, qk - m_ij[:, None], float("-inf"))
+                )
+                alpha = torch.where(has_key, torch.exp2(m_i - m_ij), 1.0)
+                l_i = l_i * alpha + torch.sum(p, -1)
                 acc = acc * alpha[:, None]
                 v_blk = v[b, tile_n, h_kv, :]
                 acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
                 m_i = m_ij
-            acc = acc / l_i[:, None]
-            out[b, tile_m, h, :] = acc.to(out.dtype)
+            result = torch.where(
+                (l_i > 0)[:, None],
+                acc / torch.where(l_i > 0, l_i, 1.0)[:, None],
+                0.0,
+            )
+            out[b, tile_m, h, :] = result.to(out.dtype)
     return out
 
 
@@ -290,14 +296,16 @@ def causal_attention_bshd_16k(
 ) -> torch.Tensor:
     """Persistent causal attention for B1/S16K/H16/D128 bf16 only."""
     batch = q.size(0)
-    m_dim = q.size(1)
+    m_dim = hl.specialize(q.size(1))
     nheads_q = hl.specialize(q.size(2))
     head_dim = hl.specialize(q.size(3))
-    n_dim = k.size(1)
+    n_dim = hl.specialize(k.size(1))
     nheads_kv = hl.specialize(k.size(2))
     group = nheads_q // nheads_kv
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
+    causal_offset = n_dim - m_dim
+    unequal_key_padding = min(1, abs(causal_offset)) * n_dim
     # A one-CTA-per-SM persistent grid interleaves short and long causal rows
     # instead of assigning all query tiles to only sixteen batch/head CTAs.
     for tile_b, tile_h, tile_m in hl.tile(
@@ -307,74 +315,34 @@ def causal_attention_bshd_16k(
         h = tile_h.begin
         h_kv = h // group
         m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-        l_i = hl.full([tile_m], 1.0, dtype=torch.float32)
+        l_i = hl.zeros([tile_m], dtype=torch.float32)
         acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
-        q_blk = q[b, tile_m, h, :] * qk_scale
-        for tile_n in hl.tile(0, tile_m.end):
+        q_blk = q[b, tile_m, h, :]
+        key_stop = min(n_dim, tile_m.end + unequal_key_padding)
+        for tile_n in hl.tile(0, key_stop):
             k_blk = k[b, tile_n, h_kv, :]
-            qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32)
-            qk = torch.where(
-                tile_m.index[:, None] >= tile_n.index[None, :], qk, float("-inf")
+            qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+            score_mask = tile_n.index[None, :] <= (
+                tile_m.index + causal_offset
+            )[:, None]
+            qk = torch.where(score_mask, qk, float("-inf"))
+            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            has_key = m_ij != float("-inf")
+            p = torch.exp2(
+                torch.where(score_mask, qk - m_ij[:, None], float("-inf"))
             )
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-            qk = qk - m_ij[:, None]
-            p = torch.exp2(qk)
-            l_ij = torch.sum(p, -1)
-            alpha = torch.exp2(m_i - m_ij)
-            l_i = l_i * alpha + l_ij
+            alpha = torch.where(has_key, torch.exp2(m_i - m_ij), 1.0)
+            l_i = l_i * alpha + torch.sum(p, -1)
             acc = acc * alpha[:, None]
             v_blk = v[b, tile_n, h_kv, :]
             acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
             m_i = m_ij
-        acc = acc / l_i[:, None]
-        out[b, tile_m, h, :] = acc.to(out.dtype)
-    return out
-
-
-@helion.kernel(
-    static_shapes=True,
-    autotune_baseline_fn=_decode_sdpa_reference,
-    autotune_baseline_atol=5e-2,
-    autotune_baseline_rtol=2e-2,
-)
-def decode_attention_bshd(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
-) -> torch.Tensor:
-    """Single-token decode over a full ``[batch, cache, heads, dim]`` KV cache.
-
-    FlashAttention aligns unequal causal masks to the bottom right. With one
-    query representing the newest token, every cache position is visible, so
-    this is the decode-specific form of causal attention without a mask.
-    """
-    batch = q.size(0)
-    nheads_q = hl.specialize(q.size(2))
-    head_dim = hl.specialize(q.size(3))
-    n_dim = k.size(1)
-    nheads_kv = hl.specialize(k.size(2))
-    group = nheads_q // nheads_kv
-    out = torch.empty_like(q)
-    qk_scale = sm_scale * 1.44269504088896340736
-    for b, h in hl.grid([batch, nheads_q]):
-        h_kv = h // group
-        m_i = hl.full([1], float("-inf"), dtype=torch.float32)
-        l_i = hl.full([1], 1.0, dtype=torch.float32)
-        acc = hl.zeros([1, head_dim], dtype=torch.float32)
-        q_row = q[b, :, h, :]
-        for tile_n in hl.tile(n_dim):
-            k_blk = k[b, tile_n, h_kv, :]
-            qk = hl.dot(q_row, k_blk.T, out_dtype=torch.float32)
-            qk = qk * qk_scale
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-            qk = qk - m_ij[:, None]
-            p = torch.exp2(qk)
-            l_ij = torch.sum(p, -1)
-            alpha = torch.exp2(m_i - m_ij)
-            l_i = l_i * alpha + l_ij
-            acc = acc * alpha[:, None]
-            v_blk = v[b, tile_n, h_kv, :]
-            acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
-            m_i = m_ij
-        out[b, :, h, :] = (acc / l_i[:, None]).to(out.dtype)
+        result = torch.where(
+            (l_i > 0)[:, None],
+            acc / torch.where(l_i > 0, l_i, 1.0)[:, None],
+            0.0,
+        )
+        out[b, tile_m, h, :] = result.to(out.dtype)
     return out
 
 

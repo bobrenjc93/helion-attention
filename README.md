@@ -147,6 +147,7 @@ one is an autotuning run, not a code change.
 | 1 | 2048 | 2048 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
 | 1 | 4096 | 4096 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
 | 1 | 4096 | 4096 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
+| 1 | 64 | 320 | 8 | 2 | 128 | bf16 | yes | vLLM chunked-prefill causal alignment |
 | 1 | 8192 | 8192 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
 | 1 | 8192 | 8192 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | bf16 | yes | GPT-2 medium style, causal |
@@ -165,7 +166,7 @@ one is an autotuning run, not a code change.
 | 8 | 2048 | 2048 | 16 | 16 | 64 | bf16 | yes | small decoder, long batch |
 | 8 | 512 | 512 | 16 | 16 | 64 | bf16 | no | short-sequence encoder batch |
 
-26 kernels.
+27 kernels.
 <!-- SHAPES:END -->
 
 Packed varlen kernels specialize the batch size and maximum lengths while

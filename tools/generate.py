@@ -42,12 +42,6 @@ if TYPE_CHECKING:
 
 def select_dense_kernel_name(spec: "AttnShape") -> str:
     """Choose a Helion source without applying shape-specific configs broadly."""
-    if spec.causal and spec.seqlen_q != spec.seqlen_k:
-        if not spec.is_decode:
-            raise ValueError(
-                "unequal causal lengths are supported only for seqlen_q=1 decode"
-            )
-        return "decode_attention_bshd"
     if spec.key == PERSISTENT_CAUSAL_16K_KEY:
         return "causal_attention_bshd_16k"
     return "causal_attention_bshd" if spec.causal else "attention_bshd"
@@ -274,16 +268,17 @@ def build_paged_inputs(
 
 
 def reference(q, k, v, sm_scale, causal):  # noqa: ANN001, ANN201
-    # PyTorch's is_causal mask is top-left aligned for unequal sequence
-    # lengths. FlashAttention's is bottom-right aligned, which means a single
-    # newest-token query sees the full cache and needs no explicit mask.
-    is_causal = causal and q.size(1) == k.size(1)
+    mask = None
+    if causal:
+        row = torch.arange(q.size(1), device=q.device)[:, None]
+        col = torch.arange(k.size(1), device=q.device)[None, :]
+        mask = col <= row + k.size(1) - q.size(1)
     return torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2).float(),
         k.transpose(1, 2).float(),
         v.transpose(1, 2).float(),
         scale=sm_scale,
-        is_causal=is_causal,
+        attn_mask=mask,
         enable_gqa=q.size(2) != k.size(2),
     ).transpose(1, 2)
 
@@ -444,15 +439,6 @@ def main() -> int:
         dtype=DTYPES[args.dtype],
         causal=args.causal,
     )
-    if (
-        not (args.varlen or args.paged)
-        and spec.causal
-        and spec.seqlen_q != spec.seqlen_k
-        and not spec.is_decode
-    ):
-        raise SystemExit(
-            "unequal causal lengths are supported only for seqlen_q=1 decode"
-        )
     if args.backward and (
         spec.causal
         or spec.seqlen_q != spec.seqlen_k

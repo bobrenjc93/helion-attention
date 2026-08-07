@@ -16,6 +16,7 @@
       "varlen": false
     },
     {
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=1 seqlen_k=1024 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -26,9 +27,11 @@
       "nheads_q": 32,
       "note": "Llama-3-8B single-token decode, 1k KV cache",
       "seqlen_k": 1024,
-      "seqlen_q": 1
+      "seqlen_q": 1,
+      "varlen": false
     },
     {
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=1 seqlen_k=16384 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -39,9 +42,11 @@
       "nheads_q": 32,
       "note": "Llama-3-8B single-token decode, 16k KV cache",
       "seqlen_k": 16384,
-      "seqlen_q": 1
+      "seqlen_q": 1,
+      "varlen": false
     },
     {
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=1 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -52,7 +57,8 @@
       "nheads_q": 32,
       "note": "Llama-3-8B single-token decode, 4k KV cache",
       "seqlen_k": 4096,
-      "seqlen_q": 1
+      "seqlen_q": 1,
+      "varlen": false
     },
     {
       "batch": 1,
@@ -118,6 +124,21 @@
       "note": "Llama-3-8B GQA 4:1",
       "seqlen_k": 4096,
       "seqlen_q": 4096
+    },
+    {
+      "backward": false,
+      "batch": 1,
+      "causal": true,
+      "description": "batch=1 seqlen_q=64 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 128,
+      "key": "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal",
+      "nheads_kv": 2,
+      "nheads_q": 8,
+      "note": "vLLM chunked-prefill causal alignment",
+      "seqlen_k": 320,
+      "seqlen_q": 64,
+      "varlen": false
     },
     {
       "batch": 1,

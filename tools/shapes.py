@@ -123,6 +123,16 @@ CATALOGUE: list[ShapeRequest] = [
         seqlen_k=16384,
     ),
     ShapeRequest(
+        1,
+        64,
+        8,
+        128,
+        causal=True,
+        nheads_kv=2,
+        label="vLLM chunked-prefill causal alignment",
+        seqlen_k=320,
+    ),
+    ShapeRequest(
         8,
         512,
         16,

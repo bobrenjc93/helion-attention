@@ -38,6 +38,7 @@ QWEN_PREFILL = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+CHUNKED_PREFILL_KEY = "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal"
 
 
 def make_inputs(
@@ -67,14 +68,16 @@ def reference_attention(
     spec: AttnShape,
     scale: float,
 ) -> torch.Tensor:
-    # PyTorch's is_causal path is top-left aligned for unequal lengths, while
-    # FlashAttention aligns its causal mask to the bottom right. A one-token
-    # newest-query row therefore sees the whole cache.
+    mask = None
+    if spec.causal:
+        row = torch.arange(spec.seqlen_q, device=q.device)[:, None]
+        col = torch.arange(spec.seqlen_k, device=q.device)[None, :]
+        mask = col <= row + spec.seqlen_k - spec.seqlen_q
     return torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2).float(),
         k.transpose(1, 2).float(),
         v.transpose(1, 2).float(),
-        is_causal=spec.causal and not spec.is_decode,
+        attn_mask=mask,
         scale=scale,
         enable_gqa=spec.nheads_q != spec.nheads_kv,
     ).transpose(1, 2)
@@ -180,6 +183,32 @@ def test_custom_softmax_scale(entry: dict[str, object]) -> None:
         q, k, v, softmax_scale=scale, causal=spec.causal, shape=spec
     )
     expected = reference_attention(q, k, v, spec, scale)
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_unequal_causal_mask_includes_bottom_right_boundary() -> None:
+    entry = next(item for item in SHAPES if item["key"] == CHUNKED_PREFILL_KEY)
+    spec = spec_from_manifest_entry(entry)
+    q = torch.zeros(
+        (spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    k = torch.zeros(
+        (spec.batch, spec.seqlen_k, spec.nheads_kv, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    v = torch.zeros_like(k)
+    # Row zero's last visible key is 320 - 64 = 256. Concentrating the value
+    # there catches both top-left alignment and an exclusive-boundary error.
+    v[:, 256] = 100.0
+
+    got = helion_attention.flash_attn_func(q, k, v, causal=True, shape=spec)
+    expected = reference_attention(q, k, v, spec, 1.0 / math.sqrt(spec.head_dim))
+
+    assert got[0, 0, 0, 0].item() > 0.25
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
 
 
