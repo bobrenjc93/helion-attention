@@ -372,6 +372,56 @@ def test_fa2_causal_alibi_lse_matches_upstream() -> None:
 
 
 @requires_cuda
+def test_fa2_noncausal_one_sided_alibi_lse_matches_upstream() -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    tokens, nheads, head_dim = 4, 2, 64
+    q = torch.zeros(tokens, nheads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.randn(
+        q.shape,
+        device=q.device,
+        dtype=q.dtype,
+        generator=torch.Generator(device="cuda").manual_seed(654),
+    )
+    cumulative = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
+    slopes = torch.tensor([0.1, 0.4], device="cuda", dtype=torch.float32)
+    window = (-1, 0)
+
+    expected_out, expected_lse, _ = flash_attn.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cumulative,
+        cumulative,
+        tokens,
+        tokens,
+        causal=False,
+        window_size=window,
+        alibi_slopes=slopes,
+        return_attn_probs=True,
+    )
+    result = compat.flash_attn_varlen_func(
+        q=q,
+        k=k,
+        v=v,
+        max_seqlen_q=tokens,
+        cu_seqlens_q=cumulative,
+        max_seqlen_k=tokens,
+        cu_seqlens_k=cumulative,
+        causal=False,
+        window_size=window,
+        alibi_slopes=slopes,
+        return_softmax_lse=True,
+        fa_version=2,
+    )
+    assert isinstance(result, tuple)
+    actual_out, actual_lse = result
+
+    torch.testing.assert_close(actual_out, expected_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_lse, expected_lse, atol=2e-3, rtol=1e-3)
+
+
+@requires_cuda
 def test_exact_shape_dispatch_infers_specialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
