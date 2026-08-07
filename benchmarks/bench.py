@@ -31,6 +31,7 @@ import helion_attention  # noqa: E402
 from helion_attention._registry import available_shapes  # noqa: E402
 from helion_attention._registry import available_varlen_shapes  # noqa: E402
 from helion_attention._registry import spec_from_manifest_entry  # noqa: E402
+from helion_attention._sdpa import sdpa_causal_options  # noqa: E402
 from helion_attention._shape import AttnShape  # noqa: E402
 
 try:
@@ -53,15 +54,21 @@ from torch.nn.attention import sdpa_kernel  # noqa: E402
 
 
 def flops(spec: AttnShape) -> float:
-    total = (
+    if spec.causal:
+        offset = spec.seqlen_k - spec.seqlen_q
+        attended_pairs = sum(
+            max(0, min(spec.seqlen_k, row + offset + 1))
+            for row in range(spec.seqlen_q)
+        )
+    else:
+        attended_pairs = spec.seqlen_q * spec.seqlen_k
+    return (
         4.0
         * spec.batch
         * spec.nheads_q
-        * spec.seqlen_q
-        * spec.seqlen_k
+        * attended_pairs
         * spec.head_dim
     )
-    return total * 0.5 if spec.causal and not spec.is_decode else total
 
 
 def build_candidates(
@@ -83,16 +90,27 @@ def build_candidates(
     qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
     gqa = spec.nheads_q != spec.nheads_kv
 
-    # SDPA's unequal-length causal mask is top-left aligned. Single-token
-    # decode uses FlashAttention's bottom-right alignment, where the newest
-    # query can see the complete cache.
-    sdpa_is_causal = spec.causal and not spec.is_decode
+    causal_mask = None
+    if spec.causal:
+        row = torch.arange(spec.seqlen_q, device=q.device)[:, None]
+        col = torch.arange(spec.seqlen_k, device=q.device)[None, :]
+        causal_mask = col <= row + spec.seqlen_k - spec.seqlen_q
+
+    # Fused SDPA can represent equal-length triangular masks through
+    # is_causal. Unequal lengths need the explicit bottom-right mask, except
+    # single-token decode where that mask is entirely true and can be omitted.
+    sdpa_mask, sdpa_is_causal = sdpa_causal_options(spec, causal_mask)
 
     def sdpa(backend: SDPBackend) -> Callable[[], torch.Tensor]:
         def run() -> torch.Tensor:
             with sdpa_kernel(backend):
                 return torch.nn.functional.scaled_dot_product_attention(
-                    qt, kt, vt, is_causal=sdpa_is_causal, enable_gqa=gqa
+                    qt,
+                    kt,
+                    vt,
+                    attn_mask=sdpa_mask,
+                    is_causal=sdpa_is_causal,
+                    enable_gqa=gqa,
                 ).transpose(1, 2)
 
         return run
@@ -124,7 +142,7 @@ def build_candidates(
         qt.float(),
         kt.float(),
         vt.float(),
-        is_causal=sdpa_is_causal,
+        attn_mask=causal_mask,
         scale=1.0 / math.sqrt(spec.head_dim),
         enable_gqa=gqa,
     ).transpose(1, 2)

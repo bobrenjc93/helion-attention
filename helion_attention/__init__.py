@@ -118,8 +118,7 @@ def flash_attn_func(
         k: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
-        causal: bottom-right causal masking. Unequal sequence lengths are
-            supported for single-token decode (``seqlen_q == 1``).
+        causal: bottom-right causal masking, including unequal sequence lengths.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -133,11 +132,6 @@ def flash_attn_func(
     _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
     spec = normalize_shape(shape, q.dtype, causal)
     check_tensors(q, k, v, spec)
-    if causal and spec.seqlen_q != spec.seqlen_k and not spec.is_decode:
-        raise NotImplementedError(
-            "causal attention with unequal sequence lengths is implemented only "
-            "for single-token decode (seqlen_q=1)"
-        )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     kernel = lookup(spec)

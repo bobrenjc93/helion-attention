@@ -6,6 +6,7 @@ from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -51,8 +52,24 @@ def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None
     )
     assert (
         generate.select_dense_kernel_name(replace(exact, seqlen_q=1))
-        == "decode_attention_bshd"
+        == "causal_attention_bshd"
     )
+    assert (
+        generate.select_dense_kernel_name(
+            replace(exact, seqlen_q=64, seqlen_k=320)
+        )
+        == "causal_attention_bshd"
+    )
+
+
+def test_decode_autotuning_rejects_persistent_launches() -> None:
+    flat = SimpleNamespace(pid_type="flat")
+    xyz = SimpleNamespace(pid_type="xyz")
+    persistent = SimpleNamespace(pid_type="persistent_interleaved")
+
+    assert generate.nonpersistent_decode_config(flat) is flat
+    assert generate.nonpersistent_decode_config(xyz) is xyz
+    assert generate.nonpersistent_decode_config(persistent) is None
 
 
 def test_failed_upgrade_restores_existing_kernel_and_manifest(
