@@ -590,6 +590,11 @@ def flash_attn_varlen_func(
             if right_window >= 0:
                 keep &= columns <= aligned_query_positions[:, None] + right_window
 
+            # A zero attention weight does not neutralize NaN/Inf under IEEE
+            # multiplication.  Clear masked values before the contraction so
+            # unused ragged-cache slots cannot poison otherwise valid rows.
+            value_f = value_f.masked_fill(~keep[:, :, None, None], 0.0)
+
             if slopes is not None:
                 distance = (aligned_query_positions[:, None] - columns).abs().float()
                 scores = (

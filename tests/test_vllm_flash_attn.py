@@ -177,6 +177,43 @@ def test_nonpaged_fallback_features_and_out_parameter(
     torch.testing.assert_close(lse, torch.cat(expected_lse, dim=1))
 
 
+def test_paged_nonfinite_cache_tail_is_masked() -> None:
+    generator = torch.Generator().manual_seed(987)
+    q = torch.randn(2, 2, 4, generator=generator)
+    clean_k = torch.zeros(2, 4, 1, 4)
+    clean_v = torch.zeros_like(clean_k)
+    clean_k[0, :1] = torch.randn(1, 1, 4, generator=generator)
+    clean_v[0, :1] = torch.randn(1, 1, 4, generator=generator)
+    clean_k[1, :3] = torch.randn(3, 1, 4, generator=generator)
+    clean_v[1, :3] = torch.randn(3, 1, 4, generator=generator)
+
+    poisoned_k = clean_k.clone()
+    poisoned_v = clean_v.clone()
+    poisoned_k[0, 1:3] = float("nan")
+    poisoned_v[0, 1] = float("nan")
+    poisoned_v[0, 2] = float("inf")
+    cumulative_q = torch.tensor([0, 1, 2], dtype=torch.int32)
+    seqused_k = torch.tensor([1, 3], dtype=torch.int32)
+    block_table = torch.tensor([[0], [1]], dtype=torch.int32)
+    kwargs = {
+        "q": q,
+        "max_seqlen_q": 1,
+        "cu_seqlens_q": cumulative_q,
+        "max_seqlen_k": 3,
+        "seqused_k": seqused_k,
+        "block_table": block_table,
+        "causal": True,
+        "fa_version": 3,
+    }
+
+    expected = compat.flash_attn_varlen_func(k=clean_k, v=clean_v, **kwargs)
+    actual = compat.flash_attn_varlen_func(k=poisoned_k, v=poisoned_v, **kwargs)
+    assert isinstance(expected, torch.Tensor)
+    assert isinstance(actual, torch.Tensor)
+    assert torch.isfinite(actual).all()
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("fa_version", [4, 999])
 def test_unsupported_fa_version_is_rejected(fa_version: int) -> None:
     tensor = torch.zeros(1, 1, 1)
