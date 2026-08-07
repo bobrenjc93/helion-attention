@@ -56,12 +56,34 @@ def benchmark_table() -> str:
         f"Measured on {report['device']} (torch {report['torch']}, triton {report['triton']}). "
         "Times are the median of interleaved rounds; lower is better.",
         "",
-        "| shape | "
-        + " | ".join(f"{name} µs" for name in names)
-        + " | helion TFLOP/s | speedup vs flash-attn |",
-        "| --- | " + " | ".join("---:" for _ in names) + " | ---: | ---: |",
     ]
+    kinds = {row.get("kind") for row in report["results"]}
+    notes = []
+    if "paged" in kinds:
+        notes.append(
+            "Paged rows use identical logical caches with each implementation's native "
+            "page size: 16 for Helion and FlashAttention's minimum of 256. Paged "
+            "decode uses `flash_attn_with_kvcache`; chunked prefill uses "
+            "`flash_attn_varlen_func`."
+        )
+    if "backward" in kinds:
+        notes.append(
+            "Backward rows time dQ/dK/dV only; their forward graphs are prepared outside "
+            "the timed region, and TFLOP/s uses the standard 2.5x-forward operation estimate."
+        )
+    if notes:
+        lines.extend([" ".join(notes), ""])
+    lines.extend(
+        [
+            "| shape | "
+            + " | ".join(f"{name} µs" for name in names)
+            + " | helion TFLOP/s | comparison vs flash-attn |",
+            "| --- | " + " | ".join("---:" for _ in names) + " | ---: | ---: |",
+        ]
+    )
     speedups = []
+    faster = 0
+    slower = 0
     for row in report["results"]:
         impls = row["implementations"]
         cells = [
@@ -72,7 +94,12 @@ def benchmark_table() -> str:
         if helion is not None and flash is not None:
             speedup = flash["us"] / helion["us"]
             speedups.append(speedup)
-            speedup_cell = f"**{speedup:.2f}x**" if speedup >= 1 else f"{speedup:.2f}x"
+            if speedup >= 1:
+                faster += 1
+                speedup_cell = f"**{speedup:.2f}x faster**"
+            else:
+                slower += 1
+                speedup_cell = f"**{1 / speedup:.2f}x slower**"
         else:
             speedup_cell = "n/a"
         tflops = "n/a" if helion is None else f"{helion['tflops']:.0f}"
@@ -83,7 +110,13 @@ def benchmark_table() -> str:
         geomean = __import__("math").exp(sum(map(__import__("math").log, speedups)) / len(speedups))
         lines.append("")
         lines.append(
-            f"Geomean speedup over flash-attn across all {len(speedups)} shapes: **{geomean:.2f}x**."
+            f"Helion is faster than flash-attn on {faster} kernel workloads and slower "
+            f"on {slower} kernel workloads."
+        )
+        lines.append("")
+        lines.append(
+            f"Geomean speedup over flash-attn across all {len(speedups)} kernel workloads: "
+            f"**{geomean:.2f}x**."
         )
     return "\n".join(lines)
 

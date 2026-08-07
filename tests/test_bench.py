@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+import importlib.util
+import json
 from dataclasses import replace
+from pathlib import Path
 
+import pytest
 import torch
 
+from benchmarks.inventory import benchmark_entries
+from benchmarks.inventory import benchmark_key
 from helion_attention._sdpa import sdpa_causal_options
 from helion_attention._shape import AttnShape
+
+REPO_ROOT = Path(__file__).parents[1]
+UPDATE_README_PATH = Path(__file__).parents[1] / "tools" / "update_readme.py"
+UPDATE_README_SPEC = importlib.util.spec_from_file_location(
+    "helion_attention_update_readme", UPDATE_README_PATH
+)
+assert UPDATE_README_SPEC is not None
+assert UPDATE_README_SPEC.loader is not None
+update_readme = importlib.util.module_from_spec(UPDATE_README_SPEC)
+UPDATE_README_SPEC.loader.exec_module(update_readme)
 
 
 def test_decode_omits_all_true_causal_mask_for_fused_sdpa() -> None:
@@ -43,3 +59,91 @@ def test_decode_omits_all_true_causal_mask_for_fused_sdpa() -> None:
     mask, is_causal = sdpa_causal_options(noncausal, None)
     assert mask is None
     assert not is_causal
+
+
+def test_markdown_labels_faster_and_slower_results_plainly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = {
+        "device": "test GPU",
+        "torch": "test torch",
+        "triton": "test triton",
+        "results": [
+            {
+                "description": "faster shape",
+                "implementations": {
+                    "helion-attention": {"us": 1.0, "tflops": 2.0},
+                    "flash-attn": {"us": 2.0},
+                },
+            },
+            {
+                "description": "slower shape",
+                "implementations": {
+                    "helion-attention": {"us": 4.0, "tflops": 0.5},
+                    "flash-attn": {"us": 2.0},
+                },
+            },
+        ],
+    }
+
+    class BenchmarkReport:
+        @staticmethod
+        def exists() -> bool:
+            return True
+
+        @staticmethod
+        def read_text() -> str:
+            return json.dumps(report)
+
+    monkeypatch.setattr(update_readme, "BENCHMARKS", BenchmarkReport())
+
+    table = update_readme.benchmark_table()
+
+    assert "2.00x faster" in table
+    assert "2.00x slower" in table
+
+
+def test_discovery_and_report_cover_every_checked_in_kernel() -> None:
+    manifest = json.loads(
+        (REPO_ROOT / "helion_attention" / "kernels" / "manifest.json").read_text()
+    )
+    expected = []
+    for entry in manifest["kernels"]:
+        expected.append(entry["key"])
+        if entry.get("backward", False):
+            expected.append(f"{entry['key']}_backward")
+    for section in ("varlen_kernels", "paged_kernels"):
+        expected.extend(entry["key"] for entry in manifest[section])
+
+    discovered = benchmark_entries()
+    discovered_keys = [benchmark_key(entry, kind) for entry, kind in discovered]
+    artifact_keys = {
+        path.stem
+        for path in (REPO_ROOT / "helion_attention" / "kernels").glob("*.py")
+        if path.name != "__init__.py"
+    }
+    report = json.loads((REPO_ROOT / "docs" / "benchmarks.json").read_text())
+    report_by_key = {row["key"]: row for row in report["results"]}
+
+    assert discovered_keys == expected
+    assert set(discovered_keys) == artifact_keys
+    assert [row["key"] for row in report["results"]] == expected
+    assert [kind for _, kind in benchmark_entries("paged")] == [
+        "paged",
+        "paged",
+    ]
+    assert [kind for _, kind in benchmark_entries("backward")] == [
+        "backward"
+    ]
+    assert (
+        report_by_key["paged_b2_sq200_sk320_hq8_hkv2_d128_bf16_causal_ps16"][
+            "flash_attn_api"
+        ]
+        == "flash_attn_varlen_func"
+    )
+    assert (
+        report_by_key["paged_b4_sq1_sk1024_hq8_hkv2_d128_bf16_causal_ps16"][
+            "flash_attn_api"
+        ]
+        == "flash_attn_with_kvcache"
+    )
