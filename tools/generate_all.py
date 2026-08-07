@@ -29,14 +29,16 @@ def existing_entries() -> dict[str, dict[str, object]]:
     if not MANIFEST.exists():
         return {}
     with MANIFEST.open() as handle:
-        entries = json.load(handle)["kernels"]
+        payload = json.load(handle)
+    entries = payload.get("kernels", []) + payload.get("varlen_kernels", [])
     return {str(entry["key"]): entry for entry in entries}
 
 
 def expected_key(request: ShapeRequest) -> str:
     heads_kv = request.nheads_kv if request.nheads_kv is not None else request.nheads
     seqlen_k = request.seqlen_k if request.seqlen_k is not None else request.seqlen
-    return (
+    prefix = "varlen_" if request.varlen else ""
+    return prefix + (
         f"b{request.batch}_sq{request.seqlen}_sk{seqlen_k}"
         f"_hq{request.nheads}_hkv{heads_kv}_d{request.head_dim}"
         f"_{request.dtype}_{'causal' if request.causal else 'noncausal'}"

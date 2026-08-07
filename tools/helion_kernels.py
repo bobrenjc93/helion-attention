@@ -52,6 +52,47 @@ def _decode_sdpa_reference(
     ).transpose(1, 2)
 
 
+def _varlen_sdpa_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    sm_scale: float,
+    causal: bool,
+) -> torch.Tensor:
+    """Packed-sequence oracle used only while autotuning."""
+    del max_seqlen_q, max_seqlen_k
+    cu_q = cu_seqlens_q.tolist()
+    cu_k = cu_seqlens_k.tolist()
+    out = torch.empty_like(q)
+    for q_start, q_end, k_start, k_end in zip(
+        cu_q[:-1], cu_q[1:], cu_k[:-1], cu_k[1:]
+    ):
+        q_seq = q[q_start:q_end].transpose(0, 1).unsqueeze(0)
+        k_seq = k[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        v_seq = v[k_start:k_end].transpose(0, 1).unsqueeze(0)
+        seqlen_q = q_end - q_start
+        seqlen_k = k_end - k_start
+        mask = None
+        if causal:
+            row = torch.arange(seqlen_q, device=q.device)[:, None]
+            col = torch.arange(seqlen_k, device=q.device)[None, :]
+            mask = col <= row + seqlen_k - seqlen_q
+        result = torch.nn.functional.scaled_dot_product_attention(
+            q_seq,
+            k_seq,
+            v_seq,
+            attn_mask=mask,
+            scale=sm_scale,
+            enable_gqa=q.size(1) != k.size(1),
+        )
+        out[q_start:q_end] = result.squeeze(0).transpose(0, 1)
+    return out
+
+
 def _attention_backward_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -221,6 +262,111 @@ def decode_attention_bshd(
             acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
             m_i = m_ij
         out[b, :, h, :] = (acc / l_i[:, None]).to(out.dtype)
+    return out
+
+
+@helion.kernel(
+    static_shapes=False,
+    autotune_effort="quick",
+    autotune_baseline_fn=_varlen_sdpa_reference,
+    autotune_baseline_atol=5e-2,
+    autotune_baseline_rtol=2e-2,
+)
+def varlen_attention_thd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: hl.constexpr,
+    max_seqlen_k: hl.constexpr,
+    sm_scale: float,
+    causal: hl.constexpr,
+) -> torch.Tensor:
+    """Attention over FlashAttention's packed ``[total, heads, dim]`` layout.
+
+    The first tensor dimension is deliberately dynamic.  The batch size,
+    maximum sequence lengths, head counts, head dimension, and masking mode
+    remain compile-time specializations, while each invocation reads the
+    actual per-sequence bounds from the two device-resident cumulative-length
+    arrays.
+    """
+    batch = hl.specialize(cu_seqlens_q.size(0) - 1)
+    max_q = max_seqlen_q
+    max_k = max_seqlen_k
+    nheads_q = hl.specialize(q.size(1))
+    nheads_kv = hl.specialize(k.size(1))
+    head_dim = hl.specialize(q.size(2))
+    is_causal = causal
+    group = nheads_q // nheads_kv
+    out = torch.empty_like(q)
+    qk_scale = sm_scale * 1.44269504088896340736
+
+    for b, h in hl.grid([batch, nheads_q]):
+        h_kv = h // group
+        q_start = cu_seqlens_q[b]
+        q_end = cu_seqlens_q[b + 1]
+        k_start = cu_seqlens_k[b]
+        k_end = cu_seqlens_k[b + 1]
+        seqlen_q = q_end - q_start
+        seqlen_k = k_end - k_start
+        for tile_m in hl.tile(max_q):
+            valid_m = tile_m.index < seqlen_q
+            q_index = q_start + tile_m.index
+            q_blk = hl.load(
+                q,
+                [q_index, h, slice(None)],
+                extra_mask=valid_m[:, None],
+            )
+            m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+            l_i = hl.zeros([tile_m], dtype=torch.float32)
+            acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+            for tile_n in hl.tile(max_k):
+                valid_n = tile_n.index < seqlen_k
+                k_index = k_start + tile_n.index
+                k_blk = hl.load(
+                    k,
+                    [k_index, h_kv, slice(None)],
+                    extra_mask=valid_n[:, None],
+                )
+                qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+                score_mask = valid_m[:, None] & valid_n[None, :]
+                if is_causal:
+                    causal_bound = tile_m.index + seqlen_k - seqlen_q
+                    score_mask = score_mask & (
+                        tile_n.index[None, :] <= causal_bound[:, None]
+                    )
+                qk = torch.where(score_mask, qk, float("-inf"))
+                m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                has_key = m_ij != float("-inf")
+                p = torch.exp2(
+                    torch.where(score_mask, qk - m_ij[:, None], float("-inf"))
+                )
+                alpha = torch.where(
+                    has_key,
+                    torch.exp2(m_i - m_ij),
+                    1.0,
+                )
+                l_i = l_i * alpha + torch.sum(p, -1)
+                acc = acc * alpha[:, None]
+                v_blk = hl.load(
+                    v,
+                    [k_index, h_kv, slice(None)],
+                    extra_mask=valid_n[:, None],
+                )
+                acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
+                m_i = m_ij
+            result = torch.where(
+                (l_i > 0)[:, None],
+                acc / torch.where(l_i > 0, l_i, 1.0)[:, None],
+                0.0,
+            )
+            hl.store(
+                out,
+                [q_index, h, slice(None)],
+                result.to(out.dtype),
+                extra_mask=valid_m[:, None],
+            )
     return out
 
 

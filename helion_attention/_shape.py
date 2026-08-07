@@ -132,3 +132,69 @@ def check_tensors(
                 f"{name} must be contiguous in [batch, seqlen, nheads, head_dim] layout; "
                 "the generated kernels bake in the strides of that layout"
             )
+
+
+def check_varlen_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    spec: AttnShape,
+) -> None:
+    """Validate FlashAttention's packed ``[total, heads, dim]`` inputs.
+
+    The cumulative values stay device-resident: checking them on the host would
+    synchronize every invocation and make CUDA graph capture impossible.  As in
+    FlashAttention, callers are responsible for supplying monotonic offsets
+    whose final values equal the corresponding packed tensor lengths.
+    """
+    expected_trailing = {
+        "q": (spec.nheads_q, spec.head_dim),
+        "k": (spec.nheads_kv, spec.head_dim),
+        "v": (spec.nheads_kv, spec.head_dim),
+    }
+    total_names = {"q": "total_q", "k": "total_k", "v": "total_k"}
+    tensors = {"q": q, "k": k, "v": v}
+    device = q.device
+    for name, tensor in tensors.items():
+        trailing = expected_trailing[name]
+        if tensor.ndim != 3 or tuple(tensor.shape[1:]) != trailing:
+            raise ValueError(
+                f"{name} has shape {tuple(tensor.shape)} but the declared varlen "
+                f"shape requires [{total_names[name]}, {trailing[0]}, {trailing[1]}]"
+            )
+        if tensor.dtype != spec.dtype:
+            raise ValueError(f"{name} has dtype {tensor.dtype} but shape declares {spec.dtype}")
+        if not tensor.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor, got device {tensor.device}")
+        if tensor.device != device:
+            raise ValueError("q, k, and v must be on the same CUDA device")
+        if not tensor.is_contiguous():
+            raise ValueError(
+                f"{name} must be contiguous in [total, heads, head_dim] layout"
+            )
+    if k.shape[0] != v.shape[0]:
+        raise ValueError(
+            f"k and v must contain the same number of packed tokens, got "
+            f"{k.shape[0]} and {v.shape[0]}"
+        )
+
+    expected_cu_shape = (spec.batch + 1,)
+    for name, cu_seqlens in (
+        ("cu_seqlens_q", cu_seqlens_q),
+        ("cu_seqlens_k", cu_seqlens_k),
+    ):
+        if tuple(cu_seqlens.shape) != expected_cu_shape:
+            raise ValueError(
+                f"{name} has shape {tuple(cu_seqlens.shape)} but batch={spec.batch} "
+                f"requires {expected_cu_shape}"
+            )
+        if cu_seqlens.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32")
+        if not cu_seqlens.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor, got device {cu_seqlens.device}")
+        if cu_seqlens.device != device:
+            raise ValueError(f"{name} must be on the same CUDA device as q, k, and v")
+        if not cu_seqlens.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")

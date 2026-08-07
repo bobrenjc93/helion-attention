@@ -105,3 +105,44 @@ def test_generator_rejects_multi_cta_cooperative_grid() -> None:
     generate.require_portable_cooperative_grid(
         "_launcher(kernel, (_NUM_SM,), launch_cooperative_grid=True)"
     )
+
+
+def test_strip_helion_removes_varlen_constexpr_annotations() -> None:
+    source = (
+        "import helion.language as hl\n"
+        "def varlen_attention(max_seqlen: hl.constexpr, causal: hl.constexpr):\n"
+        "    return max_seqlen\n"
+    )
+    rewritten = generate.strip_helion(source)
+    assert "helion" not in rewritten
+    assert "hl.constexpr" not in rewritten
+    assert "def varlen_attention(max_seqlen, causal):" in rewritten
+
+
+def test_varlen_artifact_uses_separate_manifest_section(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel_dir = tmp_path / "kernels"
+    kernel_dir.mkdir()
+    target = kernel_dir / "varlen_shape.py"
+    backward_target = kernel_dir / "varlen_shape_backward.py"
+    manifest = kernel_dir / "manifest.json"
+    dense_entry = {"key": "dense_shape"}
+    manifest.write_text(json.dumps({"kernels": [dense_entry]}) + "\n")
+    monkeypatch.setattr(generate, "MANIFEST", manifest)
+
+    generate.install_generated_artifacts(
+        target=target,
+        module="generated varlen forward\n",
+        backward_target=backward_target,
+        backward_module=None,
+        manifest_entry={"key": "varlen_shape", "varlen": True},
+        manifest_section="varlen_kernels",
+        verify=lambda: 0,
+    )
+
+    payload = json.loads(manifest.read_text())
+    assert payload["kernels"] == [dense_entry]
+    assert payload["varlen_kernels"] == [
+        {"key": "varlen_shape", "varlen": True}
+    ]

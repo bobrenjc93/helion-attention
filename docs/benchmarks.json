@@ -327,6 +327,42 @@
           "max_abs_error": 0.0019145607948303223
         }
       }
+    },
+    {
+      "key": "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
+      "description": "varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=True",
+      "varlen": true,
+      "note": "ragged decoder batch",
+      "implementations": {
+        "helion-attention": {
+          "us": 85.37823579759217,
+          "tflops": 11.820979791532105,
+          "max_abs_error": 0.007879257202148438
+        },
+        "flash-attn": {
+          "us": 214.69221765630485,
+          "tflops": 4.700936116909878,
+          "max_abs_error": 0.007879257202148438
+        }
+      }
+    },
+    {
+      "key": "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
+      "description": "varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False",
+      "varlen": true,
+      "note": "ragged encoder batch",
+      "implementations": {
+        "helion-attention": {
+          "us": 83.70457839378169,
+          "tflops": 24.052040624692555,
+          "max_abs_error": 0.003950834274291992
+        },
+        "flash-attn": {
+          "us": 213.67461140394622,
+          "tflops": 9.422111063040493,
+          "max_abs_error": 0.003924250602722168
+        }
+      }
     }
   ]
 }

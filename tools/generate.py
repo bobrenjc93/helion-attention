@@ -2,10 +2,11 @@
 
 Usage:
     python tools/generate.py --batch 2 --seqlen 1024 --nheads 32 --head-dim 64 \
-        --dtype bf16 [--causal] [--nheads-kv 8] [--seqlen-k 1024] [--backward]
+        --dtype bf16 [--causal] [--nheads-kv 8] [--seqlen-k 1024] \
+        [--backward | --varlen]
 
 The emitted module under ``helion_attention/kernels/`` is Helion's own output
-with four mechanical substitutions applied, so that the runtime package needs
+with small mechanical substitutions applied, so that the runtime package needs
 only ``torch`` and ``triton``.
 """
 
@@ -43,6 +44,8 @@ Regenerate with:
 
 _SUBSTITUTIONS = (
     ("import helion\n", ""),
+    ("import helion.language as hl\n", ""),
+    (": hl.constexpr", ""),
     (
         "from helion.runtime import default_launcher as _default_launcher",
         "from .._launcher import default_launcher as _default_launcher\n"
@@ -92,6 +95,67 @@ def build_inputs(spec: "AttnShape") -> tuple[torch.Tensor, torch.Tensor, torch.T
     k = rand(spec.seqlen_k, spec.nheads_kv)
     v = rand(spec.seqlen_k, spec.nheads_kv)
     return q, k, v, 1.0 / math.sqrt(spec.head_dim)
+
+
+def varlen_lengths(batch: int, maximum: int, *, reverse: bool = False) -> list[int]:
+    """Deterministic ragged lengths that include the declared maximum."""
+    lengths = [max(1, maximum * (batch - index) // batch) for index in range(batch)]
+    return list(reversed(lengths)) if reverse else lengths
+
+
+def build_varlen_inputs(
+    spec: "AttnShape",
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    float,
+    bool,
+]:
+    """Packed autotuning inputs with unequal per-sequence Q/K lengths."""
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    lengths_q = varlen_lengths(spec.batch, spec.seqlen_q)
+    lengths_k = varlen_lengths(spec.batch, spec.seqlen_k, reverse=True)
+
+    def cumulative(lengths: list[int]) -> torch.Tensor:
+        values = [0]
+        for length in lengths:
+            values.append(values[-1] + length)
+        return torch.tensor(values, dtype=torch.int32, device="cuda")
+
+    q = torch.randn(
+        (sum(lengths_q), spec.nheads_q, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    k = torch.randn(
+        (sum(lengths_k), spec.nheads_kv, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    v = torch.randn(
+        k.shape,
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    return (
+        q,
+        k,
+        v,
+        cumulative(lengths_q),
+        cumulative(lengths_k),
+        spec.seqlen_q,
+        spec.seqlen_k,
+        1.0 / math.sqrt(spec.head_dim),
+        spec.causal,
+    )
 
 
 def reference(q, k, v, sm_scale, causal):  # noqa: ANN001, ANN201
@@ -149,15 +213,19 @@ def build_module(
     return header + body[0] + "\n\n" + spec_block + body[1]
 
 
-def upsert_manifest(entry: dict[str, object]) -> None:
+def upsert_manifest(
+    entry: dict[str, object], section: str = "kernels"
+) -> None:
     payload = {"kernels": []}
     if MANIFEST.exists():
         with MANIFEST.open() as handle:
             payload = json.load(handle)
-    kernels = [item for item in payload["kernels"] if item["key"] != entry["key"]]
+    kernels = [
+        item for item in payload.get(section, []) if item["key"] != entry["key"]
+    ]
     kernels.append(entry)
     kernels.sort(key=lambda item: item["key"])
-    payload["kernels"] = kernels
+    payload[section] = kernels
     with MANIFEST.open("w") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -187,6 +255,7 @@ def install_generated_artifacts(
     backward_module: str | None,
     manifest_entry: dict[str, object],
     verify: Callable[[], int],
+    manifest_section: str = "kernels",
 ) -> None:
     """Install and verify generated files, restoring their exact prior state on error."""
     paths = (target, backward_target, MANIFEST)
@@ -199,7 +268,7 @@ def install_generated_artifacts(
             backward_target.unlink(missing_ok=True)
         else:
             backward_target.write_text(backward_module)
-        upsert_manifest(manifest_entry)
+        upsert_manifest(manifest_entry, manifest_section)
         if verify() != 0:
             raise GenerationVerificationError(
                 "generated kernel failed standalone verification"
@@ -228,6 +297,11 @@ def main() -> int:
         action="store_true",
         help="also generate the non-causal MHA backward specialization",
     )
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        help="generate a packed [total, heads, dim] forward specialization",
+    )
     parser.add_argument("--label", default="", help="human note stored in the manifest")
     args = parser.parse_args()
 
@@ -243,7 +317,12 @@ def main() -> int:
         dtype=DTYPES[args.dtype],
         causal=args.causal,
     )
-    if spec.causal and spec.seqlen_q != spec.seqlen_k and not spec.is_decode:
+    if (
+        not args.varlen
+        and spec.causal
+        and spec.seqlen_q != spec.seqlen_k
+        and not spec.is_decode
+    ):
         raise SystemExit(
             "unequal causal lengths are supported only for seqlen_q=1 decode"
         )
@@ -256,19 +335,30 @@ def main() -> int:
             "backward generation currently supports only non-causal MHA with "
             "equal query/key sequence lengths"
         )
+    if args.backward and args.varlen:
+        raise SystemExit("--backward and --varlen cannot be combined")
 
     import helion_kernels
 
-    kernel = helion_kernels.select_kernel(
-        causal=spec.causal,
-        seqlen_q=spec.seqlen_q,
-        seqlen_k=spec.seqlen_k,
-    )
-    q, k, v, sm_scale = build_inputs(spec)
-
-    print(f"autotuning {spec.describe()}", flush=True)
-    got = kernel(q, k, v, sm_scale)
-    expected = reference(q, k, v, sm_scale, spec.causal)
+    if args.varlen:
+        kernel = helion_kernels.varlen_attention_thd
+        forward_args = build_varlen_inputs(spec)
+        q, k, v = forward_args[:3]
+        sm_scale = forward_args[-2]
+        print(f"autotuning varlen {spec.describe()}", flush=True)
+        got = kernel(*forward_args)
+        expected = helion_kernels._varlen_sdpa_reference(*forward_args)
+    else:
+        kernel = helion_kernels.select_kernel(
+            causal=spec.causal,
+            seqlen_q=spec.seqlen_q,
+            seqlen_k=spec.seqlen_k,
+        )
+        q, k, v, sm_scale = build_inputs(spec)
+        forward_args = (q, k, v, sm_scale)
+        print(f"autotuning {spec.describe()}", flush=True)
+        got = kernel(*forward_args)
+        expected = reference(q, k, v, sm_scale, spec.causal)
     error = (got.float() - expected).abs().max().item()
     print(f"max abs error vs fp32 SDPA: {error:.4g}")
     if error > 5e-2:
@@ -310,9 +400,11 @@ def main() -> int:
         )
         require_portable_cooperative_grid(backward_code)
 
-    bound = kernel.bind((q, k, v, sm_scale))
+    bound = kernel.bind(forward_args)
     code = strip_helion(bound.to_triton_code())
-    code = rename_entry_point(code, kernel.name)
+    code = rename_entry_point(
+        code, kernel.name, "attention_varlen" if args.varlen else "attention"
+    )
 
     command = " ".join(
         ["python tools/generate.py", f"--batch {spec.batch}", f"--seqlen {spec.seqlen_q}"]
@@ -322,9 +414,11 @@ def main() -> int:
         + [f"--head-dim {spec.head_dim}", f"--dtype {spec.dtype_name}"]
         + (["--causal"] if spec.causal else [])
         + (["--backward"] if args.backward else [])
+        + (["--varlen"] if args.varlen else [])
     )
+    kernel_key = f"varlen_{spec.key}" if args.varlen else spec.key
     spec_fields = {
-        "key": spec.key,
+        "key": kernel_key,
         "batch": spec.batch,
         "seqlen_q": spec.seqlen_q,
         "seqlen_k": spec.seqlen_k,
@@ -334,17 +428,18 @@ def main() -> int:
         "dtype": spec.dtype_name,
         "causal": spec.causal,
         "backward": args.backward,
+        "varlen": args.varlen,
     }
     module = build_module(
         code,
         command=command,
-        description=spec.describe(),
+        description=f"varlen {spec.describe()}" if args.varlen else spec.describe(),
         spec_fields=spec_fields,
     )
 
     KERNELS_DIR.mkdir(parents=True, exist_ok=True)
-    target = KERNELS_DIR / f"{spec.key}.py"
-    backward_target = KERNELS_DIR / f"{spec.key}_backward.py"
+    target = KERNELS_DIR / f"{kernel_key}.py"
+    backward_target = KERNELS_DIR / f"{kernel_key}_backward.py"
     backward_module = None
     if backward_code is not None:
         backward_module = build_module(
@@ -354,7 +449,7 @@ def main() -> int:
             spec_fields=spec_fields,
         )
     manifest_entry = {
-        "key": spec.key,
+        "key": kernel_key,
         "batch": spec.batch,
         "seqlen_q": spec.seqlen_q,
         "seqlen_k": spec.seqlen_k,
@@ -364,13 +459,14 @@ def main() -> int:
         "dtype": spec.dtype_name,
         "causal": spec.causal,
         "backward": args.backward,
-        "description": spec.describe(),
+        "varlen": args.varlen,
+        "description": f"varlen {spec.describe()}" if args.varlen else spec.describe(),
         "note": args.label,
     }
 
     def verify_generated_kernel() -> int:
         return subprocess.run(
-            [sys.executable, str(REPO_ROOT / "tools" / "verify.py"), spec.key],
+            [sys.executable, str(REPO_ROOT / "tools" / "verify.py"), kernel_key],
             cwd=REPO_ROOT,
         ).returncode
 
@@ -382,6 +478,7 @@ def main() -> int:
             backward_module=backward_module,
             manifest_entry=manifest_entry,
             verify=verify_generated_kernel,
+            manifest_section="varlen_kernels" if args.varlen else "kernels",
         )
     except GenerationVerificationError as exc:
         raise SystemExit(f"{exc}; restored previous artifacts") from exc
