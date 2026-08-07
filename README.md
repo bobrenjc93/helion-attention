@@ -61,8 +61,10 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-This decode path reads a full, contiguous cache. Cache appends and partial,
-ragged, paged, or rotary-embedded caches are rejected explicitly.
+This decode path reads a full, contiguous cache. `cache_seqlens` may be omitted
+or passed as a Python integer equal to the full cache length. Tensor-valued
+lengths, cache appends, and partial, ragged, paged, or rotary-embedded caches are
+rejected explicitly.
 
 `shape` accepts:
 

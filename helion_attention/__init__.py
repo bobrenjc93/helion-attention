@@ -151,8 +151,10 @@ def flash_attn_with_kvcache(
     required and describes ``q`` plus the cache:
     ``(batch, 1, cache_len, nheads_q, nheads_kv, head_dim)``.
 
-    Cache appends, partial/ragged caches, rotary embeddings, paged caches, and
-    softmax LSE output are not implemented yet and fail explicitly.
+    ``cache_seqlens`` may be omitted or supplied as a Python integer equal to
+    the declared cache length. Tensor-valued lengths, cache appends,
+    partial/ragged caches, rotary embeddings, paged caches, and softmax LSE
+    output are not implemented yet and fail explicitly.
     """
     if k is not None or v is not None:
         raise NotImplementedError("updating the KV cache with k/v is not implemented")
@@ -192,25 +194,13 @@ def flash_attn_with_kvcache(
                     "must equal the cache length declared by shape"
                 )
         elif isinstance(cache_seqlens, torch.Tensor):
-            if tuple(cache_seqlens.shape) != (spec.batch,):
-                raise ValueError(
-                    f"cache_seqlens must have shape ({spec.batch},), "
-                    f"got {tuple(cache_seqlens.shape)}"
-                )
-            if cache_seqlens.dtype != torch.int32:
-                raise ValueError("cache_seqlens must have dtype torch.int32")
-            if cache_seqlens.device != k_cache.device:
-                raise ValueError("cache_seqlens must be on the same device as the KV cache")
-            if not cache_seqlens.is_contiguous():
-                raise ValueError("cache_seqlens must be contiguous")
-            # Keep validation on the device: converting this predicate with
-            # .item() synchronizes every decode and is illegal during CUDA
-            # graph capture. The asynchronous assertion is captured and also
-            # checks the invariant on every graph replay.
-            torch._assert_async(
-                torch.all(cache_seqlens == spec.seqlen_k),
-                "partial or ragged KV caches are not implemented; cache_seqlens "
-                "must equal the cache length declared by shape",
+            # Reading a CUDA tensor on the host would synchronize and break
+            # graph capture, while a device assertion would poison the CUDA
+            # context for an ordinary input error. Reject this unsupported
+            # dynamic form recoverably before launching any CUDA work.
+            raise NotImplementedError(
+                "tensor-valued cache_seqlens are not implemented; omit "
+                "cache_seqlens or pass the full cache length as a Python int"
             )
         else:
             raise TypeError("cache_seqlens must be an int, a torch.Tensor, or None")

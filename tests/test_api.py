@@ -304,24 +304,18 @@ def test_kvcache_default_noncausal_flag_reuses_equivalent_decode_kernel(
     DECODE_SHAPES[:1],
     ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
 )
-def test_kvcache_tensor_lengths_support_cuda_graph_capture(
+def test_kvcache_full_length_supports_cuda_graph_capture(
     entry: dict[str, object],
 ) -> None:
     spec = spec_from_manifest_entry(entry)
     q, k_cache, v_cache = make_inputs(spec)
-    cache_seqlens = torch.full(
-        (spec.batch,),
-        spec.seqlen_k,
-        dtype=torch.int32,
-        device=q.device,
-    )
 
     # Warm up Triton's JIT and the allocator before capture.
     expected = helion_attention.flash_attn_with_kvcache(
         q,
         k_cache,
         v_cache,
-        cache_seqlens=cache_seqlens,
+        cache_seqlens=spec.seqlen_k,
         causal=spec.causal,
         shape=spec,
     )
@@ -333,7 +327,7 @@ def test_kvcache_tensor_lengths_support_cuda_graph_capture(
             q,
             k_cache,
             v_cache,
-            cache_seqlens=cache_seqlens,
+            cache_seqlens=spec.seqlen_k,
             causal=spec.causal,
             shape=spec,
         )
@@ -341,6 +335,39 @@ def test_kvcache_tensor_lengths_support_cuda_graph_capture(
     torch.cuda.synchronize(q.device)
 
     torch.testing.assert_close(captured, expected)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES[:1],
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+)
+def test_kvcache_tensor_lengths_are_rejected_without_poisoning_cuda(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec)
+    invalid_lengths = torch.full(
+        (spec.batch,),
+        spec.seqlen_k - 1,
+        dtype=torch.int32,
+        device=q.device,
+    )
+
+    with pytest.raises(NotImplementedError, match="tensor-valued cache_seqlens"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=invalid_lengths,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+    # The rejection is a host-side exception, so later CUDA work remains valid.
+    torch.testing.assert_close(q + 1, q.add(1))
+    torch.cuda.synchronize(q.device)
 
 
 @requires_cuda
