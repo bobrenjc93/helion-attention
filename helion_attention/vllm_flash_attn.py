@@ -436,10 +436,16 @@ def _try_paged_specialized(
         or cp_tot_seqused_k is not None
         or dynamic_max_seqlen_q is not None
         or dynamic_max_seqlen_k is not None
-        or any(item is not None for item in (q_descale, k_descale, v_descale, s_aux))
+        or q_descale is not None
+        or s_aux is not None
+        # vLLM passes expanded K/V scale buffers for every cache dtype.  They
+        # are inert for fp16/bf16 and only participate in FP8 attention.
+        or (
+            q.dtype in _FP8_DTYPES
+            and (k_descale is not None or v_descale is not None)
+        )
         or block_table.dtype != torch.int32
         or not q.is_cuda
-        or not all(tensor.is_contiguous() for tensor in (q, k, v))
         or (torch.is_grad_enabled() and any(t.requires_grad for t in (q, k, v)))
     ):
         return None

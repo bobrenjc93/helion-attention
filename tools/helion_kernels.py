@@ -517,10 +517,9 @@ def paged_attention_thd(
     nheads_kv = hl.specialize(k.size(2))
     head_dim = hl.specialize(q.size(2))
     page_size = hl.specialize(k.size(1))
+    max_blocks = (max_k + page_size - 1) // page_size
     is_causal = causal
     group = nheads_q // nheads_kv
-    k_rows = k.flatten(0, 1)
-    v_rows = v.flatten(0, 1)
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
 
@@ -541,23 +540,29 @@ def paged_attention_thd(
             m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
             l_i = hl.zeros([tile_m], dtype=torch.float32)
             acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
-            for tile_n in hl.tile(max_k):
-                valid_n = tile_n.index < seqlen_k
-                logical_block = tile_n.index // page_size
-                page_offset = tile_n.index % page_size
+            # One tile is exactly one cache page.  Keeping the physical block
+            # index scalar lets Helion emit a native four-dimensional load
+            # with all runtime strides intact; flattening block/page would
+            # copy vLLM's split K/V cache views.
+            for tile_block in hl.tile(max_blocks, block_size=1):
+                key_positions = (
+                    tile_block.begin * page_size + hl.arange(page_size)
+                )
+                valid_n = key_positions < seqlen_k
+                logical_block = tile_block.begin
                 physical_block = block_table[b, logical_block]
-                cache_row = physical_block * page_size + page_offset
-                k_blk = hl.load(
-                    k_rows,
-                    [cache_row, h_kv, slice(None)],
+                k_page = hl.load(
+                    k,
+                    [physical_block, slice(None), h_kv, slice(None)],
                     extra_mask=valid_n[:, None],
                 )
+                k_blk = k_page.reshape(page_size, head_dim)
                 qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
                 score_mask = valid_m[:, None] & valid_n[None, :]
                 if is_causal:
                     causal_bound = tile_m.index + seqlen_k - seqlen_q
                     score_mask = score_mask & (
-                        tile_n.index[None, :] <= causal_bound[:, None]
+                        key_positions[None, :] <= causal_bound[:, None]
                     )
                 qk = torch.where(score_mask, qk, float("-inf"))
                 m_ij = torch.maximum(m_i, torch.amax(qk, -1))
@@ -572,11 +577,12 @@ def paged_attention_thd(
                 )
                 l_i = l_i * alpha + torch.sum(p, -1)
                 acc = acc * alpha[:, None]
-                v_blk = hl.load(
-                    v_rows,
-                    [cache_row, h_kv, slice(None)],
+                v_page = hl.load(
+                    v,
+                    [physical_block, slice(None), h_kv, slice(None)],
                     extra_mask=valid_n[:, None],
                 )
+                v_blk = v_page.reshape(page_size, head_dim)
                 acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
                 m_i = m_ij
             result = torch.where(

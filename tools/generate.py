@@ -203,22 +203,32 @@ def build_paged_inputs(
             values.append(values[-1] + length)
         return torch.tensor(values, dtype=torch.int32, device="cuda")
 
-    q = torch.randn(
-        (sum(lengths_q), spec.nheads_q, spec.head_dim),
+    # vLLM splits Q from a packed projection, so its token stride can exceed
+    # heads * head_dim even though the two trailing dimensions are dense.
+    q_storage = torch.randn(
+        (
+            sum(lengths_q),
+            (spec.nheads_q + 2 * spec.nheads_kv) * spec.head_dim,
+        ),
         device="cuda",
         dtype=spec.dtype,
         generator=generator,
+    )
+    q = q_storage[:, : spec.nheads_q * spec.head_dim].view(
+        sum(lengths_q), spec.nheads_q, spec.head_dim
     )
     blocks_per_request = [
         (length + page_size - 1) // page_size for length in lengths_k
     ]
     total_blocks = sum(blocks_per_request) + 3
-    k = torch.zeros(
-        (total_blocks, page_size, spec.nheads_kv, spec.head_dim),
+    # This is vLLM's real cache contract: logical [blocks, heads, page, 2*dim]
+    # followed by transpose(1, 2) and a K/V split of the content dimension.
+    kv_cache = torch.zeros(
+        (total_blocks, spec.nheads_kv, page_size, 2 * spec.head_dim),
         device="cuda",
         dtype=spec.dtype,
     )
-    v = torch.zeros_like(k)
+    k, v = kv_cache.transpose(1, 2).split(spec.head_dim, dim=-1)
     block_table = torch.zeros(
         (spec.batch, (spec.seqlen_k + page_size - 1) // page_size),
         device="cuda",

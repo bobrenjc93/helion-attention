@@ -162,11 +162,17 @@ def check_paged(spec: AttnShape, page_size: int) -> float:
     for length in lengths_q:
         offsets.append(offsets[-1] + length)
     cu_q = torch.tensor(offsets, device="cuda", dtype=torch.int32)
-    q = torch.randn(
-        (sum(lengths_q), spec.nheads_q, spec.head_dim),
+    qkv = torch.randn(
+        (
+            sum(lengths_q),
+            (spec.nheads_q + 2 * spec.nheads_kv) * spec.head_dim,
+        ),
         device="cuda",
         dtype=spec.dtype,
         generator=generator,
+    )
+    q = qkv[:, : spec.nheads_q * spec.head_dim].view(
+        sum(lengths_q), spec.nheads_q, spec.head_dim
     )
     request_kv = [
         (
@@ -189,12 +195,12 @@ def check_paged(spec: AttnShape, page_size: int) -> float:
         (length + page_size - 1) // page_size for length in lengths_k
     ]
     total_blocks = sum(blocks_per_request) + 3
-    k_cache = torch.zeros(
-        (total_blocks, page_size, spec.nheads_kv, spec.head_dim),
+    raw_cache = torch.zeros(
+        (total_blocks, spec.nheads_kv, page_size, 2 * spec.head_dim),
         device="cuda",
         dtype=spec.dtype,
     )
-    v_cache = torch.zeros_like(k_cache)
+    k_cache, v_cache = raw_cache.transpose(1, 2).split(spec.head_dim, dim=-1)
     block_table = torch.zeros(
         (spec.batch, (spec.seqlen_k + page_size - 1) // page_size),
         device="cuda",
@@ -214,19 +220,31 @@ def check_paged(spec: AttnShape, page_size: int) -> float:
             v_cache[physical_block, : stop - start] = value[start:stop]
 
     scale = 1.0 / math.sqrt(spec.head_dim)
-    got = vllm_flash_attn.flash_attn_varlen_func(
-        q=q,
-        k=k_cache,
-        v=v_cache,
-        cu_seqlens_q=cu_q,
-        seqused_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
-        block_table=block_table,
-        max_seqlen_q=spec.seqlen_q,
-        max_seqlen_k=spec.seqlen_k,
-        softmax_scale=scale,
-        causal=spec.causal,
-        fa_version=3,
-    )
+    descale = torch.ones(1, device="cuda").expand(spec.batch, spec.nheads_kv)
+
+    def reject_generic(*args: object, **kwargs: object) -> object:
+        raise AssertionError("vLLM-shaped cache views missed the generated kernel")
+
+    generic = vllm_flash_attn._paged_attention
+    vllm_flash_attn._paged_attention = reject_generic
+    try:
+        got = vllm_flash_attn.flash_attn_varlen_func(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_q,
+            seqused_k=torch.tensor(lengths_k, device="cuda", dtype=torch.int32),
+            block_table=block_table,
+            max_seqlen_q=spec.seqlen_q,
+            max_seqlen_k=spec.seqlen_k,
+            softmax_scale=scale,
+            causal=spec.causal,
+            k_descale=descale,
+            v_descale=descale,
+            fa_version=3,
+        )
+    finally:
+        vllm_flash_attn._paged_attention = generic
 
     expected_parts = []
     q_start = 0
