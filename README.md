@@ -168,3 +168,11 @@ tests/                     correctness against fp32 SDPA
 ## License
 
 BSD 3-Clause, matching Helion and PyTorch. See [LICENSE](LICENSE).
+
+<!-- burner-progress:start -->
+## Burner evaluation progress
+
+![Burner evaluation progress](docs/burner-evaluation-progress.svg)
+
+_Updated automatically on every Burner merge. [Raw history](docs/burner-evaluation-history.json)._
+<!-- burner-progress:end -->

@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "evaluations": {
+    "eval_90b186af": {
+      "name": "Correctness",
+      "color": "#ff6b35"
+    },
+    "eval_24dff610": {
+      "name": "Coverage and speed vs FlashAttention",
+      "color": "#7c5cff"
+    },
+    "eval_1afd133e": {
+      "name": "FlashAttention API compatibility",
+      "color": "#00a7a5"
+    },
+    "eval_5b403bea": {
+      "name": "README documents every kernel and benchmark",
+      "color": "#e6a700"
+    }
+  },
+  "points": [
+    {
+      "key": "base:7f3a2c09baf79cf546423c8b7a4384b6116e7ccb",
+      "commit": "7f3a2c09baf79cf546423c8b7a4384b6116e7ccb",
+      "recordedAt": "2026-08-07T06:23:33.326Z",
+      "label": "base 7f3a2c0",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 39,
+        "eval_1afd133e": 38,
+        "eval_5b403bea": 97
+      }
+    },
+    {
+      "key": "pr:1",
+      "recordedAt": "2026-08-07T06:23:33.326Z",
+      "label": "PR #1",
+      "kind": "leaf",
+      "prNumber": 1,
+      "title": "Autotune the remaining catalogued shapes",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 42,
+        "eval_1afd133e": 43,
+        "eval_5b403bea": 97
+      }
+    }
+  ]
+}
