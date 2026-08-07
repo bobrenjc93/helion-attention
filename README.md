@@ -78,31 +78,62 @@ alignment, including zero output for fully masked query rows.
 
 The compatibility surface was verified against **vLLM 0.10.1.1**, specifically
 the FA2/FA3 calls made by `vllm/v1/attention/backends/flash_attn.py`. vLLM
-imports its implementation as `vllm.vllm_flash_attn`; point that import at
-`helion_attention.vllm_flash_attn` before importing anything from vLLM:
+imports its implementation from the `vllm.vllm_flash_attn` package. The
+installed helion-attention distribution registers an opt-in
+`vllm.general_plugins` hook that points only those call exports at
+`helion_attention.vllm_flash_attn`. It preserves vLLM's package and
+compiled/nested modules, including `vllm.vllm_flash_attn.layers.rotary`, and
+vLLM loads the hook in every engine and worker process when
+`HELION_ATTENTION_VLLM=1`.
+
+For the Python API, install explicitly before the first attention backend can
+be imported (the later general-plugin call is idempotent):
 
 ```python
-import sys
+import os
 
-import helion_attention.vllm_flash_attn as helion_vllm_flash_attn
+from helion_attention.vllm_plugin import install_vllm_flash_attn
 
-# vLLM imports the call surface from the first name and probes FA support
-# through the second one. Both are supplied by the same compatibility module.
-sys.modules["vllm.vllm_flash_attn"] = helion_vllm_flash_attn
-sys.modules["vllm.vllm_flash_attn.flash_attn_interface"] = helion_vllm_flash_attn
+os.environ["HELION_ATTENTION_VLLM"] = "1"  # inherited by vLLM workers
+install_vllm_flash_attn()
 
-from vllm import LLM  # noqa: E402 -- vLLM must be imported after the aliases
+from vllm import LLM  # import vLLM after installing the adapter
 
 llm = LLM(model="meta-llama/Meta-Llama-3-8B")
 ```
 
-For `vllm serve`, put the aliases in a small launcher, replace the final two
-lines with `from vllm.entrypoints.cli.main import main; main()`, and run that
-launcher with the usual `serve` arguments. There is deliberately no `shape`
-argument on this path: vLLM never passes one, so the adapter infers the
-specialization from the packed tensors, maximum sequence lengths, head counts,
-dtype, causal flag, and cache page size. Normal unified-attention calls use
-packed queries and `k`/`v` caches in
+For `vllm serve`, use a complete launcher such as `serve_with_helion.py`:
+
+```python
+import os
+
+from helion_attention.vllm_plugin import install_vllm_flash_attn
+
+# Keep installation at module scope: a spawned worker re-executes this file.
+os.environ["HELION_ATTENTION_VLLM"] = "1"
+install_vllm_flash_attn()
+
+
+def main() -> None:
+    from vllm.entrypoints.cli.main import main as vllm_main
+
+    vllm_main()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it with the normal arguments, for example
+`python serve_with_helion.py serve meta-llama/Meta-Llama-3-8B`. The guard keeps
+spawned children from recursively starting the CLI; module-scope installation
+patches those children, and the registered general plugin also patches Ray and
+other vLLM-managed workers.
+
+There is deliberately no `shape` argument on this path: vLLM never passes one,
+so the adapter infers the specialization from the packed tensors, maximum
+sequence lengths, head counts, dtype, causal flag, and cache page size. Normal
+unified-attention calls use packed queries and `k`/`v` caches in
 `[num_blocks, page_size, heads_kv, head_dim]` layout with `block_table` and
 per-request `seqused_k`; no call-site changes are needed.
 
@@ -118,7 +149,9 @@ Dispatch depends on the call pattern:
 Here an exact paged or varlen match means the batch, declared maximum lengths,
 head counts, head dimension, dtype, causal mode, and (for a cache) page size all
 match a table row. Individual request lengths may remain ragged below those
-maxima.
+maxima. vLLM 0.10.1.1 also supplies Q/K/V descale buffers on fp16 and bf16
+calls; those buffers are inert and no longer disqualify an otherwise exact
+specialization.
 
 The specialized kernels still reject FP8 KV-cache descales (`k_descale` and
 `v_descale` for an FP8 cache), ALiBi (`alibi_slopes`), and attention sinks
