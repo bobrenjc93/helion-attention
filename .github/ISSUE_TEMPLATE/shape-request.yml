@@ -1,0 +1,42 @@
+name: Shape request
+description: Ask for a kernel for a shape that is not checked in yet
+title: "[shape] "
+labels: ["shape-request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Kernels are autotuned per shape. Filling this in is enough — no code needed.
+  - type: input
+    id: shape
+    attributes:
+      label: Shape
+      description: batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim
+      placeholder: "4, 4096, 4096, 32, 8, 128"
+    validations:
+      required: true
+  - type: dropdown
+    id: dtype
+    attributes:
+      label: dtype
+      options: ["bf16", "fp16"]
+    validations:
+      required: true
+  - type: dropdown
+    id: causal
+    attributes:
+      label: Causal
+      options: ["yes", "no"]
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      placeholder: "H100 SXM"
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: What model or workload is this for?

@@ -1,0 +1,108 @@
+{
+  "kernels": [
+    {
+      "batch": 1,
+      "causal": true,
+      "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 128,
+      "key": "b1_sq2048_sk2048_hq32_hkv32_d128_bf16_causal",
+      "nheads_kv": 32,
+      "nheads_q": 32,
+      "note": "single-sequence 7B prefill",
+      "seqlen_k": 2048,
+      "seqlen_q": 2048
+    },
+    {
+      "batch": 2,
+      "causal": true,
+      "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 64,
+      "key": "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal",
+      "nheads_kv": 32,
+      "nheads_q": 32,
+      "note": "GPT-2 medium style, causal",
+      "seqlen_k": 1024,
+      "seqlen_q": 1024
+    },
+    {
+      "batch": 2,
+      "causal": false,
+      "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False",
+      "dtype": "bf16",
+      "head_dim": 64,
+      "key": "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_noncausal",
+      "nheads_kv": 32,
+      "nheads_q": 32,
+      "note": "GPT-2 medium style prefill",
+      "seqlen_k": 1024,
+      "seqlen_q": 1024
+    },
+    {
+      "batch": 2,
+      "causal": true,
+      "description": "batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 128,
+      "key": "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
+      "nheads_kv": 16,
+      "nheads_q": 16,
+      "note": "long-context causal",
+      "seqlen_k": 8192,
+      "seqlen_q": 8192
+    },
+    {
+      "batch": 4,
+      "causal": true,
+      "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 128,
+      "key": "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
+      "nheads_kv": 32,
+      "nheads_q": 32,
+      "note": "7B-class prefill, causal",
+      "seqlen_k": 4096,
+      "seqlen_q": 4096
+    },
+    {
+      "batch": 4,
+      "causal": false,
+      "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=False",
+      "dtype": "bf16",
+      "head_dim": 128,
+      "key": "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_noncausal",
+      "nheads_kv": 32,
+      "nheads_q": 32,
+      "note": "7B-class prefill, bidirectional",
+      "seqlen_k": 4096,
+      "seqlen_q": 4096
+    },
+    {
+      "batch": 8,
+      "causal": true,
+      "description": "batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 64,
+      "key": "b8_sq2048_sk2048_hq16_hkv16_d64_bf16_causal",
+      "nheads_kv": 16,
+      "nheads_q": 16,
+      "note": "small decoder, long batch",
+      "seqlen_k": 2048,
+      "seqlen_q": 2048
+    },
+    {
+      "batch": 8,
+      "causal": false,
+      "description": "batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False",
+      "dtype": "bf16",
+      "head_dim": 64,
+      "key": "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
+      "nheads_kv": 16,
+      "nheads_q": 16,
+      "note": "short-sequence encoder batch",
+      "seqlen_k": 512,
+      "seqlen_q": 512
+    }
+  ]
+}

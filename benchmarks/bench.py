@@ -1,0 +1,203 @@
+"""Benchmark every checked-in kernel against FlashAttention and PyTorch SDPA.
+
+Usage:
+    python benchmarks/bench.py                 # markdown table on stdout
+    python benchmarks/bench.py --json          # machine readable
+    python benchmarks/bench.py --markdown docs/benchmarks.md
+
+Implementations are measured round-robin over several rounds and the median of
+each implementation's rounds is reported, so a clock drift partway through the
+run cannot make whichever kernel ran first look good.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import platform
+import statistics
+import sys
+from pathlib import Path
+from typing import Callable
+
+import torch
+import triton
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT))
+
+import helion_attention  # noqa: E402
+from helion_attention._registry import available_shapes  # noqa: E402
+from helion_attention._registry import spec_from_manifest_entry  # noqa: E402
+from helion_attention._shape import AttnShape  # noqa: E402
+
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+except ImportError:  # pragma: no cover - benchmark-only dependency
+    _flash_attn_func = None
+
+from torch.nn.attention import SDPBackend  # noqa: E402
+from torch.nn.attention import sdpa_kernel  # noqa: E402
+
+
+def flops(spec: AttnShape) -> float:
+    total = 4.0 * spec.batch * spec.nheads_q * spec.seqlen_q * spec.seqlen_k * spec.head_dim
+    return total * 0.5 if spec.causal else total
+
+
+def build_candidates(
+    spec: AttnShape,
+) -> tuple[dict[str, Callable[[], torch.Tensor]], torch.Tensor]:
+    generator = torch.Generator(device="cuda").manual_seed(0)
+
+    def rand(seqlen: int, nheads: int) -> torch.Tensor:
+        return torch.randn(
+            (spec.batch, seqlen, nheads, spec.head_dim),
+            device="cuda",
+            dtype=spec.dtype,
+            generator=generator,
+        )
+
+    q = rand(spec.seqlen_q, spec.nheads_q)
+    k = rand(spec.seqlen_k, spec.nheads_kv)
+    v = rand(spec.seqlen_k, spec.nheads_kv)
+    qt, kt, vt = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+    gqa = spec.nheads_q != spec.nheads_kv
+
+    def sdpa(backend: SDPBackend) -> Callable[[], torch.Tensor]:
+        def run() -> torch.Tensor:
+            with sdpa_kernel(backend):
+                return torch.nn.functional.scaled_dot_product_attention(
+                    qt, kt, vt, is_causal=spec.causal, enable_gqa=gqa
+                ).transpose(1, 2)
+
+        return run
+
+    candidates: dict[str, Callable[[], torch.Tensor]] = {
+        "helion-attention": lambda: helion_attention.flash_attn_func(
+            q, k, v, causal=spec.causal, shape=spec
+        )
+    }
+    if _flash_attn_func is not None:
+        candidates["flash-attn"] = lambda: _flash_attn_func(q, k, v, causal=spec.causal)
+    candidates["sdpa-flash"] = sdpa(SDPBackend.FLASH_ATTENTION)
+    candidates["sdpa-cudnn"] = sdpa(SDPBackend.CUDNN_ATTENTION)
+
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        qt.float(),
+        kt.float(),
+        vt.float(),
+        is_causal=spec.causal,
+        scale=1.0 / math.sqrt(spec.head_dim),
+        enable_gqa=gqa,
+    ).transpose(1, 2)
+    return candidates, reference
+
+
+def measure(
+    candidates: dict[str, Callable[[], torch.Tensor]],
+    reference: torch.Tensor,
+    rounds: int,
+) -> dict[str, dict[str, float]]:
+    results: dict[str, list[float]] = {name: [] for name in candidates}
+    errors: dict[str, float] = {}
+    for name, run in candidates.items():
+        try:
+            errors[name] = (run().float() - reference).abs().max().item()
+        except Exception as error:  # noqa: BLE001
+            errors[name] = float("nan")
+            print(f"  {name}: unavailable ({type(error).__name__}: {error})", file=sys.stderr)
+    live = [name for name in candidates if not math.isnan(errors[name])]
+    for _ in range(rounds):
+        for name in live:
+            results[name].append(triton.testing.do_bench(candidates[name], warmup=50, rep=200))
+    return {
+        name: {
+            "ms": statistics.median(results[name]),
+            "max_abs_error": errors[name],
+        }
+        for name in live
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    parser.add_argument("--markdown", type=Path, default=None, help="also write a table here")
+    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--only", default="", help="substring filter on the kernel key")
+    args = parser.parse_args()
+
+    entries = [e for e in available_shapes() if args.only in str(e["key"])]
+    if not entries:
+        print("no kernels to benchmark", file=sys.stderr)
+        return 1
+
+    device_name = torch.cuda.get_device_name(0)
+    report: dict[str, object] = {
+        "device": device_name,
+        "torch": torch.__version__,
+        "triton": triton.__version__,
+        "python": platform.python_version(),
+        "results": [],
+    }
+    for entry in entries:
+        spec = spec_from_manifest_entry(entry)
+        print(f"benchmarking {spec.describe()}", file=sys.stderr)
+        candidates, reference = build_candidates(spec)
+        measured = measure(candidates, reference, args.rounds)
+        scale = flops(spec)
+        row = {
+            "key": entry["key"],
+            "description": entry["description"],
+            "note": entry.get("note", ""),
+            "implementations": {
+                name: {
+                    "us": value["ms"] * 1000.0,
+                    "tflops": scale / value["ms"] / 1e9,
+                    "max_abs_error": value["max_abs_error"],
+                }
+                for name, value in measured.items()
+            },
+        }
+        report["results"].append(row)
+
+    if args.json:
+        json.dump(report, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+    table = render_markdown(report)
+    if not args.json:
+        sys.stdout.write(table)
+    if args.markdown:
+        args.markdown.write_text(table)
+    return 0
+
+
+def render_markdown(report: dict[str, object]) -> str:
+    names = ["helion-attention", "flash-attn", "sdpa-flash", "sdpa-cudnn"]
+    lines = [
+        f"Measured on {report['device']}, torch {report['torch']}, triton {report['triton']}.",
+        "",
+        "| shape | " + " | ".join(f"{n} (µs)" for n in names) + " | helion vs flash-attn |",
+        "| --- | " + " | ".join("---:" for _ in names) + " | ---: |",
+    ]
+    for row in report["results"]:  # type: ignore[index]
+        impls = row["implementations"]
+        cells = []
+        for name in names:
+            entry = impls.get(name)
+            cells.append("n/a" if entry is None else f"{entry['us']:.0f}")
+        helion = impls.get("helion-attention")
+        flash = impls.get("flash-attn")
+        speedup = (
+            f"{flash['us'] / helion['us']:.2f}x"
+            if helion is not None and flash is not None
+            else "n/a"
+        )
+        lines.append(f"| {row['description']} | " + " | ".join(cells) + f" | {speedup} |")
+    return "\n".join(lines) + "\n"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

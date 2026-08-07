@@ -1,0 +1,224 @@
+{
+  "device": "NVIDIA H100",
+  "torch": "2.14.0a0+git774d172",
+  "triton": "3.6.0",
+  "python": "3.10.20",
+  "results": [
+    {
+      "key": "b1_sq2048_sk2048_hq32_hkv32_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True",
+      "note": "single-sequence 7B prefill",
+      "implementations": {
+        "helion-attention": {
+          "us": 387.4671326316509,
+          "tflops": 88.67781412743567,
+          "max_abs_error": 0.011789083480834961
+        },
+        "flash-attn": {
+          "us": 229.79433889008834,
+          "tflops": 149.5238678809856,
+          "max_abs_error": 0.007561683654785156
+        },
+        "sdpa-flash": {
+          "us": 225.26266915385307,
+          "tflops": 152.53187976980112,
+          "max_abs_error": 0.007561683654785156
+        },
+        "sdpa-cudnn": {
+          "us": 193.94434488103082,
+          "tflops": 177.16287829416694,
+          "max_abs_error": 0.007561683654785156
+        }
+      }
+    },
+    {
+      "key": "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal",
+      "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True",
+      "note": "GPT-2 medium style, causal",
+      "implementations": {
+        "helion-attention": {
+          "us": 91.1387826374328,
+          "tflops": 94.25114472038071,
+          "max_abs_error": 0.01050710678100586
+        },
+        "flash-attn": {
+          "us": 198.4039999109197,
+          "tflops": 43.29516842330168,
+          "max_abs_error": 0.007910013198852539
+        },
+        "sdpa-flash": {
+          "us": 199.69977077784813,
+          "tflops": 43.01424362452421,
+          "max_abs_error": 0.007910013198852539
+        },
+        "sdpa-cudnn": {
+          "us": 201.28903956661773,
+          "tflops": 42.67462654943571,
+          "max_abs_error": 0.007910013198852539
+        }
+      }
+    },
+    {
+      "key": "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_noncausal",
+      "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False",
+      "note": "GPT-2 medium style prefill",
+      "implementations": {
+        "helion-attention": {
+          "us": 98.56563009362402,
+          "tflops": 174.29878110332623,
+          "max_abs_error": 0.003585129976272583
+        },
+        "flash-attn": {
+          "us": 198.3996539893438,
+          "tflops": 86.59223359796155,
+          "max_abs_error": 0.0010672807693481445
+        },
+        "sdpa-flash": {
+          "us": 197.62624619228984,
+          "tflops": 86.93111120111057,
+          "max_abs_error": 0.0010672807693481445
+        },
+        "sdpa-cudnn": {
+          "us": 196.42482776155714,
+          "tflops": 87.46281913432493,
+          "max_abs_error": 0.001183927059173584
+        }
+      }
+    },
+    {
+      "key": "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
+      "description": "batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True",
+      "note": "long-context causal",
+      "implementations": {
+        "helion-attention": {
+          "us": 5749.966358316356,
+          "tflops": 95.61026615275253,
+          "max_abs_error": 0.013725638389587402
+        },
+        "flash-attn": {
+          "us": 1690.7728703125665,
+          "tflops": 325.15060037979487,
+          "max_abs_error": 0.00937962532043457
+        },
+        "sdpa-flash": {
+          "us": 1815.0015262642291,
+          "tflops": 302.8955105175852,
+          "max_abs_error": 0.00937962532043457
+        },
+        "sdpa-cudnn": {
+          "us": 1005.9691786766052,
+          "tflops": 546.4936953746703,
+          "max_abs_error": 0.00937962532043457
+        }
+      }
+    },
+    {
+      "key": "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
+      "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=True",
+      "note": "7B-class prefill, causal",
+      "implementations": {
+        "helion-attention": {
+          "us": 1816.959081377302,
+          "tflops": 302.56917699614394,
+          "max_abs_error": 0.01401054859161377
+        },
+        "flash-attn": {
+          "us": 1693.5048525312307,
+          "tflops": 324.6260635547023,
+          "max_abs_error": 0.008622884750366211
+        },
+        "sdpa-flash": {
+          "us": 1815.8412528973001,
+          "tflops": 302.7554380157553,
+          "max_abs_error": 0.008622884750366211
+        },
+        "sdpa-cudnn": {
+          "us": 1126.6003041654021,
+          "tflops": 487.97768991840024,
+          "max_abs_error": 0.008622884750366211
+        }
+      }
+    },
+    {
+      "key": "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_noncausal",
+      "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=False",
+      "note": "7B-class prefill, bidirectional",
+      "implementations": {
+        "helion-attention": {
+          "us": 2573.7571646185484,
+          "tflops": 427.20099739438956,
+          "max_abs_error": 0.0035891830921173096
+        },
+        "flash-attn": {
+          "us": 3039.6565278371177,
+          "tflops": 361.7223254360133,
+          "max_abs_error": 0.0006209760904312134
+        },
+        "sdpa-flash": {
+          "us": 3348.0867773799573,
+          "tflops": 328.39997911775214,
+          "max_abs_error": 0.0006209760904312134
+        },
+        "sdpa-cudnn": {
+          "us": 2037.2184560849118,
+          "tflops": 539.7121867278881,
+          "max_abs_error": 0.000578463077545166
+        }
+      }
+    },
+    {
+      "key": "b8_sq2048_sk2048_hq16_hkv16_d64_bf16_causal",
+      "description": "batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True",
+      "note": "small decoder, long batch",
+      "implementations": {
+        "helion-attention": {
+          "us": 295.8819586706359,
+          "tflops": 232.2530141572295,
+          "max_abs_error": 0.013665199279785156
+        },
+        "flash-attn": {
+          "us": 271.41858845762516,
+          "tflops": 253.1863315866029,
+          "max_abs_error": 0.009153127670288086
+        },
+        "sdpa-flash": {
+          "us": 290.78223288945077,
+          "tflops": 236.32625712082515,
+          "max_abs_error": 0.009153127670288086
+        },
+        "sdpa-cudnn": {
+          "us": 223.00222337531585,
+          "tflops": 308.1560160965039,
+          "max_abs_error": 0.009153127670288086
+        }
+      }
+    },
+    {
+      "key": "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
+      "description": "batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False",
+      "note": "short-sequence encoder batch",
+      "implementations": {
+        "helion-attention": {
+          "us": 44.0183445127402,
+          "tflops": 195.14442642234812,
+          "max_abs_error": 0.005711734294891357
+        },
+        "flash-attn": {
+          "us": 203.8641610251577,
+          "tflops": 42.135579636971926,
+          "max_abs_error": 0.0019145607948303223
+        },
+        "sdpa-flash": {
+          "us": 203.86929775508034,
+          "tflops": 42.13451798082697,
+          "max_abs_error": 0.0019145607948303223
+        },
+        "sdpa-cudnn": {
+          "us": 201.0000001087233,
+          "tflops": 42.73599297190847,
+          "max_abs_error": 0.0019145607948303223
+        }
+      }
+    }
+  ]
+}
