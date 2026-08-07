@@ -52,7 +52,7 @@ def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None
     )
     assert (
         generate.select_dense_kernel_name(replace(exact, seqlen_q=1))
-        == "decode_attention_bshd_split_kv"
+        == "causal_attention_bshd"
     )
     assert (
         generate.select_dense_kernel_name(
@@ -62,7 +62,7 @@ def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None
     )
 
 
-def test_split_kv_decode_is_selected_only_for_long_caches() -> None:
+def test_split_kv_decode_is_selected_only_for_validated_shape() -> None:
     long_decode = AttnShape(
         batch=1,
         seqlen_q=1,
@@ -77,10 +77,17 @@ def test_split_kv_decode_is_selected_only_for_long_caches() -> None:
         generate.select_dense_kernel_name(long_decode)
         == "decode_attention_bshd_split_kv"
     )
-    assert (
-        generate.select_dense_kernel_name(replace(long_decode, causal=False))
-        == "decode_attention_bshd_split_kv"
-    )
+
+    unsupported = [
+        replace(long_decode, batch=2),
+        replace(long_decode, seqlen_k=32768),
+        replace(long_decode, nheads_q=28, nheads_kv=4),
+        replace(long_decode, head_dim=256),
+        replace(long_decode, dtype=torch.float16),
+    ]
+    for candidate in unsupported:
+        assert generate.select_dense_kernel_name(candidate) == "causal_attention_bshd"
+
     for cache_length in (1024, 4096):
         assert (
             generate.select_dense_kernel_name(
@@ -88,6 +95,11 @@ def test_split_kv_decode_is_selected_only_for_long_caches() -> None:
             )
             == "causal_attention_bshd"
         )
+
+    assert (
+        generate.select_dense_kernel_name(replace(long_decode, causal=False))
+        == "attention_bshd"
+    )
 
 
 def test_decode_autotuning_rejects_persistent_launches() -> None:

@@ -35,7 +35,7 @@ DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 PERSISTENT_CAUSAL_16K_KEY = (
     "b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal"
 )
-SPLIT_KV_DECODE_MIN_CACHE = 16384
+SPLIT_KV_DECODE_16K_KEY = "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
 SPLIT_KV_DECODE_SPLITS = 8
 
 if TYPE_CHECKING:
@@ -46,7 +46,7 @@ def select_dense_kernel_name(spec: "AttnShape") -> str:
     """Choose a Helion source without applying shape-specific configs broadly."""
     if spec.key == PERSISTENT_CAUSAL_16K_KEY:
         return "causal_attention_bshd_16k"
-    if spec.is_decode and spec.seqlen_k >= SPLIT_KV_DECODE_MIN_CACHE:
+    if spec.key == SPLIT_KV_DECODE_16K_KEY:
         return "decode_attention_bshd_split_kv"
     return "causal_attention_bshd" if spec.causal else "attention_bshd"
 
