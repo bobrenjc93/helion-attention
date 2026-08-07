@@ -7,13 +7,14 @@ The kernels are checked in as **plain Triton**. Helion is a build-time tool here
 not a dependency: installing `helion-attention` pulls in `torch` and `triton` and
 nothing else, and `import helion_attention` never imports Helion.
 
-The one API difference from FlashAttention is that **`shape` is a required
-argument**. Helion only beats FlashAttention when a kernel is specialized to one
-exact problem size — block sizes, warp counts, pipelining stages, indexing mode
-and the tensor strides are all baked into the generated Triton — so this library
-ships one autotuned kernel per shape rather than one kernel for everything.
-Declaring the shape at the call site makes that contract explicit and turns a
-missing kernel into a clear error instead of a silent slow path.
+The one API difference for the direct FlashAttention entry points is that
+**`shape` is a required argument**. Helion only beats FlashAttention when a
+kernel is specialized to one exact problem size — block sizes, warp counts,
+pipelining stages, indexing mode and the tensor strides are all baked into the
+generated Triton — so this library ships one autotuned kernel per shape rather
+than one kernel for everything. Declaring the shape at the call site makes that
+contract explicit and turns a missing kernel into a clear error instead of a
+silent slow path. The vLLM adapter is the exception, as described below.
 
 ## Install
 
@@ -73,12 +74,61 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
-vLLM's unified paged-cache path is available through
-`helion_attention.vllm_flash_attn`. It accepts packed queries plus
-`k`/`v` caches in `[num_blocks, page_size, heads_kv, head_dim]` layout,
-`block_table`, and per-request `seqused_k`. Generated page-size-16 kernels cover
-the common decode and chunked-prefill profiles below; other compatible CUDA
-shapes retain the generic single-launch path.
+### vLLM swap-in
+
+The compatibility surface was verified against **vLLM 0.10.1.1**, specifically
+the FA2/FA3 calls made by `vllm/v1/attention/backends/flash_attn.py`. vLLM
+imports its implementation as `vllm.vllm_flash_attn`; point that import at
+`helion_attention.vllm_flash_attn` before importing anything from vLLM:
+
+```python
+import sys
+
+import helion_attention.vllm_flash_attn as helion_vllm_flash_attn
+
+# vLLM imports the call surface from the first name and probes FA support
+# through the second one. Both are supplied by the same compatibility module.
+sys.modules["vllm.vllm_flash_attn"] = helion_vllm_flash_attn
+sys.modules["vllm.vllm_flash_attn.flash_attn_interface"] = helion_vllm_flash_attn
+
+from vllm import LLM  # noqa: E402 -- vLLM must be imported after the aliases
+
+llm = LLM(model="meta-llama/Meta-Llama-3-8B")
+```
+
+For `vllm serve`, put the aliases in a small launcher, replace the final two
+lines with `from vllm.entrypoints.cli.main import main; main()`, and run that
+launcher with the usual `serve` arguments. There is deliberately no `shape`
+argument on this path: vLLM never passes one, so the adapter infers the
+specialization from the packed tensors, maximum sequence lengths, head counts,
+dtype, causal flag, and cache page size. Normal unified-attention calls use
+packed queries and `k`/`v` caches in
+`[num_blocks, page_size, heads_kv, head_dim]` layout with `block_table` and
+per-request `seqused_k`; no call-site changes are needed.
+
+Dispatch depends on the call pattern:
+
+| vLLM call | implementation selected |
+| --- | --- |
+| Packed, non-paged varlen call exactly matching a checked-in varlen shape below, with the kernel's lean feature set | checked-in shape-specialized kernel |
+| Paged decode or chunked prefill exactly matching a checked-in paged shape below (including page size 16), with the kernel's lean feature set | checked-in shape-specialized kernel |
+| Other compatible forward CUDA calls, including mixed decode/prefill batches and other shapes | generic single-launch Triton fallback |
+| Remaining valid calls, such as CPU or grad-enabled inputs | tiled PyTorch correctness fallback |
+
+Here an exact paged or varlen match means the batch, declared maximum lengths,
+head counts, head dimension, dtype, causal mode, and (for a cache) page size all
+match a table row. Individual request lengths may remain ragged below those
+maxima.
+
+The specialized kernels still reject FP8 KV-cache descales (`k_descale` and
+`v_descale` for an FP8 cache), ALiBi (`alibi_slopes`), and attention sinks
+(`s_aux`). vLLM may pass all three. The adapter routes those calls to its generic
+fallback, which implements them correctly, but they do not receive a checked-in
+kernel speedup.
+
+In short, the swap-in is correct across the supported vLLM FA2/FA3 call
+patterns, but it is only faster on shapes with a suitable checked-in kernel;
+the fallbacks are coverage paths, not performance promises.
 
 Single-token decode reads a dense KV cache through the matching FlashAttention
 entry point. The six-field shape remains required and describes the query and
