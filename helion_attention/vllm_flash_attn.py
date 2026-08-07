@@ -62,6 +62,12 @@ _GENERIC_CUDA_DTYPES: frozenset[torch.dtype] = _FP8_DTYPES | {
 _QUERY_TILE_SIZE = 16
 _KEY_TILE_SIZE = 128
 
+# Empty attention rows still participate in vLLM's cascade and DCP state
+# merging.  Use a finite approximation of log(0) so those paths never receive
+# an infinity while the row remains numerically irrelevant next to any real
+# attention mass.
+_EMPTY_SOFTMAX_LSE = torch.finfo(torch.float32).min
+
 
 def _paged_attention(*args: Any, **kwargs: Any) -> Any:
     """Import Triton only when a CUDA paged call reaches the fast path."""
@@ -1058,9 +1064,7 @@ def flash_attn_varlen_func(
         lse_tile = torch.where(
             has_mass,
             running_max + torch.log(safe_sum),
-            torch.full_like(
-                running_max, float("inf") if fa_version == 2 else float("-inf")
-            ),
+            torch.full_like(running_max, _EMPTY_SOFTMAX_LSE),
         )
         fa2_global_left = left_window < 0 or left_window >= max_seqlen_k
         fa2_one_sided_alibi = fa2_global_left and (causal or right_window == 0)
@@ -1069,9 +1073,10 @@ def flash_attn_varlen_func(
             # ``-slope * aligned_query_position`` while accumulating LSE.  It
             # has no effect on softmax probabilities, but callers merging
             # split attention states rely on this position-shifted LSE.
-            lse_tile = lse_tile + slopes.reshape(state_shape) * (
+            shifted_lse = lse_tile + slopes.reshape(state_shape) * (
                 aligned_query_positions[:, None, None].float()
             )
+            lse_tile = torch.where(has_mass, shifted_lse, lse_tile)
         outputs.append(result_tile.to(output_dtype))
         lse_parts.append(lse_tile.reshape(q_stop - q_start, nheads_q).transpose(0, 1))
 

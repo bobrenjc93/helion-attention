@@ -13,6 +13,7 @@ from helion_attention import vllm_flash_attn as compat
 from helion_attention import AttnShape
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+EMPTY_SOFTMAX_LSE = torch.finfo(torch.float32).min
 
 VLLM_KEYWORDS = {
     "q",
@@ -395,7 +396,7 @@ def test_nonpaged_fallback_features_and_out_parameter(
     sink = torch.tensor([-0.3, 0.4])
     scale = 0.37
     softcap = 1.5
-    window = (2, 0)
+    window = [2, 0]
     out = torch.empty_like(q)
 
     returned, lse = compat.flash_attn_varlen_func(
@@ -435,7 +436,7 @@ def test_nonpaged_fallback_features_and_out_parameter(
             v[k_start : k_start + key_length] * v_descale[request],
             scale=scale,
             causal=True,
-            window=window,
+            window=(2, 0),
             softcap=softcap,
             slopes=slopes,
             sink=sink,
@@ -487,12 +488,8 @@ def test_paged_nonfinite_cache_tail_is_masked() -> None:
     torch.testing.assert_close(actual, expected)
 
 
-@pytest.mark.parametrize(
-    ("fa_version", "positive_infinity"), [(2, True), (3, False)]
-)
-def test_zero_key_lse_uses_version_specific_sentinel(
-    fa_version: int, positive_infinity: bool
-) -> None:
+@pytest.mark.parametrize("fa_version", [2, 3])
+def test_zero_key_lse_is_finite(fa_version: int) -> None:
     q = torch.zeros(2, 2, 4)
     k = torch.empty(0, 1, 4)
     v = torch.empty_like(k)
@@ -505,23 +502,22 @@ def test_zero_key_lse_uses_version_specific_sentinel(
         max_seqlen_k=0,
         cu_seqlens_k=torch.tensor([0, 0], dtype=torch.int32),
         causal=True,
+        window_size=None,
+        alibi_slopes=torch.tensor([0.1, 0.2]),
         return_softmax_lse=True,
         fa_version=fa_version,
     )
     assert isinstance(result, tuple)
     output, lse = result
     torch.testing.assert_close(output, torch.zeros_like(output))
-    assert torch.isposinf(lse).all() if positive_infinity else torch.isneginf(lse).all()
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, torch.full_like(lse, EMPTY_SOFTMAX_LSE))
 
 
 @requires_cuda
 @pytest.mark.parametrize("paged", [False, True], ids=["packed", "paged"])
-@pytest.mark.parametrize(
-    ("fa_version", "positive_infinity"), [(2, True), (3, False)]
-)
-def test_cuda_fully_masked_lse_uses_version_specific_sentinel(
-    paged: bool, fa_version: int, positive_infinity: bool
-) -> None:
+@pytest.mark.parametrize("fa_version", [2, 3])
+def test_cuda_fully_masked_lse_is_finite(paged: bool, fa_version: int) -> None:
     q = torch.zeros(3, 2, 16, device="cuda", dtype=torch.bfloat16)
     if paged:
         k = torch.zeros(1, 4, 1, 16, device="cuda", dtype=torch.bfloat16)
@@ -545,6 +541,9 @@ def test_cuda_fully_masked_lse_uses_version_specific_sentinel(
         cu_seqlens_q=torch.tensor([0, 3], device="cuda", dtype=torch.int32),
         max_seqlen_k=1,
         causal=True,
+        alibi_slopes=torch.tensor(
+            [0.1, 0.2], device="cuda", dtype=torch.float32
+        ),
         return_softmax_lse=True,
         fa_version=fa_version,
         **key_kwargs,
@@ -553,10 +552,10 @@ def test_cuda_fully_masked_lse_uses_version_specific_sentinel(
     output, lse = result
     torch.testing.assert_close(output[:2], torch.zeros_like(output[:2]))
     empty_lse = lse[:, :2]
-    assert (
-        torch.isposinf(empty_lse).all()
-        if positive_infinity
-        else torch.isneginf(empty_lse).all()
+    assert torch.isfinite(empty_lse).all()
+    torch.testing.assert_close(
+        empty_lse,
+        torch.full_like(empty_lse, EMPTY_SOFTMAX_LSE),
     )
     assert torch.isfinite(lse[:, 2:]).all()
 
@@ -1028,10 +1027,20 @@ def test_finite_window_normalization_matches_fa_version_fallback(
         expected_output = torch.full_like(output, 2.0)
         expected_lse = torch.full_like(lse, math.log(2.0))
     else:
-        expected_output = torch.tensor([0.0, 1.0, 2.0, 2.0, 2.0]).reshape(5, 1, 1)
+        expected_output = torch.tensor([0.0, 1.0, 2.0, 2.0, 2.0]).reshape(
+            5, 1, 1
+        )
         expected_output = expected_output.expand_as(output)
         expected_lse = torch.tensor(
-            [[float("-inf"), 0.0, math.log(2.0), math.log(2.0), math.log(2.0)]]
+            [
+                [
+                    EMPTY_SOFTMAX_LSE,
+                    0.0,
+                    math.log(2.0),
+                    math.log(2.0),
+                    math.log(2.0),
+                ]
+            ]
         )
     torch.testing.assert_close(output, expected_output)
     torch.testing.assert_close(lse, expected_lse)
@@ -1083,11 +1092,23 @@ def test_finite_window_normalization_matches_fa_version_cuda(
         expected_output = torch.full_like(output, 2.0)
         expected_lse = torch.full_like(lse, math.log(2.0))
     else:
-        expected_output = torch.tensor(
-            [0.0, 1.0, 2.0, 2.0, 2.0], device=q.device, dtype=q.dtype
-        ).reshape(5, 1, 1).expand_as(output)
+        expected_output = (
+            torch.tensor(
+                [0.0, 1.0, 2.0, 2.0, 2.0], device=q.device, dtype=q.dtype
+            )
+            .reshape(5, 1, 1)
+            .expand_as(output)
+        )
         expected_lse = torch.tensor(
-            [[float("-inf"), 0.0, math.log(2.0), math.log(2.0), math.log(2.0)]],
+            [
+                [
+                    EMPTY_SOFTMAX_LSE,
+                    0.0,
+                    math.log(2.0),
+                    math.log(2.0),
+                    math.log(2.0),
+                ]
+            ],
             device=q.device,
         )
     torch.testing.assert_close(output, expected_output)
