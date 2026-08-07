@@ -40,9 +40,9 @@ QWEN_PREFILL = AttnShape(
 
 
 def make_inputs(
-    spec: AttnShape, device: torch.device | str = "cuda"
+    spec: AttnShape, device: torch.device | str = "cuda", *, seed: int = 7
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    generator = torch.Generator(device=device).manual_seed(7)
+    generator = torch.Generator(device=device).manual_seed(seed)
 
     def rand(seqlen: int, nheads: int) -> torch.Tensor:
         return torch.randn(
@@ -113,6 +113,23 @@ def test_custom_softmax_scale(entry: dict[str, object]) -> None:
     q, k, v = make_inputs(spec)
     scale = 0.137
     got = helion_attention.flash_attn_func(
+        q, k, v, softmax_scale=scale, causal=spec.causal, shape=spec
+    )
+    expected = reference_attention(q, k, v, spec, scale)
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES,
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES],
+)
+def test_decode_custom_softmax_scale(entry: dict[str, object]) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k, v = make_inputs(spec, seed=11039)
+    scale = 2.0
+    got = helion_attention.flash_attn_with_kvcache(
         q, k, v, softmax_scale=scale, causal=spec.causal, shape=spec
     )
     expected = reference_attention(q, k, v, spec, scale)

@@ -182,7 +182,8 @@ def decode_attention_bshd(
         q_row = q[b, :, h, :]
         for tile_n in hl.tile(n_dim):
             k_blk = k[b, tile_n, h_kv, :]
-            qk = hl.dot(q_row * qk_scale, k_blk.T, out_dtype=torch.float32)
+            qk = hl.dot(q_row, k_blk.T, out_dtype=torch.float32)
+            qk = qk * qk_scale
             m_ij = torch.maximum(m_i, torch.amax(qk, -1))
             qk = qk - m_ij[:, None]
             p = torch.exp2(qk)
