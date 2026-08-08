@@ -401,15 +401,15 @@ def flash_attn_with_kvcache(
     if needs_backward:
         lookup_backward(spec)
         return attention_autograd(q, k_cache, v_cache, scale, spec)
-    out = kernel(q, k_cache, v_cache, scale)
-    if not return_softmax_lse:
-        return out
-
-    # Keep the default latency-sensitive path unchanged, including avoiding
-    # this helper import and all LSE temporaries unless the caller opts in.
-    from ._kvcache import single_token_softmax_lse
-
-    return out, single_token_softmax_lse(q, k_cache, scale)
+    if return_softmax_lse:
+        return kernel(
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            return_softmax_lse=True,
+        )
+    return kernel(q, k_cache, v_cache, scale)
 
 
 def flash_attn_qkvpacked_func(

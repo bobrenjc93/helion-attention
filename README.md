@@ -339,7 +339,7 @@ the call site. These unsupported FlashAttention features also raise
 - sliding-window attention and softcap
 - ALiBi slopes
 - KV-cache mutation, partial/ragged caches, paged caches, and fused rotary embeddings
-- `return_attn_probs` and KV-cache `return_softmax_lse`
+- `return_attn_probs`
 
 ## How the kernels are made
 

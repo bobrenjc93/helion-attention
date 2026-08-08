@@ -717,6 +717,45 @@ def test_split_kv_modules_are_composed_without_constexpr_collisions() -> None:
     )
 
 
+def test_direct_decode_generation_exposes_online_softmax_lse() -> None:
+    source = """def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.constexpr):
+        tl.store(out + tl.broadcast_to(offset_1 * 128 + (0 + indices_3)[None, :] * 1, [_BLOCK_SIZE_2, _RDIM_SIZE_3]), v_20, None)
+
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):
+    out = torch.empty_like(q)
+    _launcher(kernel, q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=4)
+    return out"""
+
+    rewritten = generate.add_direct_decode_lse_support(source)
+
+    assert "STORE_LSE: tl.constexpr" in rewritten
+    assert "libdevice.log2(l_i)" in rewritten
+    assert "STORE_LSE=return_softmax_lse" in rewritten
+    assert "return (out, softmax_lse)" in rewritten
+
+
+def test_split_decode_generation_exposes_combined_softmax_lse() -> None:
+    source = """def _helion_decode_attention_bshd_split_kv_combine(partial_stats, partial_acc, out, _RDIM_SIZE_2: tl.constexpr, _RDIM_SIZE_3: tl.constexpr):
+    tl.store(out + (offset_1 * 128 + (0 + indices_3)[None, :] * 1), v_6, None)
+
+def _attention_split_kv_combine(partial_acc: torch.Tensor, partial_stats: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
+    _launcher(kernel, partial_stats, partial_acc, out, _RDIM_SIZE_2, _RDIM_SIZE_3, num_warps=1)
+
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):
+    out = torch.empty_like(q)
+    with context():
+        return _attention_split_kv_combine(
+            partial_acc, partial_stats, out, _launcher=launch
+        )"""
+
+    rewritten = generate.add_split_decode_lse_support(source)
+
+    assert "STORE_LSE: tl.constexpr" in rewritten
+    assert "libdevice.log2(denominator)" in rewritten
+    assert "STORE_LSE=return_softmax_lse" in rewritten
+    assert "return (out, softmax_lse)" in rewritten
+
+
 def test_varlen_artifact_uses_separate_manifest_section(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

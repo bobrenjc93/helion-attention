@@ -160,7 +160,7 @@ from .._runtime import get_num_sm
 from .._runtime import set_triton_allocator
 
 @triton.jit
-def _helion_decode_attention_bshd_split_kv_combine(partial_stats, partial_acc, out, _RDIM_SIZE_2: tl.constexpr, _RDIM_SIZE_3: tl.constexpr):
+def _helion_decode_attention_bshd_split_kv_combine(partial_stats, partial_acc, out, softmax_lse, _RDIM_SIZE_2: tl.constexpr, _RDIM_SIZE_3: tl.constexpr, STORE_LSE: tl.constexpr):
     # src[helion_kernels.py:351]: for b, h in hl.grid([batch, nheads_q]):
     num_blocks_0 = 1
     pid_1 = tl.program_id(0) // num_blocks_0
@@ -197,8 +197,13 @@ def _helion_decode_attention_bshd_split_kv_combine(partial_stats, partial_acc, o
     v_5 = numerator / subscript_1
     v_6 = tl.cast(v_5, tl.bfloat16)
     tl.store(out + (offset_1 * 128 + (0 + indices_3)[None, :] * 1), v_6, None)
+    if STORE_LSE:
+        # The split statistics use base-2 exponentials. Convert their combined
+        # normalization factor to FlashAttention's natural-log convention.
+        lse = (global_max + libdevice.log2(denominator)) * 0.6931471805599453
+        tl.store(softmax_lse + offset_1 + tl.arange(0, 1), lse, None)
 
-def _attention_split_kv_combine(partial_acc: torch.Tensor, partial_stats: torch.Tensor, out: torch.Tensor, *, _launcher=_default_launcher):
+def _attention_split_kv_combine(partial_acc: torch.Tensor, partial_stats: torch.Tensor, out: torch.Tensor, softmax_lse: torch.Tensor, return_softmax_lse: bool, *, _launcher=_default_launcher):
     """Renormalize and combine the per-split softmax numerators."""
     # src[helion_kernels.py:349]: batch = out.size(0)
     batch = out.size(0)
@@ -209,12 +214,12 @@ def _attention_split_kv_combine(partial_acc: torch.Tensor, partial_stats: torch.
     # src[helion_kernels.py:352]:     split_max = partial_stats[b, h, 0, :, :]
     # src[helion_kernels.py:353]:     global_max = torch.amax(split_max, 0)
     # src[helion_kernels.py:351-363]: ...
-    _launcher(_helion_decode_attention_bshd_split_kv_combine, (1 * 32,), partial_stats, partial_acc, out, _RDIM_SIZE_2, _RDIM_SIZE_3, num_warps=1, num_stages=3)
+    _launcher(_helion_decode_attention_bshd_split_kv_combine, (1 * 32,), partial_stats, partial_acc, out, softmax_lse, _RDIM_SIZE_2, _RDIM_SIZE_3, STORE_LSE=return_softmax_lse, num_warps=1, num_stages=3)
     # src[helion_kernels.py:364]: return out
     return out
 from .._launcher import launcher_context as _launcher_context
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, return_softmax_lse: bool = False, _launcher=_default_launcher):
     num_splits = 8
     partial_acc = torch.empty(
         (q.size(0), q.size(2), num_splits, 1, q.size(3)),
@@ -227,10 +232,25 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
         device=q.device,
     )
     out = torch.empty_like(q)
+    softmax_lse = (
+        torch.empty(
+            (q.size(0), q.size(2), q.size(1)),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        if return_softmax_lse
+        else out
+    )
     with _launcher_context(q.device, _launcher) as launch:
         _attention_split_kv_partials(
             q, k, v, partial_acc, partial_stats, sm_scale, _launcher=launch
         )
-        return _attention_split_kv_combine(
-            partial_acc, partial_stats, out, _launcher=launch
+        out = _attention_split_kv_combine(
+            partial_acc,
+            partial_stats,
+            out,
+            softmax_lse,
+            return_softmax_lse,
+            _launcher=launch,
         )
+    return (out, softmax_lse) if return_softmax_lse else out
