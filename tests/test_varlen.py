@@ -25,6 +25,12 @@ PAGED_DECODE = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+GENERIC_VARLEN_SPECS = [
+    AttnShape(3, 19, 19, 4, 4, 32, torch.bfloat16, False),
+    AttnShape(3, 23, 29, 4, 2, 32, torch.bfloat16, True),
+    AttnShape(3, 19, 19, 4, 4, 32, torch.float16, False),
+    AttnShape(3, 29, 17, 4, 2, 32, torch.float16, True),
+]
 
 
 def _lengths(maximum: int, batch: int, *, key: bool, variant: int) -> list[int]:
@@ -476,6 +482,180 @@ def test_varlen_matches_fp32_sdpa_with_dynamic_token_totals(
         q, k, v, lengths_q, lengths_k, causal=spec.causal, scale=scale
     )
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "spec", GENERIC_VARLEN_SPECS, ids=[spec.key for spec in GENERIC_VARLEN_SPECS]
+)
+@pytest.mark.parametrize("variant", [0, 1], ids=["profile-a", "profile-b"])
+def test_unregistered_varlen_fallback_matches_fp32_sdpa(
+    spec: AttnShape, variant: int
+) -> None:
+    assert not helion_attention.is_varlen_shape_supported(
+        spec, dtype=spec.dtype, causal=spec.causal
+    )
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=variant, seed=20260808
+    )
+    scale = 1.0 / math.sqrt(spec.head_dim) if variant == 0 else 0.37
+
+    got = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        softmax_scale=None if variant == 0 else scale,
+        causal=spec.causal,
+        shape=spec,
+    )
+    expected = reference_packed(
+        q,
+        k,
+        v,
+        lengths_q,
+        lengths_k,
+        causal=spec.causal,
+        scale=scale,
+    )
+
+    assert got.shape == q.shape
+    assert got.dtype == spec.dtype
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_unregistered_varlen_packed_entry_points_use_fallback() -> None:
+    qkv_spec = GENERIC_VARLEN_SPECS[2]
+    q, k, v, cu_q, _, lengths_q, _ = make_packed(qkv_spec, variant=2)
+    qkv = torch.stack((q, k, v), dim=1)
+    qkv_out = helion_attention.flash_attn_varlen_qkvpacked_func(
+        qkv,
+        cu_q,
+        qkv_spec.seqlen_q,
+        shape=qkv_spec,
+    )
+    qkv_expected = reference_packed(
+        q,
+        k,
+        v,
+        lengths_q,
+        lengths_q,
+        causal=False,
+        scale=1.0 / math.sqrt(qkv_spec.head_dim),
+    )
+    torch.testing.assert_close(
+        qkv_out.float(), qkv_expected, atol=5e-2, rtol=2e-2
+    )
+
+    kv_spec = GENERIC_VARLEN_SPECS[1]
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(kv_spec, variant=0)
+    kv = torch.stack((k, v), dim=1)
+    kv_out = helion_attention.flash_attn_varlen_kvpacked_func(
+        q,
+        kv,
+        cu_q,
+        cu_k,
+        kv_spec.seqlen_q,
+        kv_spec.seqlen_k,
+        causal=True,
+        shape=kv_spec,
+    )
+    kv_expected = reference_packed(
+        q,
+        k,
+        v,
+        lengths_q,
+        lengths_k,
+        causal=True,
+        scale=1.0 / math.sqrt(kv_spec.head_dim),
+    )
+    torch.testing.assert_close(kv_out.float(), kv_expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize("entry", VARLEN_SHAPES, ids=VARLEN_IDS)
+def test_registered_varlen_shape_does_not_use_generic_fallback(
+    entry: dict[str, object], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q = torch.zeros(
+        spec.batch,
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    k = torch.zeros(
+        spec.batch,
+        spec.nheads_kv,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    v = torch.zeros_like(k)
+    cumulative = torch.arange(spec.batch + 1, device="cuda", dtype=torch.int32)
+    seen: list[AttnShape] = []
+
+    def fake_lookup(received: AttnShape):
+        seen.append(received)
+
+        def fake_kernel(*args: object) -> torch.Tensor:
+            return torch.zeros_like(q)
+
+        return fake_kernel
+
+    def reject_fallback(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("registered varlen shape reached generic fallback")
+
+    monkeypatch.setattr(helion_attention, "lookup_varlen", fake_lookup)
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_fallback
+    )
+    out = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cumulative,
+        cumulative,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=spec.causal,
+        shape=spec,
+    )
+
+    assert seen == [spec]
+    assert out.shape == q.shape
+
+
+@requires_cuda
+def test_unregistered_varlen_fallback_rejects_gradients_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = GENERIC_VARLEN_SPECS[0]
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec)
+    q.requires_grad_()
+
+    def reject_fallback(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("gradient-bearing input reached generic fallback")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_fallback
+    )
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            shape=spec,
+        )
 
 
 @requires_cuda

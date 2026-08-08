@@ -6,9 +6,10 @@ time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
-exact generated specialization; compatible unregistered dense shapes use a
-generic forward-only Triton kernel. The explicit shape validates both paths and
-makes specialization introspection independent of fallback coverage.
+exact generated specialization; compatible unregistered dense and packed-varlen
+shapes use a generic forward-only Triton kernel. The explicit shape validates
+both paths and makes specialization introspection independent of fallback
+coverage.
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ __version__ = "0.1.0"
 
 _CORE_PAGED_VARLEN_SHAPE = (4, 1, 1024, 8, 2, 128, torch.bfloat16)
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
+# Both generic core paths use the same packed runtime and inherit this limit.
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 
@@ -157,39 +159,66 @@ def _validate_generic_dense_layout(spec: AttnShape) -> tuple[int, int]:
     return total_q, total_k
 
 
-def _generic_dense_forward(
+def _validate_generic_varlen_layout(
+    q: torch.Tensor, k: torch.Tensor, spec: AttnShape
+) -> None:
+    """Validate the generic kernel's limits for actual packed token totals."""
+    if spec.head_dim > _GENERIC_DENSE_MAX_HEAD_DIM:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback supports head_dim <= "
+            f"{_GENERIC_DENSE_MAX_HEAD_DIM}. To request a specialization, file "
+            "an issue at https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    total_q = q.shape[0]
+    total_k = k.shape[0]
+    if max(total_q, total_k) > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback requires packed token offsets to fit "
+            "in int32. To request a specialization, file an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    layout_numels = (
+        ("Q/output", q.numel()),
+        ("K/V", k.numel()),
+    )
+    for layout, numel in layout_numels:
+        max_element_offset = numel - 1
+        if max_element_offset > _INT32_MAX:
+            raise UnsupportedShapeError(
+                "no checked-in varlen specialization exists for:\n"
+                f"    {spec.describe()}\n"
+                "the generic varlen fallback uses signed int32 element "
+                f"offsets, but {layout} requires maximum offset "
+                f"{max_element_offset} (limit {_INT32_MAX}). To request a "
+                "specialization, file an issue at "
+                "https://github.com/bobrenjc93/helion-attention/issues"
+            )
+
+
+def _generic_packed_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
 ) -> torch.Tensor:
-    """Adapt a validated dense batch to the generic packed Triton runtime."""
-    total_q, total_k = _validate_generic_dense_layout(spec)
-
-    # The dense inputs were validated as contiguous, so these views retain the
-    # packed runtime's [total, heads, head_dim] layout without copying data.
-    packed_q = q.view(total_q, spec.nheads_q, spec.head_dim)
-    packed_k = k.view(total_k, spec.nheads_kv, spec.head_dim)
-    packed_v = v.view(total_k, spec.nheads_kv, spec.head_dim)
-    request_ids = torch.arange(
-        spec.batch + 1, device=q.device, dtype=torch.int32
-    )
-    cu_seqlens_q = request_ids * spec.seqlen_q
-    cu_seqlens_k = (
-        cu_seqlens_q
-        if spec.seqlen_q == spec.seqlen_k
-        else request_ids * spec.seqlen_k
-    )
-
+    """Launch the generic packed Triton runtime for validated core inputs."""
     # Keep the Triton dependency lazy for callers that only inspect the
     # specialization manifest.
     from ._paged_attention import packed_attention
 
     packed_out = packed_attention(
-        packed_q,
-        packed_k,
-        packed_v,
+        q,
+        k,
+        v,
         cu_seqlens_q,
         cu_seqlens_k,
         max_seqlen_q=spec.seqlen_q,
@@ -216,8 +245,67 @@ def _generic_dense_forward(
     )
     if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
         raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
+    return packed_out
+
+
+def _generic_dense_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Adapt a validated dense batch to the generic packed Triton runtime."""
+    total_q, total_k = _validate_generic_dense_layout(spec)
+
+    # The dense inputs were validated as contiguous, so these views retain the
+    # packed runtime's [total, heads, head_dim] layout without copying data.
+    packed_q = q.view(total_q, spec.nheads_q, spec.head_dim)
+    packed_k = k.view(total_k, spec.nheads_kv, spec.head_dim)
+    packed_v = v.view(total_k, spec.nheads_kv, spec.head_dim)
+    request_ids = torch.arange(
+        spec.batch + 1, device=q.device, dtype=torch.int32
+    )
+    cu_seqlens_q = request_ids * spec.seqlen_q
+    cu_seqlens_k = (
+        cu_seqlens_q
+        if spec.seqlen_q == spec.seqlen_k
+        else request_ids * spec.seqlen_k
+    )
+
+    packed_out = _generic_packed_forward(
+        packed_q,
+        packed_k,
+        packed_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        softmax_scale,
+        spec,
+    )
     return packed_out.view(
         spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
+    )
+
+
+def _generic_varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Run an unregistered validated packed-varlen shape generically."""
+    _validate_generic_varlen_layout(q, k, spec)
+    return _generic_packed_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        softmax_scale,
+        spec,
     )
 
 
@@ -337,6 +425,10 @@ def flash_attn_varlen_func(
     The packed token totals and individual sequence lengths may change between
     calls to the same specialization.  The batch size, maxima, head geometry,
     dtype, and causal mode must continue to match ``shape``.
+
+    Compatible unregistered shapes without ``block_table`` use the generic
+    packed Triton forward. :func:`is_varlen_shape_supported` continues to report
+    only checked-in specializations.
     """
     del deterministic  # This option affects backward only.
     _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
@@ -385,7 +477,6 @@ def flash_attn_varlen_func(
         )
 
     check_varlen_tensors(q, k, v, cu_seqlens_q, cu_seqlens_k, spec)
-    kernel = lookup_varlen(spec)
     if torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
     ):
@@ -395,16 +486,27 @@ def flash_attn_varlen_func(
         )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
-    return kernel(
+    scale = float(softmax_scale)
+    if has_varlen_kernel(spec):
+        return lookup_varlen(spec)(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            causal,
+        )
+    return _generic_varlen_forward(
         q,
         k,
         v,
         cu_seqlens_q,
         cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        float(softmax_scale),
-        causal,
+        scale,
+        spec,
     )
 
 
