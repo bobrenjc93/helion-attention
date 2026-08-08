@@ -83,6 +83,37 @@ def make_inputs(
     )
 
 
+def make_rotary_tables(
+    spec: AttnShape, *, seed: int = 11
+) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    angles = torch.randn(
+        (spec.seqlen_k, spec.head_dim // 2),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+    return angles.cos().to(spec.dtype), angles.sin().to(spec.dtype)
+
+
+def reference_interleaved_rotary(
+    tensor: torch.Tensor,
+    rotary_cos: torch.Tensor,
+    rotary_sin: torch.Tensor,
+    position: int,
+) -> torch.Tensor:
+    pairs = tensor.float().reshape(*tensor.shape[:-1], tensor.shape[-1] // 2, 2)
+    cos = rotary_cos[position].float()
+    sin = rotary_sin[position].float()
+    even = pairs[..., 0]
+    odd = pairs[..., 1]
+    return (
+        torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
+        .flatten(-2)
+        .to(tensor.dtype)
+    )
+
+
 def make_paged_kvcache_inputs(
     *, seed: int = 314159
 ) -> tuple[
@@ -1459,6 +1490,81 @@ def test_kvcache_appends_one_token_in_place_and_attends_to_it(
 @requires_cuda
 @pytest.mark.parametrize(
     "entry",
+    DECODE_SHAPES,
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES],
+)
+@pytest.mark.parametrize("return_softmax_lse", [False, True], ids=["out", "out-lse"])
+def test_kvcache_full_head_interleaved_rotary_append_matches_fa2(
+    entry: dict[str, object], return_softmax_lse: bool
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(entry)
+    q, initial_k, initial_v = make_inputs(spec, seed=57721)
+    new_k = initial_k[:, :1].clone()
+    new_v = initial_v[:, :1].clone()
+    rotary_cos, rotary_sin = make_rotary_tables(spec, seed=46349)
+    position = spec.seqlen_k - 1
+
+    q_helion = q.clone()
+    k_helion = initial_k.clone()
+    v_helion = initial_v.clone()
+    got = helion_attention.flash_attn_with_kvcache(
+        q_helion,
+        k_helion,
+        v_helion,
+        k=new_k,
+        v=new_v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=position,
+        causal=spec.causal,
+        return_softmax_lse=return_softmax_lse,
+        shape=spec,
+    )
+
+    q_fa2 = q.clone()
+    k_fa2 = initial_k.clone()
+    v_fa2 = initial_v.clone()
+    expected = flash_attn.flash_attn_with_kvcache(
+        q_fa2,
+        k_fa2,
+        v_fa2,
+        k=new_k,
+        v=new_v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=position,
+        causal=spec.causal,
+        return_softmax_lse=return_softmax_lse,
+    )
+
+    expected_appended_k = reference_interleaved_rotary(
+        new_k, rotary_cos, rotary_sin, position
+    )
+    assert torch.equal(q_helion, q)
+    assert torch.equal(q_fa2, q)
+    assert torch.equal(new_k, initial_k[:, :1])
+    assert torch.equal(k_helion, k_fa2)
+    assert torch.equal(k_helion[:, -1:], expected_appended_k)
+    assert torch.equal(v_helion, v_fa2)
+    assert torch.equal(v_helion[:, -1:], new_v)
+
+    if return_softmax_lse:
+        got_out, got_lse = got
+        expected_out, expected_lse = expected
+        torch.testing.assert_close(got_lse, expected_lse, atol=2e-3, rtol=1e-5)
+    else:
+        assert isinstance(got, torch.Tensor)
+        assert isinstance(expected, torch.Tensor)
+        got_out, expected_out = got, expected
+    torch.testing.assert_close(
+        got_out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
     DECODE_SHAPES[:1],
     ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
 )
@@ -1535,6 +1641,88 @@ def test_kvcache_rejects_invalid_updates_before_mutating_either_cache(
         v=None,
         cache_seqlens=spec.seqlen_k - 1,
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES[:1],
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+)
+def test_kvcache_rejects_invalid_rotary_before_mutating_either_cache(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec, seed=31623)
+    original_q = q.clone()
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    new_k = k_cache[:, :1].clone()
+    new_v = v_cache[:, :1].clone()
+    rotary_cos, rotary_sin = make_rotary_tables(spec, seed=14159)
+    base_kwargs: dict[str, object] = {
+        "k": new_k,
+        "v": new_v,
+        "rotary_cos": rotary_cos,
+        "rotary_sin": rotary_sin,
+        "cache_seqlens": spec.seqlen_k - 1,
+    }
+
+    def reject(error: type[Exception], match: str, **overrides: object) -> None:
+        kwargs = {**base_kwargs, **overrides}
+        with pytest.raises(error, match=match):
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                causal=spec.causal,
+                shape=spec,
+                **kwargs,
+            )
+        assert torch.equal(q, original_q)
+        assert torch.equal(k_cache, original_k)
+        assert torch.equal(v_cache, original_v)
+
+    reject(ValueError, "provided together", rotary_sin=None)
+    reject(ValueError, "provided together", rotary_cos=None)
+    reject(NotImplementedError, "non-interleaved", rotary_interleaved=False)
+    reject(NotImplementedError, "one-token KV-cache append", k=None, v=None)
+
+    partial_cos = rotary_cos[:, :-1].contiguous()
+    partial_sin = rotary_sin[:, :-1].contiguous()
+    reject(
+        NotImplementedError,
+        "partial rotary dimensions",
+        rotary_cos=partial_cos,
+        rotary_sin=partial_sin,
+    )
+    reject(
+        ValueError,
+        "same shape",
+        rotary_sin=rotary_sin[:, :-1].contiguous(),
+    )
+    reject(
+        ValueError,
+        "final cache position",
+        rotary_cos=rotary_cos[:-1].contiguous(),
+        rotary_sin=rotary_sin[:-1].contiguous(),
+    )
+    reject(ValueError, "dtype", rotary_cos=rotary_cos.float())
+    reject(ValueError, "CUDA tensor", rotary_sin=rotary_sin.cpu())
+    reject(
+        ValueError,
+        "contiguous",
+        rotary_cos=rotary_cos.T.contiguous().T,
+    )
+    reject(
+        ValueError,
+        "shape",
+        rotary_cos=rotary_cos.unsqueeze(0),
+    )
+    reject(TypeError, "torch.Tensor", rotary_sin=object())
+
+    grad_cos = rotary_cos.detach().requires_grad_()
+    reject(NotImplementedError, "autograd", rotary_cos=grad_cos)
 
 
 @requires_cuda

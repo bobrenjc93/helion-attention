@@ -96,6 +96,78 @@ def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bo
     return first_start < second_end and second_start < first_end
 
 
+def _validate_kvcache_rotary(
+    rotary_cos: torch.Tensor,
+    rotary_sin: torch.Tensor,
+    q: torch.Tensor,
+    spec: AttnShape,
+) -> None:
+    """Validate the narrow full-head rotary contract for a final-slot append."""
+    for name, tensor in (("rotary_cos", rotary_cos), ("rotary_sin", rotary_sin)):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor or None")
+        if tensor.layout != torch.strided:
+            raise ValueError(f"{name} must use torch.strided layout")
+        if tensor.ndim != 2:
+            raise ValueError(
+                f"{name} must have shape [seqlen_ro, head_dim / 2], got "
+                f"{tuple(tensor.shape)}"
+            )
+
+    if rotary_cos.shape != rotary_sin.shape:
+        raise ValueError(
+            "rotary_cos and rotary_sin must have the same shape, got "
+            f"{tuple(rotary_cos.shape)} and {tuple(rotary_sin.shape)}"
+        )
+    rotary_dim = rotary_cos.shape[1] * 2
+    if rotary_dim != spec.head_dim:
+        raise NotImplementedError(
+            "partial rotary dimensions are not implemented; full-head rotary "
+            f"requires rotary_dim={spec.head_dim}, got {rotary_dim}"
+        )
+    if rotary_cos.shape[0] < spec.seqlen_k:
+        raise ValueError(
+            "rotary_cos and rotary_sin must contain the final cache position; "
+            f"seqlen_ro must be at least {spec.seqlen_k}, got "
+            f"{rotary_cos.shape[0]}"
+        )
+
+    for name, tensor in (("rotary_cos", rotary_cos), ("rotary_sin", rotary_sin)):
+        if tensor.dtype != spec.dtype:
+            raise ValueError(
+                f"{name} has dtype {tensor.dtype} but q has dtype {spec.dtype}"
+            )
+        if not tensor.is_cuda:
+            raise ValueError(
+                f"{name} must be a CUDA tensor, got device {tensor.device}"
+            )
+        if tensor.device != q.device:
+            raise ValueError(
+                f"{name} must be on the same CUDA device as q, k_cache, and v_cache"
+            )
+        if not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+
+def _apply_interleaved_rotary(
+    tensor: torch.Tensor,
+    rotary_cos: torch.Tensor,
+    rotary_sin: torch.Tensor,
+    position: int,
+) -> torch.Tensor:
+    """Rotate adjacent full-head pairs with one fp32-rounded rotary table row."""
+    pairs = tensor.float().reshape(*tensor.shape[:-1], tensor.shape[-1] // 2, 2)
+    cos = rotary_cos[position].float()
+    sin = rotary_sin[position].float()
+    even = pairs[..., 0]
+    odd = pairs[..., 1]
+    return (
+        torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
+        .flatten(-2)
+        .to(dtype=tensor.dtype)
+    )
+
+
 def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
     """Require the one paged specialization exposed by the core varlen API."""
     requested = (
@@ -737,15 +809,27 @@ def flash_attn_with_kvcache(
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. Cache
     tensors created in inference mode must also be updated in inference mode,
     and an append requires disjoint query, K-cache, and V-cache memory. Dense
-    tensor-valued/partial lengths, multi-token updates, rotary embeddings, and
-    other paged profiles fail explicitly.
+    tensor-valued/partial lengths and multi-token updates fail explicitly. A
+    paired ``rotary_cos``/``rotary_sin`` table may be supplied only for this
+    final-slot append: it must cover the full head, use the default interleaved
+    layout, and rotates both ``q`` and the appended ``k`` at ``cache_seqlens``.
+    Read-only rotary calls and other paged profiles fail explicitly.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
     append_kv = k is not None
-    if rotary_cos is not None or rotary_sin is not None:
+    has_rotary_metadata = rotary_cos is not None or rotary_sin is not None
+    if has_rotary_metadata and not append_kv:
         raise NotImplementedError(
-            "rotary embeddings in the KV-cache entry point are not implemented"
+            "rotary embeddings are implemented only for a one-token KV-cache append"
+        )
+    if (rotary_cos is None) != (rotary_sin is None):
+        raise ValueError("rotary_cos and rotary_sin must be provided together")
+    apply_rotary = rotary_cos is not None
+    if apply_rotary and not rotary_interleaved:
+        raise NotImplementedError(
+            "non-interleaved rotary embeddings are not implemented; pass "
+            "rotary_interleaved=True"
         )
     if cache_batch_idx is not None:
         raise NotImplementedError("cache_batch_idx is not implemented")
@@ -755,9 +839,8 @@ def flash_attn_with_kvcache(
         raise NotImplementedError(
             "explicit num_splits is not implemented; pass num_splits=0"
         )
-    # This flag changes only how rotary pairs are laid out, so it is irrelevant
-    # when rotary_cos/rotary_sin are absent. Keep it in the compatible signature.
-    del rotary_interleaved
+    # This flag changes only how rotary pairs are laid out, so it remains
+    # irrelevant when rotary_cos/rotary_sin are absent.
 
     _reject_unsupported(0.0, window_size, softcap, alibi_slopes, False)
     if block_table is not None:
@@ -869,13 +952,16 @@ def flash_attn_with_kvcache(
                 "KV caches created in torch.inference_mode() must be updated "
                 "while torch.inference_mode() is enabled"
             )
+        if apply_rotary:
+            assert rotary_cos is not None and rotary_sin is not None
+            _validate_kvcache_rotary(rotary_cos, rotary_sin, q, spec)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     kernel = lookup(spec)
     scale = float(softmax_scale)
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad
-        for tensor in (q, k_cache, v_cache, k, v)
+        for tensor in (q, k_cache, v_cache, k, v, rotary_cos, rotary_sin)
         if tensor is not None
     )
     if needs_backward:
@@ -886,14 +972,24 @@ def flash_attn_with_kvcache(
 
     # All input, feature, dispatch, and autograd validation must precede both
     # writes so a rejected call cannot leave a half-updated cache.
+    q_for_attention = q
     if append_kv:
         assert k is not None and v is not None and cache_seqlens is not None
         cache_tensors = (k_cache, v_cache)
-        update_k = (
-            k.clone()
-            if any(_contiguous_tensors_overlap(k, cache) for cache in cache_tensors)
-            else k
-        )
+        if apply_rotary:
+            assert rotary_cos is not None and rotary_sin is not None
+            update_k = _apply_interleaved_rotary(
+                k, rotary_cos, rotary_sin, cache_seqlens
+            )
+            q_for_attention = _apply_interleaved_rotary(
+                q, rotary_cos, rotary_sin, cache_seqlens
+            )
+        else:
+            update_k = (
+                k.clone()
+                if any(_contiguous_tensors_overlap(k, cache) for cache in cache_tensors)
+                else k
+            )
         update_v = (
             v.clone()
             if any(_contiguous_tensors_overlap(v, cache) for cache in cache_tensors)
@@ -903,13 +999,13 @@ def flash_attn_with_kvcache(
         v_cache[:, cache_seqlens : cache_seqlens + 1].copy_(update_v)
     if return_softmax_lse:
         return kernel(
-            q,
+            q_for_attention,
             k_cache,
             v_cache,
             scale,
             return_softmax_lse=True,
         )
-    return kernel(q, k_cache, v_cache, scale)
+    return kernel(q_for_attention, k_cache, v_cache, scale)
 
 
 def flash_attn_qkvpacked_func(
