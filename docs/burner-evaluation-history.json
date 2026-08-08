@@ -568,6 +568,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:e84faa86ef0a22f5ecd90faf5abddff431edffc1",
+      "commit": "e84faa86ef0a22f5ecd90faf5abddff431edffc1",
+      "recordedAt": "2026-08-08T09:48:49.920Z",
+      "label": "base e84faa8",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 65,
+        "eval_1afd133e": 46,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:24",
+      "recordedAt": "2026-08-08T09:48:49.920Z",
+      "label": "PR #24",
+      "kind": "leaf",
+      "prNumber": 24,
+      "title": "Validate dense packed axes before slicing",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 65,
+        "eval_1afd133e": 47,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
