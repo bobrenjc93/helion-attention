@@ -328,7 +328,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
     *,
     shape: ShapeLike,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Read a full KV cache with FlashAttention's decode entry-point shape.
 
     The supported path is a dense, contiguous, read-only cache and exactly one
@@ -337,9 +337,10 @@ def flash_attn_with_kvcache(
     ``(batch, 1, cache_len, nheads_q, nheads_kv, head_dim)``.
 
     ``cache_seqlens`` may be omitted or supplied as a Python integer equal to
-    the declared cache length. Tensor-valued lengths, cache appends,
-    partial/ragged caches, rotary embeddings, paged caches, and softmax LSE
-    output are not implemented yet and fail explicitly.
+    the declared cache length. If ``return_softmax_lse=True``, the result is
+    ``(out, softmax_lse)`` with LSE shape ``[batch, nheads_q, 1]`` and fp32
+    dtype, matching FlashAttention. Tensor-valued lengths, cache appends,
+    partial/ragged caches, rotary embeddings, and paged caches fail explicitly.
     """
     if k is not None or v is not None:
         raise NotImplementedError("updating the KV cache with k/v is not implemented")
@@ -357,9 +358,6 @@ def flash_attn_with_kvcache(
         raise NotImplementedError(
             "explicit num_splits is not implemented; pass num_splits=0"
         )
-    if return_softmax_lse:
-        raise NotImplementedError("return_softmax_lse is not implemented")
-
     # This flag changes only how rotary pairs are laid out, so it is irrelevant
     # when rotary_cos/rotary_sin are absent. Keep it in the compatible signature.
     del rotary_interleaved
@@ -403,7 +401,15 @@ def flash_attn_with_kvcache(
     if needs_backward:
         lookup_backward(spec)
         return attention_autograd(q, k_cache, v_cache, scale, spec)
-    return kernel(q, k_cache, v_cache, scale)
+    out = kernel(q, k_cache, v_cache, scale)
+    if not return_softmax_lse:
+        return out
+
+    # Keep the default latency-sensitive path unchanged, including avoiding
+    # this helper import and all LSE temporaries unless the caller opts in.
+    from ._kvcache import single_token_softmax_lse
+
+    return out, single_token_softmax_lse(q, k_cache, scale)
 
 
 def flash_attn_qkvpacked_func(

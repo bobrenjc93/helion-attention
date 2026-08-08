@@ -89,6 +89,25 @@ def reference_attention(
     ).transpose(1, 2)
 
 
+def reference_single_token_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    spec: AttnShape,
+    scale: float,
+) -> torch.Tensor:
+    grouped_q = q[:, 0].reshape(
+        spec.batch,
+        spec.nheads_kv,
+        spec.nheads_q // spec.nheads_kv,
+        spec.head_dim,
+    ).float()
+    grouped_k_t = k.float().permute(0, 2, 3, 1)
+    scores = torch.matmul(grouped_q, grouped_k_t) * scale
+    return torch.logsumexp(scores, dim=-1).reshape(
+        spec.batch, spec.nheads_q, spec.seqlen_q
+    )
+
+
 def test_package_does_not_import_helion() -> None:
     assert "helion" not in sys.modules
 
@@ -378,6 +397,48 @@ def test_kvcache_entry_point_matches_plain_attention(
         shape=spec,
     )
     torch.testing.assert_close(cached, plain)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES,
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES],
+)
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.37],
+    ids=["default-scale", "custom-scale"],
+)
+def test_kvcache_returns_flash_compatible_softmax_lse(
+    entry: dict[str, object], softmax_scale: float | None
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260807)
+    out, lse = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        return_softmax_lse=True,
+        shape=spec,
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    expected_out = reference_attention(q, k_cache, v_cache, spec, scale)
+    expected_lse = reference_single_token_lse(q, k_cache, spec, scale)
+
+    assert out.shape == q.shape
+    assert out.dtype == q.dtype
+    assert lse.shape == (spec.batch, spec.nheads_q, spec.seqlen_q)
+    assert lse.dtype == torch.float32
+    assert lse.device == q.device
+    torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
 
 
 @requires_cuda
