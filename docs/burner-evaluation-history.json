@@ -943,6 +943,36 @@
         "eval_5b403bea": 96,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6609400fdf0dcba871ba8102be1c2ca77844f2b0",
+      "commit": "6609400fdf0dcba871ba8102be1c2ca77844f2b0",
+      "recordedAt": "2026-08-08T22:20:41.161Z",
+      "label": "base 6609400",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:42",
+      "recordedAt": "2026-08-08T22:20:41.161Z",
+      "label": "PR #42",
+      "kind": "leaf",
+      "prNumber": 42,
+      "title": "Return the diagnostic tuple for shipped dense decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
