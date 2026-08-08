@@ -13,11 +13,14 @@ only ``torch`` and ``triton``.
 from __future__ import annotations
 
 import argparse
+import fcntl
+from importlib.metadata import version as package_version
 import json
 import math
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable
 from typing import TYPE_CHECKING
@@ -62,6 +65,8 @@ Regenerate with:
     {command}
 
 {description}
+
+{provenance}
 """
 
 '''
@@ -359,12 +364,136 @@ def reference_gradients(
         return grads[0], grads[1], grads[2]
 
 
+def config_dict(config) -> dict[str, object]:  # noqa: ANN001
+    """Return JSON-compatible arguments that reconstruct a ``helion.Config``."""
+    if hasattr(config, "to_json"):
+        value = json.loads(config.to_json())
+    else:
+        value = dict(config)
+    if not isinstance(value, dict):
+        raise TypeError("Helion config serialization did not produce an object")
+    return value
+
+
+def render_helion_config(config: dict[str, object]) -> str:
+    """Render structured config arguments as a copyable constructor."""
+    arguments = ", ".join(
+        f"{name}={value!r}" for name, value in sorted(config.items())
+    )
+    return f"helion.Config({arguments})"
+
+
+def make_provenance(
+    *,
+    helion_version: str,
+    selection: str,
+    configs: list[tuple[str, object]],
+    wall_time_seconds: float,
+    measured_time_ms: float,
+) -> dict[str, object]:
+    """Build the stable, JSON-compatible provenance schema."""
+    if selection not in {"autotuned", "fixed"}:
+        raise ValueError(f"unknown config selection mode: {selection}")
+    if not configs:
+        raise ValueError("at least one Helion config is required")
+    if wall_time_seconds < 0 or measured_time_ms <= 0:
+        raise ValueError("provenance timings must be non-negative and non-zero")
+    return {
+        "helion_version": helion_version,
+        "selection": selection,
+        "configs": [
+            {"kernel": kernel_name, "config": config_dict(config)}
+            for kernel_name, config in configs
+        ],
+        "autotuning_wall_time_seconds": round(wall_time_seconds, 3),
+        "measured_time_ms": round(measured_time_ms, 6),
+    }
+
+
+def format_provenance(provenance: dict[str, object]) -> str:
+    """Format manifest provenance for a generated module docstring."""
+    configs = provenance["configs"]
+    assert isinstance(configs, list)
+    lines = [
+        "Autotuning provenance:",
+        f"    Helion version: {provenance['helion_version']}",
+        f"    Config selection: {provenance['selection']}",
+        "    Autotuning wall time: "
+        f"{float(provenance['autotuning_wall_time_seconds']):.3f} s",
+        f"    Measured time: {float(provenance['measured_time_ms']):.6f} ms",
+    ]
+    for item in configs:
+        assert isinstance(item, dict)
+        label = "Config" if len(configs) == 1 else f"Config ({item['kernel']})"
+        config = item["config"]
+        assert isinstance(config, dict)
+        lines.append(f"    {label}: {render_helion_config(config)}")
+    return "\n".join(lines)
+
+
+def run_with_provenance(
+    kernel,  # noqa: ANN001
+    args: tuple[object, ...],
+    *,
+    helion_version: str,
+):  # noqa: ANN201
+    """Select a config, run the kernel, and capture tuning provenance."""
+    from helion.autotuner.benchmarking import do_bench
+    from helion.autotuner.metrics import register_post_autotune_hook
+    from helion.autotuner.metrics import remove_post_autotune_hook
+
+    bound = kernel.bind(args)
+    if len(kernel.configs) == 1:
+        config = kernel.configs[0]
+        result = bound(*args)
+        measured_time_ms = float(
+            do_bench(lambda: bound(*args), return_mode="mean")
+        )
+        provenance = make_provenance(
+            helion_version=helion_version,
+            selection="fixed",
+            configs=[(kernel.name, config)],
+            wall_time_seconds=0.0,
+            measured_time_ms=measured_time_ms,
+        )
+        return result, provenance
+
+    captured_metrics = []
+    capture_metrics = captured_metrics.append
+    register_post_autotune_hook(capture_metrics)
+    started = time.perf_counter()
+    try:
+        # Generation is the authoritative search for a checked-in artifact. Do
+        # not silently substitute a local cache hit whose original wall time
+        # and winning measurement are unavailable.
+        config = bound.autotune(args, force=not kernel.configs)
+    finally:
+        wall_time_seconds = time.perf_counter() - started
+        remove_post_autotune_hook(capture_metrics)
+    if len(captured_metrics) != 1:
+        raise RuntimeError(
+            "Helion did not report exactly one set of autotuning metrics"
+        )
+    metrics = captured_metrics[0]
+    measured_time_ms = float(metrics.best_perf_ms)
+    result = bound(*args)
+    provenance = make_provenance(
+        helion_version=helion_version,
+        selection="autotuned",
+        configs=[(kernel.name, config)],
+        wall_time_seconds=wall_time_seconds,
+        measured_time_ms=measured_time_ms,
+    )
+    return result, provenance
+
+
 def build_module(
     code: str,
     *,
     command: str,
     description: str,
     spec_fields: dict[str, object],
+    provenance: dict[str, object],
 ) -> str:
     """Add the checked-in module header and shape metadata to Helion output."""
     spec_block = (
@@ -372,7 +501,11 @@ def build_module(
         + "".join(f"    {name!r}: {value!r},\n" for name, value in spec_fields.items())
         + "}\n\n"
     )
-    header = _HEADER.format(command=command, description=description)
+    header = _HEADER.format(
+        command=command,
+        description=description,
+        provenance=format_provenance(provenance),
+    )
     body = code.split("\n", 1)
     assert body[0] == "from __future__ import annotations"
     return header + body[0] + "\n\n" + spec_block + body[1]
@@ -381,19 +514,30 @@ def build_module(
 def upsert_manifest(
     entry: dict[str, object], section: str = "kernels"
 ) -> None:
-    payload = {"kernels": []}
-    if MANIFEST.exists():
-        with MANIFEST.open() as handle:
-            payload = json.load(handle)
-    kernels = [
-        item for item in payload.get(section, []) if item["key"] != entry["key"]
-    ]
-    kernels.append(entry)
-    kernels.sort(key=lambda item: item["key"])
-    payload[section] = kernels
-    with MANIFEST.open("w") as handle:
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    # generate_all.py has one process per GPU. Lock the shared manifest while
+    # reading and rewriting it so two shapes that finish together cannot drop
+    # each other's entries or observe a partially-written JSON document.
+    MANIFEST.touch(exist_ok=True)
+    with MANIFEST.open("r+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.seek(0)
+        contents = handle.read()
+        payload = json.loads(contents) if contents else {"kernels": []}
+        kernels = [
+            item
+            for item in payload.get(section, [])
+            if item["key"] != entry["key"]
+        ]
+        kernels.append(entry)
+        kernels.sort(key=lambda item: item["key"])
+        payload[section] = kernels
+        handle.seek(0)
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.write("\n")
+        handle.truncate()
+        handle.flush()
+        fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 class GenerationVerificationError(RuntimeError):
@@ -510,7 +654,9 @@ def main() -> int:
 
     import helion_kernels
 
+    helion_version = package_version("helion")
     split_kv_decode = False
+    forward_provenance = None
     if args.paged:
         kernel = helion_kernels.paged_attention_thd
         forward_args = build_paged_inputs(spec, args.page_size)
@@ -520,7 +666,9 @@ def main() -> int:
             f"autotuning paged page_size={args.page_size} {spec.describe()}",
             flush=True,
         )
-        got = kernel(*forward_args)
+        got, forward_provenance = run_with_provenance(
+            kernel, forward_args, helion_version=helion_version
+        )
         expected = helion_kernels._paged_sdpa_reference(*forward_args)
     elif args.varlen:
         kernel = helion_kernels.varlen_attention_thd
@@ -528,7 +676,9 @@ def main() -> int:
         q, k, v = forward_args[:3]
         sm_scale = forward_args[-2]
         print(f"autotuning varlen {spec.describe()}", flush=True)
-        got = kernel(*forward_args)
+        got, forward_provenance = run_with_provenance(
+            kernel, forward_args, helion_version=helion_version
+        )
         expected = helion_kernels._varlen_sdpa_reference(*forward_args)
     else:
         kernel_name = select_dense_kernel_name(spec)
@@ -541,7 +691,13 @@ def main() -> int:
         q, k, v, sm_scale = build_inputs(spec)
         forward_args = (q, k, v, sm_scale)
         print(f"autotuning {spec.describe()}", flush=True)
-        got = kernel(*forward_args)
+        if split_kv_decode:
+            # This composite uses two deliberately fixed Helion configs.
+            got = kernel(*forward_args)
+        else:
+            got, forward_provenance = run_with_provenance(
+                kernel, forward_args, helion_version=helion_version
+            )
         expected = reference(q, k, v, sm_scale, spec.causal)
     error = (got.float() - expected).abs().max().item()
     print(f"max abs error vs fp32 SDPA: {error:.4g}")
@@ -550,6 +706,7 @@ def main() -> int:
 
     backward_kernel = None
     backward_code = None
+    backward_provenance = None
     if args.backward:
         backward_kernel = helion_kernels.attention_backward_bshd
         grad_generator = torch.Generator(device="cuda").manual_seed(1)
@@ -560,7 +717,12 @@ def main() -> int:
             generator=grad_generator,
         )
         print(f"autotuning backward for {spec.describe()}", flush=True)
-        got_grads = backward_kernel(q, k, v, grad_out, sm_scale)
+        backward_args = (q, k, v, grad_out, sm_scale)
+        got_grads, backward_provenance = run_with_provenance(
+            backward_kernel,
+            backward_args,
+            helion_version=helion_version,
+        )
         expected_grads = reference_gradients(q, k, v, grad_out, sm_scale)
         grad_errors = [
             (actual.float() - expected).abs().max().item()
@@ -577,7 +739,7 @@ def main() -> int:
             raise SystemExit(
                 f"autotuned backward kernel is not accurate enough: {grad_errors}"
             )
-        backward_bound = backward_kernel.bind((q, k, v, grad_out, sm_scale))
+        backward_bound = backward_kernel.bind(backward_args)
         backward_code = strip_helion(backward_bound.to_triton_code())
         backward_code = rename_entry_point(
             backward_code, backward_kernel.name, "attention_backward"
@@ -626,6 +788,21 @@ def main() -> int:
         code = (
             merge_generated_modules(partial_code, combine_code)
             + _SPLIT_KV_DECODE_ENTRY_POINT
+        )
+        from helion.autotuner.benchmarking import do_bench
+
+        measured_time_ms = float(
+            do_bench(lambda: kernel(*forward_args), return_mode="mean")
+        )
+        forward_provenance = make_provenance(
+            helion_version=helion_version,
+            selection="fixed",
+            configs=[
+                (partial_kernel.name, partial_kernel.configs[0]),
+                (combine_kernel.name, combine_kernel.configs[0]),
+            ],
+            wall_time_seconds=0.0,
+            measured_time_ms=measured_time_ms,
         )
     else:
         bound = kernel.bind(forward_args)
@@ -676,11 +853,13 @@ def main() -> int:
     }
     if args.paged:
         spec_fields.update({"paged": True, "page_size": args.page_size})
+    assert forward_provenance is not None
     module = build_module(
         code,
         command=command,
         description=description,
         spec_fields=spec_fields,
+        provenance=forward_provenance,
     )
 
     KERNELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -688,11 +867,13 @@ def main() -> int:
     backward_target = KERNELS_DIR / f"{kernel_key}_backward.py"
     backward_module = None
     if backward_code is not None:
+        assert backward_provenance is not None
         backward_module = build_module(
             backward_code,
             command=command,
             description=f"{spec.describe()} backward",
             spec_fields=spec_fields,
+            provenance=backward_provenance,
         )
     manifest_entry = {
         "key": kernel_key,
@@ -708,7 +889,10 @@ def main() -> int:
         "varlen": args.varlen,
         "description": description,
         "note": args.label,
+        "autotuning_provenance": forward_provenance,
     }
+    if backward_provenance is not None:
+        manifest_entry["backward_autotuning_provenance"] = backward_provenance
     if args.paged:
         manifest_entry.update({"paged": True, "page_size": args.page_size})
 

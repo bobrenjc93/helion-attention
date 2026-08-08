@@ -1,6 +1,34 @@
 {
   "kernels": [
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 0.0,
+        "configs": [
+          {
+            "config": {
+              "block_sizes": [
+                128,
+                128
+              ],
+              "indexing": [
+                "pointer",
+                "tensor_descriptor",
+                "block_ptr",
+                "pointer",
+                "pointer"
+              ],
+              "num_sm_multiplier": 1,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_interleaved"
+            },
+            "kernel": "causal_attention_bshd_16k"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 3.208534,
+        "selection": "fixed"
+      },
       "backward": false,
       "batch": 1,
       "causal": true,
@@ -16,6 +44,71 @@
       "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 320.532,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                8,
+                128
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                16
+              ],
+              "load_eviction_policies": [
+                "last",
+                "last",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 1,
+              "num_warps": 4,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                false
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                3
+              ],
+              "range_unroll_factors": [
+                0,
+                0,
+                1
+              ],
+              "range_warp_specializes": [],
+              "static_ranges": [
+                true
+              ]
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.014496,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 1,
       "causal": true,
@@ -31,6 +124,40 @@
       "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 0.0,
+        "configs": [
+          {
+            "config": {
+              "block_sizes": [
+                128
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  2,
+                  0
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 4,
+              "pid_type": "flat"
+            },
+            "kernel": "decode_attention_bshd_split_kv_partials"
+          },
+          {
+            "config": {
+              "num_stages": 3,
+              "num_warps": 1,
+              "pid_type": "flat"
+            },
+            "kernel": "decode_attention_bshd_split_kv_combine"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.116448,
+        "selection": "fixed"
+      },
       "backward": false,
       "batch": 1,
       "causal": true,
@@ -46,6 +173,71 @@
       "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 389.546,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                64,
+                128
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                32
+              ],
+              "load_eviction_policies": [
+                "",
+                "last",
+                "first"
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 4,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                false
+              ],
+              "range_num_stages": [
+                0,
+                1,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                2,
+                0
+              ],
+              "range_warp_specializes": [],
+              "static_ranges": [
+                false
+              ]
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.040192,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 1,
       "causal": true,
@@ -61,6 +253,70 @@
       "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 603.331,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                128
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                2
+              ],
+              "load_eviction_policies": [
+                "first",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 1,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_blocked",
+              "range_flattens": [
+                false,
+                false,
+                false
+              ],
+              "range_multi_buffers": [
+                true,
+                false,
+                true
+              ],
+              "range_num_stages": [
+                1,
+                0,
+                0
+              ],
+              "range_unroll_factors": [
+                1,
+                4,
+                2
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.39304,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
@@ -71,9 +327,74 @@
       "nheads_q": 28,
       "note": "Qwen2-7B GQA 7:1",
       "seqlen_k": 2048,
-      "seqlen_q": 2048
+      "seqlen_q": 2048,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 526.449,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                64
+              ],
+              "load_eviction_policies": [
+                "first",
+                "first",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 1,
+              "num_stages": 5,
+              "num_warps": 8,
+              "pid_type": "persistent_interleaved",
+              "range_flattens": [
+                null,
+                null,
+                true
+              ],
+              "range_multi_buffers": [
+                null,
+                false,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                4,
+                1
+              ],
+              "range_unroll_factors": [
+                0,
+                1,
+                4
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.4176,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True",
@@ -84,9 +405,74 @@
       "nheads_q": 32,
       "note": "single-sequence 7B prefill",
       "seqlen_k": 2048,
-      "seqlen_q": 2048
+      "seqlen_q": 2048,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 705.757,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                8
+              ],
+              "load_eviction_policies": [
+                "",
+                "",
+                "first"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 2,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_blocked",
+              "range_flattens": [
+                null,
+                true,
+                true
+              ],
+              "range_multi_buffers": [
+                true,
+                null,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                4,
+                0
+              ],
+              "range_unroll_factors": [
+                2,
+                3,
+                4
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.384704,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -97,9 +483,75 @@
       "nheads_q": 32,
       "note": "Llama-3-8B GQA 4:1",
       "seqlen_k": 2048,
-      "seqlen_q": 2048
+      "seqlen_q": 2048,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1331.075,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                64
+              ],
+              "load_eviction_policies": [
+                "first",
+                "last",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "maxnreg": 256,
+              "num_sm_multiplier": 128,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_interleaved",
+              "range_flattens": [
+                true,
+                true,
+                null
+              ],
+              "range_multi_buffers": [
+                false,
+                null,
+                false
+              ],
+              "range_num_stages": [
+                1,
+                2,
+                3
+              ],
+              "range_unroll_factors": [
+                3,
+                2,
+                3
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 1.391712,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
@@ -110,9 +562,75 @@
       "nheads_q": 28,
       "note": "Qwen2-7B GQA 7:1",
       "seqlen_k": 4096,
-      "seqlen_q": 4096
+      "seqlen_q": 4096,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1265.97,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                128
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                8
+              ],
+              "load_eviction_policies": [
+                "first",
+                "first",
+                "first"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "maxnreg": 256,
+              "num_sm_multiplier": 1,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_interleaved",
+              "range_flattens": [
+                null,
+                null,
+                false
+              ],
+              "range_multi_buffers": [
+                true,
+                false,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                2,
+                3
+              ],
+              "range_unroll_factors": [
+                0,
+                2,
+                0
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 1.449872,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -123,9 +641,72 @@
       "nheads_q": 32,
       "note": "Llama-3-8B GQA 4:1",
       "seqlen_k": 4096,
-      "seqlen_q": 4096
+      "seqlen_q": 4096,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 307.195,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                64,
+                64
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                64
+              ],
+              "load_eviction_policies": [
+                "",
+                "",
+                "first"
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 4,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                false,
+                true
+              ],
+              "range_multi_buffers": [
+                null,
+                false,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                4,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                3,
+                0
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.010752,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 1,
       "causal": true,
@@ -141,6 +722,70 @@
       "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1553.583,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "last",
+                "",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 32,
+              "num_stages": 5,
+              "num_warps": 8,
+              "pid_type": "persistent_blocked",
+              "range_flattens": [
+                true,
+                true,
+                true
+              ],
+              "range_multi_buffers": [
+                true,
+                true,
+                false
+              ],
+              "range_num_stages": [
+                3,
+                3,
+                0
+              ],
+              "range_unroll_factors": [
+                2,
+                1,
+                3
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 5.80872,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
@@ -151,9 +796,74 @@
       "nheads_q": 28,
       "note": "Qwen2-7B GQA 7:1",
       "seqlen_k": 8192,
-      "seqlen_q": 8192
+      "seqlen_q": 8192,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1492.333,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                128
+              ],
+              "indexing": [
+                "pointer",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "pointer"
+              ],
+              "l2_groupings": [
+                32
+              ],
+              "load_eviction_policies": [
+                "last",
+                "",
+                "first"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 16,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_interleaved",
+              "range_flattens": [
+                false,
+                false,
+                true
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                null
+              ],
+              "range_num_stages": [
+                3,
+                4,
+                4
+              ],
+              "range_unroll_factors": [
+                0,
+                3,
+                3
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 5.442768,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 1,
       "causal": true,
       "description": "batch=1 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -164,9 +874,73 @@
       "nheads_q": 32,
       "note": "Llama-3-8B GQA 4:1",
       "seqlen_k": 8192,
-      "seqlen_q": 8192
+      "seqlen_q": 8192,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 494.669,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                32
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                4
+              ],
+              "load_eviction_policies": [
+                "first",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_sm_multiplier": 2,
+              "num_stages": 4,
+              "num_warps": 8,
+              "pid_type": "persistent_blocked",
+              "range_flattens": [
+                false,
+                true,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                false
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                0
+              ],
+              "range_unroll_factors": [
+                2,
+                1,
+                1
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.270048,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 2,
       "causal": false,
@@ -182,6 +956,70 @@
       "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 603.245,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                128
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                4
+              ],
+              "load_eviction_policies": [
+                "first",
+                "last",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 1,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_blocked",
+              "range_flattens": [
+                null,
+                true,
+                false
+              ],
+              "range_multi_buffers": [
+                null,
+                true,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                2
+              ],
+              "range_unroll_factors": [
+                0,
+                2,
+                4
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.09424,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 2,
       "causal": true,
       "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True",
@@ -192,9 +1030,74 @@
       "nheads_q": 32,
       "note": "GPT-2 medium style, causal",
       "seqlen_k": 1024,
-      "seqlen_q": 1024
+      "seqlen_q": 1024,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 398.819,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                256,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                8
+              ],
+              "load_eviction_policies": [
+                "",
+                "first",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 1,
+              "num_stages": 3,
+              "num_warps": 16,
+              "pid_type": "persistent_blocked",
+              "range_flattens": [
+                null,
+                true,
+                true
+              ],
+              "range_multi_buffers": [
+                null,
+                false,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                1,
+                1
+              ],
+              "range_unroll_factors": [
+                0,
+                1,
+                2
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.095552,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 2,
       "causal": false,
       "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False",
@@ -205,9 +1108,74 @@
       "nheads_q": 32,
       "note": "GPT-2 medium style prefill",
       "seqlen_k": 1024,
-      "seqlen_q": 1024
+      "seqlen_q": 1024,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 384.54,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                256,
+                64
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                32
+              ],
+              "load_eviction_policies": [
+                "last",
+                "last",
+                "first"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 2,
+              "num_stages": 3,
+              "num_warps": 16,
+              "pid_type": "persistent_interleaved",
+              "range_flattens": [
+                null,
+                true,
+                null
+              ],
+              "range_multi_buffers": [
+                false,
+                null,
+                false
+              ],
+              "range_num_stages": [
+                1,
+                3,
+                0
+              ],
+              "range_unroll_factors": [
+                1,
+                3,
+                2
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.095872,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 2,
       "causal": false,
       "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=fp16 causal=False",
@@ -218,9 +1186,73 @@
       "nheads_q": 32,
       "note": "fp16 coverage",
       "seqlen_k": 1024,
-      "seqlen_q": 1024
+      "seqlen_q": 1024,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1831.128,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                32
+              ],
+              "load_eviction_policies": [
+                "first",
+                "first",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                false
+              ],
+              "range_num_stages": [
+                0,
+                1,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                2,
+                3
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 5.195488,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 2,
       "causal": true,
       "description": "batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True",
@@ -231,9 +1263,74 @@
       "nheads_q": 16,
       "note": "long-context causal",
       "seqlen_k": 8192,
-      "seqlen_q": 8192
+      "seqlen_q": 8192,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 967.051,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                32
+              ],
+              "load_eviction_policies": [
+                "last",
+                "last",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_sm_multiplier": 1,
+              "num_stages": 5,
+              "num_warps": 8,
+              "pid_type": "persistent_interleaved",
+              "range_flattens": [
+                false,
+                null,
+                false
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                false
+              ],
+              "range_num_stages": [
+                0,
+                2,
+                3
+              ],
+              "range_unroll_factors": [
+                1,
+                0,
+                0
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.401472,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": true,
       "description": "batch=4 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
@@ -244,9 +1341,74 @@
       "nheads_q": 28,
       "note": "Qwen2-7B GQA 7:1",
       "seqlen_k": 2048,
-      "seqlen_q": 2048
+      "seqlen_q": 2048,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 928.518,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                16
+              ],
+              "load_eviction_policies": [
+                "last",
+                "",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 2,
+              "num_stages": 5,
+              "num_warps": 8,
+              "pid_type": "persistent_interleaved",
+              "range_flattens": [
+                null,
+                false,
+                false
+              ],
+              "range_multi_buffers": [
+                null,
+                false,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                1,
+                3
+              ],
+              "range_unroll_factors": [
+                0,
+                4,
+                3
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.401472,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": true,
       "description": "batch=4 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -257,9 +1419,74 @@
       "nheads_q": 32,
       "note": "Llama-3-8B GQA 4:1",
       "seqlen_k": 2048,
-      "seqlen_q": 2048
+      "seqlen_q": 2048,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1385.067,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "last",
+                "last",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 1,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_blocked",
+              "range_flattens": [
+                false,
+                null,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                false,
+                false
+              ],
+              "range_num_stages": [
+                1,
+                3,
+                0
+              ],
+              "range_unroll_factors": [
+                2,
+                2,
+                4
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 1.402624,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": true,
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
@@ -270,9 +1497,73 @@
       "nheads_q": 28,
       "note": "Qwen2-7B GQA 7:1",
       "seqlen_k": 4096,
-      "seqlen_q": 4096
+      "seqlen_q": 4096,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1302.098,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                256,
+                32
+              ],
+              "indexing": [
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                64
+              ],
+              "load_eviction_policies": [
+                "",
+                "last",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 16,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                true
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                false
+              ],
+              "range_num_stages": [
+                0,
+                4,
+                1
+              ],
+              "range_unroll_factors": [
+                0,
+                1,
+                2
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 1.64328,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": true,
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=True",
@@ -283,9 +1574,74 @@
       "nheads_q": 32,
       "note": "7B-class prefill, causal",
       "seqlen_k": 4096,
-      "seqlen_q": 4096
+      "seqlen_q": 4096,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1091.397,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                256,
+                64
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                32
+              ],
+              "load_eviction_policies": [
+                "",
+                "first",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_sm_multiplier": 1,
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "persistent_interleaved",
+              "range_flattens": [
+                null,
+                null,
+                false
+              ],
+              "range_multi_buffers": [
+                null,
+                true,
+                false
+              ],
+              "range_num_stages": [
+                0,
+                1,
+                1
+              ],
+              "range_unroll_factors": [
+                0,
+                3,
+                1
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 2.257824,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": false,
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=bf16 causal=False",
@@ -296,9 +1652,73 @@
       "nheads_q": 32,
       "note": "7B-class prefill, bidirectional",
       "seqlen_k": 4096,
-      "seqlen_q": 4096
+      "seqlen_q": 4096,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1003.14,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                256,
+                32
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "last",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 16,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                true
+              ],
+              "range_multi_buffers": [
+                null,
+                true,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                4
+              ],
+              "range_unroll_factors": [
+                0,
+                4,
+                0
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 1.6944,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": true,
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 head_dim=128 dtype=fp16 causal=True",
@@ -309,9 +1729,73 @@
       "nheads_q": 32,
       "note": "fp16 causal coverage",
       "seqlen_k": 4096,
-      "seqlen_q": 4096
+      "seqlen_q": 4096,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1086.018,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                64
+              ],
+              "load_eviction_policies": [
+                "last",
+                "last",
+                "first"
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                false,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                4,
+                4
+              ],
+              "range_unroll_factors": [
+                0,
+                4,
+                4
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 1.420704,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": true,
       "description": "batch=4 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -322,9 +1806,73 @@
       "nheads_q": 32,
       "note": "Llama-3-8B GQA 4:1",
       "seqlen_k": 4096,
-      "seqlen_q": 4096
+      "seqlen_q": 4096,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1495.767,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                64
+              ],
+              "load_eviction_policies": [
+                "first",
+                "first",
+                "first"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_stages": 4,
+              "num_warps": 8,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                true,
+                true
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                3,
+                3
+              ],
+              "range_unroll_factors": [
+                0,
+                0,
+                3
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 5.274816,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": true,
       "description": "batch=4 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
@@ -335,9 +1883,73 @@
       "nheads_q": 28,
       "note": "Qwen2-7B GQA 7:1",
       "seqlen_k": 8192,
-      "seqlen_q": 8192
+      "seqlen_q": 8192,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 1359.11,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                64
+              ],
+              "indexing": [
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                4
+              ],
+              "load_eviction_policies": [
+                "first",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_stages": 4,
+              "num_warps": 8,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                true,
+                false
+              ],
+              "range_multi_buffers": [
+                null,
+                false,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                2,
+                1
+              ],
+              "range_unroll_factors": [
+                0,
+                2,
+                3
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 5.850416,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 4,
       "causal": true,
       "description": "batch=4 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
@@ -348,9 +1960,73 @@
       "nheads_q": 32,
       "note": "Llama-3-8B GQA 4:1",
       "seqlen_k": 8192,
-      "seqlen_q": 8192
+      "seqlen_q": 8192,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 779.924,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                256,
+                32
+              ],
+              "indexing": [
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor",
+                "tensor_descriptor"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "first",
+                "first",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                true,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                2,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                2,
+                3
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.344416,
+        "selection": "autotuned"
+      },
+      "backward": false,
       "batch": 8,
       "causal": true,
       "description": "batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True",
@@ -361,10 +2037,230 @@
       "nheads_q": 16,
       "note": "small decoder, long batch",
       "seqlen_k": 2048,
-      "seqlen_q": 2048
+      "seqlen_q": 2048,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 595.404,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                256,
+                64
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "first",
+                "last",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_stages": 4,
+              "num_warps": 16,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                true
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                1,
+                3
+              ],
+              "range_unroll_factors": [
+                0,
+                4,
+                0
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.035072,
+        "selection": "autotuned"
+      },
       "backward": true,
+      "backward_autotuning_provenance": {
+        "autotuning_wall_time_seconds": 171.228,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                64,
+                64,
+                16,
+                256,
+                16,
+                128,
+                128,
+                16
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                1,
+                1,
+                1,
+                1
+              ],
+              "load_eviction_policies": [
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ],
+                [
+                  0,
+                  1
+                ],
+                [
+                  1,
+                  0
+                ],
+                [
+                  0,
+                  1
+                ]
+              ],
+              "maxnreg": null,
+              "num_sm_multiplier": 1,
+              "num_stages": 1,
+              "num_warps": 8,
+              "pid_type": "persistent_blocked",
+              "range_flattens": [
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                false
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "attention_backward_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 3.638656,
+        "selection": "autotuned"
+      },
       "batch": 8,
       "causal": false,
       "description": "batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False",
@@ -375,9 +2271,72 @@
       "nheads_q": 16,
       "note": "short-sequence encoder batch",
       "seqlen_k": 512,
-      "seqlen_q": 512
+      "seqlen_q": 512,
+      "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 664.847,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                128
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "last",
+                "last",
+                "last"
+              ],
+              "loop_orders": [
+                [
+                  1,
+                  0
+                ]
+              ],
+              "num_stages": 3,
+              "num_warps": 8,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                true,
+                false
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                1,
+                3
+              ],
+              "range_unroll_factors": [
+                0,
+                3,
+                2
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "causal_attention_bshd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.026272,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 8,
       "causal": true,
@@ -395,6 +2354,75 @@
   ],
   "paged_kernels": [
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 79.985,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                256
+              ],
+              "indexing": [
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "",
+                "last",
+                "",
+                "first",
+                "",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 1,
+              "num_warps": 16,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                0,
+                0
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "paged_attention_thd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.038784,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 2,
       "causal": true,
@@ -412,6 +2440,78 @@
       "varlen": false
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 66.59,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                4
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "tensor_descriptor",
+                "pointer"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 1,
+              "num_warps": 1,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                0,
+                0
+              ],
+              "range_warp_specializes": [],
+              "static_ranges": [
+                false
+              ]
+            },
+            "kernel": "paged_attention_thd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.093536,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 4,
       "causal": true,
@@ -431,6 +2531,76 @@
   ],
   "varlen_kernels": [
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 112.206,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                128,
+                128
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "tensor_descriptor",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                1
+              ],
+              "load_eviction_policies": [
+                "",
+                "",
+                "",
+                "",
+                "last",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 2,
+              "num_warps": 8,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                null,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                null
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                0,
+                0
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "varlen_attention_thd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.059728,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 8,
       "causal": true,
@@ -446,6 +2616,76 @@
       "varlen": true
     },
     {
+      "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 76.447,
+        "configs": [
+          {
+            "config": {
+              "atomic_indexing": [],
+              "block_sizes": [
+                512,
+                32
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "l2_groupings": [
+                2
+              ],
+              "load_eviction_policies": [
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                ""
+              ],
+              "loop_orders": [
+                [
+                  0,
+                  1
+                ]
+              ],
+              "num_stages": 1,
+              "num_warps": 16,
+              "pid_type": "flat",
+              "range_flattens": [
+                null,
+                true,
+                null
+              ],
+              "range_multi_buffers": [
+                null,
+                null,
+                true
+              ],
+              "range_num_stages": [
+                0,
+                0,
+                0
+              ],
+              "range_unroll_factors": [
+                0,
+                0,
+                1
+              ],
+              "range_warp_specializes": []
+            },
+            "kernel": "varlen_attention_thd"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.055232,
+        "selection": "autotuned"
+      },
       "backward": false,
       "batch": 8,
       "causal": false,

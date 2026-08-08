@@ -111,6 +111,24 @@ def test_markdown_reports_fa3_and_fastest_baseline_plainly(
     assert "fastest measured implementation on 1 of 2 workloads" in table
 
 
+def test_readme_autotuning_table_covers_every_generated_module() -> None:
+    manifest = json.loads(update_readme.MANIFEST.read_text())
+    expected = []
+    for section in ("kernels", "varlen_kernels", "paged_kernels"):
+        for entry in manifest[section]:
+            expected.append(str(entry["key"]))
+            if entry.get("backward"):
+                expected.append(f"{entry['key']}_backward")
+
+    table = update_readme.autotuning_table()
+
+    for key in expected:
+        assert table.count(f"[`{key}`]") == 1
+    assert table.count(" ms |") == len(expected)
+    assert "helion.Config(" in table
+    assert "| fixed | 0 s |" in table
+
+
 def test_discovery_and_report_cover_every_checked_in_kernel() -> None:
     manifest = json.loads(
         (REPO_ROOT / "helion_attention" / "kernels" / "manifest.json").read_text()

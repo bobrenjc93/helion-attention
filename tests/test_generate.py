@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import replace
 import importlib.util
 import json
@@ -19,6 +20,111 @@ SPEC = importlib.util.spec_from_file_location("helion_attention_generate", GENER
 assert SPEC is not None and SPEC.loader is not None
 generate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(generate)
+GENERATE_ALL_PATH = REPO_ROOT / "tools" / "generate_all.py"
+GENERATE_ALL_SPEC = importlib.util.spec_from_file_location(
+    "helion_attention_generate_all", GENERATE_ALL_PATH
+)
+assert GENERATE_ALL_SPEC is not None and GENERATE_ALL_SPEC.loader is not None
+generate_all = importlib.util.module_from_spec(GENERATE_ALL_SPEC)
+GENERATE_ALL_SPEC.loader.exec_module(generate_all)
+
+
+def test_provenance_is_structured_and_rendered_in_module_docstring() -> None:
+    config = {
+        "block_sizes": [128, 64],
+        "num_stages": 3,
+        "num_warps": 8,
+        "pid_type": "flat",
+    }
+    provenance = generate.make_provenance(
+        helion_version="1.4.0",
+        selection="autotuned",
+        configs=[("attention_bshd", config)],
+        wall_time_seconds=125.6784,
+        measured_time_ms=0.1067024,
+    )
+
+    assert provenance == {
+        "helion_version": "1.4.0",
+        "selection": "autotuned",
+        "configs": [{"kernel": "attention_bshd", "config": config}],
+        "autotuning_wall_time_seconds": 125.678,
+        "measured_time_ms": 0.106702,
+    }
+    module = generate.build_module(
+        "from __future__ import annotations\n\nVALUE = 1\n",
+        command="python tools/generate.py --batch 1",
+        description="test shape",
+        spec_fields={"key": "test"},
+        provenance=provenance,
+    )
+    docstring = ast.get_docstring(ast.parse(module))
+    assert docstring is not None
+    assert "Helion version: 1.4.0" in docstring
+    assert "Autotuning wall time: 125.678 s" in docstring
+    assert "Measured time: 0.106702 ms" in docstring
+    assert (
+        "helion.Config(block_sizes=[128, 64], num_stages=3, num_warps=8, "
+        "pid_type='flat')" in docstring
+    )
+
+
+def test_checked_in_modules_publish_manifest_provenance() -> None:
+    manifest = json.loads(generate.MANIFEST.read_text())
+    for section in ("kernels", "varlen_kernels", "paged_kernels"):
+        for entry in manifest[section]:
+            artifacts = [
+                (
+                    generate.KERNELS_DIR / f"{entry['key']}.py",
+                    entry["autotuning_provenance"],
+                )
+            ]
+            if entry.get("backward"):
+                artifacts.append(
+                    (
+                        generate.KERNELS_DIR / f"{entry['key']}_backward.py",
+                        entry["backward_autotuning_provenance"],
+                    )
+                )
+            for path, provenance in artifacts:
+                assert provenance["helion_version"]
+                assert provenance["selection"] in {"autotuned", "fixed"}
+                assert provenance["configs"]
+                assert provenance["autotuning_wall_time_seconds"] >= 0
+                assert provenance["measured_time_ms"] > 0
+                docstring = ast.get_docstring(ast.parse(path.read_text()))
+                assert docstring is not None
+                assert generate.format_provenance(provenance) in docstring
+
+
+def test_catalogue_backfills_missing_forward_and_backward_provenance() -> None:
+    request = generate_all.ShapeRequest(1, 64, 8, 128)
+    forward_provenance = {"helion_version": "1.4.0"}
+
+    assert not generate_all.entry_is_complete(request, None)
+    assert not generate_all.entry_is_complete(request, {"key": "shape"})
+    assert generate_all.entry_is_complete(
+        request, {"key": "shape", "autotuning_provenance": forward_provenance}
+    )
+
+    backward_request = request._replace(backward=True)
+    assert not generate_all.entry_is_complete(
+        backward_request,
+        {
+            "key": "shape",
+            "backward": True,
+            "autotuning_provenance": forward_provenance,
+        },
+    )
+    assert generate_all.entry_is_complete(
+        backward_request,
+        {
+            "key": "shape",
+            "backward": True,
+            "autotuning_provenance": forward_provenance,
+            "backward_autotuning_provenance": forward_provenance,
+        },
+    )
 
 
 def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None:

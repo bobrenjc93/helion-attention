@@ -50,6 +50,20 @@ def expected_key(request: ShapeRequest) -> str:
     ) + suffix
 
 
+def entry_is_complete(
+    request: ShapeRequest, entry: dict[str, object] | None
+) -> bool:
+    """Return whether an existing artifact includes all required provenance."""
+    if entry is None or "autotuning_provenance" not in entry:
+        return False
+    if request.backward and (
+        not entry.get("backward")
+        or "backward_autotuning_provenance" not in entry
+    ):
+        return False
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpus", type=int, default=8)
@@ -63,10 +77,7 @@ def main() -> int:
         request
         for request in CATALOGUE
         if args.only in request.name
-        and (
-            expected_key(request) not in have
-            or (request.backward and not have[expected_key(request)].get("backward"))
-        )
+        and not entry_is_complete(request, have.get(expected_key(request)))
     ]
     if not pending:
         print("nothing to do")

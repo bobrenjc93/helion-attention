@@ -47,6 +47,65 @@ def shape_table() -> str:
     return "\n".join(lines)
 
 
+def _format_duration(seconds: float) -> str:
+    if seconds == 0:
+        return "0 s"
+    if seconds >= 60:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds:.1f} s"
+
+
+def _format_configs(configs: list[dict[str, object]]) -> str:
+    rendered = []
+    for item in configs:
+        config = item["config"]
+        assert isinstance(config, dict)
+        arguments = ", ".join(
+            f"{name}={value!r}" for name, value in sorted(config.items())
+        )
+        label = f"{item['kernel']}: " if len(configs) > 1 else ""
+        rendered.append(f"{label}`helion.Config({arguments})`")
+    return "<br>".join(rendered)
+
+
+def autotuning_table() -> str:
+    """Render generation provenance for every checked-in kernel module."""
+    manifest = json.loads(MANIFEST.read_text())
+    lines = [
+        "| kernel | Helion | selection | tuning wall time | measured time | chosen config |",
+        "| --- | --- | --- | ---: | ---: | --- |",
+    ]
+    for section in ("kernels", "varlen_kernels", "paged_kernels"):
+        for entry in manifest.get(section, []):
+            rows = [
+                (
+                    str(entry["key"]),
+                    entry["autotuning_provenance"],
+                    f"helion_attention/kernels/{entry['key']}.py",
+                )
+            ]
+            if entry.get("backward"):
+                rows.append(
+                    (
+                        f"{entry['key']}_backward",
+                        entry["backward_autotuning_provenance"],
+                        f"helion_attention/kernels/{entry['key']}_backward.py",
+                    )
+                )
+            for name, provenance, module_path in rows:
+                assert isinstance(provenance, dict)
+                configs = provenance["configs"]
+                assert isinstance(configs, list)
+                lines.append(
+                    f"| [`{name}`]({module_path}) "
+                    f"| {provenance['helion_version']} | {provenance['selection']} "
+                    f"| {_format_duration(float(provenance['autotuning_wall_time_seconds']))} "
+                    f"| {float(provenance['measured_time_ms']):.6f} ms "
+                    f"| {_format_configs(configs)} |"
+                )
+    return "\n".join(lines)
+
+
 def benchmark_table() -> str:
     if not BENCHMARKS.exists():
         return "_No benchmark run recorded yet._"
@@ -154,6 +213,7 @@ def benchmark_table() -> str:
 def main() -> int:
     text = README.read_text()
     text = replace_section(text, "SHAPES", shape_table())
+    text = replace_section(text, "AUTOTUNING", autotuning_table())
     text = replace_section(text, "BENCHMARKS", benchmark_table())
     README.write_text(text)
     print("README.md updated")
