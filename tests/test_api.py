@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
+from numbers import Real
 
 import pytest
 import torch
@@ -301,6 +303,29 @@ def test_dense_minimum_normal_softcap_preserves_uniform_logits() -> None:
 
 
 @requires_cuda
+def test_dense_softcap_supports_head_dim_256() -> None:
+    q = torch.zeros(1, 1, 1, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.randn_like(q)
+
+    result = helion_attention.flash_attn_func(
+        q, k, v, softcap=1.0, shape=(1, 1, 1, 256)
+    )
+
+    torch.testing.assert_close(result, v)
+
+
+@requires_cuda
+def test_dense_softcap_rejects_head_dim_above_256() -> None:
+    q = torch.zeros(1, 1, 1, 257, device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(NotImplementedError, match="head_dim <= 256"):
+        helion_attention.flash_attn_func(
+            q, q, q, softcap=1.0, shape=(1, 1, 1, 257)
+        )
+
+
+@requires_cuda
 def test_softcap_zero_retains_specialized_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -365,6 +390,25 @@ def test_dense_softcap_rejects_unrepresentable_values(softcap: float) -> None:
     q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="normal float32"):
         helion_attention.flash_attn_func(
+            q, q, q, softcap=softcap, shape=(1, 1, 1, 1)
+        )
+
+
+@pytest.mark.parametrize(
+    ("softcap", "message"),
+    [
+        (int(torch.finfo(torch.float32).max) + 1, "normal float32"),
+        (Fraction(1, 10**1000), "normal float32"),
+        (Fraction(-1, 10**1000), "non-negative"),
+    ],
+    ids=["integer-above-maximum", "positive-underflow", "negative-underflow"],
+)
+def test_dense_softcap_validates_exact_value_before_float_conversion(
+    softcap: Real, message: str
+) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=message):
+        helion_attention.flash_attn_func(  # type: ignore[arg-type]
             q, q, q, softcap=softcap, shape=(1, 1, 1, 1)
         )
 

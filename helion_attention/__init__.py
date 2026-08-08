@@ -58,6 +58,7 @@ __version__ = "0.1.0"
 _INT32_MAX = torch.iinfo(torch.int32).max
 _FLOAT32_TINY = torch.finfo(torch.float32).tiny
 _FLOAT32_MAX = torch.finfo(torch.float32).max
+_GENERIC_MAX_HEAD_DIM = 256
 
 
 def _reject_unsupported(
@@ -75,22 +76,25 @@ def _reject_unsupported(
         raise NotImplementedError("sliding-window attention is not implemented")
     if isinstance(softcap, bool) or not isinstance(softcap, Real):
         raise TypeError("softcap must be a finite non-negative real number")
+    if softcap != softcap or softcap in (math.inf, -math.inf):
+        raise ValueError("softcap must be finite")
+    if softcap < 0:
+        raise ValueError("softcap must be non-negative")
+    is_zero_softcap = softcap == 0
+    if not is_zero_softcap:
+        if not allow_softcap:
+            raise NotImplementedError("softcap is not implemented")
+        if softcap < _FLOAT32_TINY or softcap > _FLOAT32_MAX:
+            raise ValueError(
+                "positive softcap must be representable as a normal float32 value "
+                f"in [{_FLOAT32_TINY}, {_FLOAT32_MAX}]"
+            )
     try:
         normalized_softcap = float(softcap)
     except OverflowError as exc:
         raise ValueError("softcap must be finite") from exc
     if not math.isfinite(normalized_softcap):
         raise ValueError("softcap must be finite")
-    if normalized_softcap < 0.0:
-        raise ValueError("softcap must be non-negative")
-    if normalized_softcap != 0.0:
-        if not allow_softcap:
-            raise NotImplementedError("softcap is not implemented")
-        if not _FLOAT32_TINY <= normalized_softcap <= _FLOAT32_MAX:
-            raise ValueError(
-                "positive softcap must be representable as a normal float32 value "
-                f"in [{_FLOAT32_TINY}, {_FLOAT32_MAX}]"
-            )
     if alibi_slopes is not None:
         raise NotImplementedError("ALiBi slopes are not implemented")
     if return_attn_probs:
@@ -154,6 +158,11 @@ def _dense_softcap_forward(
     spec: AttnShape,
 ) -> torch.Tensor:
     """Run validated dense inputs through the generic packed Triton forward."""
+    if spec.head_dim > _GENERIC_MAX_HEAD_DIM:
+        raise NotImplementedError(
+            "dense softcap attention supports head_dim <= "
+            f"{_GENERIC_MAX_HEAD_DIM}; got {spec.head_dim}"
+        )
     _check_dense_packed_addressing(spec)
     cu_seqlens_q = _dense_cumulative_offsets(
         spec.batch, spec.seqlen_q, label="query", device=q.device
