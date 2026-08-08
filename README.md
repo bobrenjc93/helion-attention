@@ -83,9 +83,10 @@ query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 Contiguous CUDA fp16 and bf16 calls without a checked-in varlen specialization
 use the same generic packed forward as dense fallback calls, provided
-`head_dim <= 256` and the packed layouts fit signed 32-bit element offsets.
-The two catalogue entries remain specialization-accelerated; support queries
-report those checked-in entries rather than generic fallback coverage.
+`head_dim <= 256`, the packed layouts fit signed 32-bit element offsets, and
+the flattened query launch fits CUDA's X-grid limit. The two catalogue entries
+remain specialization-accelerated; support queries report those checked-in
+entries rather than generic fallback coverage.
 
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus

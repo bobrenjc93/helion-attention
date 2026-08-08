@@ -527,6 +527,64 @@ def test_unregistered_varlen_fallback_matches_fp32_sdpa(
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
 
 
+def test_generic_varlen_layout_accepts_maximum_cuda_x_grid() -> None:
+    limit = 2**31 - 1
+    spec = AttnShape(
+        limit, 16, 1, 1, 1, 1, torch.bfloat16, False
+    )
+    q = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+
+    assert helion_attention._validate_generic_varlen_layout(q, k, spec) is None
+
+
+def test_generic_varlen_layout_rejects_first_oversized_cuda_x_grid() -> None:
+    spec = AttnShape(2**30, 17, 1, 1, 1, 1, torch.bfloat16, False)
+    q = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+
+    with pytest.raises(
+        helion_attention.UnsupportedShapeError,
+        match=r"CUDA launch grid requires 2147483648 blocks .*limit 2147483647",
+    ):
+        helion_attention._validate_generic_varlen_layout(q, k, spec)
+
+
+@requires_cuda
+def test_unregistered_varlen_rejects_oversized_grid_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    batch = 65_536
+    query_heads = 65_536
+    spec = AttnShape(
+        batch, 16, 1, query_heads, 1, 1, torch.bfloat16, False
+    )
+    q = torch.empty((1, query_heads, 1), device="cuda", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="cuda", dtype=spec.dtype)
+    v = torch.empty_like(k)
+    cumulative = torch.ones(batch + 1, device="cuda", dtype=torch.int32)
+    cumulative[0] = 0
+
+    def reject_launch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("oversized grid reached the Triton launcher")
+
+    monkeypatch.setattr(helion_attention, "_generic_packed_forward", reject_launch)
+    with pytest.raises(
+        helion_attention.UnsupportedShapeError,
+        match=r"CUDA launch grid requires 4294967296 blocks .*limit 2147483647",
+    ):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cumulative,
+            cumulative,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            shape=spec,
+        )
+
+
 @requires_cuda
 def test_unregistered_varlen_packed_entry_points_use_fallback() -> None:
     qkv_spec = GENERIC_VARLEN_SPECS[2]

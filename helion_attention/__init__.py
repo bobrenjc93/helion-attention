@@ -172,6 +172,25 @@ def _validate_generic_varlen_layout(
             "an issue at https://github.com/bobrenjc93/helion-attention/issues"
         )
 
+    # Import the launch tile lazily along with the generic Triton runtime so
+    # validation and dispatch cannot drift to different CTA counts.
+    from ._paged_attention import _PACKED_QUERY_BLOCK_SIZE
+
+    query_blocks = (
+        spec.seqlen_q + _PACKED_QUERY_BLOCK_SIZE - 1
+    ) // _PACKED_QUERY_BLOCK_SIZE
+    grid_size = query_blocks * spec.batch * spec.nheads_q
+    if grid_size > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback's flattened CUDA launch grid requires "
+            f"{grid_size} blocks (limit {_INT32_MAX}) with query block size "
+            f"{_PACKED_QUERY_BLOCK_SIZE}. To request a specialization, "
+            "file an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
     total_q = q.shape[0]
     total_k = k.shape[0]
     if max(total_q, total_k) > _INT32_MAX:
