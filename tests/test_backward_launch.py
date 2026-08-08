@@ -36,6 +36,31 @@ def _backward_launch() -> ast.Call:
     return launches[0]
 
 
+def test_backward_module_certifies_deterministic_execution() -> None:
+    tree = ast.parse(MODULE_PATH.read_text(), filename=str(MODULE_PATH))
+    assignments = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "KERNEL_SPEC"
+            for target in node.targets
+        )
+    ]
+    assert len(assignments) == 1
+    spec = ast.literal_eval(assignments[0].value)
+    assert spec["backward_deterministic"] is True
+
+    atomic_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr.startswith("atomic_")
+    ]
+    assert not atomic_calls
+
+
 @pytest.mark.parametrize("architecture", ["sm80", "sm86", "sm89"])
 def test_cooperative_grid_uses_one_cta_per_sm(architecture: str) -> None:
     """One resident CTA per SM is safe across Ampere and Ada resource limits."""

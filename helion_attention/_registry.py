@@ -288,8 +288,16 @@ def has_backward(spec: AttnShape) -> bool:
     return entry is not None and bool(entry.get("backward", False))
 
 
-def lookup_backward(spec: AttnShape) -> AttnBackwardKernel:
-    """Return the generated backward kernel for ``spec``."""
+def lookup_backward(
+    spec: AttnShape, *, deterministic: bool = False
+) -> AttnBackwardKernel:
+    """Return a backward kernel satisfying the requested execution contract.
+
+    ``deterministic=True`` is accepted only for specializations whose manifest
+    explicitly certifies that every gradient tile has a single writer.  This
+    keeps future atomic or otherwise nondeterministic backward kernels from
+    silently ignoring FlashAttention's public determinism request.
+    """
     entry = _entry_for_spec(spec)
     if entry is None or not entry.get("backward", False):
         supported = [
@@ -302,5 +310,12 @@ def lookup_backward(spec: AttnShape) -> AttnBackwardKernel:
             "no helion-attention backward kernel is checked in for:\n"
             f"    {spec.describe()}\n"
             f"training-enabled shapes:\n{listing or '    (none)'}"
+        )
+    if deterministic and entry.get("backward_deterministic") is not True:
+        raise NotImplementedError(
+            "deterministic=True requires a backward specialization explicitly "
+            "certified as deterministic; the checked-in backward kernel for:\n"
+            f"    {spec.describe()}\n"
+            "does not carry that certification"
         )
     return _load_backward(str(entry["key"]))

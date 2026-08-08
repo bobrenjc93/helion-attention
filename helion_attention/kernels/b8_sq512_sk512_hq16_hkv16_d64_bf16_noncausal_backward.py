@@ -33,6 +33,7 @@ KERNEL_SPEC = {
     'dtype': 'bf16',
     'causal': False,
     'backward': True,
+    'backward_deterministic': True,
 }
 
 

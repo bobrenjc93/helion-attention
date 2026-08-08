@@ -121,6 +121,8 @@ def flash_attn_func(
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
+        deterministic: require a backward specialization explicitly certified
+            as deterministic. This option does not change forward execution.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -144,8 +146,10 @@ def flash_attn_func(
     if needs_backward:
         # Resolve this before launching the forward so unsupported training
         # shapes fail at the call site rather than later during loss.backward().
-        lookup_backward(spec)
-        return attention_autograd(q, k, v, scale, spec)
+        lookup_backward(spec, deterministic=deterministic)
+        return attention_autograd(
+            q, k, v, scale, spec, deterministic=deterministic
+        )
     return kernel(q, k, v, scale)
 
 
@@ -399,8 +403,10 @@ def flash_attn_with_kvcache(
         tensor.requires_grad for tensor in (q, k_cache, v_cache)
     )
     if needs_backward:
-        lookup_backward(spec)
-        return attention_autograd(q, k_cache, v_cache, scale, spec)
+        lookup_backward(spec, deterministic=False)
+        return attention_autograd(
+            q, k_cache, v_cache, scale, spec, deterministic=False
+        )
     if return_softmax_lse:
         return kernel(
             q,

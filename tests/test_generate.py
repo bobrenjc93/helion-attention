@@ -353,7 +353,7 @@ def test_checked_in_modules_publish_manifest_provenance() -> None:
                 assert generate.format_provenance(provenance) in docstring
 
 
-def test_catalogue_backfills_missing_forward_and_backward_provenance() -> None:
+def test_catalogue_backfills_missing_forward_and_backward_metadata() -> None:
     request = generate_all.ShapeRequest(1, 64, 8, 128)
     forward_provenance = {"helion_version": "1.4.0"}
 
@@ -372,7 +372,7 @@ def test_catalogue_backfills_missing_forward_and_backward_provenance() -> None:
             "autotuning_provenance": forward_provenance,
         },
     )
-    assert generate_all.entry_is_complete(
+    assert not generate_all.entry_is_complete(
         backward_request,
         {
             "key": "shape",
@@ -380,6 +380,86 @@ def test_catalogue_backfills_missing_forward_and_backward_provenance() -> None:
             "autotuning_provenance": forward_provenance,
             "backward_autotuning_provenance": forward_provenance,
         },
+    )
+    assert not generate_all.entry_is_complete(
+        backward_request,
+        {
+            "key": "shape",
+            "backward": True,
+            "backward_deterministic": False,
+            "autotuning_provenance": forward_provenance,
+            "backward_autotuning_provenance": forward_provenance,
+        },
+    )
+    assert generate_all.entry_is_complete(
+        backward_request,
+        {
+            "key": "shape",
+            "backward": True,
+            "backward_deterministic": True,
+            "autotuning_provenance": forward_provenance,
+            "backward_autotuning_provenance": forward_provenance,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("prior_entry", "expected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"backward_deterministic": False}, False),
+        ({"backward_deterministic": True}, True),
+    ],
+)
+def test_retained_backward_inherits_only_an_existing_determinism_certificate(
+    prior_entry: dict[str, object] | None, expected: bool
+) -> None:
+    provenance: dict[str, object] = {"selection": "incumbent"}
+
+    assert (
+        generate.backward_determinism_for_publication(prior_entry, provenance)
+        is expected
+    )
+
+
+def test_uncertified_backward_incumbents_are_replaced_before_the_gate() -> None:
+    for prior_entry in (
+        None,
+        {},
+        {"backward_deterministic": False},
+    ):
+        assert generate.should_replace_incumbent(
+            requested=False,
+            backward=True,
+            prior_entry=prior_entry,
+        )
+
+    certified = {"backward_deterministic": True}
+    assert not generate.should_replace_incumbent(
+        requested=False,
+        backward=True,
+        prior_entry=certified,
+    )
+    assert not generate.should_replace_incumbent(
+        requested=False,
+        backward=False,
+        prior_entry=None,
+    )
+    assert generate.should_replace_incumbent(
+        requested=True,
+        backward=False,
+        prior_entry=certified,
+    )
+
+
+@pytest.mark.parametrize("selection", ["autotuned", "fixed"])
+def test_fresh_backward_artifacts_receive_determinism_certificate(
+    selection: str,
+) -> None:
+    assert generate.backward_determinism_for_publication(
+        {"backward_deterministic": False},
+        {"selection": selection},
     )
 
 

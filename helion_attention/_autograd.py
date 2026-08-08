@@ -20,11 +20,13 @@ class _Attention(torch.autograd.Function):
         v: torch.Tensor,
         softmax_scale: float,
         spec: AttnShape,
+        deterministic: bool,
     ) -> torch.Tensor:
         out = lookup(spec)(q, k, v, softmax_scale)
         ctx.save_for_backward(q, k, v)
         ctx.softmax_scale = softmax_scale
         ctx.spec = spec
+        ctx.deterministic = deterministic
         return out
 
     @staticmethod
@@ -37,9 +39,12 @@ class _Attention(torch.autograd.Function):
         torch.Tensor | None,
         None,
         None,
+        None,
     ]:
         q, k, v = ctx.saved_tensors
-        dq, dk, dv = lookup_backward(ctx.spec)(
+        dq, dk, dv = lookup_backward(
+            ctx.spec, deterministic=ctx.deterministic
+        )(
             q,
             k,
             v,
@@ -53,6 +58,7 @@ class _Attention(torch.autograd.Function):
             dv if needs_v else None,
             None,
             None,
+            None,
         )
 
 
@@ -62,6 +68,8 @@ def attention_autograd(
     v: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
+    *,
+    deterministic: bool,
 ) -> torch.Tensor:
-    """Run a generated forward and attach its matching generated backward."""
-    return _Attention.apply(q, k, v, softmax_scale, spec)
+    """Run a forward and attach a backward meeting the determinism request."""
+    return _Attention.apply(q, k, v, softmax_scale, spec, deterministic)
