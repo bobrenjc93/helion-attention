@@ -151,6 +151,212 @@ def test_varlen_signature_matches_flash_attention_plus_shape() -> None:
     ].kind is inspect.Parameter.KEYWORD_ONLY
 
 
+@pytest.mark.parametrize(
+    ("name", "parameter_names"),
+    [
+        (
+            "flash_attn_varlen_qkvpacked_func",
+            [
+                "qkv",
+                "cu_seqlens",
+                "max_seqlen",
+                "dropout_p",
+                "softmax_scale",
+                "causal",
+                "window_size",
+                "softcap",
+                "alibi_slopes",
+                "deterministic",
+                "return_attn_probs",
+                "shape",
+            ],
+        ),
+        (
+            "flash_attn_varlen_kvpacked_func",
+            [
+                "q",
+                "kv",
+                "cu_seqlens_q",
+                "cu_seqlens_k",
+                "max_seqlen_q",
+                "max_seqlen_k",
+                "dropout_p",
+                "softmax_scale",
+                "causal",
+                "window_size",
+                "softcap",
+                "alibi_slopes",
+                "deterministic",
+                "return_attn_probs",
+                "shape",
+            ],
+        ),
+    ],
+)
+def test_varlen_packed_signatures_match_flash_attention_2_8_3_plus_shape(
+    name: str, parameter_names: list[str]
+) -> None:
+    assert name in helion_attention.__all__
+    signature = inspect.signature(getattr(helion_attention, name))
+    assert list(signature.parameters) == parameter_names
+    assert signature.parameters["shape"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert signature.parameters["shape"].default is inspect.Parameter.empty
+    expected_defaults = {
+        "dropout_p": 0.0,
+        "softmax_scale": None,
+        "causal": False,
+        "window_size": (-1, -1),
+        "softcap": 0.0,
+        "alibi_slopes": None,
+        "deterministic": False,
+        "return_attn_probs": False,
+    }
+    for parameter, default in expected_defaults.items():
+        assert signature.parameters[parameter].default == default
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("dropout_p", 0.1, "dropout"),
+        ("window_size", (1, 1), "sliding-window"),
+        ("softcap", 1.0, "softcap"),
+        ("alibi_slopes", torch.ones(1), "ALiBi"),
+        ("return_attn_probs", True, "return_attn_probs"),
+    ],
+)
+@pytest.mark.parametrize(
+    "name",
+    ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
+)
+def test_varlen_packed_entry_points_reject_unsupported_options(
+    name: str, option: str, value: object, message: str
+) -> None:
+    cu_seqlens = torch.zeros(2, dtype=torch.int32)
+    kwargs = {option: value, "shape": (1, 1, 1, 1)}
+    with pytest.raises(NotImplementedError, match=message):
+        if name == "flash_attn_varlen_qkvpacked_func":
+            helion_attention.flash_attn_varlen_qkvpacked_func(
+                torch.zeros(1, 3, 1, 1), cu_seqlens, 1, **kwargs
+            )
+        else:
+            helion_attention.flash_attn_varlen_kvpacked_func(
+                torch.zeros(1, 1, 1),
+                torch.zeros(1, 2, 1, 1),
+                cu_seqlens,
+                cu_seqlens,
+                1,
+                1,
+                **kwargs,
+            )
+
+
+def test_varlen_packed_entry_points_validate_the_packed_axis() -> None:
+    cu_seqlens = torch.zeros(2, dtype=torch.int32)
+    with pytest.raises(ValueError, match="qkv must have shape"):
+        helion_attention.flash_attn_varlen_qkvpacked_func(
+            torch.zeros(1, 2, 1, 1),
+            cu_seqlens,
+            1,
+            shape=(1, 1, 1, 1),
+        )
+    with pytest.raises(ValueError, match="kv must have shape"):
+        helion_attention.flash_attn_varlen_kvpacked_func(
+            torch.zeros(1, 1, 1),
+            torch.zeros(1, 3, 1, 1),
+            cu_seqlens,
+            cu_seqlens,
+            1,
+            1,
+            shape=(1, 1, 1, 1),
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize("entry", VARLEN_SHAPES, ids=VARLEN_IDS)
+def test_varlen_packed_entry_points_match_unpacked(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    kv = torch.stack((k, v), dim=1)
+    kvpacked = helion_attention.flash_attn_varlen_kvpacked_func(
+        q,
+        kv,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=spec.causal,
+        shape=spec,
+    )
+    unpacked = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=spec.causal,
+        shape=spec,
+    )
+    torch.testing.assert_close(kvpacked, unpacked)
+
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
+    qkv = torch.stack((q, k, v), dim=1)
+    qkvpacked = helion_attention.flash_attn_varlen_qkvpacked_func(
+        qkv,
+        cu_q,
+        spec.seqlen_q,
+        causal=spec.causal,
+        shape=spec,
+    )
+    unpacked = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=spec.causal,
+        shape=spec,
+    )
+    torch.testing.assert_close(qkvpacked, unpacked)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "name",
+    ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
+)
+def test_varlen_packed_entry_points_reject_gradients(name: str) -> None:
+    entry = next(item for item in VARLEN_SHAPES if not item["causal"])
+    spec = spec_from_manifest_entry(entry)
+    variant = 2 if name == "flash_attn_varlen_qkvpacked_func" else 0
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=variant)
+
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        if name == "flash_attn_varlen_qkvpacked_func":
+            qkv = torch.stack((q, k, v), dim=1).requires_grad_()
+            helion_attention.flash_attn_varlen_qkvpacked_func(
+                qkv, cu_q, spec.seqlen_q, shape=spec
+            )
+        else:
+            kv = torch.stack((k, v), dim=1).requires_grad_()
+            helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                kv,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                shape=spec,
+            )
+
+
 @requires_cuda
 @pytest.mark.parametrize("entry", VARLEN_SHAPES, ids=VARLEN_IDS)
 @pytest.mark.parametrize(

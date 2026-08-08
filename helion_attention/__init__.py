@@ -44,6 +44,8 @@ __all__ = [
     "flash_attn_kvpacked_func",
     "flash_attn_qkvpacked_func",
     "flash_attn_varlen_func",
+    "flash_attn_varlen_kvpacked_func",
+    "flash_attn_varlen_qkvpacked_func",
     "flash_attn_with_kvcache",
     "is_shape_supported",
     "is_paged_shape_supported",
@@ -214,6 +216,93 @@ def flash_attn_varlen_func(
         max_seqlen_k,
         float(softmax_scale),
         causal,
+    )
+
+
+def flash_attn_varlen_qkvpacked_func(
+    qkv: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seqlen: int,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor | None = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    *,
+    shape: ShapeLike,
+) -> torch.Tensor:
+    """Run varlen self-attention on ``[total, 3, nheads, head_dim]`` QKV."""
+    if qkv.ndim != 4 or qkv.shape[1] != 3:
+        raise ValueError(
+            "qkv must have shape [total, 3, nheads, head_dim], "
+            f"got {tuple(qkv.shape)}"
+        )
+    q, k, v = (qkv[:, index].contiguous() for index in range(3))
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        shape=shape,
+    )
+
+
+def flash_attn_varlen_kvpacked_func(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    dropout_p: float = 0.0,
+    softmax_scale: float | None = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
+    alibi_slopes: torch.Tensor | None = None,
+    deterministic: bool = False,
+    return_attn_probs: bool = False,
+    *,
+    shape: ShapeLike,
+) -> torch.Tensor:
+    """Run varlen attention with ``[total_k, 2, nheads_kv, head_dim]`` KV."""
+    if kv.ndim != 4 or kv.shape[1] != 2:
+        raise ValueError(
+            "kv must have shape [total_k, 2, nheads_kv, head_dim], "
+            f"got {tuple(kv.shape)}"
+        )
+    k, v = (kv[:, index].contiguous() for index in range(2))
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p,
+        softmax_scale,
+        causal,
+        window_size,
+        softcap,
+        alibi_slopes,
+        deterministic,
+        return_attn_probs,
+        shape=shape,
     )
 
 
