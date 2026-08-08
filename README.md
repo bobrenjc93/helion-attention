@@ -358,7 +358,8 @@ the call site. These unsupported FlashAttention features also raise
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes
-- KV-cache mutation, partial/ragged caches, paged caches, and fused rotary embeddings
+- KV-cache mutation beyond the paired one-token final-slot append above;
+  partial/ragged caches, paged caches, and fused rotary embeddings
 - `return_attn_probs`
 
 ## How the kernels are made

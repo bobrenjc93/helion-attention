@@ -538,19 +538,24 @@ def test_kvcache_appends_one_token_in_place_and_attends_to_it(
 ) -> None:
     spec = spec_from_manifest_entry(entry)
     q, k_cache, v_cache = make_inputs(spec, seed=8675309)
-    generator = torch.Generator(device=q.device).manual_seed(314159)
+    q.fill_(1.0)
+    k_cache.zero_()
+    v_cache.zero_()
     update_shape = (spec.batch, 1, spec.nheads_kv, spec.head_dim)
-    new_k = torch.randn(
+    # This final key's score is 4 * sqrt(head_dim), so it dominates even the
+    # 16K cache. Its distinctive value makes a missing or delayed V copy turn
+    # the output from approximately 7 into zero.
+    new_k = torch.full(
         update_shape,
+        4.0,
         device=q.device,
         dtype=spec.dtype,
-        generator=generator,
     )
-    new_v = torch.randn(
+    new_v = torch.full(
         update_shape,
+        7.0,
         device=q.device,
         dtype=spec.dtype,
-        generator=generator,
     )
     expected_k = k_cache.clone()
     expected_v = v_cache.clone()
@@ -583,6 +588,7 @@ def test_kvcache_appends_one_token_in_place_and_attends_to_it(
     scale = 1.0 / math.sqrt(spec.head_dim)
     expected_out = reference_attention(q, expected_k, expected_v, spec, scale)
     torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
+    assert out.float().amin().item() > 6.5
     if return_softmax_lse:
         expected_lse = reference_single_token_lse(q, expected_k, spec, scale)
         torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
