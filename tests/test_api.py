@@ -288,6 +288,41 @@ def test_unregistered_dense_fallback_rejects_gradients() -> None:
         helion_attention.flash_attn_func(q, k, v, shape=spec)
 
 
+def test_generic_dense_layout_accepts_exact_int32_element_offset_boundary() -> None:
+    # 8,388,608 rows * 256 elements has a final offset of INT32_MAX.
+    spec = AttnShape(
+        1, 8_388_608, 8_388_608, 1, 1, 256, torch.bfloat16, False
+    )
+    assert helion_attention._validate_generic_dense_layout(spec) == (
+        8_388_608,
+        8_388_608,
+    )
+
+
+@pytest.mark.parametrize(
+    ("spec", "layout"),
+    [
+        (
+            AttnShape(1, 8_388_609, 1, 1, 1, 256, torch.bfloat16, False),
+            "Q/output",
+        ),
+        (
+            AttnShape(1, 1, 8_388_609, 1, 1, 256, torch.bfloat16, False),
+            "K/V",
+        ),
+    ],
+    ids=["query-output", "key-value"],
+)
+def test_generic_dense_layout_rejects_int32_element_offset_overflow(
+    spec: AttnShape, layout: str
+) -> None:
+    with pytest.raises(
+        UnsupportedShapeError,
+        match=rf"{layout} requires maximum offset .*limit 2147483647",
+    ):
+        helion_attention._validate_generic_dense_layout(spec)
+
+
 @requires_cuda
 def test_unequal_causal_mask_includes_bottom_right_boundary() -> None:
     entry = next(item for item in SHAPES if item["key"] == CHUNKED_PREFILL_KEY)

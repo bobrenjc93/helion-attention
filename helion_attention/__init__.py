@@ -59,7 +59,7 @@ __version__ = "0.1.0"
 _CORE_PAGED_VARLEN_SHAPE = (4, 1, 1024, 8, 2, 128, torch.bfloat16)
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
-_PACKED_OFFSET_MAX = 2**31 - 1
+_INT32_MAX = 2**31 - 1
 
 
 def _reject_unsupported(
@@ -113,14 +113,8 @@ def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
         )
 
 
-def _generic_dense_forward(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    softmax_scale: float,
-    spec: AttnShape,
-) -> torch.Tensor:
-    """Adapt a validated dense batch to the generic packed Triton runtime."""
+def _validate_generic_dense_layout(spec: AttnShape) -> tuple[int, int]:
+    """Validate signed-int32 indices and return packed Q/K token totals."""
     if spec.head_dim > _GENERIC_DENSE_MAX_HEAD_DIM:
         raise UnsupportedShapeError(
             "no checked-in dense specialization exists for:\n"
@@ -132,7 +126,7 @@ def _generic_dense_forward(
 
     total_q = spec.batch * spec.seqlen_q
     total_k = spec.batch * spec.seqlen_k
-    if max(total_q, total_k) > _PACKED_OFFSET_MAX:
+    if max(total_q, total_k) > _INT32_MAX:
         raise UnsupportedShapeError(
             "no checked-in dense specialization exists for:\n"
             f"    {spec.describe()}\n"
@@ -140,6 +134,38 @@ def _generic_dense_forward(
             "in int32. To request a specialization, file an issue at "
             "https://github.com/bobrenjc93/helion-attention/issues"
         )
+
+    # The packed kernel forms pointers with signed-int32 element arithmetic.
+    # Token offsets alone are insufficient: token * stride can overflow first
+    # for a large head count or dimension. Q and output share one layout, as do
+    # K and V, so bound the maximum valid relative element offset for each.
+    layout_numels = (
+        ("Q/output", total_q * spec.nheads_q * spec.head_dim),
+        ("K/V", total_k * spec.nheads_kv * spec.head_dim),
+    )
+    for layout, numel in layout_numels:
+        max_element_offset = numel - 1
+        if max_element_offset > _INT32_MAX:
+            raise UnsupportedShapeError(
+                "no checked-in dense specialization exists for:\n"
+                f"    {spec.describe()}\n"
+                "the generic dense fallback uses signed int32 element offsets, "
+                f"but {layout} requires maximum offset {max_element_offset} "
+                f"(limit {_INT32_MAX}). To request a specialization, file an "
+                "issue at https://github.com/bobrenjc93/helion-attention/issues"
+            )
+    return total_q, total_k
+
+
+def _generic_dense_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Adapt a validated dense batch to the generic packed Triton runtime."""
+    total_q, total_k = _validate_generic_dense_layout(spec)
 
     # The dense inputs were validated as contiguous, so these views retain the
     # packed runtime's [total, heads, head_dim] layout without copying data.

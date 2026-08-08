@@ -47,7 +47,8 @@ fp16 and bf16 MHA/GQA inputs with `head_dim <= 256` use the generic fallback
 when their exact shape is absent, including unequal query/key lengths and
 bottom-right causal masking. Dropout, local windows, softcap, ALiBi, attention
 probabilities, and gradients through this fallback still fail explicitly as
-described below.
+described below. The flattened Q/output and K/V layouts must also fit the
+generic kernel's signed 32-bit element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
