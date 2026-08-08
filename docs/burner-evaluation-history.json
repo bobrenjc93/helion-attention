@@ -793,6 +793,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:f975f4c0625d3d2e33440d36ce4ea06622d8d02e",
+      "commit": "f975f4c0625d3d2e33440d36ce4ea06622d8d02e",
+      "recordedAt": "2026-08-08T16:12:20.002Z",
+      "label": "base f975f4c",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 79,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:37",
+      "recordedAt": "2026-08-08T16:12:20.002Z",
+      "label": "PR #37",
+      "kind": "leaf",
+      "prNumber": 37,
+      "title": "Use the persistent schedule for the 4K Qwen GQA kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
