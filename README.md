@@ -172,6 +172,13 @@ created inside `torch.inference_mode()` must be updated while that mode remains
 enabled. For an append, `q`, `k_cache`, and `v_cache` must occupy disjoint
 memory; update `k`/`v` aliases are staged safely.
 
+This same final-slot append accepts paired, contiguous `rotary_cos` and
+`rotary_sin` tensors shaped `[seqlen_ro, D / 2]`, with `seqlen_ro >= S_CACHE`
+and the same CUDA dtype/device as `q`. The default interleaved layout rotates
+adjacent full-head pairs in `q` and `new_k` at position `cache_seqlens`; the
+rotated key is what the cache stores. Partial rotary dimensions,
+`rotary_interleaved=False`, and rotary on a read-only call are rejected.
+
 `shape` accepts:
 
 | form | meaning |
@@ -413,7 +420,8 @@ raise `NotImplementedError` rather than silently doing something else:
 - ALiBi slopes for varlen and KV-cache calls
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense partial/ragged caches, paged profiles other than the exact read-only
-  page-size-16 profile above, paged LSE, and fused rotary embeddings
+  page-size-16 profile above, paged LSE, and KV-cache rotary outside the
+  full-head interleaved final-slot append
 - `return_attn_probs`
 
 ## How the kernels are made
