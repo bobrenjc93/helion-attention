@@ -62,6 +62,7 @@ class ShapeRequest(NamedTuple):
 
 
 CATALOGUE: list[ShapeRequest] = [
+    ShapeRequest(8, 512, 8, 32, causal=True, label="small-model decoder"),
     ShapeRequest(2, 1024, 32, 64, label="GPT-2 medium style prefill"),
     ShapeRequest(2, 1024, 32, 64, causal=True, label="GPT-2 medium style, causal"),
     ShapeRequest(
@@ -73,6 +74,7 @@ CATALOGUE: list[ShapeRequest] = [
         backward=True,
     ),
     ShapeRequest(8, 2048, 16, 64, causal=True, label="small decoder, long batch"),
+    ShapeRequest(2, 1024, 16, 256, label="vision/multimodal encoder"),
     ShapeRequest(4, 4096, 32, 128, label="7B-class prefill, bidirectional"),
     ShapeRequest(4, 4096, 32, 128, causal=True, label="7B-class prefill, causal"),
     ShapeRequest(1, 2048, 32, 128, causal=True, label="single-sequence 7B prefill"),

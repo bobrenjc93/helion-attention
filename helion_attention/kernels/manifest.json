@@ -167,6 +167,21 @@
       "seqlen_q": 8192
     },
     {
+      "backward": false,
+      "batch": 2,
+      "causal": false,
+      "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=16 head_dim=256 dtype=bf16 causal=False",
+      "dtype": "bf16",
+      "head_dim": 256,
+      "key": "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal",
+      "nheads_kv": 16,
+      "nheads_q": 16,
+      "note": "vision/multimodal encoder",
+      "seqlen_k": 1024,
+      "seqlen_q": 1024,
+      "varlen": false
+    },
+    {
       "batch": 2,
       "causal": true,
       "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True",
@@ -361,6 +376,21 @@
       "note": "short-sequence encoder batch",
       "seqlen_k": 512,
       "seqlen_q": 512
+    },
+    {
+      "backward": false,
+      "batch": 8,
+      "causal": true,
+      "description": "batch=8 seqlen_q=512 seqlen_k=512 nheads=8 head_dim=32 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 32,
+      "key": "b8_sq512_sk512_hq8_hkv8_d32_bf16_causal",
+      "nheads_kv": 8,
+      "nheads_q": 8,
+      "note": "small-model decoder",
+      "seqlen_k": 512,
+      "seqlen_q": 512,
+      "varlen": false
     }
   ],
   "paged_kernels": [

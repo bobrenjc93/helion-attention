@@ -150,6 +150,7 @@ one is an autotuning run, not a code change.
 | 1 | 64 | 320 | 8 | 2 | 128 | bf16 | yes | vLLM chunked-prefill causal alignment |
 | 1 | 8192 | 8192 | 28 | 4 | 128 | bf16 | yes | Qwen2-7B GQA 7:1 |
 | 1 | 8192 | 8192 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
+| 2 | 1024 | 1024 | 16 | 16 | 256 | bf16 | no | vision/multimodal encoder |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | bf16 | yes | GPT-2 medium style, causal |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | bf16 | no | GPT-2 medium style prefill |
 | 2 | 1024 | 1024 | 32 | 32 | 64 | fp16 | no | fp16 coverage |
@@ -165,8 +166,9 @@ one is an autotuning run, not a code change.
 | 4 | 8192 | 8192 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B GQA 4:1 |
 | 8 | 2048 | 2048 | 16 | 16 | 64 | bf16 | yes | small decoder, long batch |
 | 8 | 512 | 512 | 16 | 16 | 64 | bf16 | no | short-sequence encoder batch |
+| 8 | 512 | 512 | 8 | 8 | 32 | bf16 | yes | small-model decoder |
 
-27 kernels.
+29 kernels.
 <!-- SHAPES:END -->
 
 Packed varlen kernels specialize the batch size and maximum lengths while
@@ -206,6 +208,7 @@ Paged rows use identical logical caches with each implementation's native page s
 | batch=1 seqlen_q=64 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 27 | 220 | n/a | 335 | 3 | **8.28x faster** |
 | batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 5235 | 1485 | 1592 | 877 | 92 | **3.53x slower** |
 | batch=1 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 5503 | 1669 | 1801 | 999 | 100 | **3.30x slower** |
+| batch=2 seqlen_q=1024 seqlen_k=1024 nheads=16 head_dim=256 dtype=bf16 causal=False | 276 | 198 | 199 | n/a | 124 | **1.39x slower** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True | 113 | 201 | 200 | 199 | 76 | **1.78x faster** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False | 114 | 198 | 201 | 195 | 150 | **1.73x faster** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=fp16 causal=False | 122 | 203 | 202 | 199 | 141 | **1.67x faster** |
@@ -222,15 +225,20 @@ Paged rows use identical logical caches with each implementation's native page s
 | batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True | 295 | 275 | 291 | 232 | 233 | **1.07x slower** |
 | batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 50 | 204 | 199 | 194 | 171 | **4.06x faster** |
 | backward batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 3526 | 599 | n/a | n/a | 6 | **5.89x slower** |
+| batch=8 seqlen_q=512 seqlen_k=512 nheads=8 head_dim=32 dtype=bf16 causal=True | 31 | 199 | 195 | 194 | 35 | **6.49x faster** |
 | varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=True | 82 | 210 | n/a | n/a | 12 | **2.56x faster** |
 | varlen batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False | 77 | 204 | n/a | n/a | 26 | **2.65x faster** |
 | paged page_size=16 batch=2 seqlen_q=200 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 98 | 208 | n/a | n/a | 2 | **2.12x faster** |
 | paged page_size=16 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 120 | 101 | n/a | n/a | 0 | **1.20x slower** |
 
-Helion is faster than flash-attn on 18 kernel workloads and slower on 14 kernel workloads.
+Helion is faster than flash-attn on 19 kernel workloads and slower on 15 kernel workloads.
 
-Geomean speedup over flash-attn across all 32 kernel workloads: **1.01x**.
+Geomean speedup over flash-attn across all 34 kernel workloads: **1.06x**.
 <!-- BENCHMARKS:END -->
+
+For the newly covered dimensions on H100, Helion beats flash-attn at head dim
+32 (**6.49x faster** on the small-model decoder shape), but not at head dim 256
+(**1.39x slower** on the vision/multimodal encoder shape).
 
 Reproduce with:
 

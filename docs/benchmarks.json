@@ -384,6 +384,33 @@
       }
     },
     {
+      "key": "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal",
+      "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=16 head_dim=256 dtype=bf16 causal=False",
+      "kind": "forward",
+      "varlen": false,
+      "paged": false,
+      "backward": false,
+      "flash_attn_api": "flash_attn_func",
+      "note": "vision/multimodal encoder",
+      "implementations": {
+        "helion-attention": {
+          "us": 276.3114497970473,
+          "tflops": 124.35148233356767,
+          "max_abs_error": 0.0011501014232635498
+        },
+        "flash-attn": {
+          "us": 198.498578480258,
+          "tflops": 173.0981583397954,
+          "max_abs_error": 0.0010856091976165771
+        },
+        "sdpa-flash": {
+          "us": 198.57590320435438,
+          "tflops": 173.03075455555356,
+          "max_abs_error": 0.0010856091976165771
+        }
+      }
+    },
+    {
       "key": "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal",
       "description": "batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True",
       "kind": "forward",
@@ -882,6 +909,38 @@
           "us": 598.8991483758315,
           "tflops": 35.857183197268036,
           "max_abs_error": 0.00401151180267334
+        }
+      }
+    },
+    {
+      "key": "b8_sq512_sk512_hq8_hkv8_d32_bf16_causal",
+      "description": "batch=8 seqlen_q=512 seqlen_k=512 nheads=8 head_dim=32 dtype=bf16 causal=True",
+      "kind": "forward",
+      "varlen": false,
+      "paged": false,
+      "backward": false,
+      "flash_attn_api": "flash_attn_func",
+      "note": "small-model decoder",
+      "implementations": {
+        "helion-attention": {
+          "us": 30.64830287179198,
+          "tflops": 35.10272593234448,
+          "max_abs_error": 0.00780177116394043
+        },
+        "flash-attn": {
+          "us": 198.94084460654503,
+          "tflops": 5.407833560412087,
+          "max_abs_error": 0.00780177116394043
+        },
+        "sdpa-flash": {
+          "us": 195.2858206012315,
+          "tflops": 5.509048084944348,
+          "max_abs_error": 0.00780177116394043
+        },
+        "sdpa-cudnn": {
+          "us": 194.18634615446393,
+          "tflops": 5.540240069938968,
+          "max_abs_error": 0.00780177116394043
         }
       }
     },

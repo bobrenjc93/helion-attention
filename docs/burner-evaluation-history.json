@@ -328,6 +328,36 @@
         "eval_5b403bea": 91,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:fbfd95249262a4a75fbfffe141bba9af277b254d",
+      "commit": "fbfd95249262a4a75fbfffe141bba9af277b254d",
+      "recordedAt": "2026-08-08T00:17:36.059Z",
+      "label": "base fbfd952",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 59,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:14",
+      "recordedAt": "2026-08-08T00:17:36.059Z",
+      "label": "PR #14",
+      "kind": "leaf",
+      "prNumber": 14,
+      "title": "Cover head_dim 256 and head_dim 32",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 62,
+        "eval_1afd133e": 50,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
