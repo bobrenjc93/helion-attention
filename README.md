@@ -57,10 +57,13 @@ their exact shape is absent, including unequal query/key lengths and
 bottom-right causal masking. Grad-enabled calls without a generated backward
 use PyTorch SDPA autograd instead. Dense ALiBi forward calls accept fp32 slopes
 shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
-ALiBi backward is not implemented. Dropout, local windows, softcap, diagnostic
-returns outside the decode subset above, and `deterministic=True` on the SDPA
-backward path still fail explicitly as described below. Unregistered calls must
-also fit the generic kernel's signed 32-bit Q/output and K/V element offsets.
+ALiBi backward is not implemented. The shipped noncausal bf16
+`(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
+`0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
+Other dropout calls, local windows, softcap, diagnostic returns outside the
+decode subset above, and deterministic dropout still fail explicitly as
+described below. Unregistered calls must also fit the generic kernel's signed
+32-bit Q/output and K/V element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -438,15 +441,17 @@ same page-16 logical cache as Helion.
 ## What is not implemented
 
 The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape uses
-its checked-in generated backward. Default-option dense MHA, GQA, and
-cross-attention calls without a generated backward use PyTorch SDPA autograd,
-including fp16/bf16 and bottom-right causal masking. Packed varlen and KV-cache
-calls remain forward-only. These unsupported FlashAttention features also
-raise `NotImplementedError` rather than silently doing something else:
+its checked-in generated backward when dropout is zero and PyTorch SDPA
+autograd when `0 < dropout_p < 1`. Default-option dense MHA, GQA, and
+cross-attention calls without a generated backward also use PyTorch SDPA
+autograd, including fp16/bf16 and bottom-right causal masking. Packed varlen and
+KV-cache calls remain forward-only. These unsupported FlashAttention features
+also raise `NotImplementedError` rather than silently doing something else:
 
 - backward for dense ALiBi, varlen, and KV-cache calls
 - `deterministic=True` when using the dense SDPA autograd fallback
-- dropout
+- dropout outside the exact encoder-training profile above, or combined with
+  ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
 - sliding-window attention and softcap
 - ALiBi slopes for varlen profiles other than the causal bf16
   `(8, 512, 512, 16, 16, 64)` profile above, and for KV-cache calls

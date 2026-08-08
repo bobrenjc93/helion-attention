@@ -31,6 +31,7 @@ def dense_attention_sdpa(
     v: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
+    dropout_p: float = 0.0,
 ) -> torch.Tensor:
     """Run a validated dense call through PyTorch's native SDPA autograd."""
     query = q.transpose(1, 2)
@@ -52,7 +53,7 @@ def dense_attention_sdpa(
                 query[:, :, masked_rows:],
                 key,
                 value,
-                dropout_p=0.0,
+                dropout_p=dropout_p,
                 is_causal=True,
                 scale=softmax_scale,
                 enable_gqa=enable_gqa,
@@ -75,7 +76,7 @@ def dense_attention_sdpa(
                 key,
                 value,
                 attn_mask=causal_bias,
-                dropout_p=0.0,
+                dropout_p=dropout_p,
                 is_causal=is_causal,
                 scale=softmax_scale,
                 enable_gqa=enable_gqa,
