@@ -353,7 +353,7 @@ def test_checked_in_modules_publish_manifest_provenance() -> None:
                 assert generate.format_provenance(provenance) in docstring
 
 
-def test_catalogue_backfills_missing_forward_and_backward_provenance() -> None:
+def test_catalogue_backfills_missing_forward_and_backward_metadata() -> None:
     request = generate_all.ShapeRequest(1, 64, 8, 128)
     forward_provenance = {"helion_version": "1.4.0"}
 
@@ -372,11 +372,31 @@ def test_catalogue_backfills_missing_forward_and_backward_provenance() -> None:
             "autotuning_provenance": forward_provenance,
         },
     )
+    assert not generate_all.entry_is_complete(
+        backward_request,
+        {
+            "key": "shape",
+            "backward": True,
+            "autotuning_provenance": forward_provenance,
+            "backward_autotuning_provenance": forward_provenance,
+        },
+    )
+    assert not generate_all.entry_is_complete(
+        backward_request,
+        {
+            "key": "shape",
+            "backward": True,
+            "backward_deterministic": False,
+            "autotuning_provenance": forward_provenance,
+            "backward_autotuning_provenance": forward_provenance,
+        },
+    )
     assert generate_all.entry_is_complete(
         backward_request,
         {
             "key": "shape",
             "backward": True,
+            "backward_deterministic": True,
             "autotuning_provenance": forward_provenance,
             "backward_autotuning_provenance": forward_provenance,
         },

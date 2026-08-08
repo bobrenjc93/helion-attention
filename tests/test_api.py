@@ -119,6 +119,75 @@ def test_manifest_is_not_empty() -> None:
 def test_backward_catalogue_is_scoped_to_one_noncausal_shape() -> None:
     assert len(BACKWARD_SHAPES) == 1
     assert BACKWARD_SHAPES[0]["causal"] is False
+    assert BACKWARD_SHAPES[0]["backward_deterministic"] is True
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_autograd_threads_deterministic_to_backward_dispatch(
+    deterministic: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import helion_attention._autograd as autograd_bridge
+
+    spec = spec_from_manifest_entry(BACKWARD_SHAPES[0])
+    observed: list[bool] = []
+
+    def forward(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        softmax_scale: float,
+    ) -> torch.Tensor:
+        del softmax_scale
+        return q + k + v
+
+    def backward(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        grad_out: torch.Tensor,
+        softmax_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del q, k, v, softmax_scale
+        return grad_out, 2 * grad_out, 3 * grad_out
+
+    def lookup_backward(
+        actual_spec: AttnShape, *, deterministic: bool = False
+    ):  # noqa: ANN202
+        assert actual_spec == spec
+        observed.append(deterministic)
+        return backward
+
+    monkeypatch.setattr(autograd_bridge, "lookup", lambda actual_spec: forward)
+    monkeypatch.setattr(autograd_bridge, "lookup_backward", lookup_backward)
+
+    q = torch.randn(2, 3, requires_grad=True)
+    k = torch.randn(2, 3, requires_grad=True)
+    v = torch.randn(2, 3, requires_grad=True)
+    out = autograd_bridge.attention_autograd(
+        q, k, v, 0.5, spec, deterministic=deterministic
+    )
+    grads = torch.autograd.grad(out, (q, k, v), torch.ones_like(out))
+
+    assert observed == [deterministic]
+    for multiplier, grad in enumerate(grads, start=1):
+        torch.testing.assert_close(grad, torch.full_like(grad, multiplier))
+
+
+def test_deterministic_backward_requires_an_explicit_certificate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._registry as registry
+
+    entry = dict(BACKWARD_SHAPES[0])
+    entry.pop("backward_deterministic")
+    spec = spec_from_manifest_entry(entry)
+    backward = object()
+    monkeypatch.setattr(registry, "_entry_for_spec", lambda actual_spec: entry)
+    monkeypatch.setattr(registry, "_load_backward", lambda key: backward)
+
+    assert registry.lookup_backward(spec, deterministic=False) is backward
+    with pytest.raises(NotImplementedError, match="certified as deterministic"):
+        registry.lookup_backward(spec, deterministic=True)
 
 
 def test_decode_cache_lengths_are_checked_in() -> None:
@@ -159,15 +228,23 @@ def test_gradients_match_fp32_sdpa(
     v.requires_grad_()
     grad_out = make_inputs(spec, seed=456)[0]
 
-    got = helion_attention.flash_attn_func(
-        q,
-        k,
-        v,
-        softmax_scale=softmax_scale,
-        causal=False,
-        shape=spec,
-    )
-    got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
+    def run_backward() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        got = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=False,
+            deterministic=True,
+            shape=spec,
+        )
+        return torch.autograd.grad(got, (q, k, v), grad_out)
+
+    got_grads = run_backward()
+    repeated_grads = run_backward()
+    for actual, repeated in zip(got_grads, repeated_grads):
+        assert torch.equal(actual, repeated)
+    del repeated_grads
 
     q_ref = q.float().detach().requires_grad_()
     k_ref = k.float().detach().requires_grad_()
@@ -187,15 +264,31 @@ def test_gradients_match_fp32_sdpa(
 
 
 @requires_cuda
-def test_requires_grad_rejects_shape_without_backward() -> None:
+def test_requires_grad_rejects_shape_without_backward_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     entry = next(item for item in SHAPES if not item.get("backward", False))
     spec = spec_from_manifest_entry(entry)
     q, k, v = make_inputs(spec)
     q.requires_grad_()
+    forward_launched = False
+
+    def forward(*args: object) -> torch.Tensor:
+        nonlocal forward_launched
+        forward_launched = True
+        return q
+
+    monkeypatch.setattr(helion_attention, "lookup", lambda actual_spec: forward)
     with pytest.raises(NotImplementedError, match="backward kernel"):
         helion_attention.flash_attn_func(
-            q, k, v, causal=spec.causal, shape=spec
+            q,
+            k,
+            v,
+            causal=spec.causal,
+            deterministic=True,
+            shape=spec,
         )
+    assert not forward_launched
 
 
 @requires_cuda

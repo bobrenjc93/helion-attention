@@ -59,6 +59,7 @@ def entry_is_complete(
     if request.backward and (
         not entry.get("backward")
         or "backward_autotuning_provenance" not in entry
+        or entry.get("backward_deterministic") is not True
     ):
         return False
     return True

@@ -310,6 +310,7 @@ def check_gradients(
         v,
         softmax_scale=softmax_scale,
         causal=spec.causal,
+        deterministic=True,
         shape=spec,
     )
     got_grads = torch.autograd.grad(got, (q, k, v), grad_out)

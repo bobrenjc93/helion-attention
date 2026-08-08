@@ -47,6 +47,10 @@ SPLIT_KV_DECODE_16K_KEY = "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
 SPLIT_KV_DECODE_SPLITS = 8
 AUTOTUNE_ACCEPTANCE_REPEAT = 100
 MIN_CANDIDATE_SPEEDUP = 0.02
+# ``attention_backward_bshd`` gives each dQ, dK, and dV tile exactly one
+# owner and emits no atomic updates, so repeated launches have a fixed
+# reduction order. Publish that property with every generated specialization.
+BACKWARD_DETERMINISTIC = True
 
 if TYPE_CHECKING:
     from helion_attention._shape import AttnShape
@@ -1531,6 +1535,8 @@ def main() -> int:
         "backward": args.backward,
         "varlen": args.varlen,
     }
+    if args.backward:
+        spec_fields["backward_deterministic"] = BACKWARD_DETERMINISTIC
     if args.paged:
         spec_fields.update({"paged": True, "page_size": args.page_size})
     assert forward_provenance is not None
@@ -1580,6 +1586,7 @@ def main() -> int:
     }
     if backward_provenance is not None:
         manifest_entry["backward_autotuning_provenance"] = backward_provenance
+        manifest_entry["backward_deterministic"] = BACKWARD_DETERMINISTIC
     if args.paged:
         manifest_entry.update({"paged": True, "page_size": args.page_size})
 

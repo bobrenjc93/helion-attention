@@ -27,6 +27,7 @@ KERNEL_SPEC = {
     'causal': False,
     'backward': True,
     'varlen': False,
+    'backward_deterministic': True,
 }
 
 
