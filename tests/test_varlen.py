@@ -328,12 +328,15 @@ def test_varlen_packed_entry_points_reject_unsupported_options(
     with pytest.raises(NotImplementedError, match=message):
         if name == "flash_attn_varlen_qkvpacked_func":
             helion_attention.flash_attn_varlen_qkvpacked_func(
-                torch.zeros(1, 3, 1, 1), cu_seqlens, 1, **kwargs
+                torch.zeros(1, 3, 1, 1, requires_grad=True),
+                cu_seqlens,
+                1,
+                **kwargs,
             )
         else:
             helion_attention.flash_attn_varlen_kvpacked_func(
-                torch.zeros(1, 1, 1),
-                torch.zeros(1, 2, 1, 1),
+                torch.zeros(1, 1, 1, requires_grad=True),
+                torch.zeros(1, 2, 1, 1, requires_grad=True),
                 cu_seqlens,
                 cu_seqlens,
                 1,
@@ -423,29 +426,227 @@ def test_varlen_packed_entry_points_match_unpacked(
     "name",
     ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
 )
-def test_varlen_packed_entry_points_reject_gradients(name: str) -> None:
+def test_varlen_packed_entry_points_propagate_gradients(name: str) -> None:
     entry = next(item for item in VARLEN_SHAPES if not item["causal"])
     spec = spec_from_manifest_entry(entry)
     variant = 2 if name == "flash_attn_varlen_qkvpacked_func" else 0
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=variant)
 
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        if name == "flash_attn_varlen_qkvpacked_func":
-            qkv = torch.stack((q, k, v), dim=1).requires_grad_()
-            helion_attention.flash_attn_varlen_qkvpacked_func(
-                qkv, cu_q, spec.seqlen_q, shape=spec
-            )
-        else:
-            kv = torch.stack((k, v), dim=1).requires_grad_()
-            helion_attention.flash_attn_varlen_kvpacked_func(
-                q,
-                kv,
-                cu_q,
-                cu_k,
-                spec.seqlen_q,
-                spec.seqlen_k,
-                shape=spec,
-            )
+    if name == "flash_attn_varlen_qkvpacked_func":
+        packed = torch.stack((q, k, v), dim=1).requires_grad_()
+        out = helion_attention.flash_attn_varlen_qkvpacked_func(
+            packed, cu_q, spec.seqlen_q, shape=spec
+        )
+        inputs = (packed,)
+    else:
+        q.requires_grad_()
+        packed = torch.stack((k, v), dim=1).requires_grad_()
+        out = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            packed,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            shape=spec,
+        )
+        inputs = (q, packed)
+
+    gradients = torch.autograd.grad(out, inputs, torch.randn_like(out))
+    assert all(
+        gradient.shape == source.shape
+        for gradient, source in zip(gradients, inputs)
+    )
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+@requires_cuda
+def test_varlen_packed_no_grad_calls_retain_generated_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = next(item for item in VARLEN_SHAPES if not item["causal"])
+    spec = spec_from_manifest_entry(entry)
+    cu = torch.arange(spec.batch + 1, device="cuda", dtype=torch.int32)
+    q = torch.randn(
+        spec.batch,
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+        requires_grad=True,
+    )
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+    dispatched: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def kernel(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        *args: object,
+    ) -> torch.Tensor:
+        dispatched.append((q_arg, k_arg, v_arg))
+        return torch.empty_like(q_arg)
+
+    def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("no-grad varlen call reached the SDPA fallback")
+
+    monkeypatch.setattr(helion_attention, "lookup_varlen", lambda _: kernel)
+    monkeypatch.setattr(helion_attention, "varlen_attention_sdpa", reject_sdpa)
+
+    with torch.no_grad():
+        qkv = torch.stack((q, k, v), dim=1)
+        qkv_out = helion_attention.flash_attn_varlen_qkvpacked_func(
+            qkv, cu, spec.seqlen_q, shape=spec
+        )
+        kv = torch.stack((k, v), dim=1)
+        kv_out = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu,
+            cu,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            shape=spec,
+        )
+
+    assert qkv_out.shape == q.shape
+    assert kv_out.shape == q.shape
+    assert len(dispatched) == 2
+
+
+@requires_cuda
+def test_varlen_empty_requests_ignore_poisoned_inputs() -> None:
+    entry = next(item for item in VARLEN_SHAPES if not item["causal"])
+    spec = spec_from_manifest_entry(entry)
+    lengths_q = [1, 0, 1, 1, 1, 1, 1, 1]
+    lengths_k = [0, 1, 1, 1, 1, 1, 1, 1]
+    generator = torch.Generator(device="cuda").manual_seed(2027)
+    q = torch.randn(
+        sum(lengths_q),
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        sum(lengths_k),
+        spec.nheads_kv,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    with torch.no_grad():
+        q[0].fill_(float("inf"))
+        k[0].fill_(float("inf"))
+        v[0].fill_(float("nan"))
+    cu_q = _cumulative(lengths_q, q.device)
+    cu_k = _cumulative(lengths_k, q.device)
+    args = (q, k, v, cu_q, cu_k, spec.seqlen_q, spec.seqlen_k)
+
+    with torch.no_grad():
+        generated = helion_attention.flash_attn_varlen_func(*args, shape=spec)
+    out = helion_attention.flash_attn_varlen_func(*args, shape=spec)
+
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out[0], torch.zeros_like(out[0]))
+    torch.testing.assert_close(
+        out.float(), generated.float(), atol=5e-2, rtol=2e-2
+    )
+
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), torch.ones_like(out))
+    assert torch.isfinite(dq).all()
+    assert torch.isfinite(dk).all()
+    assert torch.isfinite(dv).all()
+    torch.testing.assert_close(dq[0], torch.zeros_like(dq[0]))
+    torch.testing.assert_close(dk[0], torch.zeros_like(dk[0]))
+    torch.testing.assert_close(dv[0], torch.zeros_like(dv[0]))
+
+
+@requires_cuda
+@pytest.mark.parametrize("entry", VARLEN_SHAPES, ids=VARLEN_IDS)
+def test_varlen_gradients_match_fp32_sdpa(entry: dict[str, object]) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=0, seed=321
+    )
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    grad_generator = torch.Generator(device="cuda").manual_seed(654)
+    grad_out = torch.randn(
+        q.shape,
+        device=q.device,
+        dtype=q.dtype,
+        generator=grad_generator,
+    )
+    scale = 1.0 / math.sqrt(spec.head_dim)
+
+    out = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=spec.causal,
+        shape=spec,
+    )
+    actual_grads = torch.autograd.grad(out, (q, k, v), grad_out)
+
+    q_ref = q.float().detach().requires_grad_()
+    k_ref = k.float().detach().requires_grad_()
+    v_ref = v.float().detach().requires_grad_()
+    expected = reference_packed(
+        q_ref,
+        k_ref,
+        v_ref,
+        lengths_q,
+        lengths_k,
+        causal=spec.causal,
+        scale=scale,
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    for actual, reference in zip(actual_grads, expected_grads):
+        torch.testing.assert_close(actual.float(), reference, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_varlen_deterministic_backward_fails_before_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = next(item for item in VARLEN_SHAPES if not item["causal"])
+    spec = spec_from_manifest_entry(entry)
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec)
+    q.requires_grad_()
+
+    def reject_forward(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("deterministic backward reached an attention forward")
+
+    monkeypatch.setattr(helion_attention, "lookup_varlen", lambda _: reject_forward)
+    monkeypatch.setattr(helion_attention, "varlen_attention_sdpa", reject_forward)
+
+    with pytest.raises(NotImplementedError, match="deterministic=True"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            deterministic=True,
+            shape=spec,
+        )
 
 
 @requires_cuda
@@ -531,6 +732,93 @@ def test_varlen_supports_cuda_graph_capture() -> None:
     graph.replay()
     torch.cuda.synchronize(q.device)
     torch.testing.assert_close(captured, expected)
+
+
+@requires_cuda
+@pytest.mark.parametrize("entry", VARLEN_SHAPES, ids=VARLEN_IDS)
+def test_varlen_autograd_supports_cuda_graph_capture(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    capture_lengths_q = [8, 7, 6, 5, 4, 3, 2, 1]
+    capture_lengths_k = [1, 2, 3, 4, 5, 6, 7, 8]
+    replay_lengths_q = capture_lengths_k
+    replay_lengths_k = capture_lengths_q
+    generator = torch.Generator(device="cuda").manual_seed(2028)
+    q = torch.randn(
+        sum(capture_lengths_q),
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+        requires_grad=True,
+    )
+    k = torch.randn(
+        sum(capture_lengths_k),
+        spec.nheads_kv,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    grad_out = torch.randn(
+        q.shape, device=q.device, dtype=q.dtype, generator=generator
+    )
+    cu_q = _cumulative(capture_lengths_q, q.device)
+    cu_k = _cumulative(capture_lengths_k, q.device)
+    replay_cu_q = _cumulative(replay_lengths_q, q.device)
+    replay_cu_k = _cumulative(replay_lengths_k, q.device)
+
+    # Warm the fixed-shape SDPA kernels and build an eager replay reference on
+    # separate leaves, avoiding stale AccumulateGrad state on captured inputs.
+    q_ref = q.detach().clone().requires_grad_()
+    k_ref = k.detach().clone().requires_grad_()
+    v_ref = v.detach().clone().requires_grad_()
+    expected = helion_attention.flash_attn_varlen_func(
+        q_ref,
+        k_ref,
+        v_ref,
+        replay_cu_q,
+        replay_cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=spec.causal,
+        shape=spec,
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out
+    )
+    expected = expected.detach()
+    expected_grads = tuple(gradient.detach() for gradient in expected_grads)
+    del q_ref, k_ref, v_ref
+
+    torch.cuda.synchronize(q.device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+    cu_q.copy_(replay_cu_q)
+    cu_k.copy_(replay_cu_k)
+    graph.replay()
+    torch.cuda.synchronize(q.device)
+    captured_grads = torch.autograd.grad(captured, (q, k, v), grad_out)
+
+    torch.testing.assert_close(captured, expected)
+    for actual, reference in zip(captured_grads, expected_grads):
+        torch.testing.assert_close(actual, reference)
 
 
 @requires_cuda
@@ -743,7 +1031,7 @@ def test_varlen_shape_argument_is_required() -> None:
 
 
 @requires_cuda
-def test_varlen_validates_maxima_cu_seqlens_and_forward_only_contract() -> None:
+def test_varlen_validates_maxima_cu_seqlens_and_autograd_contract() -> None:
     entry = next(item for item in VARLEN_SHAPES if not item["causal"])
     spec = spec_from_manifest_entry(entry)
     q, k, v, cu_q, cu_k, *_ = make_packed(spec)
@@ -767,8 +1055,8 @@ def test_varlen_validates_maxima_cu_seqlens_and_forward_only_contract() -> None:
         )
 
     q.requires_grad_()
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        helion_attention.flash_attn_varlen_func(*call_args, shape=spec)
+    result = helion_attention.flash_attn_varlen_func(*call_args, shape=spec)
+    assert result.requires_grad
 
 
 def test_support_queries_are_metadata_only_and_varlen_is_separate(

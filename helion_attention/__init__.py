@@ -8,9 +8,9 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization; compatible unregistered dense shapes and dense
 ALiBi calls use a generic Triton forward kernel. Grad-enabled dense calls
-without a generated backward use PyTorch SDPA autograd. The explicit shape
-validates these paths and makes specialization introspection independent of
-fallback coverage.
+without a generated backward and grad-enabled calls to the shipped varlen
+profiles use PyTorch SDPA autograd. The explicit shape validates these paths and
+makes specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from ._registry import lookup_backward
 from ._registry import lookup_paged
 from ._registry import lookup_varlen
 from ._sdpa import dense_attention_sdpa
+from ._sdpa import varlen_attention_sdpa
 from ._shape import AttnShape
 from ._shape import ShapeLike
 from ._shape import check_paged_varlen_tensors
@@ -400,8 +401,11 @@ def flash_attn_varlen_func(
     The packed token totals and individual sequence lengths may change between
     calls to the same specialization.  The batch size, maxima, head geometry,
     dtype, and causal mode must continue to match ``shape``.
+
+    Grad-enabled calls to the two checked-in contiguous varlen profiles run
+    each request through PyTorch SDPA autograd. Calls without autograd retain
+    the generated packed dispatch. Paged-cache calls remain forward-only.
     """
-    del deterministic  # This option affects backward only.
     _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
     if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
@@ -449,15 +453,27 @@ def flash_attn_varlen_func(
 
     check_varlen_tensors(q, k, v, cu_seqlens_q, cu_seqlens_k, spec)
     kernel = lookup_varlen(spec)
-    if torch.is_grad_enabled() and any(
+    needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
-    ):
-        raise NotImplementedError(
-            "flash_attn_varlen_func is currently forward-only; no packed-sequence "
-            "backward kernel is checked in"
-        )
+    )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
+    scale = float(softmax_scale)
+    if needs_backward:
+        if deterministic:
+            raise NotImplementedError(
+                "deterministic=True is not supported by the PyTorch SDPA "
+                "varlen autograd fallback"
+            )
+        return varlen_attention_sdpa(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            scale,
+            spec,
+        )
     return kernel(
         q,
         k,
@@ -466,7 +482,7 @@ def flash_attn_varlen_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        float(softmax_scale),
+        scale,
         causal,
     )
 
