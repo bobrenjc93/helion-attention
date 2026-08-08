@@ -129,10 +129,13 @@ out = helion_attention.flash_attn_with_kvcache(
 ```
 
 The append mutates both caches in place and attends over the updated full cache.
-Read-only calls may omit `cache_seqlens` or pass the full cache length. Update
-lengths must be Python integers and satisfy `cache_seqlens + 1 == S_CACHE`;
-unpaired or multi-token updates and tensor-valued, partial, ragged, paged, or
-rotary-embedded caches are rejected explicitly. Caches created inside
+Read-only calls may omit `cache_seqlens`, pass the full cache length, or pass a
+contiguous CUDA int32 vector of shape `[B]` to select an independent prefix for
+each cache row. Tensor lengths are bounds-checked on the host, so this ragged
+path deliberately rejects CUDA graph capture and autograd. Update lengths must
+be Python integers and satisfy `cache_seqlens + 1 == S_CACHE`; tensor-length,
+unpaired, and multi-token updates are rejected before either cache is mutated.
+Paged and rotary-embedded caches also remain unsupported. Caches created inside
 `torch.inference_mode()` must be updated while that mode remains enabled. For
 an append, `q`, `k_cache`, and `v_cache` must occupy disjoint memory; update
 `k`/`v` aliases are staged safely.
@@ -376,7 +379,7 @@ doing something else:
 - sliding-window attention and softcap
 - ALiBi slopes
 - KV-cache mutation beyond the paired one-token final-slot append above;
-  partial/ragged caches, paged caches, and fused rotary embeddings
+  tensor-length updates, paged caches, and fused rotary embeddings
 - `return_attn_probs`
 
 ## How the kernels are made

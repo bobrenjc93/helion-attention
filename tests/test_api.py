@@ -51,6 +51,9 @@ GENERIC_DENSE_SPECS = [
     AttnShape(1, 29, 17, 4, 4, 128, torch.float16, True),
     AttnShape(1, 13, 21, 8, 2, 256, torch.float16, True),
 ]
+RAGGED_DECODE_SPEC = AttnShape(
+    3, 1, 137, 8, 2, 64, torch.bfloat16, True
+)
 
 
 def make_inputs(
@@ -112,6 +115,34 @@ def reference_single_token_lse(
     return torch.logsumexp(scores, dim=-1).reshape(
         spec.batch, spec.nheads_q, spec.seqlen_q
     )
+
+
+def reference_ragged_single_token_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lengths: list[int],
+    spec: AttnShape,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return an fp32 reference for one independently sized cache per row."""
+    outputs = []
+    lse_parts = []
+    group_size = spec.nheads_q // spec.nheads_kv
+    for batch_index, length in enumerate(lengths):
+        grouped_q = q[batch_index, 0].reshape(
+            spec.nheads_kv, group_size, spec.head_dim
+        ).float()
+        key = k[batch_index, :length].float()
+        value = v[batch_index, :length].float()
+        scores = torch.einsum("hgd,shd->hgs", grouped_q, key) * scale
+        probabilities = torch.softmax(scores, dim=-1)
+        output = torch.einsum("hgs,shd->hgd", probabilities, value)
+        outputs.append(output.reshape(1, spec.nheads_q, spec.head_dim))
+        lse_parts.append(
+            torch.logsumexp(scores, dim=-1).reshape(spec.nheads_q, 1)
+        )
+    return torch.stack(outputs), torch.stack(lse_parts)
 
 
 def test_package_does_not_import_helion() -> None:
@@ -546,6 +577,150 @@ def test_kvcache_entry_point_matches_plain_attention(
         shape=spec,
     )
     torch.testing.assert_close(cached, plain)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+def test_kvcache_ragged_tensor_lengths_match_fp32(
+    softmax_scale: float | None,
+) -> None:
+    spec = RAGGED_DECODE_SPEC
+    q, k_cache, v_cache = make_inputs(spec, seed=314159)
+    host_lengths = [1, 65, spec.seqlen_k]
+    cache_seqlens = torch.tensor(
+        host_lengths, device=q.device, dtype=torch.int32
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    out, lse = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        return_softmax_lse=True,
+        shape=spec,
+    )
+    out_without_lse = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        shape=spec,
+    )
+    expected_out, expected_lse = reference_ragged_single_token_attention(
+        q, k_cache, v_cache, host_lengths, spec, scale
+    )
+
+    assert out.shape == q.shape
+    assert out.dtype == q.dtype
+    assert lse.shape == (spec.batch, spec.nheads_q, 1)
+    assert lse.dtype == torch.float32
+    assert lse.device == q.device
+    torch.testing.assert_close(out_without_lse, out)
+    torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+
+
+@requires_cuda
+def test_kvcache_ragged_tensor_lengths_validate_metadata_and_bounds() -> None:
+    spec = RAGGED_DECODE_SPEC
+    q, k_cache, v_cache = make_inputs(spec, seed=161803)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+
+    noncontiguous = torch.tensor(
+        [1, 99, 65, 99, spec.seqlen_k, 99],
+        device=q.device,
+        dtype=torch.int32,
+    )[::2]
+    assert not noncontiguous.is_contiguous()
+    invalid_lengths = [
+        (
+            torch.tensor([1, 65], device=q.device, dtype=torch.int32),
+            ValueError,
+            "shape",
+        ),
+        (
+            torch.tensor(
+                [1, 65, spec.seqlen_k], device=q.device, dtype=torch.int64
+            ),
+            ValueError,
+            "dtype torch.int32",
+        ),
+        (
+            torch.tensor([1, 65, spec.seqlen_k], dtype=torch.int32),
+            ValueError,
+            "CUDA tensor",
+        ),
+        (noncontiguous, ValueError, "contiguous"),
+        (
+            torch.tensor([-1, 65, spec.seqlen_k], device=q.device, dtype=torch.int32),
+            ValueError,
+            "inclusive range",
+        ),
+        (
+            torch.tensor(
+                [1, 65, spec.seqlen_k + 1], device=q.device, dtype=torch.int32
+            ),
+            ValueError,
+            "inclusive range",
+        ),
+    ]
+
+    for cache_seqlens, error, match in invalid_lengths:
+        with pytest.raises(error, match=match):
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                cache_seqlens=cache_seqlens,
+                causal=spec.causal,
+                shape=spec,
+            )
+        assert torch.equal(k_cache, original_k)
+        assert torch.equal(v_cache, original_v)
+
+    # Value errors remain recoverable host exceptions rather than device-side
+    # assertions that poison subsequent CUDA work.
+    torch.testing.assert_close(q + 1, q.add(1))
+    torch.cuda.synchronize(q.device)
+
+
+@requires_cuda
+def test_kvcache_ragged_tensor_lengths_reject_autograd() -> None:
+    spec = RAGGED_DECODE_SPEC
+    q, k_cache, v_cache = make_inputs(spec, seed=141421)
+    q.requires_grad_()
+    cache_seqlens = torch.tensor(
+        [1, 65, spec.seqlen_k], device=q.device, dtype=torch.int32
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+
+    with pytest.raises(NotImplementedError, match="do not support autograd"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
 
 
 @requires_cuda
@@ -1169,29 +1344,37 @@ def test_kvcache_full_length_supports_cuda_graph_capture(
     DECODE_SHAPES[:1],
     ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
 )
-def test_kvcache_tensor_lengths_are_rejected_without_poisoning_cuda(
+def test_kvcache_tensor_lengths_reject_cuda_graph_capture(
     entry: dict[str, object],
 ) -> None:
     spec = spec_from_manifest_entry(entry)
     q, k_cache, v_cache = make_inputs(spec)
-    invalid_lengths = torch.full(
+    cache_seqlens = torch.full(
         (spec.batch,),
         spec.seqlen_k - 1,
         dtype=torch.int32,
         device=q.device,
     )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
 
-    with pytest.raises(NotImplementedError, match="tensor-valued cache_seqlens"):
-        helion_attention.flash_attn_with_kvcache(
-            q,
-            k_cache,
-            v_cache,
-            cache_seqlens=invalid_lengths,
-            causal=spec.causal,
-            shape=spec,
-        )
+    graph = torch.cuda.CUDAGraph()
+    capture_marker = torch.empty_like(q)
+    with pytest.raises(NotImplementedError, match="during CUDA graph capture"):
+        with torch.cuda.graph(graph):
+            capture_marker.copy_(q)
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                cache_seqlens=cache_seqlens,
+                causal=spec.causal,
+                shape=spec,
+            )
 
-    # The rejection is a host-side exception, so later CUDA work remains valid.
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    # Capture was ended cleanly, so later CUDA work remains valid.
     torch.testing.assert_close(q + 1, q.add(1))
     torch.cuda.synchronize(q.device)
 
