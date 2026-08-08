@@ -6,10 +6,11 @@ time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
-exact generated specialization; compatible unregistered dense shapes use a
-generic Triton forward kernel. Grad-enabled dense calls without a generated
-backward use PyTorch SDPA autograd. The explicit shape validates these paths
-and makes specialization introspection independent of fallback coverage.
+exact generated specialization; compatible unregistered dense shapes and dense
+ALiBi calls use a generic Triton forward kernel. Grad-enabled dense calls
+without a generated backward use PyTorch SDPA autograd. The explicit shape
+validates these paths and makes specialization introspection independent of
+fallback coverage.
 """
 
 from __future__ import annotations
@@ -71,6 +72,8 @@ def _reject_unsupported(
     softcap: float,
     alibi_slopes: torch.Tensor | None,
     return_attn_probs: bool,
+    *,
+    allow_alibi: bool = False,
 ) -> None:
     if dropout_p != 0.0:
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
@@ -78,7 +81,7 @@ def _reject_unsupported(
         raise NotImplementedError("sliding-window attention is not implemented")
     if softcap != 0.0:
         raise NotImplementedError("softcap is not implemented")
-    if alibi_slopes is not None:
+    if alibi_slopes is not None and not allow_alibi:
         raise NotImplementedError("ALiBi slopes are not implemented")
     if return_attn_probs:
         raise NotImplementedError("return_attn_probs is not implemented")
@@ -160,12 +163,42 @@ def _validate_generic_dense_layout(spec: AttnShape) -> tuple[int, int]:
     return total_q, total_k
 
 
+def _validate_dense_alibi_slopes(
+    alibi_slopes: torch.Tensor,
+    q: torch.Tensor,
+    spec: AttnShape,
+) -> None:
+    """Validate FlashAttention's dense ALiBi metadata contract."""
+    if not isinstance(alibi_slopes, torch.Tensor):
+        raise TypeError("alibi_slopes must be a torch.Tensor or None")
+    if alibi_slopes.layout != torch.strided:
+        raise ValueError("alibi_slopes must use torch.strided layout")
+    if alibi_slopes.dtype != torch.float32:
+        raise ValueError("alibi_slopes must have dtype torch.float32")
+    expected_shapes = ((spec.nheads_q,), (spec.batch, spec.nheads_q))
+    if tuple(alibi_slopes.shape) not in expected_shapes:
+        raise ValueError(
+            "alibi_slopes must have shape [nheads_q] or [batch, nheads_q]; "
+            f"expected {expected_shapes[0]} or {expected_shapes[1]}, got "
+            f"{tuple(alibi_slopes.shape)}"
+        )
+    if not alibi_slopes.is_cuda:
+        raise ValueError(
+            f"alibi_slopes must be a CUDA tensor, got device {alibi_slopes.device}"
+        )
+    if alibi_slopes.device != q.device:
+        raise ValueError("alibi_slopes must be on the same CUDA device as q, k, and v")
+    if alibi_slopes.stride(-1) != 1:
+        raise ValueError("alibi_slopes must be contiguous in its last dimension")
+
+
 def _generic_dense_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
+    alibi_slopes: torch.Tensor | None,
 ) -> torch.Tensor:
     """Adapt a validated dense batch to the generic packed Triton runtime."""
     total_q, total_k = _validate_generic_dense_layout(spec)
@@ -203,7 +236,7 @@ def _generic_dense_forward(
         causal=spec.causal,
         window_size=(-1, -1),
         softcap=0.0,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -275,6 +308,8 @@ def flash_attn_func(
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
+        alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
+            ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -282,20 +317,36 @@ def flash_attn_func(
     Returns:
         ``[batch, seqlen_q, nheads_q, head_dim]``.
 
-    Unregistered fp16/bf16 shapes with ``head_dim <= 256`` use a generic packed
-    Triton forward kernel. Grad-enabled calls without a generated backward use
-    PyTorch SDPA autograd. :func:`is_shape_supported` remains ``False`` for
-    unregistered calls because it reports checked-in acceleration only.
+    Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
+    use a generic packed Triton forward kernel. Grad-enabled calls without
+    ALiBi or a generated backward use PyTorch SDPA autograd.
+    :func:`is_shape_supported` remains ``False`` for unregistered calls because
+    it reports checked-in acceleration only.
     """
-    _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
+    _reject_unsupported(
+        dropout_p,
+        window_size,
+        softcap,
+        alibi_slopes,
+        return_attn_probs,
+        allow_alibi=True,
+    )
     spec = normalize_shape(shape, q.dtype, causal)
     check_tensors(q, k, v, spec)
+    if alibi_slopes is not None:
+        _validate_dense_alibi_slopes(alibi_slopes, q, spec)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
     )
+    if alibi_slopes is not None and torch.is_grad_enabled() and (
+        needs_backward or alibi_slopes.requires_grad
+    ):
+        raise NotImplementedError(
+            "ALiBi backward is not implemented; ALiBi calls are forward-only"
+        )
     if needs_backward:
         if has_backward(spec):
             return attention_autograd(q, k, v, scale, spec)
@@ -309,9 +360,9 @@ def flash_attn_func(
         if not has_kernel(spec):
             _validate_generic_dense_layout(spec)
         return dense_attention_sdpa(q, k, v, scale, spec)
-    if has_kernel(spec):
+    if alibi_slopes is None and has_kernel(spec):
         return lookup(spec)(q, k, v, scale)
-    return _generic_dense_forward(q, k, v, scale, spec)
+    return _generic_dense_forward(q, k, v, scale, spec, alibi_slopes)
 
 
 def flash_attn_varlen_func(

@@ -46,10 +46,12 @@ Dense calls do not need a checked-in specialization. Contiguous CUDA fp16 and
 bf16 MHA/GQA inputs with `head_dim <= 256` use the generic Triton forward when
 their exact shape is absent, including unequal query/key lengths and
 bottom-right causal masking. Grad-enabled calls without a generated backward
-use PyTorch SDPA autograd instead. Dropout, local windows, softcap, ALiBi,
-attention probabilities, and `deterministic=True` on the SDPA backward path
-still fail explicitly as described below. Unregistered calls must also fit the
-generic kernel's signed 32-bit Q/output and K/V element offsets.
+use PyTorch SDPA autograd instead. Dense ALiBi forward calls accept fp32 slopes
+shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
+ALiBi backward is not implemented. Dropout, local windows, softcap, attention
+probabilities, and `deterministic=True` on the SDPA backward path still fail
+explicitly as described below. Unregistered calls must also fit the generic
+kernel's signed 32-bit Q/output and K/V element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -372,11 +374,11 @@ including fp16/bf16 and bottom-right causal masking. Packed varlen and KV-cache
 calls remain forward-only. These unsupported FlashAttention features also
 raise `NotImplementedError` rather than silently doing something else:
 
-- backward for varlen and KV-cache calls
+- backward for dense ALiBi, varlen, and KV-cache calls
 - `deterministic=True` when using the dense SDPA autograd fallback
 - dropout
 - sliding-window attention and softcap
-- ALiBi slopes
+- ALiBi slopes for varlen and KV-cache calls
 - KV-cache mutation beyond the paired one-token final-slot append above;
   partial/ragged caches, paged caches, and fused rotary embeddings
 - `return_attn_probs`

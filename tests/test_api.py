@@ -296,6 +296,79 @@ def test_unregistered_dense_fallback_matches_fp32_sdpa(spec: AttnShape) -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize("nheads_kv", [4, 2], ids=["mha", "gqa"])
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+def test_dense_alibi_matches_flash_attention_2(
+    causal: bool, nheads_kv: int, batched_slopes: bool
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = AttnShape(2, 11, 17, 4, nheads_kv, 32, torch.bfloat16, causal)
+    q, k, v = make_inputs(spec, seed=20260809)
+    head_slopes = torch.tensor([0.03, 0.07, 0.13, 0.29], device="cuda")
+    slopes = (
+        torch.stack((head_slopes, head_slopes.flip(0)))
+        if batched_slopes
+        else head_slopes
+    )
+
+    got = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        alibi_slopes=slopes,
+        shape=spec,
+    )
+    expected = flash_attn.flash_attn_func(
+        q, k, v, causal=causal, alibi_slopes=slopes
+    )
+
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    torch.testing.assert_close(got.float(), expected.float(), atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_dense_alibi_bypasses_registered_specialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = next(item for item in SHAPES if item["key"] == CHUNKED_PREFILL_KEY)
+    spec = spec_from_manifest_entry(entry)
+    q, k, v = make_inputs(spec, seed=112358)
+    slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    sentinel = torch.empty_like(q)
+    dispatched: list[tuple[AttnShape, torch.Tensor | None]] = []
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        dispatched.append((spec_arg, slopes_arg))
+        return sentinel
+
+    def reject_specialized(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("ALiBi call reached a generated specialization")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(helion_attention, "lookup", reject_specialized)
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=spec.causal, alibi_slopes=slopes, shape=spec
+    )
+
+    assert out is sentinel
+    assert dispatched == [(spec, slopes)]
+
+
+@requires_cuda
 def test_unregistered_dense_packed_entry_points_use_fallback() -> None:
     mha_spec = GENERIC_DENSE_SPECS[0]
     q, k, v = make_inputs(mha_spec, seed=314159)
@@ -318,6 +391,47 @@ def test_unregistered_dense_packed_entry_points_use_fallback() -> None:
         q, k, v, gqa_spec, 1.0 / math.sqrt(gqa_spec.head_dim)
     )
     torch.testing.assert_close(kv_out.float(), kv_expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_dense_packed_entry_points_inherit_alibi_support() -> None:
+    mha_spec = GENERIC_DENSE_SPECS[0]
+    q, k, v = make_inputs(mha_spec, seed=173205)
+    slopes = torch.linspace(0.02, 0.2, mha_spec.nheads_q, device=q.device)
+    qkv = torch.stack((q, k, v), dim=2)
+    expected = helion_attention.flash_attn_func(
+        q, k, v, alibi_slopes=slopes, shape=mha_spec
+    )
+    packed = helion_attention.flash_attn_qkvpacked_func(
+        qkv, alibi_slopes=slopes, shape=mha_spec
+    )
+    torch.testing.assert_close(packed, expected)
+
+    gqa_spec = GENERIC_DENSE_SPECS[1]
+    q, k, v = make_inputs(gqa_spec, seed=223607)
+    slopes = torch.linspace(
+        0.01,
+        0.2,
+        gqa_spec.batch * gqa_spec.nheads_q,
+        device=q.device,
+    ).view(gqa_spec.batch, gqa_spec.nheads_q)
+    kv = torch.stack((k, v), dim=2)
+    expected = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=gqa_spec.causal,
+        alibi_slopes=slopes,
+        shape=gqa_spec,
+    )
+    packed = helion_attention.flash_attn_kvpacked_func(
+        q,
+        kv,
+        causal=gqa_spec.causal,
+        alibi_slopes=slopes,
+        shape=gqa_spec,
+    )
+    torch.testing.assert_close(packed, expected)
 
 
 @requires_cuda
@@ -684,11 +798,80 @@ def test_rejects_unimplemented_features() -> None:
         {"dropout_p": 0.1},
         {"window_size": (128, 0)},
         {"softcap": 30.0},
-        {"alibi_slopes": torch.ones(2, device="cuda")},
         {"return_attn_probs": True},
     ):
         with pytest.raises(NotImplementedError):
             helion_attention.flash_attn_func(q, q, q, shape=(1, 7, 2, 32), **kwargs)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("not-tensor", "torch.Tensor"),
+        ("dtype", "dtype torch.float32"),
+        ("head-shape", "shape.*nheads_q"),
+        ("batch-shape", "shape.*nheads_q"),
+        ("rank", "shape.*nheads_q"),
+        ("cpu", "CUDA tensor"),
+        ("last-stride", "contiguous.*last dimension"),
+    ],
+)
+def test_dense_alibi_rejects_malformed_slopes_before_dispatch(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = GENERIC_DENSE_SPECS[0]
+    q, k, v = make_inputs(spec, seed=244949)
+    if case == "not-tensor":
+        slopes: object = [0.1] * spec.nheads_q
+    elif case == "dtype":
+        slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float16)
+    elif case == "head-shape":
+        slopes = torch.ones(spec.nheads_q - 1, device=q.device)
+    elif case == "batch-shape":
+        slopes = torch.ones(spec.batch + 1, spec.nheads_q, device=q.device)
+    elif case == "rank":
+        slopes = torch.ones(spec.batch, 1, spec.nheads_q, device=q.device)
+    elif case == "cpu":
+        slopes = torch.ones(spec.nheads_q)
+    else:
+        slopes = torch.ones(spec.nheads_q, 2, device=q.device)[:, 0]
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("malformed ALiBi slopes reached generic dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    with pytest.raises((TypeError, ValueError), match=message):
+        helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            alibi_slopes=slopes,  # type: ignore[arg-type]
+            shape=spec,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize("gradient_source", ["q", "slopes"])
+def test_dense_alibi_rejects_gradients_before_dispatch(
+    gradient_source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = GENERIC_DENSE_SPECS[0]
+    q, k, v = make_inputs(spec, seed=264575)
+    slopes = torch.ones(spec.nheads_q, device=q.device)
+    if gradient_source == "q":
+        q.requires_grad_()
+    else:
+        slopes.requires_grad_()
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("grad-enabled ALiBi call reached generic dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    with pytest.raises(NotImplementedError, match="ALiBi backward"):
+        helion_attention.flash_attn_func(
+            q, k, v, alibi_slopes=slopes, shape=spec
+        )
 
 
 def test_shape_argument_is_required() -> None:
