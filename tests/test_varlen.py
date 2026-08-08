@@ -550,6 +550,56 @@ def test_generic_varlen_layout_rejects_first_oversized_cuda_x_grid() -> None:
         helion_attention._validate_generic_varlen_layout(q, k, spec)
 
 
+def test_generic_varlen_layout_accepts_maximum_padded_query_index() -> None:
+    spec = AttnShape(1, 2**31, 1, 1, 1, 1, torch.bfloat16, False)
+    q = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+
+    assert helion_attention._validate_generic_varlen_layout(q, k, spec) is None
+
+
+def test_generic_varlen_layout_rejects_first_wrapped_query_tile() -> None:
+    spec = AttnShape(1, 2**31 + 1, 1, 1, 1, 1, torch.bfloat16, False)
+    q = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+
+    with pytest.raises(
+        helion_attention.UnsupportedShapeError,
+        match=r"signed int32 query indices.*padded maximum is 2147483663 .*limit 2147483647",
+    ):
+        helion_attention._validate_generic_varlen_layout(q, k, spec)
+
+
+@requires_cuda
+def test_unregistered_varlen_rejects_wrapped_query_tile_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = AttnShape(1, 2**31 + 1, 1, 1, 1, 1, torch.bfloat16, False)
+    q = torch.empty((1, 1, 1), device="cuda", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="cuda", dtype=spec.dtype)
+    v = torch.empty_like(k)
+    cumulative = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+
+    def reject_launch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("wrapped query tile reached the Triton launcher")
+
+    monkeypatch.setattr(helion_attention, "_generic_packed_forward", reject_launch)
+    with pytest.raises(
+        helion_attention.UnsupportedShapeError,
+        match=r"padded maximum is 2147483663 .*limit 2147483647",
+    ):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cumulative,
+            cumulative,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            shape=spec,
+        )
+
+
 @requires_cuda
 def test_unregistered_varlen_rejects_oversized_grid_before_launch(
     monkeypatch: pytest.MonkeyPatch,

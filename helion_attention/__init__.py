@@ -179,6 +179,19 @@ def _validate_generic_varlen_layout(
     query_blocks = (
         spec.seqlen_q + _PACKED_QUERY_BLOCK_SIZE - 1
     ) // _PACKED_QUERY_BLOCK_SIZE
+    max_padded_query_index = query_blocks * _PACKED_QUERY_BLOCK_SIZE - 1
+    if max_padded_query_index > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback uses signed int32 query indices, but "
+            f"the padded maximum is {max_padded_query_index} "
+            f"(limit {_INT32_MAX}) with query block size "
+            f"{_PACKED_QUERY_BLOCK_SIZE}. To request a specialization, file "
+            "an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
     grid_size = query_blocks * spec.batch * spec.nheads_q
     if grid_size > _INT32_MAX:
         raise UnsupportedShapeError(
