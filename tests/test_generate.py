@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -69,6 +71,83 @@ def test_provenance_is_structured_and_rendered_in_module_docstring() -> None:
     )
 
 
+def test_retained_incumbent_records_the_rejected_candidate() -> None:
+    incumbent = {"block_sizes": [256, 64], "num_warps": 8}
+    candidate = {"block_sizes": [256, 32], "num_warps": 8}
+    provenance = generate.make_provenance(
+        helion_version="1.4.0",
+        selection="incumbent",
+        configs=[("attention_bshd", incumbent)],
+        wall_time_seconds=779.924,
+        measured_time_ms=0.293216,
+        rejected_candidate=("attention_bshd", candidate, 0.34879),
+    )
+
+    assert provenance["rejected_candidate"] == {
+        "kernel": "attention_bshd",
+        "config": candidate,
+        "measured_time_ms": 0.34879,
+    }
+    rendered = generate.format_provenance(provenance)
+    assert "Config selection: incumbent" in rendered
+    assert "Rejected candidate time: 0.348790 ms" in rendered
+    assert generate.provenance_config(provenance, "attention_bshd") == incumbent
+
+
+def test_candidate_requires_a_material_speedup() -> None:
+    assert generate.candidate_is_faster(1.0, 0.97)
+    assert not generate.candidate_is_faster(1.0, 0.99)
+    assert not generate.candidate_is_faster(1.0, 1.01)
+
+
+def test_incumbent_config_is_prepended_to_existing_search_seeds() -> None:
+    existing = {"block_sizes": [64], "num_warps": 4}
+    incumbent = {"block_sizes": [128], "num_warps": 8}
+    kernel = SimpleNamespace(settings=SimpleNamespace(autotune_seed_configs=existing))
+
+    selected = generate.seed_incumbent_config(kernel, incumbent)
+
+    assert generate.config_dict(selected) == incumbent
+    assert [
+        generate.config_dict(config) for config in kernel.settings.autotune_seed_configs
+    ] == [incumbent, existing]
+
+
+def test_refresh_module_provenance_preserves_executable_body() -> None:
+    original = generate.make_provenance(
+        helion_version="1.4.0",
+        selection="autotuned",
+        configs=[("attention_bshd", {"block_sizes": [64]})],
+        wall_time_seconds=10.0,
+        measured_time_ms=0.2,
+    )
+    retained = generate.make_provenance(
+        helion_version="1.4.0",
+        selection="incumbent",
+        configs=[("attention_bshd", {"block_sizes": [128]})],
+        wall_time_seconds=20.0,
+        measured_time_ms=0.1,
+        rejected_candidate=("attention_bshd", {"block_sizes": [64]}, 0.2),
+    )
+    module = generate.build_module(
+        "from __future__ import annotations\n\nVALUE = 1\n",
+        command="python tools/generate.py --batch 1",
+        description="test shape",
+        spec_fields={"key": "test"},
+        provenance=original,
+    )
+    executable = module[module.index("from __future__ import annotations") :]
+
+    refreshed = generate.refresh_module_provenance(module, retained)
+
+    assert (
+        refreshed[refreshed.index("from __future__ import annotations") :] == executable
+    )
+    assert generate.format_provenance(retained) in ast.get_docstring(
+        ast.parse(refreshed)
+    )
+
+
 def test_checked_in_modules_publish_manifest_provenance() -> None:
     manifest = json.loads(generate.MANIFEST.read_text())
     for section in ("kernels", "varlen_kernels", "paged_kernels"):
@@ -88,7 +167,11 @@ def test_checked_in_modules_publish_manifest_provenance() -> None:
                 )
             for path, provenance in artifacts:
                 assert provenance["helion_version"]
-                assert provenance["selection"] in {"autotuned", "fixed"}
+                assert provenance["selection"] in {
+                    "autotuned",
+                    "fixed",
+                    "incumbent",
+                }
                 assert provenance["configs"]
                 assert provenance["autotuning_wall_time_seconds"] >= 0
                 assert provenance["measured_time_ms"] > 0
@@ -233,7 +316,7 @@ def test_failed_upgrade_restores_existing_kernel_and_manifest(
     }
     manifest.write_text(json.dumps(old_manifest, indent=1) + "\n")
     previous = {
-        path: path.read_bytes() for path in (target, backward_target, manifest)
+        path: path.read_bytes() for path in (target, backward_target)
     }
     monkeypatch.setattr(generate, "MANIFEST", manifest)
 
@@ -256,6 +339,62 @@ def test_failed_upgrade_restores_existing_kernel_and_manifest(
         )
 
     assert {path: path.read_bytes() for path in previous} == previous
+    assert json.loads(manifest.read_text()) == old_manifest
+
+
+def test_failed_parallel_verification_preserves_successful_manifest_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel_dir = tmp_path / "kernels"
+    kernel_dir.mkdir()
+    manifest = kernel_dir / "manifest.json"
+    old_a = {"key": "shape_a", "note": "old a"}
+    manifest.write_text(json.dumps({"kernels": [old_a]}) + "\n")
+    monkeypatch.setattr(generate, "MANIFEST", manifest)
+    a_target = kernel_dir / "shape_a.py"
+    a_backward = kernel_dir / "shape_a_backward.py"
+    b_target = kernel_dir / "shape_b.py"
+    b_backward = kernel_dir / "shape_b_backward.py"
+    a_target.write_text("old a\n")
+    a_verifying = threading.Event()
+    allow_a_failure = threading.Event()
+
+    def fail_a_after_b_succeeds() -> int:
+        a_verifying.set()
+        assert allow_a_failure.wait(timeout=5)
+        return 1
+
+    def install_a() -> None:
+        generate.install_generated_artifacts(
+            target=a_target,
+            module="candidate a\n",
+            backward_target=a_backward,
+            backward_module=None,
+            manifest_entry={"key": "shape_a", "note": "candidate a"},
+            verify=fail_a_after_b_succeeds,
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        failed_a = executor.submit(install_a)
+        assert a_verifying.wait(timeout=5)
+        generate.install_generated_artifacts(
+            target=b_target,
+            module="candidate b\n",
+            backward_target=b_backward,
+            backward_module=None,
+            manifest_entry={"key": "shape_b", "note": "candidate b"},
+            verify=lambda: 0,
+        )
+        allow_a_failure.set()
+        with pytest.raises(generate.GenerationVerificationError):
+            failed_a.result(timeout=5)
+
+    assert a_target.read_text() == "old a\n"
+    assert b_target.read_text() == "candidate b\n"
+    assert json.loads(manifest.read_text())["kernels"] == [
+        old_a,
+        {"key": "shape_b", "note": "candidate b"},
+    ]
 
 
 def test_forward_only_upgrade_removes_stale_backward_artifact(

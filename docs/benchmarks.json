@@ -18,9 +18,9 @@
       "note": "16k context, single sequence",
       "implementations": {
         "helion-attention": {
-          "us": 2921.3743726412454,
-          "tflops": 376.3909024935613,
-          "max_abs_error": 0.013725638389587402
+          "us": 3315.1868835824434,
+          "tflops": 331.67926130661385,
+          "max_abs_error": 0.008774995803833008
         },
         "flash-attn": {
           "us": 3404.7857310090744,
@@ -56,8 +56,8 @@
       "note": "Llama-3-8B single-token decode, 1k KV cache",
       "implementations": {
         "helion-attention": {
-          "us": 22.233361587842683,
-          "tflops": 0.7545964623349564,
+          "us": 28.079448288316158,
+          "tflops": 0.5974909416927892,
           "max_abs_error": 0.0005254894495010376
         },
         "flash-attn": {
@@ -94,8 +94,8 @@
       "note": "Llama-3-8B single-token decode, 16k KV cache",
       "implementations": {
         "helion-attention": {
-          "us": 93.00624821587573,
-          "tflops": 2.8862088424095718,
+          "us": 105.88107641437466,
+          "tflops": 2.535254316356351,
           "max_abs_error": 0.00014953315258026123
         },
         "flash-attn": {
@@ -132,8 +132,8 @@
       "note": "Llama-3-8B single-token decode, 4k KV cache",
       "implementations": {
         "helion-attention": {
-          "us": 41.416611740501914,
-          "tflops": 1.6203368933333882,
+          "us": 45.29321467586857,
+          "tflops": 1.4816538079765493,
           "max_abs_error": 0.0002873539924621582
         },
         "flash-attn": {
@@ -170,9 +170,9 @@
       "note": "Qwen2-7B GQA 7:1",
       "implementations": {
         "helion-attention": {
-          "us": 409.7805595098261,
-          "tflops": 73.40380220081848,
-          "max_abs_error": 0.01452183723449707
+          "us": 410.52817584069305,
+          "tflops": 73.27012591621101,
+          "max_abs_error": 0.008452892303466797
         },
         "flash-attn": {
           "us": 213.3039049108486,
@@ -208,9 +208,9 @@
       "note": "single-sequence 7B prefill",
       "implementations": {
         "helion-attention": {
-          "us": 385.56841440460227,
-          "tflops": 89.1580178762425,
-          "max_abs_error": 0.011789083480834961
+          "us": 429.602077956927,
+          "tflops": 80.0194350723012,
+          "max_abs_error": 0.007561683654785156
         },
         "flash-attn": {
           "us": 227.72363641045308,
@@ -246,9 +246,9 @@
       "note": "Llama-3-8B GQA 4:1",
       "implementations": {
         "helion-attention": {
-          "us": 389.4062315947131,
-          "tflops": 88.27931551896286,
-          "max_abs_error": 0.013182997703552246
+          "us": 393.5065202199881,
+          "tflops": 87.35945611468384,
+          "max_abs_error": 0.009014368057250977
         },
         "flash-attn": {
           "us": 224.392793454775,
@@ -284,9 +284,9 @@
       "note": "Qwen2-7B GQA 7:1",
       "implementations": {
         "helion-attention": {
-          "us": 1442.2852037444945,
-          "tflops": 83.40128852719582,
-          "max_abs_error": 0.011678218841552734
+          "us": 1422.2977039382215,
+          "tflops": 84.573323913082,
+          "max_abs_error": 0.007873058319091797
         },
         "flash-attn": {
           "us": 427.3049032556781,
@@ -322,9 +322,9 @@
       "note": "Llama-3-8B GQA 4:1",
       "implementations": {
         "helion-attention": {
-          "us": 1450.2609792302867,
-          "tflops": 94.79156501677535,
-          "max_abs_error": 0.014030933380126953
+          "us": 1494.3477587822156,
+          "tflops": 91.99499052083436,
+          "max_abs_error": 0.008115291595458984
         },
         "flash-attn": {
           "us": 470.6238076045794,
@@ -360,8 +360,8 @@
       "note": "vLLM chunked-prefill causal alignment",
       "implementations": {
         "helion-attention": {
-          "us": 23.842845626307913,
-          "tflops": 3.171959638766958,
+          "us": 27.526569832376513,
+          "tflops": 2.7474743297309194,
           "max_abs_error": 0.0017712116241455078
         },
         "flash-attn": {
@@ -393,9 +393,9 @@
       "note": "Qwen2-7B GQA 7:1",
       "implementations": {
         "helion-attention": {
-          "us": 5199.390965123331,
-          "tflops": 92.52911747454797,
-          "max_abs_error": 0.012372970581054688
+          "us": 5884.970633188884,
+          "tflops": 81.74978048230453,
+          "max_abs_error": 0.00818490982055664
         },
         "flash-attn": {
           "us": 1498.072693667074,
@@ -431,9 +431,9 @@
       "note": "Llama-3-8B GQA 4:1",
       "implementations": {
         "helion-attention": {
-          "us": 5493.051867331227,
-          "tflops": 100.09425289099423,
-          "max_abs_error": 0.012697696685791016
+          "us": 5582.817891064812,
+          "tflops": 98.48483928375677,
+          "max_abs_error": 0.00836324691772461
         },
         "flash-attn": {
           "us": 1665.3015151106079,
@@ -469,8 +469,8 @@
       "note": "vision/multimodal encoder",
       "implementations": {
         "helion-attention": {
-          "us": 275.5271823468333,
-          "tflops": 124.70543949724714,
+          "us": 273.1533514661808,
+          "tflops": 125.78918832066421,
           "max_abs_error": 0.0011501014232635498
         },
         "flash-attn": {
@@ -502,9 +502,9 @@
       "note": "GPT-2 medium style, causal",
       "implementations": {
         "helion-attention": {
-          "us": 107.05804495915177,
-          "tflops": 80.31459198867967,
-          "max_abs_error": 0.01050710678100586
+          "us": 127.7381381715223,
+          "tflops": 67.31210680755714,
+          "max_abs_error": 0.007910013198852539
         },
         "flash-attn": {
           "us": 197.743974661713,
@@ -540,9 +540,9 @@
       "note": "GPT-2 medium style prefill",
       "implementations": {
         "helion-attention": {
-          "us": 106.70220220163381,
-          "tflops": 161.00763460847244,
-          "max_abs_error": 0.003585129976272583
+          "us": 130.23840754306147,
+          "tflops": 131.91092787524852,
+          "max_abs_error": 0.0011026263236999512
         },
         "flash-attn": {
           "us": 198.75809052805073,
@@ -578,9 +578,9 @@
       "note": "fp16 coverage",
       "implementations": {
         "helion-attention": {
-          "us": 112.53253183612934,
-          "tflops": 152.6658016458516,
-          "max_abs_error": 0.00047531723976135254
+          "us": 98.37378848637088,
+          "tflops": 174.63868626326382,
+          "max_abs_error": 0.00013208389282226562
         },
         "flash-attn": {
           "us": 195.64029611187217,
@@ -616,9 +616,9 @@
       "note": "long-context causal",
       "implementations": {
         "helion-attention": {
-          "us": 5735.162326267788,
-          "tflops": 95.86876385934879,
-          "max_abs_error": 0.013725638389587402
+          "us": 5248.851371533943,
+          "tflops": 104.75109387433803,
+          "max_abs_error": 0.00937962532043457
         },
         "flash-attn": {
           "us": 1671.7583434335118,
@@ -654,9 +654,9 @@
       "note": "Qwen2-7B GQA 7:1",
       "implementations": {
         "helion-attention": {
-          "us": 395.83217216435304,
-          "tflops": 303.9616610396261,
-          "max_abs_error": 0.014467954635620117
+          "us": 410.50728940301474,
+          "tflops": 293.0954154772103,
+          "max_abs_error": 0.008772134780883789
         },
         "flash-attn": {
           "us": 405.1785490342549,
@@ -692,9 +692,9 @@
       "note": "Llama-3-8B GQA 4:1",
       "implementations": {
         "helion-attention": {
-          "us": 422.94113312153456,
-          "tflops": 325.1186786235021,
-          "max_abs_error": 0.016986846923828125
+          "us": 412.43585917879557,
+          "tflops": 333.3998712182531,
+          "max_abs_error": 0.008740425109863281
         },
         "flash-attn": {
           "us": 455.4030734422969,
@@ -730,9 +730,9 @@
       "note": "Qwen2-7B GQA 7:1",
       "implementations": {
         "helion-attention": {
-          "us": 1455.5737250441805,
-          "tflops": 330.5595377172639,
-          "max_abs_error": 0.013400554656982422
+          "us": 1434.3407407954887,
+          "tflops": 335.45291155653223,
+          "max_abs_error": 0.009270429611206055
         },
         "flash-attn": {
           "us": 1456.7925551140954,
@@ -768,9 +768,9 @@
       "note": "7B-class prefill, causal",
       "implementations": {
         "helion-attention": {
-          "us": 1807.1229010820389,
-          "tflops": 304.2903342582544,
-          "max_abs_error": 0.01401054859161377
+          "us": 1774.5779819702834,
+          "tflops": 309.87087476734416,
+          "max_abs_error": 0.008622884750366211
         },
         "flash-attn": {
           "us": 1692.0414111193488,
@@ -806,9 +806,9 @@
       "note": "7B-class prefill, bidirectional",
       "implementations": {
         "helion-attention": {
-          "us": 2567.4014739048334,
-          "tflops": 428.2585481668832,
-          "max_abs_error": 0.0035891830921173096
+          "us": 2453.6440107557505,
+          "tflops": 448.11375364812505,
+          "max_abs_error": 0.000578463077545166
         },
         "flash-attn": {
           "us": 3160.2696356226184,
@@ -844,9 +844,9 @@
       "note": "fp16 causal coverage",
       "implementations": {
         "helion-attention": {
-          "us": 1691.3909899561029,
-          "tflops": 325.1111273983264,
-          "max_abs_error": 0.0018554925918579102
+          "us": 1862.7822344456245,
+          "tflops": 295.19823704978086,
+          "max_abs_error": 0.0012814998626708984
         },
         "flash-attn": {
           "us": 1734.0293797579677,
@@ -882,9 +882,9 @@
       "note": "Llama-3-8B GQA 4:1",
       "implementations": {
         "helion-attention": {
-          "us": 1512.3535271674868,
-          "tflops": 363.5988687419525,
-          "max_abs_error": 0.013426065444946289
+          "us": 1536.7897366577724,
+          "tflops": 357.817350350027,
+          "max_abs_error": 0.009511709213256836
         },
         "flash-attn": {
           "us": 1679.7829876426888,
@@ -920,9 +920,9 @@
       "note": "Qwen2-7B GQA 7:1",
       "implementations": {
         "helion-attention": {
-          "us": 5631.082352469949,
-          "tflops": 341.7425122166635,
-          "max_abs_error": 0.013122916221618652
+          "us": 5479.375123977661,
+          "tflops": 351.20432277230697,
+          "max_abs_error": 0.010365724563598633
         },
         "flash-attn": {
           "us": 5746.57827104841,
@@ -958,9 +958,9 @@
       "note": "Llama-3-8B GQA 4:1",
       "implementations": {
         "helion-attention": {
-          "us": 5851.494391759236,
-          "tflops": 375.8512858023587,
-          "max_abs_error": 0.01282191276550293
+          "us": 6195.898277418954,
+          "tflops": 354.95929605935464,
+          "max_abs_error": 0.009353160858154297
         },
         "flash-attn": {
           "us": 6539.972257614136,
@@ -996,8 +996,8 @@
       "note": "small decoder, long batch",
       "implementations": {
         "helion-attention": {
-          "us": 294.00215961259124,
-          "tflops": 233.8521297210754,
+          "us": 296.61426550463625,
+          "tflops": 231.7927327299278,
           "max_abs_error": 0.013665199279785156
         },
         "flash-attn": {
@@ -1034,8 +1034,8 @@
       "note": "short-sequence encoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 52.32128002991279,
-          "tflops": 164.17669038465834,
+          "us": 41.86303108375265,
+          "tflops": 205.19141518478858,
           "max_abs_error": 0.0022808313369750977
         },
         "flash-attn": {
@@ -1072,8 +1072,8 @@
       "note": "short-sequence encoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 3526.953053924273,
-          "tflops": 6.088778657290596,
+          "us": 3741.1487913131714,
+          "tflops": 5.7401717167368185,
           "max_abs_error": 0.00380098819732666
         },
         "flash-attn": {
@@ -1100,8 +1100,8 @@
       "note": "small-model decoder",
       "implementations": {
         "helion-attention": {
-          "us": 29.34792269585878,
-          "tflops": 36.65809628671978,
+          "us": 30.621157716645946,
+          "tflops": 35.13384392436488,
           "max_abs_error": 0.00780177116394043
         },
         "flash-attn": {
@@ -1138,8 +1138,8 @@
       "note": "ragged decoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 77.878283678808,
-          "tflops": 12.959381644341953,
+          "us": 81.95411182400505,
+          "tflops": 12.314872036772911,
           "max_abs_error": 0.007879257202148438
         },
         "flash-attn": {
@@ -1166,8 +1166,8 @@
       "note": "ragged encoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 77.59191340595376,
-          "tflops": 25.946852341000767,
+          "us": 81.07503332860385,
+          "tflops": 24.832131882574327,
           "max_abs_error": 0.003950834274291992
         },
         "flash-attn": {
@@ -1194,8 +1194,8 @@
       "note": "vLLM paged chunked prefill",
       "implementations": {
         "helion-attention": {
-          "us": 97.97335610683285,
-          "tflops": 1.6693648814240578,
+          "us": 103.11059869346757,
+          "tflops": 1.5861927102782085,
           "max_abs_error": 0.007934808731079102
         },
         "flash-attn": {
@@ -1222,8 +1222,8 @@
       "note": "vLLM paged ragged decode",
       "implementations": {
         "helion-attention": {
-          "us": 114.35909438351135,
-          "tflops": 0.0916915270842847,
+          "us": 121.13682795697027,
+          "tflops": 0.08656128922019246,
           "max_abs_error": 0.0008890926837921143
         },
         "flash-attn": {
