@@ -7,6 +7,39 @@
   "python": "3.10.20",
   "results": [
     {
+      "key": "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal",
+      "description": "batch=16 seqlen_q=512 seqlen_k=512 nheads=12 head_dim=64 dtype=bf16 causal=False",
+      "kind": "forward",
+      "varlen": false,
+      "paged": false,
+      "backward": false,
+      "flash_attn_api": "flash_attn_func",
+      "flash_attn_3_api": "flash_attn_func",
+      "note": "BERT-base encoder",
+      "implementations": {
+        "helion-attention": {
+          "us": 75.20897932729478,
+          "tflops": 171.3213236404582,
+          "max_abs_error": 0.0019829273223876953
+        },
+        "flash-attn": {
+          "us": 202.0081144732398,
+          "tflops": 63.784080761304644,
+          "max_abs_error": 0.001970827579498291
+        },
+        "sdpa-flash": {
+          "us": 199.45310884825537,
+          "tflops": 64.60115844974308,
+          "max_abs_error": 0.001970827579498291
+        },
+        "sdpa-cudnn": {
+          "us": 195.9939252902574,
+          "tflops": 65.74133289548689,
+          "max_abs_error": 0.001935422420501709
+        }
+      }
+    },
+    {
       "key": "b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal",
       "description": "batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True",
       "kind": "forward",

@@ -174,6 +174,7 @@ a specialization is an autotuning run, not a runtime code change.
 <!-- SHAPES:START -->
 | batch | seqlen q | seqlen k | heads q | heads kv | head dim | dtype | causal | note |
 | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- |
+| 16 | 512 | 512 | 12 | 12 | 64 | bf16 | no | BERT-base encoder |
 | 1 | 16384 | 16384 | 16 | 16 | 128 | bf16 | yes | 16k context, single sequence |
 | 1 | 1 | 1024 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B single-token decode, 1k KV cache |
 | 1 | 1 | 16384 | 32 | 8 | 128 | bf16 | yes | Llama-3-8B single-token decode, 16k KV cache |
@@ -204,7 +205,7 @@ a specialization is an autotuning run, not a runtime code change.
 | 8 | 512 | 512 | 16 | 16 | 64 | bf16 | no | short-sequence encoder batch |
 | 8 | 512 | 512 | 8 | 8 | 32 | bf16 | yes | small-model decoder |
 
-29 kernels.
+30 kernels.
 <!-- SHAPES:END -->
 
 Packed varlen kernels specialize the batch size and maximum lengths while
@@ -244,6 +245,7 @@ The generated module linked in each row contains the exact regeneration command.
 <!-- AUTOTUNING:START -->
 | kernel | Helion | selection | tuning wall time | measured time | chosen config | rejected search |
 | --- | --- | --- | ---: | ---: | --- | --- |
+| [`b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal`](helion_attention/kernels/b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal.py) | 1.4.0 | autotuned | 6.0 min | 0.062592 ms | `helion.Config(atomic_indexing=[], block_sizes=[256, 64], indexing=['pointer', 'pointer', 'pointer', 'pointer'], l2_groupings=[16], load_eviction_policies=['first', '', 'first'], loop_orders=[[1, 0]], num_sm_multiplier=1, num_stages=2, num_warps=16, pid_type='persistent_blocked', range_flattens=[None, True, True], range_multi_buffers=[None, None, True], range_num_stages=[0, 4, 3], range_unroll_factors=[0, 4, 1], range_warp_specializes=[])` | — |
 | [`b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal`](helion_attention/kernels/b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal.py) | unknown | incumbent (origin: fixed) | 0 s | 2.615888 ms | `helion.Config(block_sizes=[128, 128], indexing=['pointer', 'tensor_descriptor', 'block_ptr', 'pointer', 'pointer'], num_sm_multiplier=1, num_stages=3, num_warps=8, pid_type='persistent_interleaved')` | Helion 1.4.0, 0 s; candidate 3.060256 ms, incumbent 2.615888 ms<br>`helion.Config(block_sizes=[128, 128], indexing=['pointer', 'tensor_descriptor', 'block_ptr', 'pointer', 'pointer'], num_sm_multiplier=1, num_stages=3, num_warps=8, pid_type='persistent_interleaved')` |
 | [`b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal`](helion_attention/kernels/b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal.py) | 1.4.0 | autotuned | 5.3 min | 0.014496 ms | `helion.Config(atomic_indexing=[], block_sizes=[8, 128], indexing=['pointer', 'pointer', 'pointer', 'pointer'], l2_groupings=[16], load_eviction_policies=['last', 'last', 'last'], loop_orders=[[0, 1]], num_stages=1, num_warps=4, pid_type='flat', range_flattens=[None, None, False], range_multi_buffers=[None, None, True], range_num_stages=[0, 0, 3], range_unroll_factors=[0, 0, 1], range_warp_specializes=[], static_ranges=[True])` | — |
 | [`b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal`](helion_attention/kernels/b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal.py) | 1.4.0 | fixed | 0 s | 0.116448 ms | decode_attention_bshd_split_kv_partials: `helion.Config(block_sizes=[128], loop_orders=[[1, 2, 0]], num_stages=3, num_warps=4, pid_type='flat')`<br>decode_attention_bshd_split_kv_combine: `helion.Config(num_stages=3, num_warps=1, pid_type='flat')` | — |
@@ -289,6 +291,7 @@ Paged rows use identical logical caches with each implementation's native page s
 
 | shape | helion-attention µs | flash-attn-3 µs | flash-attn µs | sdpa-flash µs | sdpa-cudnn µs | helion TFLOP/s | comparison vs flash-attn-3 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| batch=16 seqlen_q=512 seqlen_k=512 nheads=12 head_dim=64 dtype=bf16 causal=False | 75 | n/a | 202 | 199 | 196 | 171 | n/a |
 | batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True | 2838 | 1715 | 3405 | 3485 | 1942 | 387 | **1.65x slower** |
 | batch=1 seqlen_q=1 seqlen_k=1024 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 28 | 216 | 79 | 249 | 193 | 1 | **7.71x faster** |
 | batch=1 seqlen_q=1 seqlen_k=16384 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 106 | 214 | 81 | 254 | 195 | 3 | **2.02x faster** |
@@ -328,7 +331,7 @@ Against FlashAttention 3, Helion is faster on 15 kernel workloads and slower on 
 
 Geomean speedup over FlashAttention 3 across all 34 comparable kernel workloads: **1.15x**.
 
-Helion is the fastest measured implementation on 11 of 34 workloads; FA2, FA3, or a PyTorch SDPA backend is faster on the remainder.
+Helion is the fastest measured implementation on 12 of 35 workloads; FA2, FA3, or a PyTorch SDPA backend is faster on the remainder.
 <!-- BENCHMARKS:END -->
 
 Reproduce with:

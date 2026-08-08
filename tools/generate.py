@@ -1562,7 +1562,7 @@ def main() -> int:
                 spec_fields=spec_fields,
                 provenance=backward_provenance,
             )
-    manifest_entry = {
+    generated_manifest_entry = {
         "key": kernel_key,
         "batch": spec.batch,
         "seqlen_q": spec.seqlen_q,
@@ -1579,9 +1579,13 @@ def main() -> int:
         "autotuning_provenance": forward_provenance,
     }
     if backward_provenance is not None:
-        manifest_entry["backward_autotuning_provenance"] = backward_provenance
+        generated_manifest_entry["backward_autotuning_provenance"] = (
+            backward_provenance
+        )
     if args.paged:
-        manifest_entry.update({"paged": True, "page_size": args.page_size})
+        generated_manifest_entry.update(
+            {"paged": True, "page_size": args.page_size}
+        )
 
     def verify_generated_kernel() -> int:
         return subprocess.run(
@@ -1595,7 +1599,7 @@ def main() -> int:
             module=module,
             backward_target=backward_target,
             backward_module=backward_module,
-            manifest_entry=manifest_entry,
+            manifest_entry=generated_manifest_entry,
             verify=verify_generated_kernel,
             manifest_section=manifest_section,
         )
