@@ -45,6 +45,12 @@ QWEN_PREFILL = AttnShape(
     causal=True,
 )
 CHUNKED_PREFILL_KEY = "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal"
+GENERIC_DENSE_SPECS = [
+    AttnShape(2, 23, 23, 4, 4, 32, torch.bfloat16, False),
+    AttnShape(2, 19, 31, 8, 2, 64, torch.bfloat16, True),
+    AttnShape(1, 29, 17, 4, 4, 128, torch.float16, True),
+    AttnShape(1, 13, 21, 8, 2, 256, torch.float16, True),
+]
 
 
 def make_inputs(
@@ -212,6 +218,77 @@ def test_custom_softmax_scale(entry: dict[str, object]) -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "spec", GENERIC_DENSE_SPECS, ids=[spec.key for spec in GENERIC_DENSE_SPECS]
+)
+def test_unregistered_dense_fallback_matches_fp32_sdpa(spec: AttnShape) -> None:
+    assert not helion_attention.is_shape_supported(
+        spec, dtype=spec.dtype, causal=spec.causal
+    )
+    assert spec.key not in {str(entry["key"]) for entry in available_shapes()}
+
+    q, k, v = make_inputs(spec, seed=20260808)
+    got = helion_attention.flash_attn_func(
+        q, k, v, causal=spec.causal, shape=spec
+    )
+    expected = reference_attention(q, k, v, spec, 1.0 / math.sqrt(spec.head_dim))
+
+    assert got.shape == q.shape
+    assert got.dtype == spec.dtype
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_unregistered_dense_packed_entry_points_use_fallback() -> None:
+    mha_spec = GENERIC_DENSE_SPECS[0]
+    q, k, v = make_inputs(mha_spec, seed=314159)
+    qkv = torch.stack((q, k, v), dim=2)
+    qkv_out = helion_attention.flash_attn_qkvpacked_func(qkv, shape=mha_spec)
+    qkv_expected = reference_attention(
+        q, k, v, mha_spec, 1.0 / math.sqrt(mha_spec.head_dim)
+    )
+    torch.testing.assert_close(
+        qkv_out.float(), qkv_expected, atol=5e-2, rtol=2e-2
+    )
+
+    gqa_spec = GENERIC_DENSE_SPECS[1]
+    q, k, v = make_inputs(gqa_spec, seed=271828)
+    kv = torch.stack((k, v), dim=2)
+    kv_out = helion_attention.flash_attn_kvpacked_func(
+        q, kv, causal=gqa_spec.causal, shape=gqa_spec
+    )
+    kv_expected = reference_attention(
+        q, k, v, gqa_spec, 1.0 / math.sqrt(gqa_spec.head_dim)
+    )
+    torch.testing.assert_close(kv_out.float(), kv_expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_registered_dense_shape_does_not_use_generic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = next(item for item in SHAPES if item["key"] == CHUNKED_PREFILL_KEY)
+    spec = spec_from_manifest_entry(entry)
+    q, k, v = make_inputs(spec, seed=161803)
+
+    def reject_fallback(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("registered shape reached generic dense fallback")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_fallback)
+    out = helion_attention.flash_attn_func(q, k, v, causal=True, shape=spec)
+    assert out.shape == q.shape
+
+
+@requires_cuda
+def test_unregistered_dense_fallback_rejects_gradients() -> None:
+    spec = GENERIC_DENSE_SPECS[0]
+    q, k, v = make_inputs(spec)
+    q.requires_grad_()
+    with pytest.raises(NotImplementedError, match="backward kernel"):
+        helion_attention.flash_attn_func(q, k, v, shape=spec)
+
+
+@requires_cuda
 def test_unequal_causal_mask_includes_bottom_right_boundary() -> None:
     entry = next(item for item in SHAPES if item["key"] == CHUNKED_PREFILL_KEY)
     spec = spec_from_manifest_entry(entry)
@@ -318,13 +395,10 @@ def test_split_decode_launches_on_tensor_device_when_it_is_not_current() -> None
 
 
 @requires_cuda
-def test_unsupported_shape_names_the_shape_and_the_issue_tracker() -> None:
-    q = torch.randn(3, 77, 5, 64, device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(UnsupportedShapeError) as caught:
-        helion_attention.flash_attn_func(q, q, q, shape=(3, 77, 5, 64))
-    message = str(caught.value)
-    assert "seqlen_q=77" in message
-    assert "issues" in message
+def test_unregistered_dense_fallback_rejects_head_dim_above_256() -> None:
+    q = torch.randn(1, 2, 1, 257, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(UnsupportedShapeError, match="head_dim <= 256"):
+        helion_attention.flash_attn_func(q, q, q, shape=(1, 2, 1, 257))
 
 
 @requires_cuda
@@ -336,15 +410,16 @@ def test_shape_must_match_tensors() -> None:
 
 @requires_cuda
 def test_rejects_unimplemented_features() -> None:
-    q = torch.randn(2, 1024, 32, 64, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, 7, 2, 32, device="cuda", dtype=torch.bfloat16)
     for kwargs in (
         {"dropout_p": 0.1},
         {"window_size": (128, 0)},
         {"softcap": 30.0},
+        {"alibi_slopes": torch.ones(2, device="cuda")},
         {"return_attn_probs": True},
     ):
         with pytest.raises(NotImplementedError):
-            helion_attention.flash_attn_func(q, q, q, shape=(2, 1024, 32, 64), **kwargs)
+            helion_attention.flash_attn_func(q, q, q, shape=(1, 7, 2, 32), **kwargs)
 
 
 def test_shape_argument_is_required() -> None:

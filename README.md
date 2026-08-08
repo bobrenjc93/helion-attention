@@ -10,10 +10,10 @@ nothing else, and `import helion_attention` never imports Helion.
 The one API difference from FlashAttention is that **`shape` is a required
 argument**. Helion only beats FlashAttention when a kernel is specialized to one
 exact problem size — block sizes, warp counts, pipelining stages, indexing mode
-and the tensor strides are all baked into the generated Triton — so this library
-ships one autotuned kernel per shape rather than one kernel for everything.
-Declaring the shape at the call site makes that contract explicit and turns a
-missing kernel into a clear error instead of a silent slow path.
+and the tensor strides are all baked into the generated Triton. Shapes in the
+checked-in catalogue use those autotuned kernels. Other compatible dense calls
+use a generic packed Triton kernel for correctness and API coverage. Declaring
+the shape at the call site validates both paths and keeps acceleration explicit.
 
 ## Install
 
@@ -41,6 +41,13 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `[batch, seqlen, nheads, head_dim]`, `softmax_scale` defaults to
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
+
+Dense forward calls do not need a checked-in specialization. Contiguous CUDA
+fp16 and bf16 MHA/GQA inputs with `head_dim <= 256` use the generic fallback
+when their exact shape is absent, including unequal query/key lengths and
+bottom-right causal masking. Dropout, local windows, softcap, ALiBi, attention
+probabilities, and gradients through this fallback still fail explicitly as
+described below.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -140,7 +147,7 @@ an append, `q`, `k_cache`, and `v_cache` must occupy disjoint memory; update
 The declared shape is checked against the tensors, so a mismatch is a `ValueError`
 rather than a wrong answer.
 
-Ask before you call:
+Ask whether a call has a checked-in accelerated specialization:
 
 ```python
 helion_attention.is_shape_supported((2, 1024, 32, 64), torch.bfloat16, causal=True)
@@ -153,12 +160,15 @@ helion_attention.is_paged_shape_supported(
 helion_attention.available_paged_shapes()
 ```
 
-A shape with no kernel raises `UnsupportedShapeError`, which names the closest
-shapes that do exist. **If you need a shape that is not listed below, please
+These introspection functions intentionally describe only checked-in generated
+kernels; they do not report generic fallback coverage. An unlisted compatible
+dense shape remains callable but is not specialization-accelerated. Dense shapes
+outside the fallback envelope and unlisted varlen/paged shapes raise
+`UnsupportedShapeError`. **To accelerate an unlisted shape, please
 [file an issue](https://github.com/bobrenjc93/helion-attention/issues)** — adding
-one is an autotuning run, not a code change.
+a specialization is an autotuning run, not a runtime code change.
 
-## Supported shapes
+## Checked-in accelerated shapes
 
 <!-- SHAPES:START -->
 | batch | seqlen q | seqlen k | heads q | heads kv | head dim | dtype | causal | note |
@@ -351,10 +361,11 @@ same page-16 logical cache as Helion.
 ## What is not implemented
 
 Backward/training is implemented for the non-causal bf16
-`(batch=8, seqlen=512, nheads=16, head_dim=64)` shape. Other shapes remain
-forward-only, including packed varlen kernels, and reject grad-enabled calls at
-the call site. These unsupported FlashAttention features also raise
-`NotImplementedError` rather than silently doing something else:
+`(batch=8, seqlen=512, nheads=16, head_dim=64)` shape. The generic dense
+fallback, other dense specializations, and packed varlen kernels are
+forward-only and reject grad-enabled calls at the call site. These unsupported
+FlashAttention features also raise `NotImplementedError` rather than silently
+doing something else:
 
 - backward for varlen, causal, cross-attention, GQA, fp16, and other shapes
 - dropout
@@ -400,6 +411,7 @@ helion_attention/          runtime package: torch + triton only
   __init__.py              flash_attn_func, flash_attn_varlen_func, and friends
   _shape.py                shape specification and validation
   _registry.py             shape -> generated kernel lookup
+  _paged_attention.py      generic packed/paged Triton runtime and dense fallback
   _launcher.py             vendored Triton launcher
   _runtime.py              vendored allocator / SM-count helpers
   kernels/                 one generated Triton module per shape

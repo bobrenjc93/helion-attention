@@ -2,8 +2,8 @@
 
 Helion only beats FlashAttention when the kernel is specialized to one exact
 problem size, so ``shape`` is a required argument of the public API instead of
-something inferred from the tensors. Passing it explicitly also means a missing
-kernel is reported before any tensor is touched.
+something inferred from the tensors. The same declaration validates calls that
+use the generic dense fallback when no specialization is checked in.
 """
 
 from __future__ import annotations
@@ -118,6 +118,7 @@ def check_tensors(
     """Fail loudly when the tensors disagree with the declared shape."""
     expected_q = (spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim)
     expected_kv = (spec.batch, spec.seqlen_k, spec.nheads_kv, spec.head_dim)
+    device = q.device
     for name, tensor, expected in (("q", q, expected_q), ("k", k, expected_kv), ("v", v, expected_kv)):
         if tuple(tensor.shape) != expected:
             raise ValueError(
@@ -127,6 +128,8 @@ def check_tensors(
             raise ValueError(f"{name} has dtype {tensor.dtype} but shape declares {spec.dtype}")
         if not tensor.is_cuda:
             raise ValueError(f"{name} must be a CUDA tensor, got device {tensor.device}")
+        if tensor.device != device:
+            raise ValueError("q, k, and v must be on the same CUDA device")
         if not tensor.is_contiguous():
             raise ValueError(
                 f"{name} must be contiguous in [batch, seqlen, nheads, head_dim] layout; "
