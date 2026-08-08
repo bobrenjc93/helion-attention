@@ -628,6 +628,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:bddeee65e26014dc8ed5763bdf764dbdc88a9eda",
+      "commit": "bddeee65e26014dc8ed5763bdf764dbdc88a9eda",
+      "recordedAt": "2026-08-08T11:03:17.109Z",
+      "label": "base bddeee6",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 67,
+        "eval_1afd133e": 54,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:27",
+      "recordedAt": "2026-08-08T11:03:17.109Z",
+      "label": "PR #27",
+      "kind": "leaf",
+      "prNumber": 27,
+      "title": "Add one BERT-base encoder kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 71,
+        "eval_1afd133e": 54,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
