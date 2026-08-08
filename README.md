@@ -93,6 +93,13 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
+The causal bf16 profile above also supports forward-only ALiBi. Pass fp32 CUDA
+slopes shaped `[16]` or `[8, 16]` through `alibi_slopes`; both the unpacked API
+and the varlen QKV/KV-packed adapters accept them, with either the default or a
+custom `softmax_scale`. ALiBi calls use the generic packed Triton runtime, while
+`alibi_slopes=None` retains the checked-in generated specialization. Other
+varlen profiles and paged calls still reject ALiBi explicitly.
+
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
 profiles when `block_table` is supplied. Both use bf16 page-size-16 caches in
 `[num_blocks, 16, heads_kv, head_dim]` layout, support ragged request lengths
@@ -441,7 +448,8 @@ raise `NotImplementedError` rather than silently doing something else:
 - `deterministic=True` when using the dense SDPA autograd fallback
 - dropout
 - sliding-window attention and softcap
-- ALiBi slopes for varlen and KV-cache calls
+- ALiBi slopes for varlen profiles other than the causal bf16
+  `(8, 512, 512, 16, 16, 64)` profile above, and for KV-cache calls
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense partial/ragged caches, paged profiles other than the exact read-only
   page-size-16 profile above, paged LSE, and KV-cache rotary outside the

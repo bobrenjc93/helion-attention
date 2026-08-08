@@ -6,11 +6,11 @@ time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
-exact generated specialization; compatible unregistered dense shapes and dense
-ALiBi calls use a generic Triton forward kernel. Grad-enabled dense calls
-without a generated backward use PyTorch SDPA autograd. The explicit shape
-validates these paths and makes specialization introspection independent of
-fallback coverage.
+exact generated specialization; compatible unregistered dense shapes, dense
+ALiBi calls, and ALiBi on one shipped causal varlen profile use a generic
+Triton forward kernel. Grad-enabled dense calls without a generated backward
+use PyTorch SDPA autograd. The explicit shape validates these paths and makes
+specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -76,6 +76,7 @@ _CORE_PAGED_VARLEN_SHAPES = frozenset(
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
+_VARLEN_ALIBI_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
         (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
@@ -300,12 +301,12 @@ def _validate_generic_dense_layout(spec: AttnShape) -> tuple[int, int]:
     return total_q, total_k
 
 
-def _validate_dense_alibi_slopes(
+def _validate_alibi_slopes(
     alibi_slopes: torch.Tensor,
     q: torch.Tensor,
     spec: AttnShape,
 ) -> None:
-    """Validate FlashAttention's dense ALiBi metadata contract."""
+    """Validate FlashAttention's dense and varlen ALiBi metadata contract."""
     if not isinstance(alibi_slopes, torch.Tensor):
         raise TypeError("alibi_slopes must be a torch.Tensor or None")
     if alibi_slopes.layout != torch.strided:
@@ -327,6 +328,15 @@ def _validate_dense_alibi_slopes(
         raise ValueError("alibi_slopes must be on the same CUDA device as q, k, and v")
     if alibi_slopes.stride(-1) != 1:
         raise ValueError("alibi_slopes must be contiguous in its last dimension")
+
+
+def _check_varlen_alibi_spec(spec: AttnShape) -> None:
+    """Restrict generic varlen ALiBi dispatch to its validated profile."""
+    if f"varlen_{spec.key}" != _VARLEN_ALIBI_KEY:
+        raise NotImplementedError(
+            "varlen ALiBi slopes are implemented only for "
+            f"{_VARLEN_ALIBI_KEY}; got varlen_{spec.key}"
+        )
 
 
 def _generic_dense_forward(
@@ -392,6 +402,54 @@ def _generic_dense_forward(
     return packed_out.view(
         spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
     )
+
+
+def _generic_varlen_alibi_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+    alibi_slopes: torch.Tensor,
+) -> torch.Tensor:
+    """Run validated packed ALiBi inputs through the generic Triton runtime."""
+    # Keep the Triton dependency lazy for callers that only inspect the
+    # specialization manifest.
+    from ._paged_attention import packed_attention
+
+    packed_out = packed_attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=alibi_slopes,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
+    return packed_out
 
 
 def is_shape_supported(
@@ -481,7 +539,7 @@ def flash_attn_func(
     spec = normalize_shape(shape, q.dtype, causal)
     check_tensors(q, k, v, spec)
     if alibi_slopes is not None:
-        _validate_dense_alibi_slopes(alibi_slopes, q, spec)
+        _validate_alibi_slopes(alibi_slopes, q, spec)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
@@ -572,10 +630,19 @@ def flash_attn_varlen_func(
 
     The packed token totals and individual sequence lengths may change between
     calls to the same specialization.  The batch size, maxima, head geometry,
-    dtype, and causal mode must continue to match ``shape``.
+    dtype, and causal mode must continue to match ``shape``. Forward-only
+    ALiBi is supported for the causal ``(8, 512, 512, 16, 16, 64)`` bf16
+    profile, with fp32 slopes shaped ``[16]`` or ``[8, 16]``.
     """
     del deterministic  # This option affects backward only.
-    _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
+    _reject_unsupported(
+        dropout_p,
+        window_size,
+        softcap,
+        alibi_slopes,
+        return_attn_probs,
+        allow_alibi=block_table is None,
+    )
     if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
 
@@ -586,6 +653,9 @@ def flash_attn_varlen_func(
             f"declared by shape ({spec.seqlen_q}, {spec.seqlen_k}); got "
             f"({max_seqlen_q}, {max_seqlen_k})"
         )
+
+    if alibi_slopes is not None:
+        _check_varlen_alibi_spec(spec)
 
     if block_table is not None:
         page_size = check_paged_varlen_tensors(
@@ -622,16 +692,36 @@ def flash_attn_varlen_func(
         )
 
     check_varlen_tensors(q, k, v, cu_seqlens_q, cu_seqlens_k, spec)
-    kernel = lookup_varlen(spec)
-    if torch.is_grad_enabled() and any(
-        tensor.requires_grad for tensor in (q, k, v)
-    ):
+    if alibi_slopes is not None:
+        _validate_alibi_slopes(alibi_slopes, q, spec)
+    else:
+        # Keep slope-free calls on the generated specialization.
+        kernel = lookup_varlen(spec)
+    grad_tensors = (q, k, v, alibi_slopes) if alibi_slopes is not None else (q, k, v)
+    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in grad_tensors):
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "ALiBi backward is not implemented; varlen ALiBi calls are "
+                "forward-only"
+            )
         raise NotImplementedError(
             "flash_attn_varlen_func is currently forward-only; no packed-sequence "
             "backward kernel is checked in"
         )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
+    scale = float(softmax_scale)
+    if alibi_slopes is not None:
+        return _generic_varlen_alibi_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            scale,
+            spec,
+            alibi_slopes,
+        )
     return kernel(
         q,
         k,
@@ -640,7 +730,7 @@ def flash_attn_varlen_func(
         cu_seqlens_k,
         max_seqlen_q,
         max_seqlen_k,
-        float(softmax_scale),
+        scale,
         causal,
     )
 
