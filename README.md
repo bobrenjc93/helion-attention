@@ -102,10 +102,32 @@ out = helion_attention.flash_attn_with_kvcache(
 Pass `return_softmax_lse=True` to receive `(out, softmax_lse)`. The LSE is fp32
 with shape `[batch, heads_q, 1]`, matching FlashAttention's KV-cache API.
 
-This decode path reads a full, contiguous cache. `cache_seqlens` may be omitted
-or passed as a Python integer equal to the full cache length. Tensor-valued
-lengths, cache appends, and partial, ragged, paged, or rotary-embedded caches are
-rejected explicitly.
+This decode path also appends one paired K/V token when a scalar cache length
+points at the final slot declared by `shape`:
+
+```python
+new_k = torch.randn(B, 1, H_KV, D, device="cuda", dtype=torch.bfloat16)
+new_v = torch.randn_like(new_k)
+out = helion_attention.flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    k=new_k,
+    v=new_v,
+    cache_seqlens=S_CACHE - 1,
+    causal=True,
+    shape=(B, 1, S_CACHE, H_Q, H_KV, D),
+)
+```
+
+The append mutates both caches in place and attends over the updated full cache.
+Read-only calls may omit `cache_seqlens` or pass the full cache length. Update
+lengths must be Python integers and satisfy `cache_seqlens + 1 == S_CACHE`;
+unpaired or multi-token updates and tensor-valued, partial, ragged, paged, or
+rotary-embedded caches are rejected explicitly. Caches created inside
+`torch.inference_mode()` must be updated while that mode remains enabled. For
+an append, `q`, `k_cache`, and `v_cache` must occupy disjoint memory; update
+`k`/`v` aliases are staged safely.
 
 `shape` accepts:
 
@@ -338,7 +360,8 @@ the call site. These unsupported FlashAttention features also raise
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes
-- KV-cache mutation, partial/ragged caches, paged caches, and fused rotary embeddings
+- KV-cache mutation beyond the paired one-token final-slot append above;
+  partial/ragged caches, paged caches, and fused rotary embeddings
 - `return_attn_probs`
 
 ## How the kernels are made

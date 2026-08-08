@@ -508,6 +508,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:4ec3e9f4a49b839a8348ae296c39e87cb8918601",
+      "commit": "4ec3e9f4a49b839a8348ae296c39e87cb8918601",
+      "recordedAt": "2026-08-08T08:02:09.710Z",
+      "label": "base 4ec3e9f",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 68,
+        "eval_1afd133e": 54,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:21",
+      "recordedAt": "2026-08-08T08:02:09.710Z",
+      "label": "PR #21",
+      "kind": "leaf",
+      "prNumber": 21,
+      "title": "Append one token to scalar-length dense KV caches",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 68,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
