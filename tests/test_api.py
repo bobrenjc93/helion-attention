@@ -193,15 +193,72 @@ def test_gradients_match_fp32_sdpa(
 
 
 @requires_cuda
-def test_requires_grad_rejects_shape_without_backward() -> None:
-    entry = next(item for item in SHAPES if not item.get("backward", False))
+def test_generated_backward_retains_exact_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(BACKWARD_SHAPES[0])
+    q, k, v = make_inputs(spec)
+    q.requires_grad_()
+    sentinel = torch.empty_like(q)
+    dispatched: list[AttnShape] = []
+
+    def generated(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        dispatched.append(spec_arg)
+        return sentinel
+
+    def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("generated backward shape reached SDPA")
+
+    monkeypatch.setattr(helion_attention, "attention_autograd", generated)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+
+    out = helion_attention.flash_attn_func(q, k, v, shape=spec)
+
+    assert out is sentinel
+    assert dispatched == [spec]
+
+
+@requires_cuda
+def test_registered_shape_without_backward_dispatches_to_sdpa(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = next(item for item in SHAPES if item["key"] == CHUNKED_PREFILL_KEY)
     spec = spec_from_manifest_entry(entry)
     q, k, v = make_inputs(spec)
     q.requires_grad_()
-    with pytest.raises(NotImplementedError, match="backward kernel"):
-        helion_attention.flash_attn_func(
-            q, k, v, causal=spec.causal, shape=spec
-        )
+    sentinel = torch.empty_like(q)
+    dispatched: list[AttnShape] = []
+
+    def fallback(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        dispatched.append(spec_arg)
+        return sentinel
+
+    def reject_generated(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("shape without generated backward used exact dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", fallback)
+    monkeypatch.setattr(helion_attention, "attention_autograd", reject_generated)
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=spec.causal, shape=spec
+    )
+
+    assert out is sentinel
+    assert dispatched == [spec]
 
 
 @requires_cuda
@@ -264,6 +321,54 @@ def test_unregistered_dense_packed_entry_points_use_fallback() -> None:
 
 
 @requires_cuda
+def test_dense_packed_entry_points_propagate_sdpa_gradients() -> None:
+    mha_spec = GENERIC_DENSE_SPECS[0]
+    q, k, v = make_inputs(mha_spec, seed=12345)
+    qkv = torch.stack((q, k, v), dim=2).requires_grad_()
+    grad_out = make_inputs(mha_spec, seed=54321)[0]
+    qkv_out = helion_attention.flash_attn_qkvpacked_func(qkv, shape=mha_spec)
+    qkv_grad = torch.autograd.grad(qkv_out, qkv, grad_out)[0]
+
+    qkv_ref = qkv.float().detach().requires_grad_()
+    q_ref, k_ref, v_ref = (qkv_ref[:, :, index] for index in range(3))
+    qkv_expected = reference_attention(
+        q_ref, k_ref, v_ref, mha_spec, 1.0 / math.sqrt(mha_spec.head_dim)
+    )
+    qkv_expected_grad = torch.autograd.grad(
+        qkv_expected, qkv_ref, grad_out.float()
+    )[0]
+    torch.testing.assert_close(
+        qkv_grad.float(), qkv_expected_grad, atol=5e-2, rtol=2e-2
+    )
+
+    gqa_spec = GENERIC_DENSE_SPECS[1]
+    q, k, v = make_inputs(gqa_spec, seed=67890)
+    q.requires_grad_()
+    kv = torch.stack((k, v), dim=2).requires_grad_()
+    grad_out = make_inputs(gqa_spec, seed=9876)[0]
+    kv_out = helion_attention.flash_attn_kvpacked_func(
+        q, kv, causal=gqa_spec.causal, shape=gqa_spec
+    )
+    q_grad, kv_grad = torch.autograd.grad(kv_out, (q, kv), grad_out)
+
+    q_ref = q.float().detach().requires_grad_()
+    kv_ref = kv.float().detach().requires_grad_()
+    k_ref, v_ref = (kv_ref[:, :, index] for index in range(2))
+    kv_expected = reference_attention(
+        q_ref, k_ref, v_ref, gqa_spec, 1.0 / math.sqrt(gqa_spec.head_dim)
+    )
+    q_expected_grad, kv_expected_grad = torch.autograd.grad(
+        kv_expected, (q_ref, kv_ref), grad_out.float()
+    )
+    torch.testing.assert_close(
+        q_grad.float(), q_expected_grad, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        kv_grad.float(), kv_expected_grad, atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
 def test_registered_dense_shape_does_not_use_generic_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -280,12 +385,141 @@ def test_registered_dense_shape_does_not_use_generic_fallback(
 
 
 @requires_cuda
-def test_unregistered_dense_fallback_rejects_gradients() -> None:
+@pytest.mark.parametrize(
+    "spec", GENERIC_DENSE_SPECS, ids=[spec.key for spec in GENERIC_DENSE_SPECS]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
+)
+def test_dense_sdpa_fallback_gradients_match_fp32(
+    spec: AttnShape, softmax_scale: float | None
+) -> None:
+    q, k, v = make_inputs(spec, seed=4242)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    grad_out = make_inputs(spec, seed=9090)[0]
+
+    got = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        shape=spec,
+    )
+    got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
+
+    q_ref = q.float().detach().requires_grad_()
+    k_ref = k.float().detach().requires_grad_()
+    v_ref = v.float().detach().requires_grad_()
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    expected = reference_attention(q_ref, k_ref, v_ref, spec, scale)
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    assert got.shape == q.shape
+    assert got.dtype == spec.dtype
+    assert got.is_contiguous()
+    torch.testing.assert_close(
+        got.float(), expected, atol=5e-2, rtol=2e-2
+    )
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=5e-2, rtol=2e-2
+        )
+    if spec.causal and spec.seqlen_q > spec.seqlen_k:
+        masked_rows = spec.seqlen_q - spec.seqlen_k
+        assert torch.count_nonzero(got[:, :masked_rows]).item() == 0
+        assert torch.count_nonzero(got_grads[0][:, :masked_rows]).item() == 0
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("input_dtype", "autocast_dtype"),
+    [
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.bfloat16),
+    ],
+    ids=["bf16-input-fp16-autocast", "fp16-input-bf16-autocast"],
+)
+def test_dense_sdpa_fallback_preserves_dtype_under_cross_dtype_autocast(
+    input_dtype: torch.dtype, autocast_dtype: torch.dtype
+) -> None:
+    spec = AttnShape(1, 17, 19, 4, 4, 32, input_dtype, True)
+    q, k, v = make_inputs(spec, seed=2468)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    grad_out = make_inputs(spec, seed=1357)[0]
+
+    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+        got = helion_attention.flash_attn_func(
+            q, k, v, causal=True, shape=spec
+        )
+    got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
+
+    q_ref = q.float().detach().requires_grad_()
+    k_ref = k.float().detach().requires_grad_()
+    v_ref = v.float().detach().requires_grad_()
+    expected = reference_attention(
+        q_ref, k_ref, v_ref, spec, 1.0 / math.sqrt(spec.head_dim)
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    assert got.dtype == input_dtype
+    assert all(grad.dtype == input_dtype for grad in got_grads)
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=5e-2, rtol=2e-2
+        )
+
+
+@requires_cuda
+def test_unequal_causal_sdpa_fallback_has_bounded_peak_allocation() -> None:
+    # A materialized [8191, 8192] bool mask alone is about 64 MiB. The lazy
+    # lower-right bias should leave only fused-SDPA output/autograd storage.
+    spec = AttnShape(1, 8191, 8192, 4, 1, 32, torch.float16, True)
+    q, k, v = make_inputs(spec, seed=8642)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+
+    torch.cuda.synchronize(q.device)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(q.device)
+    allocated_before = torch.cuda.memory_allocated(q.device)
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    torch.cuda.synchronize(q.device)
+    incremental_peak = (
+        torch.cuda.max_memory_allocated(q.device) - allocated_before
+    )
+
+    assert out.shape == q.shape
+    assert out.grad_fn is not None
+    assert incremental_peak < 32 * 1024 * 1024, incremental_peak
+
+
+@requires_cuda
+def test_dense_sdpa_fallback_rejects_deterministic_backward() -> None:
     spec = GENERIC_DENSE_SPECS[0]
     q, k, v = make_inputs(spec)
     q.requires_grad_()
-    with pytest.raises(NotImplementedError, match="backward kernel"):
-        helion_attention.flash_attn_func(q, k, v, shape=spec)
+    with pytest.raises(NotImplementedError, match="deterministic=True"):
+        helion_attention.flash_attn_func(
+            q, k, v, deterministic=True, shape=spec
+        )
 
 
 def test_generic_dense_layout_accepts_exact_int32_element_offset_boundary() -> None:
