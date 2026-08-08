@@ -133,12 +133,11 @@ def _check_core_paged_kvcache_spec(spec: AttnShape, page_size: int) -> None:
     if (
         requested != _CORE_PAGED_VARLEN_SHAPE
         or page_size != _CORE_PAGED_VARLEN_PAGE_SIZE
-        or not spec.causal
     ):
         raise UnsupportedShapeError(
             "flash_attn_with_kvcache with block_table currently supports only:\n"
             "    batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
-            "head_dim=128 dtype=bf16 causal=True page_size=16\n"
+            "head_dim=128 dtype=bf16 page_size=16\n"
             f"got:\n    {spec.describe()}, page_size={page_size}"
         )
 
@@ -722,10 +721,12 @@ def flash_attn_with_kvcache(
     required and describes ``q`` plus the cache:
     ``(batch, 1, cache_len, nheads_q, nheads_kv, head_dim)``.
 
-    One read-only paged specialization is also exposed: causal bf16
+    One read-only paged specialization is also exposed: bf16
     ``(4, 1, 1024, 8, 2, 128)`` with page-size-16 caches, an int32 CUDA
     ``cache_seqlens`` tensor shaped ``[4]``, and ``block_table``. It routes
     through :func:`flash_attn_varlen_func` and supports ragged logical caches.
+    Because this is single-token bottom-right decode, the default
+    ``causal=False`` and ``causal=True`` modes are equivalent and both work.
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. A paired,

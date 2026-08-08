@@ -114,10 +114,11 @@ For dense caches, pass `return_softmax_lse=True` to receive
 `(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
 FlashAttention's KV-cache API.
 
-The exact causal bf16 profile `(4, 1, 1024, 8, 2, 128)` also accepts a
-read-only page-size-16 cache. `cache_seqlens` must be a CUDA int32 tensor shaped
-`[4]`; each row may select a different used length. Logical pages can map to
-physical cache pages in any order:
+The exact bf16 profile `(4, 1, 1024, 8, 2, 128)` also accepts a read-only
+page-size-16 cache. `cache_seqlens` must be a CUDA int32 tensor shaped `[4]`;
+each row may select a different used length. Logical pages can map to physical
+cache pages in any order. The default `causal=False` works; for this
+single-token bottom-right decode it is equivalent to `causal=True`:
 
 ```python
 B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 16
@@ -136,7 +137,6 @@ out = helion_attention.flash_attn_with_kvcache(
     cache_seqlens=cache_seqlens,
     block_table=block_table,
     softmax_scale=0.37,
-    causal=True,
     shape=(B, 1, MAX_CACHE, H_Q, H_KV, D),
 )
 ```

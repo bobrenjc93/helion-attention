@@ -1022,7 +1022,12 @@ def test_kvcache_shape_argument_is_required() -> None:
 
 
 @requires_cuda
-def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages() -> None:
+@pytest.mark.parametrize(
+    "causal", [True, False], ids=["causal", "default-noncausal"]
+)
+def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
+    causal: bool,
+) -> None:
     q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
         make_paged_kvcache_inputs()
     )
@@ -1030,6 +1035,8 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages() -> None:
     original_v = v_cache.clone()
     scale = 0.37
 
+    declared_shape = PAGED_KVCACHE if causal else (4, 1, 1024, 8, 2, 128)
+    causal_kwargs = {"causal": True} if causal else {}
     got = helion_attention.flash_attn_with_kvcache(
         q,
         k_cache,
@@ -1037,8 +1044,8 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages() -> None:
         cache_seqlens=cache_seqlens,
         block_table=block_table,
         softmax_scale=scale,
-        causal=True,
-        shape=PAGED_KVCACHE,
+        shape=declared_shape,
+        **causal_kwargs,
     )
     expected = torch.stack(
         [
@@ -1164,14 +1171,6 @@ def test_paged_kvcache_rejects_unsupported_modes_before_varlen_dispatch(
             v_cache,
             **{**base, "shape": other_profile},
         )
-    with pytest.raises(UnsupportedShapeError, match="causal=True"):
-        helion_attention.flash_attn_with_kvcache(
-            q,
-            k_cache,
-            v_cache,
-            **{**base, "causal": False, "shape": (4, 1, 1024, 8, 2, 128)},
-        )
-
     page_32_k = torch.empty(
         1, 32, 2, 128, device=q.device, dtype=torch.bfloat16
     )
