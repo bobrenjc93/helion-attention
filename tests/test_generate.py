@@ -383,8 +383,8 @@ def test_catalogue_backfills_missing_forward_and_backward_provenance() -> None:
     )
 
 
-def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None:
-    exact = AttnShape(
+def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
+    persistent_16k = AttnShape(
         batch=1,
         seqlen_q=16384,
         seqlen_k=16384,
@@ -394,31 +394,50 @@ def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None
         dtype=torch.bfloat16,
         causal=True,
     )
-    assert generate.select_dense_kernel_name(exact) == "causal_attention_bshd_16k"
+    persistent_qwen_2k = AttnShape(
+        batch=1,
+        seqlen_q=2048,
+        seqlen_k=2048,
+        nheads_q=28,
+        nheads_kv=4,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        causal=True,
+    )
+    for exact in (persistent_16k, persistent_qwen_2k):
+        assert (
+            generate.select_dense_kernel_name(exact)
+            == "causal_attention_bshd_16k"
+        )
 
     incompatible = [
-        replace(exact, batch=2),
-        replace(exact, seqlen_q=8192, seqlen_k=8192),
-        replace(exact, nheads_q=32, nheads_kv=32),
-        replace(exact, nheads_kv=8),
-        replace(exact, head_dim=256),
-        replace(exact, nheads_q=1, nheads_kv=1, head_dim=256),
-        replace(exact, dtype=torch.float16),
+        replace(persistent_16k, batch=2),
+        replace(persistent_16k, seqlen_q=8192, seqlen_k=8192),
+        replace(persistent_16k, nheads_q=32, nheads_kv=32),
+        replace(persistent_16k, nheads_kv=8),
+        replace(persistent_16k, head_dim=256),
+        replace(persistent_16k, nheads_q=1, nheads_kv=1, head_dim=256),
+        replace(persistent_16k, dtype=torch.float16),
+        replace(persistent_qwen_2k, batch=2),
+        replace(persistent_qwen_2k, seqlen_q=4096, seqlen_k=4096),
+        replace(persistent_qwen_2k, nheads_q=32, nheads_kv=8),
+        replace(persistent_qwen_2k, head_dim=64),
+        replace(persistent_qwen_2k, dtype=torch.float16),
     ]
     for candidate in incompatible:
         assert generate.select_dense_kernel_name(candidate) == "causal_attention_bshd"
 
     assert (
-        generate.select_dense_kernel_name(replace(exact, causal=False))
+        generate.select_dense_kernel_name(replace(persistent_16k, causal=False))
         == "attention_bshd"
     )
     assert (
-        generate.select_dense_kernel_name(replace(exact, seqlen_q=1))
+        generate.select_dense_kernel_name(replace(persistent_16k, seqlen_q=1))
         == "causal_attention_bshd"
     )
     assert (
         generate.select_dense_kernel_name(
-            replace(exact, seqlen_q=64, seqlen_k=320)
+            replace(persistent_16k, seqlen_q=64, seqlen_k=320)
         )
         == "causal_attention_bshd"
     )
