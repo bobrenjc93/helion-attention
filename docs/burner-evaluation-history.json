@@ -388,6 +388,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:06ed703042862334b7f590ae976585a511d4177a",
+      "commit": "06ed703042862334b7f590ae976585a511d4177a",
+      "recordedAt": "2026-08-08T04:36:14.980Z",
+      "label": "base 06ed703",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 62,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 95,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:16",
+      "recordedAt": "2026-08-08T04:36:14.980Z",
+      "label": "PR #16",
+      "kind": "leaf",
+      "prNumber": 16,
+      "title": "Publish per-shape autotuning provenance",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 63,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 95,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
