@@ -538,6 +538,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:83ddd5ac1d1c6041946826428681e6598003a434",
+      "commit": "83ddd5ac1d1c6041946826428681e6598003a434",
+      "recordedAt": "2026-08-08T09:33:50.212Z",
+      "label": "base 83ddd5a",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 68,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:23",
+      "recordedAt": "2026-08-08T09:33:50.212Z",
+      "label": "PR #23",
+      "kind": "leaf",
+      "prNumber": 23,
+      "title": "Expose the shipped paged-decode kernel through core varlen block tables",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 68,
+        "eval_1afd133e": 50,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

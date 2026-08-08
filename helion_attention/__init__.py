@@ -27,9 +27,11 @@ from ._registry import has_paged_kernel
 from ._registry import has_varlen_kernel
 from ._registry import lookup
 from ._registry import lookup_backward
+from ._registry import lookup_paged
 from ._registry import lookup_varlen
 from ._shape import AttnShape
 from ._shape import ShapeLike
+from ._shape import check_paged_varlen_tensors
 from ._shape import check_tensors
 from ._shape import check_varlen_tensors
 from ._shape import normalize_shape
@@ -53,6 +55,9 @@ __all__ = [
 ]
 
 __version__ = "0.1.0"
+
+_CORE_PAGED_VARLEN_SHAPE = (4, 1, 1024, 8, 2, 128, torch.bfloat16)
+_CORE_PAGED_VARLEN_PAGE_SIZE = 16
 
 
 def _reject_unsupported(
@@ -81,6 +86,29 @@ def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bo
     second_start = second.data_ptr()
     second_end = second_start + second.numel() * second.element_size()
     return first_start < second_end and second_start < first_end
+
+
+def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
+    """Require the one paged specialization exposed by the core varlen API."""
+    requested = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    )
+    if (
+        requested != _CORE_PAGED_VARLEN_SHAPE
+        or page_size != _CORE_PAGED_VARLEN_PAGE_SIZE
+    ):
+        raise UnsupportedShapeError(
+            "flash_attn_varlen_func with block_table currently supports only:\n"
+            "    batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
+            "head_dim=128 dtype=bf16 page_size=16\n"
+            f"got:\n    {spec.describe()}, page_size={page_size}"
+        )
 
 
 def is_shape_supported(
@@ -180,19 +208,21 @@ def flash_attn_varlen_func(
 ) -> torch.Tensor:
     """Drop-in replacement for ``flash_attn.flash_attn_varlen_func``.
 
-    ``q`` is ``[total_q, nheads_q, head_dim]`` and ``k``/``v`` are
-    ``[total_k, nheads_kv, head_dim]``.  The int32 CUDA cumulative-length
-    tensors contain ``batch + 1`` offsets.  ``shape`` uses the same forms as
-    :func:`flash_attn_func`, but its sequence dimensions are the maximum query
-    and key lengths rather than dense tensor dimensions.
+    ``q`` is ``[total_q, nheads_q, head_dim]``. Without ``block_table``,
+    ``k``/``v`` are ``[total_k, nheads_kv, head_dim]``. With ``block_table``,
+    the exact checked-in paged-decode specialization accepts caches shaped
+    ``[num_blocks, 16, 2, 128]`` and derives each request's used cache length
+    from adjacent ``cu_seqlens_k`` offsets without copying them to the host.
+    The int32 CUDA cumulative-length tensors contain ``batch + 1`` offsets.
+    ``shape`` uses the same forms as :func:`flash_attn_func`, but its sequence
+    dimensions are the maximum query and key lengths rather than dense tensor
+    dimensions.
 
     The packed token totals and individual sequence lengths may change between
     calls to the same specialization.  The batch size, maxima, head geometry,
     dtype, and causal mode must continue to match ``shape``.
     """
     del deterministic  # This option affects backward only.
-    if block_table is not None:
-        raise NotImplementedError("paged KV block tables are not implemented")
     _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
     if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
@@ -204,6 +234,40 @@ def flash_attn_varlen_func(
             f"declared by shape ({spec.seqlen_q}, {spec.seqlen_k}); got "
             f"({max_seqlen_q}, {max_seqlen_k})"
         )
+
+    if block_table is not None:
+        page_size = check_paged_varlen_tensors(
+            q, k, v, cu_seqlens_q, cu_seqlens_k, block_table, spec
+        )
+        _check_core_paged_varlen_spec(spec, page_size)
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k, v)
+        ):
+            raise NotImplementedError(
+                "flash_attn_varlen_func with block_table is forward-only; "
+                "no paged-cache backward kernel is checked in"
+            )
+        # For a bottom-right-aligned single-token query, causal and non-causal
+        # attention expose the same keys. The registry handles that equivalence.
+        kernel = lookup_paged(spec, page_size)
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(spec.head_dim)
+        # Keep sequence metadata on-device. This allocates the four per-request
+        # used lengths directly on CUDA and remains safe for graph capture.
+        seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
+        return kernel(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q,
+            max_seqlen_k,
+            float(softmax_scale),
+            causal,
+        )
+
     check_varlen_tensors(q, k, v, cu_seqlens_q, cu_seqlens_k, spec)
     kernel = lookup_varlen(spec)
     if torch.is_grad_enabled() and any(

@@ -15,6 +15,16 @@ from helion_attention._registry import spec_from_manifest_entry
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 VARLEN_SHAPES = helion_attention.available_varlen_shapes()
 VARLEN_IDS = [str(entry["key"]) for entry in VARLEN_SHAPES]
+PAGED_DECODE = AttnShape(
+    batch=4,
+    seqlen_q=1,
+    seqlen_k=1024,
+    nheads_q=8,
+    nheads_kv=2,
+    head_dim=128,
+    dtype=torch.bfloat16,
+    causal=True,
+)
 
 
 def _lengths(maximum: int, batch: int, *, key: bool, variant: int) -> list[int]:
@@ -82,6 +92,87 @@ def make_packed(
         lengths_q,
         lengths_k,
     )
+
+
+def make_paged_decode(
+    *, seed: int = 2026
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[int],
+    list[tuple[torch.Tensor, torch.Tensor]],
+]:
+    """Build ragged logical caches backed by reverse-ordered physical pages."""
+    spec = PAGED_DECODE
+    page_size = 16
+    lengths_k = [37, 128, 1024, 5]
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(
+        spec.batch,
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    request_kv = [
+        (
+            torch.randn(
+                length,
+                spec.nheads_kv,
+                spec.head_dim,
+                device="cuda",
+                dtype=spec.dtype,
+                generator=generator,
+            ),
+            torch.randn(
+                length,
+                spec.nheads_kv,
+                spec.head_dim,
+                device="cuda",
+                dtype=spec.dtype,
+                generator=generator,
+            ),
+        )
+        for length in lengths_k
+    ]
+    blocks_per_request = [
+        (length + page_size - 1) // page_size for length in lengths_k
+    ]
+    total_blocks = sum(blocks_per_request) + 3
+    k = torch.zeros(
+        total_blocks,
+        page_size,
+        spec.nheads_kv,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    v = torch.zeros_like(k)
+    block_table = torch.zeros(
+        spec.batch,
+        spec.seqlen_k // page_size,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    physical = total_blocks - 1
+    for request, ((key, value), request_blocks) in enumerate(
+        zip(request_kv, blocks_per_request)
+    ):
+        for logical in range(request_blocks):
+            block_table[request, logical] = physical
+            start = logical * page_size
+            stop = min(start + page_size, key.shape[0])
+            k[physical, : stop - start] = key[start:stop]
+            v[physical, : stop - start] = value[start:stop]
+            physical -= 1
+    cu_q = torch.arange(spec.batch + 1, device="cuda", dtype=torch.int32)
+    cu_k = _cumulative(lengths_k, q.device)
+    return q, k, v, cu_q, cu_k, block_table, lengths_k, request_kv
 
 
 def reference_packed(
@@ -442,6 +533,206 @@ def test_varlen_supports_cuda_graph_capture() -> None:
     torch.testing.assert_close(captured, expected)
 
 
+@requires_cuda
+def test_core_varlen_paged_decode_matches_fp32_with_permuted_pages() -> None:
+    q, k, v, cu_q, cu_k, block_table, _, request_kv = make_paged_decode()
+    scale = 0.37
+    got = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        PAGED_DECODE.seqlen_q,
+        PAGED_DECODE.seqlen_k,
+        softmax_scale=scale,
+        causal=True,
+        block_table=block_table,
+        shape=PAGED_DECODE,
+    )
+    expected = torch.cat(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                query.float().transpose(0, 1).unsqueeze(0),
+                key.float().transpose(0, 1).unsqueeze(0),
+                value.float().transpose(0, 1).unsqueeze(0),
+                scale=scale,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+            for query, (key, value) in zip(q.split(1), request_kv)
+        ]
+    )
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_core_varlen_derives_paged_used_lengths_on_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, lengths_k, _ = make_paged_decode()
+    seen: dict[str, object] = {}
+
+    def fake_kernel(*args: object) -> torch.Tensor:
+        seen["args"] = args
+        return torch.zeros_like(q)
+
+    def fake_lookup(spec: AttnShape, page_size: int):
+        assert spec == PAGED_DECODE
+        assert page_size == 16
+        return fake_kernel
+
+    monkeypatch.setattr(helion_attention, "lookup_paged", fake_lookup)
+    result = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        PAGED_DECODE.seqlen_q,
+        PAGED_DECODE.seqlen_k,
+        causal=True,
+        block_table=block_table,
+        shape=PAGED_DECODE,
+    )
+
+    args = seen["args"]
+    assert isinstance(args, tuple)
+    seqused_k = args[4]
+    assert isinstance(seqused_k, torch.Tensor)
+    assert seqused_k.is_cuda
+    assert seqused_k.device == cu_k.device
+    assert seqused_k.dtype == torch.int32
+    torch.testing.assert_close(
+        seqused_k, torch.tensor(lengths_k, device="cuda", dtype=torch.int32)
+    )
+    torch.testing.assert_close(result, torch.zeros_like(q))
+
+
+@requires_cuda
+def test_core_varlen_paged_rejects_malformed_storage_before_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode()
+
+    def reject_lookup(*args: object, **kwargs: object) -> object:
+        raise AssertionError("malformed paged inputs reached kernel lookup")
+
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_lookup)
+    call = (
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        PAGED_DECODE.seqlen_q,
+        PAGED_DECODE.seqlen_k,
+    )
+    kwargs = {"causal": True, "block_table": block_table, "shape": PAGED_DECODE}
+
+    with pytest.raises(ValueError, match="paged KV cache"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k.flatten(0, 1),
+            v.flatten(0, 1),
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            **kwargs,
+        )
+    with pytest.raises(ValueError, match="same shape"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v[:-1],
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            **kwargs,
+        )
+    with pytest.raises(ValueError, match="capacity"):
+        helion_attention.flash_attn_varlen_func(
+            *call, **{**kwargs, "block_table": block_table[:, :-1]}
+        )
+    with pytest.raises(ValueError, match="torch.int32"):
+        helion_attention.flash_attn_varlen_func(
+            *call, **{**kwargs, "block_table": block_table.to(torch.int64)}
+        )
+
+
+@requires_cuda
+def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
+    q, _, _, cu_q, cu_k, _, *_ = make_paged_decode()
+    k = torch.zeros(
+        1, 32, 2, 128, device="cuda", dtype=PAGED_DECODE.dtype
+    )
+    v = torch.zeros_like(k)
+    block_table = torch.zeros(4, 32, device="cuda", dtype=torch.int32)
+    with pytest.raises(helion_attention.UnsupportedShapeError, match="page_size=16"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            causal=True,
+            block_table=block_table,
+            shape=PAGED_DECODE,
+        )
+
+    chunked = AttnShape(2, 200, 320, 8, 2, 128, torch.bfloat16, True)
+    q = q[:2]
+    k = torch.zeros(1, 16, 2, 128, device="cuda", dtype=chunked.dtype)
+    v = torch.zeros_like(k)
+    cu_q = torch.arange(3, device="cuda", dtype=torch.int32)
+    cu_k = torch.arange(3, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros(2, 20, device="cuda", dtype=torch.int32)
+    with pytest.raises(helion_attention.UnsupportedShapeError, match="supports only"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            chunked.seqlen_q,
+            chunked.seqlen_k,
+            causal=True,
+            block_table=block_table,
+            shape=chunked,
+        )
+
+
+@requires_cuda
+def test_core_varlen_paged_rejects_gradients_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode()
+
+    def reject_lookup(*args: object, **kwargs: object) -> object:
+        raise AssertionError("gradient-bearing input reached paged kernel lookup")
+
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_lookup)
+    q.requires_grad_()
+    with pytest.raises(NotImplementedError, match="paged-cache backward"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            causal=True,
+            block_table=block_table,
+            shape=PAGED_DECODE,
+        )
+
+
 def test_varlen_shape_argument_is_required() -> None:
     tensor = torch.zeros(1, 1, 1)
     cu = torch.zeros(2, dtype=torch.int32)
@@ -470,7 +761,7 @@ def test_varlen_validates_maxima_cu_seqlens_and_forward_only_contract() -> None:
         helion_attention.flash_attn_varlen_func(
             q, k, v, cu_q[:-1], cu_k, spec.seqlen_q, spec.seqlen_k, shape=spec
         )
-    with pytest.raises(NotImplementedError, match="block tables"):
+    with pytest.raises(ValueError, match="paged KV cache"):
         helion_attention.flash_attn_varlen_func(
             *call_args, block_table=torch.ones(1, device=q.device), shape=spec
         )

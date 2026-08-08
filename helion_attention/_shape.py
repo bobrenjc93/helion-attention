@@ -198,3 +198,122 @@ def check_varlen_tensors(
             raise ValueError(f"{name} must be on the same CUDA device as q, k, and v")
         if not cu_seqlens.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
+
+
+def check_paged_varlen_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    block_table: torch.Tensor,
+    spec: AttnShape,
+) -> int:
+    """Validate packed queries and block-table-addressed paged K/V caches.
+
+    The generated paged kernels take explicit strides for queries, caches, and
+    block tables, so those tensors need not be contiguous.  Cumulative lengths
+    remain device-resident, just as they do on the contiguous varlen path.
+
+    Returns:
+        The cache page size, used to select the exact generated specialization.
+    """
+    tensors = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "block_table": block_table,
+    }
+    for name, tensor in tensors.items():
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if tensor.layout != torch.strided:
+            raise ValueError(f"{name} must use torch.strided layout")
+
+    expected_q_trailing = (spec.nheads_q, spec.head_dim)
+    if q.ndim != 3 or tuple(q.shape[1:]) != expected_q_trailing:
+        raise ValueError(
+            f"q has shape {tuple(q.shape)} but the declared paged varlen shape "
+            f"requires [total_q, {spec.nheads_q}, {spec.head_dim}]"
+        )
+    if q.shape[0] > spec.batch * spec.seqlen_q:
+        raise ValueError(
+            f"q contains {q.shape[0]} packed tokens, more than batch={spec.batch} "
+            f"and max_seqlen_q={spec.seqlen_q} allow"
+        )
+    if q.dtype != spec.dtype:
+        raise ValueError(f"q has dtype {q.dtype} but shape declares {spec.dtype}")
+    if not q.is_cuda:
+        raise ValueError(f"q must be a CUDA tensor, got device {q.device}")
+
+    expected_cache_tail = (spec.nheads_kv, spec.head_dim)
+    for name, cache in (("k", k), ("v", v)):
+        if cache.ndim != 4 or tuple(cache.shape[2:]) != expected_cache_tail:
+            raise ValueError(
+                f"{name} must be a paged KV cache with shape "
+                f"[num_blocks, page_size, {spec.nheads_kv}, {spec.head_dim}], "
+                f"got {tuple(cache.shape)}"
+            )
+        if cache.dtype != spec.dtype:
+            raise ValueError(
+                f"{name} has dtype {cache.dtype} but shape declares {spec.dtype}"
+            )
+        if not cache.is_cuda:
+            raise ValueError(f"{name} must be a CUDA tensor, got device {cache.device}")
+        if cache.device != q.device:
+            raise ValueError("q, k, and v must be on the same CUDA device")
+    if k.shape != v.shape:
+        raise ValueError(
+            f"k and v paged caches must have the same shape, got "
+            f"{tuple(k.shape)} and {tuple(v.shape)}"
+        )
+    if k.shape[0] == 0 or k.shape[1] == 0:
+        raise ValueError("paged K/V caches must contain at least one non-empty page")
+
+    expected_cu_shape = (spec.batch + 1,)
+    for name, cu_seqlens in (
+        ("cu_seqlens_q", cu_seqlens_q),
+        ("cu_seqlens_k", cu_seqlens_k),
+    ):
+        if tuple(cu_seqlens.shape) != expected_cu_shape:
+            raise ValueError(
+                f"{name} has shape {tuple(cu_seqlens.shape)} but batch={spec.batch} "
+                f"requires {expected_cu_shape}"
+            )
+        if cu_seqlens.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32")
+        if not cu_seqlens.is_cuda:
+            raise ValueError(
+                f"{name} must be a CUDA tensor, got device {cu_seqlens.device}"
+            )
+        if cu_seqlens.device != q.device:
+            raise ValueError(
+                f"{name} must be on the same CUDA device as q, k, and v"
+            )
+        if not cu_seqlens.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+
+    page_size = k.shape[1]
+    if block_table.ndim != 2 or block_table.shape[0] != spec.batch:
+        raise ValueError(
+            "block_table must have shape [batch, max_num_blocks_per_seq] "
+            f"with batch={spec.batch}, got {tuple(block_table.shape)}"
+        )
+    if block_table.dtype != torch.int32:
+        raise ValueError("block_table must have dtype torch.int32")
+    if not block_table.is_cuda:
+        raise ValueError(
+            f"block_table must be a CUDA tensor, got device {block_table.device}"
+        )
+    if block_table.device != q.device:
+        raise ValueError("block_table must be on the same CUDA device as q, k, and v")
+    required_blocks = (spec.seqlen_k + page_size - 1) // page_size
+    if block_table.shape[1] < required_blocks:
+        raise ValueError(
+            f"block_table has capacity for {block_table.shape[1] * page_size} "
+            f"tokens but max_seqlen_k={spec.seqlen_k} requires {required_blocks} "
+            "logical pages"
+        )
+    return page_size
