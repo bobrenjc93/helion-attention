@@ -763,6 +763,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:e34e967b2fcd4101b2c4badfb8f3b32fcbd10ee2",
+      "commit": "e34e967b2fcd4101b2c4badfb8f3b32fcbd10ee2",
+      "recordedAt": "2026-08-08T14:13:03.378Z",
+      "label": "base e34e967",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 78,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:35",
+      "recordedAt": "2026-08-08T14:13:03.378Z",
+      "label": "PR #35",
+      "kind": "leaf",
+      "prNumber": 35,
+      "title": "Use the persistent schedule for the 2K Llama GQA kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 78,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
