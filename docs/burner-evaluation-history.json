@@ -718,6 +718,21 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:33",
+      "recordedAt": "2026-08-08T13:25:36.563Z",
+      "label": "PR #33",
+      "kind": "leaf",
+      "prNumber": 33,
+      "title": "Use the persistent schedule for the 2K single-sequence MHA kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 78,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
