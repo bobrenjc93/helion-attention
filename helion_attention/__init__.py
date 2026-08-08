@@ -5,15 +5,16 @@ The kernels in :mod:`helion_attention.kernels` were generated and autotuned by
 time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
-Every entry point takes a required ``shape`` argument. Helion only wins against
-FlashAttention when a kernel is specialized to one exact problem size, so the
-shape is part of the call contract rather than something discovered from the
-tensors at runtime.
+Every entry point takes a required ``shape`` argument. Uncapped calls use a
+kernel specialized to that exact problem size. Dense forward calls with a
+positive softcap reuse the package's generic packed Triton runtime, with
+``shape`` still providing the checked tensor contract.
 """
 
 from __future__ import annotations
 
 import math
+from numbers import Real
 
 import torch
 
@@ -61,17 +62,30 @@ def _reject_unsupported(
     softcap: float,
     alibi_slopes: torch.Tensor | None,
     return_attn_probs: bool,
-) -> None:
+    *,
+    allow_softcap: bool = False,
+) -> float:
     if dropout_p != 0.0:
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
     if tuple(window_size) != (-1, -1):
         raise NotImplementedError("sliding-window attention is not implemented")
-    if softcap != 0.0:
+    if isinstance(softcap, bool) or not isinstance(softcap, Real):
+        raise TypeError("softcap must be a finite non-negative real number")
+    try:
+        normalized_softcap = float(softcap)
+    except OverflowError as exc:
+        raise ValueError("softcap must be finite") from exc
+    if not math.isfinite(normalized_softcap):
+        raise ValueError("softcap must be finite")
+    if normalized_softcap < 0.0:
+        raise ValueError("softcap must be non-negative")
+    if normalized_softcap != 0.0 and not allow_softcap:
         raise NotImplementedError("softcap is not implemented")
     if alibi_slopes is not None:
         raise NotImplementedError("ALiBi slopes are not implemented")
     if return_attn_probs:
         raise NotImplementedError("return_attn_probs is not implemented")
+    return normalized_softcap
 
 
 def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
@@ -81,6 +95,57 @@ def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bo
     second_start = second.data_ptr()
     second_end = second_start + second.numel() * second.element_size()
     return first_start < second_end and second_start < first_end
+
+
+def _dense_softcap_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    softcap: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Run validated dense inputs through the generic packed Triton forward."""
+    from ._paged_attention import packed_attention
+
+    cu_seqlens_q = torch.arange(
+        spec.batch + 1, device=q.device, dtype=torch.int32
+    ) * spec.seqlen_q
+    cu_seqlens_k = torch.arange(
+        spec.batch + 1, device=q.device, dtype=torch.int32
+    ) * spec.seqlen_k
+    packed = packed_attention(
+        q.reshape(-1, spec.nheads_q, spec.head_dim),
+        k.reshape(-1, spec.nheads_kv, spec.head_dim),
+        v.reshape(-1, spec.nheads_kv, spec.head_dim),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=scale,
+        causal=spec.causal,
+        window_size=(-1, -1),
+        softcap=softcap,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    assert isinstance(packed, torch.Tensor)
+    return packed.reshape(
+        spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
+    )
 
 
 def is_shape_supported(
@@ -138,18 +203,35 @@ def flash_attn_func(
         ``[batch, seqlen_q, nheads_q, head_dim]``.
 
     Raises:
-        UnsupportedShapeError: no kernel is checked in for this shape.
+        UnsupportedShapeError: ``softcap=0`` and no kernel is checked in for
+            this shape.
+        NotImplementedError: a softcapped call requests autograd.
     """
-    _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
+    normalized_softcap = _reject_unsupported(
+        dropout_p,
+        window_size,
+        softcap,
+        alibi_slopes,
+        return_attn_probs,
+        allow_softcap=True,
+    )
     spec = normalize_shape(shape, q.dtype, causal)
     check_tensors(q, k, v, spec)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
-    kernel = lookup(spec)
     scale = float(softmax_scale)
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
     )
+    if normalized_softcap > 0.0:
+        if needs_backward:
+            raise NotImplementedError(
+                "softcapped dense attention is currently forward-only; "
+                "no softcap backward kernel is checked in"
+            )
+        return _dense_softcap_forward(q, k, v, scale, normalized_softcap, spec)
+
+    kernel = lookup(spec)
     if needs_backward:
         # Resolve this before launching the forward so unsupported training
         # shapes fail at the call site rather than later during loss.backward().

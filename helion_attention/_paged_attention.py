@@ -1,4 +1,4 @@
-"""Single-launch generic packed and paged attention for the vLLM adapter."""
+"""Single-launch generic packed and paged attention runtime."""
 
 from __future__ import annotations
 
