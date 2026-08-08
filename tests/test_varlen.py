@@ -577,7 +577,6 @@ def test_varlen_matches_fp32_sdpa_with_dynamic_token_totals(
 def test_varlen_alibi_matches_fa2_and_fp32_for_dynamic_ragged_calls(
     batched_slopes: bool, softmax_scale: float | None, variant: int
 ) -> None:
-    flash_attn = pytest.importorskip("flash_attn")
     spec = VARLEN_ALIBI
     q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
         spec, variant=variant, seed=20260808
@@ -604,18 +603,6 @@ def test_varlen_alibi_matches_fa2_and_fp32_for_dynamic_ragged_calls(
         alibi_slopes=slopes,
         shape=spec,
     )
-    expected_fa2 = flash_attn.flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        spec.seqlen_q,
-        spec.seqlen_k,
-        softmax_scale=softmax_scale,
-        causal=True,
-        alibi_slopes=slopes,
-    )
     scale = (
         1.0 / math.sqrt(spec.head_dim)
         if softmax_scale is None
@@ -632,10 +619,29 @@ def test_varlen_alibi_matches_fa2_and_fp32_for_dynamic_ragged_calls(
         alibi_slopes=slopes,
     )
 
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+    # FlashAttention is an optional benchmark dependency. The independent fp32
+    # assertion above must still run in environments with only the dev extras.
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    expected_fa2 = flash_attn.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=True,
+        alibi_slopes=slopes,
+    )
     torch.testing.assert_close(
         got.float(), expected_fa2.float(), atol=1e-2, rtol=1e-2
     )
-    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
 
 
 @requires_cuda
