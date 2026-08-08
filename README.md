@@ -93,6 +93,21 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
+The core `flash_attn_varlen_func` exposes exactly two forward-only paged
+profiles when `block_table` is supplied. Both use bf16 page-size-16 caches in
+`[num_blocks, 16, heads_kv, head_dim]` layout, support ragged request lengths
+and permuted physical pages, and accept a custom `softmax_scale`:
+
+| profile | causal modes | use |
+| --- | --- | --- |
+| `(2, 200, 320, 8, 2, 128)` | `True` | chunked prefill |
+| `(4, 1, 1024, 8, 2, 128)` | `True` or `False` | single-token decode |
+
+As on the non-paged path, the shape sequence dimensions are maxima and actual
+lengths come from adjacent cumulative offsets. The chunked-prefill profile
+uses bottom-right causal alignment. The decode modes are equivalent because a
+bottom-right single-token query can see the whole used cache.
+
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus
 `k`/`v` caches in `[num_blocks, page_size, heads_kv, head_dim]` layout,

@@ -60,7 +60,19 @@ __all__ = [
 
 __version__ = "0.1.0"
 
-_CORE_PAGED_VARLEN_SHAPE = (4, 1, 1024, 8, 2, 128, torch.bfloat16)
+_CORE_PAGED_CHUNKED_PREFILL_SHAPE = (
+    2,
+    200,
+    320,
+    8,
+    2,
+    128,
+    torch.bfloat16,
+)
+_CORE_PAGED_KVCACHE_SHAPE = (4, 1, 1024, 8, 2, 128, torch.bfloat16)
+_CORE_PAGED_VARLEN_SHAPES = frozenset(
+    {_CORE_PAGED_CHUNKED_PREFILL_SHAPE, _CORE_PAGED_KVCACHE_SHAPE}
+)
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
@@ -192,7 +204,7 @@ def _apply_interleaved_rotary(
 
 
 def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
-    """Require the one paged specialization exposed by the core varlen API."""
+    """Require a paged specialization exposed by the core varlen API."""
     requested = (
         spec.batch,
         spec.seqlen_q,
@@ -203,13 +215,20 @@ def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
         spec.dtype,
     )
     if (
-        requested != _CORE_PAGED_VARLEN_SHAPE
+        requested not in _CORE_PAGED_VARLEN_SHAPES
+        or (
+            requested == _CORE_PAGED_CHUNKED_PREFILL_SHAPE
+            and not spec.causal
+        )
         or page_size != _CORE_PAGED_VARLEN_PAGE_SIZE
     ):
         raise UnsupportedShapeError(
-            "flash_attn_varlen_func with block_table currently supports only:\n"
+            "flash_attn_varlen_func with block_table currently supports only "
+            "these bf16 profiles with page_size=16:\n"
+            "    batch=2 seqlen_q=200 seqlen_k=320 nheads=8 (GQA 8:2) "
+            "head_dim=128 causal=True\n"
             "    batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
-            "head_dim=128 dtype=bf16 page_size=16\n"
+            "head_dim=128 causal=True or causal=False\n"
             f"got:\n    {spec.describe()}, page_size={page_size}"
         )
 
@@ -226,7 +245,7 @@ def _check_core_paged_kvcache_spec(spec: AttnShape, page_size: int) -> None:
         spec.dtype,
     )
     if (
-        requested != _CORE_PAGED_VARLEN_SHAPE
+        requested != _CORE_PAGED_KVCACHE_SHAPE
         or page_size != _CORE_PAGED_VARLEN_PAGE_SIZE
     ):
         raise UnsupportedShapeError(
@@ -540,9 +559,12 @@ def flash_attn_varlen_func(
 
     ``q`` is ``[total_q, nheads_q, head_dim]``. Without ``block_table``,
     ``k``/``v`` are ``[total_k, nheads_kv, head_dim]``. With ``block_table``,
-    the exact checked-in paged-decode specialization accepts caches shaped
-    ``[num_blocks, 16, 2, 128]`` and derives each request's used cache length
-    from adjacent ``cu_seqlens_k`` offsets without copying them to the host.
+    the checked-in bf16 page-size-16 profiles are chunked prefill
+    ``(2, 200, 320, 8, 2, 128)`` with ``causal=True`` and decode
+    ``(4, 1, 1024, 8, 2, 128)`` with either causal flag. They accept caches
+    shaped ``[num_blocks, 16, 2, 128]`` and derive each request's used cache
+    length from adjacent ``cu_seqlens_k`` offsets without copying them to the
+    host.
     The int32 CUDA cumulative-length tensors contain ``batch + 1`` offsets.
     ``shape`` uses the same forms as :func:`flash_attn_func`, but its sequence
     dimensions are the maximum query and key lengths rather than dense tensor
@@ -577,8 +599,9 @@ def flash_attn_varlen_func(
                 "flash_attn_varlen_func with block_table is forward-only; "
                 "no paged-cache backward kernel is checked in"
             )
-        # For a bottom-right-aligned single-token query, causal and non-causal
-        # attention expose the same keys. The registry handles that equivalence.
+        # For the decode profile, a bottom-right-aligned single-token query has
+        # equivalent causal and non-causal results. The registry handles that
+        # equivalence; chunked prefill still requires its generated causal mode.
         kernel = lookup_paged(spec, page_size)
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(spec.head_dim)

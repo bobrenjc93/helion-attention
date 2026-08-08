@@ -25,6 +25,27 @@ PAGED_DECODE = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+PAGED_CHUNKED_PREFILL = AttnShape(
+    batch=2,
+    seqlen_q=200,
+    seqlen_k=320,
+    nheads_q=8,
+    nheads_kv=2,
+    head_dim=128,
+    dtype=torch.bfloat16,
+    causal=True,
+)
+PagedInputs = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[int],
+    list[int],
+    list[tuple[torch.Tensor, torch.Tensor]],
+]
 
 
 def _lengths(maximum: int, batch: int, *, key: bool, variant: int) -> list[int]:
@@ -94,25 +115,18 @@ def make_packed(
     )
 
 
-def make_paged_decode(
-    *, seed: int = 2026
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    list[int],
-    list[tuple[torch.Tensor, torch.Tensor]],
-]:
-    """Build ragged logical caches backed by reverse-ordered physical pages."""
-    spec = PAGED_DECODE
+def make_paged_inputs(
+    spec: AttnShape,
+    lengths_q: list[int],
+    lengths_k: list[int],
+    *,
+    seed: int,
+) -> PagedInputs:
+    """Build ragged packed queries and reverse-mapped physical cache pages."""
     page_size = 16
-    lengths_k = [37, 128, 1024, 5]
     generator = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(
-        spec.batch,
+        sum(lengths_q),
         spec.nheads_q,
         spec.head_dim,
         device="cuda",
@@ -170,9 +184,56 @@ def make_paged_decode(
             k[physical, : stop - start] = key[start:stop]
             v[physical, : stop - start] = value[start:stop]
             physical -= 1
-    cu_q = torch.arange(spec.batch + 1, device="cuda", dtype=torch.int32)
-    cu_k = _cumulative(lengths_k, q.device)
+    return (
+        q,
+        k,
+        v,
+        _cumulative(lengths_q, q.device),
+        _cumulative(lengths_k, q.device),
+        block_table,
+        lengths_q,
+        lengths_k,
+        request_kv,
+    )
+
+
+def make_paged_decode(
+    *, seed: int = 2026
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[int],
+    list[tuple[torch.Tensor, torch.Tensor]],
+]:
+    """Build ragged logical caches backed by reverse-ordered physical pages."""
+    q, k, v, cu_q, cu_k, block_table, _, lengths_k, request_kv = (
+        make_paged_inputs(
+            PAGED_DECODE,
+            [1] * PAGED_DECODE.batch,
+            [37, 128, 1024, 5],
+            seed=seed,
+        )
+    )
     return q, k, v, cu_q, cu_k, block_table, lengths_k, request_kv
+
+
+def make_paged_chunked_prefill(
+    *,
+    lengths_q: tuple[int, int] = (137, 200),
+    lengths_k: tuple[int, int] = (233, 320),
+    seed: int = 2027,
+) -> PagedInputs:
+    """Build ragged chunked-prefill inputs on reverse-mapped cache pages."""
+    return make_paged_inputs(
+        PAGED_CHUNKED_PREFILL,
+        list(lengths_q),
+        list(lengths_k),
+        seed=seed,
+    )
 
 
 def reference_packed(
@@ -568,6 +629,46 @@ def test_core_varlen_paged_decode_matches_fp32_with_permuted_pages() -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    ("lengths_q", "lengths_k"),
+    [
+        pytest.param((137, 200), (233, 320), id="maxima-split-across-requests"),
+        pytest.param((200, 17), (113, 271), id="fully-masked-prefix"),
+    ],
+)
+def test_core_varlen_paged_chunked_prefill_matches_fp32_with_permuted_pages(
+    lengths_q: tuple[int, int], lengths_k: tuple[int, int]
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, actual_q, actual_k, request_kv = (
+        make_paged_chunked_prefill(lengths_q=lengths_q, lengths_k=lengths_k)
+    )
+    scale = 0.37
+    got = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        PAGED_CHUNKED_PREFILL.seqlen_q,
+        PAGED_CHUNKED_PREFILL.seqlen_k,
+        softmax_scale=scale,
+        causal=True,
+        block_table=block_table,
+        shape=PAGED_CHUNKED_PREFILL,
+    )
+    expected = reference_packed(
+        q,
+        torch.cat([key for key, _ in request_kv]),
+        torch.cat([value for _, value in request_kv]),
+        actual_q,
+        actual_k,
+        causal=True,
+        scale=scale,
+    )
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
 def test_core_varlen_derives_paged_used_lengths_on_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -685,9 +786,9 @@ def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
             shape=PAGED_DECODE,
         )
 
-    chunked = AttnShape(2, 200, 320, 8, 2, 128, torch.bfloat16, True)
+    unsupported = AttnShape(2, 199, 320, 8, 2, 128, torch.bfloat16, True)
     q = q[:2]
-    k = torch.zeros(1, 16, 2, 128, device="cuda", dtype=chunked.dtype)
+    k = torch.zeros(1, 16, 2, 128, device="cuda", dtype=unsupported.dtype)
     v = torch.zeros_like(k)
     cu_q = torch.arange(3, device="cuda", dtype=torch.int32)
     cu_k = torch.arange(3, device="cuda", dtype=torch.int32)
@@ -699,19 +800,63 @@ def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
             v,
             cu_q,
             cu_k,
-            chunked.seqlen_q,
-            chunked.seqlen_k,
+            unsupported.seqlen_q,
+            unsupported.seqlen_k,
             causal=True,
             block_table=block_table,
-            shape=chunked,
+            shape=unsupported,
         )
 
 
 @requires_cuda
-def test_core_varlen_paged_rejects_gradients_before_launch(
+def test_core_varlen_paged_chunked_prefill_rejects_noncausal_mode_before_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode()
+    spec = PAGED_CHUNKED_PREFILL
+    q = torch.zeros(2, 8, 128, device="cuda", dtype=spec.dtype)
+    k = torch.zeros(1, 16, 2, 128, device="cuda", dtype=spec.dtype)
+    v = torch.zeros_like(k)
+    cu_seqlens = torch.arange(3, device="cuda", dtype=torch.int32)
+    block_table = torch.zeros(2, 20, device="cuda", dtype=torch.int32)
+
+    def reject_lookup(*args: object, **kwargs: object) -> object:
+        raise AssertionError("non-causal chunked prefill reached kernel lookup")
+
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_lookup)
+    with pytest.raises(helion_attention.UnsupportedShapeError, match="causal=True"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=False,
+            block_table=block_table,
+            shape=(2, 200, 320, 8, 2, 128),
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("spec", "factory"),
+    [
+        pytest.param(PAGED_DECODE, make_paged_decode, id="decode"),
+        pytest.param(
+            PAGED_CHUNKED_PREFILL,
+            make_paged_chunked_prefill,
+            id="chunked-prefill",
+        ),
+    ],
+)
+def test_core_varlen_paged_rejects_gradients_before_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    spec: AttnShape,
+    factory: object,
+) -> None:
+    assert callable(factory)
+    q, k, v, cu_q, cu_k, block_table, *_ = factory()
 
     def reject_lookup(*args: object, **kwargs: object) -> object:
         raise AssertionError("gradient-bearing input reached paged kernel lookup")
@@ -725,11 +870,11 @@ def test_core_varlen_paged_rejects_gradients_before_launch(
             v,
             cu_q,
             cu_k,
-            PAGED_DECODE.seqlen_q,
-            PAGED_DECODE.seqlen_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
             causal=True,
             block_table=block_table,
-            shape=PAGED_DECODE,
+            shape=spec,
         )
 
 
