@@ -276,11 +276,28 @@ def test_dense_large_softcap_preserves_small_logits(dtype: torch.dtype) -> None:
         k,
         v,
         softmax_scale=1.0,
-        softcap=1e8,
+        softcap=3e38,
         shape=(1, 1, 2, 1, 1, 1),
     )
 
     assert result.item() == pytest.approx(math.tanh(1.0), abs=5e-4)
+
+
+@requires_cuda
+def test_dense_minimum_normal_softcap_preserves_uniform_logits() -> None:
+    q = torch.zeros(1, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(1, 2, 1, 1, device="cuda", dtype=torch.bfloat16)
+    v = torch.tensor([[[[1.0]], [[3.0]]]], device="cuda", dtype=torch.bfloat16)
+
+    result = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softcap=torch.finfo(torch.float32).tiny,
+        shape=(1, 1, 2, 1, 1, 1),
+    )
+
+    assert result.item() == 2.0
 
 
 @requires_cuda
@@ -339,12 +356,54 @@ def test_dense_softcap_rejects_invalid_values(softcap: float) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "softcap",
+    [1e-46, torch.finfo(torch.float32).max * 2.0],
+    ids=["below-float32-normal", "above-float32-maximum"],
+)
+def test_dense_softcap_rejects_unrepresentable_values(softcap: float) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="normal float32"):
+        helion_attention.flash_attn_func(
+            q, q, q, softcap=softcap, shape=(1, 1, 1, 1)
+        )
+
+
 @pytest.mark.parametrize("softcap", [True, "1.0", None])
 def test_dense_softcap_rejects_invalid_types(softcap: object) -> None:
     q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
     with pytest.raises(TypeError, match="softcap"):
         helion_attention.flash_attn_func(  # type: ignore[arg-type]
             q, q, q, softcap=softcap, shape=(1, 1, 1, 1)
+        )
+
+
+def test_dense_cumulative_offsets_allow_int32_maximum() -> None:
+    int32_max = torch.iinfo(torch.int32).max
+    offsets = helion_attention._dense_cumulative_offsets(
+        1,
+        int32_max,
+        label="query",
+        device=torch.device("cpu"),
+    )
+
+    assert offsets.dtype == torch.int32
+    assert offsets.tolist() == [0, int32_max]
+
+
+@pytest.mark.parametrize(
+    ("batch", "seqlen", "label"),
+    [(3, 800_000_000, "query"), (2, 1_073_741_824, "key")],
+)
+def test_dense_cumulative_offsets_reject_int32_overflow(
+    batch: int, seqlen: int, label: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"dense {label}.*INT32_MAX"):
+        helion_attention._dense_cumulative_offsets(
+            batch,
+            seqlen,
+            label=label,
+            device=torch.device("cpu"),
         )
 
 

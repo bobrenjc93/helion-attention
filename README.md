@@ -42,9 +42,11 @@ out = helion_attention.flash_attn_func(q, k, v, causal=True, shape=(B, S, H, D))
 Everything else matches `flash_attn.flash_attn_func`: the layout is
 `[batch, seqlen, nheads, head_dim]`, `softmax_scale` defaults to
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
-mask alignment. Positive finite `softcap` values are supported for dense
-forward MHA and GQA in fp16 or bf16. This path applies
-`softcap * tanh(scores / softcap)` before softmax and is forward-only.
+mask alignment. Positive, normal-float32 `softcap` values are supported for
+dense forward MHA and GQA in fp16 or bf16; smaller positive values and values
+above `torch.finfo(torch.float32).max` raise `ValueError` before launch. This
+path applies `softcap * tanh(scores / softcap)` before softmax and is
+forward-only.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;

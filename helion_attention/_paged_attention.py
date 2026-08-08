@@ -269,8 +269,16 @@ def _varlen_attention_kernel(
         scores *= softmax_scale
         if HAS_SOFTCAP:
             # The equivalent sigmoid identity loses small logits to cancellation
-            # when the cap is large; libdevice tanh remains stable in that limit.
-            scores = softcap * libdevice.tanh(scores / softcap)
+            # when the cap is large. Below 2^-12, tanh(x) rounds to x at fp32
+            # precision, and selecting the original score also survives FTZ
+            # when scores / softcap is a subnormal value.
+            normalized_scores = scores / softcap
+            capped_scores = softcap * libdevice.tanh(normalized_scores)
+            scores = tl.where(
+                tl.abs(normalized_scores) < 0.000244140625,
+                scores,
+                capped_scores,
+            )
 
         score_mask = (
             valid_m[:, None]

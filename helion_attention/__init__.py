@@ -55,6 +55,10 @@ __all__ = [
 
 __version__ = "0.1.0"
 
+_INT32_MAX = torch.iinfo(torch.int32).max
+_FLOAT32_TINY = torch.finfo(torch.float32).tiny
+_FLOAT32_MAX = torch.finfo(torch.float32).max
+
 
 def _reject_unsupported(
     dropout_p: float,
@@ -79,8 +83,14 @@ def _reject_unsupported(
         raise ValueError("softcap must be finite")
     if normalized_softcap < 0.0:
         raise ValueError("softcap must be non-negative")
-    if normalized_softcap != 0.0 and not allow_softcap:
-        raise NotImplementedError("softcap is not implemented")
+    if normalized_softcap != 0.0:
+        if not allow_softcap:
+            raise NotImplementedError("softcap is not implemented")
+        if not _FLOAT32_TINY <= normalized_softcap <= _FLOAT32_MAX:
+            raise ValueError(
+                "positive softcap must be representable as a normal float32 value "
+                f"in [{_FLOAT32_TINY}, {_FLOAT32_MAX}]"
+            )
     if alibi_slopes is not None:
         raise NotImplementedError("ALiBi slopes are not implemented")
     if return_attn_probs:
@@ -97,6 +107,24 @@ def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bo
     return first_start < second_end and second_start < first_end
 
 
+def _dense_cumulative_offsets(
+    batch: int,
+    seqlen: int,
+    *,
+    label: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build packed offsets after proving every value fits signed int32."""
+    total = batch * seqlen
+    if total > _INT32_MAX:
+        raise ValueError(
+            f"dense {label} token total batch * seqlen = {total} exceeds "
+            f"INT32_MAX ({_INT32_MAX}) required by the packed runtime"
+        )
+    request_ids = torch.arange(batch + 1, device=device, dtype=torch.int64)
+    return (request_ids * seqlen).to(torch.int32)
+
+
 def _dense_softcap_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -106,14 +134,15 @@ def _dense_softcap_forward(
     spec: AttnShape,
 ) -> torch.Tensor:
     """Run validated dense inputs through the generic packed Triton forward."""
+    cu_seqlens_q = _dense_cumulative_offsets(
+        spec.batch, spec.seqlen_q, label="query", device=q.device
+    )
+    cu_seqlens_k = _dense_cumulative_offsets(
+        spec.batch, spec.seqlen_k, label="key", device=q.device
+    )
+
     from ._paged_attention import packed_attention
 
-    cu_seqlens_q = torch.arange(
-        spec.batch + 1, device=q.device, dtype=torch.int32
-    ) * spec.seqlen_q
-    cu_seqlens_k = torch.arange(
-        spec.batch + 1, device=q.device, dtype=torch.int32
-    ) * spec.seqlen_k
     packed = packed_attention(
         q.reshape(-1, spec.nheads_q, spec.head_dim),
         k.reshape(-1, spec.nheads_kv, spec.head_dim),
@@ -195,6 +224,8 @@ def flash_attn_func(
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
+        softcap: 0 disables capping; positive values must be representable as
+            normal finite float32 values.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
