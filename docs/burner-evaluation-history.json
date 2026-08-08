@@ -418,6 +418,36 @@
         "eval_5b403bea": 95,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:e03bede50264674d8135dfe84e2be2e3e3a8bca7",
+      "commit": "e03bede50264674d8135dfe84e2be2e3e3a8bca7",
+      "recordedAt": "2026-08-08T04:54:00.581Z",
+      "label": "base e03bede",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 63,
+        "eval_1afd133e": 45,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:17",
+      "recordedAt": "2026-08-08T04:54:00.581Z",
+      "label": "PR #17",
+      "kind": "leaf",
+      "prNumber": 17,
+      "title": "Export the varlen packed entry points",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 65,
+        "eval_1afd133e": 48,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
