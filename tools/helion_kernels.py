@@ -427,7 +427,7 @@ def decode_attention_bshd_split_kv(
 def causal_attention_bshd_16k(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
 ) -> torch.Tensor:
-    """Persistent causal attention for B1/S16K/H16/D128 bf16 only."""
+    """Fixed persistent causal attention for explicitly validated shapes."""
     batch = q.size(0)
     m_dim = hl.specialize(q.size(1))
     nheads_q = hl.specialize(q.size(2))
