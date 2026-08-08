@@ -61,26 +61,30 @@ def test_decode_omits_all_true_causal_mask_for_fused_sdpa() -> None:
     assert not is_causal
 
 
-def test_markdown_labels_faster_and_slower_results_plainly(
+def test_markdown_reports_fa3_and_fastest_baseline_plainly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report = {
         "device": "test GPU",
         "torch": "test torch",
         "triton": "test triton",
+        "flash_attn": "2.test",
+        "flash_attn_3": "3.test",
         "results": [
             {
                 "description": "faster shape",
                 "implementations": {
                     "helion-attention": {"us": 1.0, "tflops": 2.0},
-                    "flash-attn": {"us": 2.0},
+                    "flash-attn-3": {"us": 2.0},
+                    "flash-attn": {"us": 3.0},
                 },
             },
             {
                 "description": "slower shape",
                 "implementations": {
                     "helion-attention": {"us": 4.0, "tflops": 0.5},
-                    "flash-attn": {"us": 2.0},
+                    "flash-attn-3": {"us": 2.0},
+                    "flash-attn": {"us": 3.0},
                 },
             },
         ],
@@ -99,8 +103,12 @@ def test_markdown_labels_faster_and_slower_results_plainly(
 
     table = update_readme.benchmark_table()
 
+    assert "FA2 2.test, FA3 3.test" in table
+    assert "flash-attn-3 µs" in table
     assert "2.00x faster" in table
     assert "2.00x slower" in table
+    assert "Against FlashAttention 3" in table
+    assert "fastest measured implementation on 1 of 2 workloads" in table
 
 
 def test_discovery_and_report_cover_every_checked_in_kernel() -> None:
@@ -147,3 +155,4 @@ def test_discovery_and_report_cover_every_checked_in_kernel() -> None:
         ]
         == "flash_attn_with_kvcache"
     )
+    assert all("flash_attn_3_api" in row for row in report["results"])

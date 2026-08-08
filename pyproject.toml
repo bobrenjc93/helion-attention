@@ -22,6 +22,9 @@ Issues = "https://github.com/bobrenjc93/helion-attention/issues"
 # Only needed to regenerate kernels; the runtime package never imports Helion.
 generate = ["helion>=1.4.0"]
 bench = ["flash-attn>=2.7"]
+bench-fa3 = [
+    "flash-attn-3 @ git+https://github.com/Dao-AILab/flash-attention.git@69e1bcbe77c359c84b3a4589e92a7c076e33a202#subdirectory=hopper",
+]
 dev = ["pytest>=8.0"]
 
 [tool.setuptools.packages.find]
