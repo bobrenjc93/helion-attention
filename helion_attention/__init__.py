@@ -156,7 +156,7 @@ def _validate_kvcache_rotary(
     q: torch.Tensor,
     spec: AttnShape,
 ) -> None:
-    """Validate the narrow full-head rotary contract for a final-slot append."""
+    """Validate the narrow rotary contract for a final-slot append."""
     for name, tensor in (("rotary_cos", rotary_cos), ("rotary_sin", rotary_sin)):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor or None")
@@ -164,7 +164,7 @@ def _validate_kvcache_rotary(
             raise ValueError(f"{name} must use torch.strided layout")
         if tensor.ndim != 2:
             raise ValueError(
-                f"{name} must have shape [seqlen_ro, head_dim / 2], got "
+                f"{name} must have shape [seqlen_ro, rotary_dim / 2], got "
                 f"{tuple(tensor.shape)}"
             )
 
@@ -174,10 +174,15 @@ def _validate_kvcache_rotary(
             f"{tuple(rotary_cos.shape)} and {tuple(rotary_sin.shape)}"
         )
     rotary_dim = rotary_cos.shape[1] * 2
-    if rotary_dim != spec.head_dim:
+    supported_rotary_dims = {spec.head_dim}
+    if spec.head_dim == 128:
+        supported_rotary_dims.add(64)
+    if rotary_dim not in supported_rotary_dims:
+        expected = " or ".join(str(dim) for dim in sorted(supported_rotary_dims))
         raise NotImplementedError(
-            "partial rotary dimensions are not implemented; full-head rotary "
-            f"requires rotary_dim={spec.head_dim}, got {rotary_dim}"
+            "partial rotary dimensions are implemented only for rotary_dim=64 "
+            "with head_dim=128; "
+            f"rotary_dim must be {expected}, got {rotary_dim}"
         )
     if rotary_cos.shape[0] < spec.seqlen_k:
         raise ValueError(
@@ -209,17 +214,24 @@ def _apply_interleaved_rotary(
     rotary_sin: torch.Tensor,
     position: int,
 ) -> torch.Tensor:
-    """Rotate adjacent full-head pairs with one fp32-rounded rotary table row."""
-    pairs = tensor.float().reshape(*tensor.shape[:-1], tensor.shape[-1] // 2, 2)
+    """Rotate adjacent prefix pairs and preserve the unrotated head tail."""
+    rotary_dim = rotary_cos.shape[1] * 2
+    rotary_prefix = tensor[..., :rotary_dim]
+    pairs = rotary_prefix.float().reshape(
+        *tensor.shape[:-1], rotary_dim // 2, 2
+    )
     cos = rotary_cos[position].float()
     sin = rotary_sin[position].float()
     even = pairs[..., 0]
     odd = pairs[..., 1]
-    return (
+    rotated_prefix = (
         torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
         .flatten(-2)
         .to(dtype=tensor.dtype)
     )
+    if rotary_dim == tensor.shape[-1]:
+        return rotated_prefix
+    return torch.cat((rotated_prefix, tensor[..., rotary_dim:]), dim=-1)
 
 
 def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
@@ -1014,9 +1026,10 @@ def flash_attn_with_kvcache(
     and an append requires disjoint query, K-cache, and V-cache memory. Dense
     tensor-valued/partial lengths and multi-token updates fail explicitly. A
     paired ``rotary_cos``/``rotary_sin`` table may be supplied only for this
-    final-slot append: it must cover the full head, use the default interleaved
-    layout, and rotates both ``q`` and the appended ``k`` at ``cache_seqlens``.
-    Read-only rotary calls and other paged profiles fail explicitly.
+    final-slot append: it may cover the full head or the first 64 dimensions of
+    a 128-dimensional head, must use the default interleaved layout, and rotates
+    both ``q`` and the appended ``k`` at ``cache_seqlens``. Read-only rotary
+    calls and other paged profiles fail explicitly.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")

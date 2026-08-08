@@ -207,10 +207,12 @@ enabled. For an append, `q`, `k_cache`, and `v_cache` must occupy disjoint
 memory; update `k`/`v` aliases are staged safely.
 
 This same final-slot append accepts paired, contiguous `rotary_cos` and
-`rotary_sin` tensors shaped `[seqlen_ro, D / 2]`, with `seqlen_ro >= S_CACHE`
-and the same CUDA dtype/device as `q`. The default interleaved layout rotates
-adjacent full-head pairs in `q` and `new_k` at position `cache_seqlens`; the
-rotated key is what the cache stores. Partial rotary dimensions,
+`rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
+`seqlen_ro >= S_CACHE` and the same CUDA dtype/device as `q`. The default
+interleaved layout rotates adjacent pairs in `q` and `new_k` at position
+`cache_seqlens`; the rotated key is what the cache stores. `rotary_dim` may be
+the full head dimension, or 64 for a D128 head; the latter preserves dimensions
+64 through 127 unchanged. Other partial rotary dimensions,
 `rotary_interleaved=False`, and rotary on a read-only call are rejected.
 
 `shape` accepts:
@@ -458,7 +460,7 @@ also raise `NotImplementedError` rather than silently doing something else:
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense partial/ragged caches, paged profiles other than the exact read-only
   page-size-16 profile above, paged LSE, and KV-cache rotary outside the
-  full-head interleaved final-slot append
+  full-head or D128 half-head interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward, default-option dense and
   KV-packed calls for the three Llama GQA decode profiles described above
 

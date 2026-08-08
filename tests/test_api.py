@@ -85,11 +85,13 @@ def make_inputs(
 
 
 def make_rotary_tables(
-    spec: AttnShape, *, seed: int = 11
+    spec: AttnShape, *, rotary_dim: int | None = None, seed: int = 11
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if rotary_dim is None:
+        rotary_dim = spec.head_dim
     generator = torch.Generator(device="cuda").manual_seed(seed)
     angles = torch.randn(
-        (spec.seqlen_k, spec.head_dim // 2),
+        (spec.seqlen_k, rotary_dim // 2),
         device="cuda",
         dtype=torch.float32,
         generator=generator,
@@ -103,16 +105,22 @@ def reference_interleaved_rotary(
     rotary_sin: torch.Tensor,
     position: int,
 ) -> torch.Tensor:
-    pairs = tensor.float().reshape(*tensor.shape[:-1], tensor.shape[-1] // 2, 2)
+    rotary_dim = rotary_cos.shape[1] * 2
+    pairs = tensor[..., :rotary_dim].float().reshape(
+        *tensor.shape[:-1], rotary_dim // 2, 2
+    )
     cos = rotary_cos[position].float()
     sin = rotary_sin[position].float()
     even = pairs[..., 0]
     odd = pairs[..., 1]
-    return (
+    rotated_prefix = (
         torch.stack((even * cos - odd * sin, even * sin + odd * cos), dim=-1)
         .flatten(-2)
         .to(tensor.dtype)
     )
+    if rotary_dim == tensor.shape[-1]:
+        return rotated_prefix
+    return torch.cat((rotated_prefix, tensor[..., rotary_dim:]), dim=-1)
 
 
 def make_paged_kvcache_inputs(
@@ -1864,15 +1872,20 @@ def test_kvcache_appends_one_token_in_place_and_attends_to_it(
     ids=[str(entry["key"]) for entry in DECODE_SHAPES],
 )
 @pytest.mark.parametrize("return_softmax_lse", [False, True], ids=["out", "out-lse"])
-def test_kvcache_full_head_interleaved_rotary_append_matches_fa2(
-    entry: dict[str, object], return_softmax_lse: bool
+@pytest.mark.parametrize(
+    "rotary_dim", [64, 128], ids=["half-head", "full-head"]
+)
+def test_kvcache_interleaved_rotary_append_matches_fa2(
+    entry: dict[str, object], return_softmax_lse: bool, rotary_dim: int
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = spec_from_manifest_entry(entry)
     q, initial_k, initial_v = make_inputs(spec, seed=57721)
     new_k = initial_k[:, :1].clone()
     new_v = initial_v[:, :1].clone()
-    rotary_cos, rotary_sin = make_rotary_tables(spec, seed=46349)
+    rotary_cos, rotary_sin = make_rotary_tables(
+        spec, rotary_dim=rotary_dim, seed=46349
+    )
     position = spec.seqlen_k - 1
 
     q_helion = q.clone()
@@ -1916,19 +1929,22 @@ def test_kvcache_full_head_interleaved_rotary_append_matches_fa2(
     assert torch.equal(new_k, initial_k[:, :1])
     assert torch.equal(k_helion, k_fa2)
     assert torch.equal(k_helion[:, -1:], expected_appended_k)
+    assert torch.equal(
+        k_helion[:, -1:, :, rotary_dim:], new_k[..., rotary_dim:]
+    )
     assert torch.equal(v_helion, v_fa2)
     assert torch.equal(v_helion[:, -1:], new_v)
 
     if return_softmax_lse:
         got_out, got_lse = got
         expected_out, expected_lse = expected
-        torch.testing.assert_close(got_lse, expected_lse, atol=2e-3, rtol=1e-5)
+        torch.testing.assert_close(got_lse, expected_lse, atol=2e-6, rtol=0.0)
     else:
         assert isinstance(got, torch.Tensor)
         assert isinstance(expected, torch.Tensor)
         got_out, expected_out = got, expected
     torch.testing.assert_close(
-        got_out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+        got_out.float(), expected_out.float(), atol=1e-3, rtol=0.0
     )
 
 
@@ -2029,7 +2045,9 @@ def test_kvcache_rejects_invalid_rotary_before_mutating_either_cache(
     original_v = v_cache.clone()
     new_k = k_cache[:, :1].clone()
     new_v = v_cache[:, :1].clone()
-    rotary_cos, rotary_sin = make_rotary_tables(spec, seed=14159)
+    rotary_cos, rotary_sin = make_rotary_tables(
+        spec, rotary_dim=64, seed=14159
+    )
     base_kwargs: dict[str, object] = {
         "k": new_k,
         "v": new_v,
