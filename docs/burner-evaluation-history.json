@@ -1033,6 +1033,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:edb32bb966cbeeef06158d604d52f0e09a5afd32",
+      "commit": "edb32bb966cbeeef06158d604d52f0e09a5afd32",
+      "recordedAt": "2026-08-08T23:31:33.043Z",
+      "label": "base edb32bb",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:45",
+      "recordedAt": "2026-08-08T23:31:33.043Z",
+      "label": "PR #45",
+      "kind": "leaf",
+      "prNumber": 45,
+      "title": "Enable dropout on the shipped encoder-training profile",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
