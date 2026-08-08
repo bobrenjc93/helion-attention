@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import inspect
 import math
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -52,6 +55,8 @@ VLLM_KEYWORDS = {
     "aux_tensors",
     "aux_tensor_leading_dims",
 }
+
+REPO_ROOT = Path(__file__).parents[1]
 
 
 def _reference_one(
@@ -126,6 +131,52 @@ def test_vllm_surface_has_no_shape_argument() -> None:
         headdim=8,
         cache_seqlens=torch.tensor([4], dtype=torch.int32),
     )
+
+
+def test_adapter_import_does_not_require_generated_kernel_internals() -> None:
+    script = """
+import importlib.abc
+import sys
+
+BLOCKED = "torch._inductor.runtime.triton_compat"
+KERNEL = (
+    "helion_attention.kernels."
+    "paged_b4_sq1_sk1024_hq8_hkv2_d128_bf16_causal_ps16"
+)
+
+class BlockInternalModule(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == BLOCKED:
+            raise ModuleNotFoundError(f"blocked test dependency: {fullname}")
+        return None
+
+sys.meta_path.insert(0, BlockInternalModule())
+import torch
+import helion_attention.vllm_flash_attn as adapter
+assert KERNEL not in sys.modules
+
+tensor = torch.zeros(1, 1, 1)
+cumulative = torch.tensor([0, 1], dtype=torch.int32)
+result = adapter.flash_attn_varlen_func(
+    tensor,
+    tensor,
+    tensor,
+    1,
+    cumulative,
+    1,
+    cu_seqlens_k=cumulative,
+)
+assert result.shape == tensor.shape
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_nonzero_dropout_is_rejected_explicitly() -> None:

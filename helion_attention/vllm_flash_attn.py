@@ -25,9 +25,6 @@ from ._registry import has_paged_kernel
 from ._registry import has_varlen_kernel
 from ._registry import lookup_paged
 from ._shape import AttnShape
-from .kernels.paged_b4_sq1_sk1024_hq8_hkv2_d128_bf16_causal_ps16 import (
-    attention_paged as _paged_b4_sq1_sk1024_kernel,
-)
 
 __all__ = [
     "compile_flash_attn_varlen_func_from_specs",
@@ -65,6 +62,21 @@ _GENERIC_CUDA_DTYPES: frozenset[torch.dtype] = _FP8_DTYPES | {
 _QUERY_TILE_SIZE = 16
 _KEY_TILE_SIZE = 128
 _PAGED_B4_SQ1_SK1024_DEFAULT_SCALE = 0.08838834764831843
+_paged_b4_sq1_sk1024_kernel: Any = None
+
+
+def _get_paged_b4_sq1_sk1024_kernel() -> Any:
+    """Load and cache the generated kernel only after its fast path matches."""
+    global _paged_b4_sq1_sk1024_kernel
+    kernel = _paged_b4_sq1_sk1024_kernel
+    if kernel is None:
+        from .kernels.paged_b4_sq1_sk1024_hq8_hkv2_d128_bf16_causal_ps16 import (
+            attention_paged,
+        )
+
+        kernel = attention_paged
+        _paged_b4_sq1_sk1024_kernel = kernel
+    return kernel
 
 
 def _valid_paged_b4_sq1_sk1024_tensors(
@@ -659,7 +671,7 @@ def flash_attn_varlen_func(
             if softmax_scale is None
             else float(softmax_scale)
         )
-        result = _paged_b4_sq1_sk1024_kernel(
+        result = _get_paged_b4_sq1_sk1024_kernel()(
             q,
             k,
             v,
