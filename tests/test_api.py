@@ -675,6 +675,60 @@ def test_kvcache_rejects_invalid_updates_before_mutating_either_cache(
     DECODE_SHAPES[:1],
     ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
 )
+def test_kvcache_inference_tensor_lifecycle_cannot_half_apply_update(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, initial_k, initial_v = make_inputs(spec, seed=141421)
+    new_k = initial_k[:, :1].clone()
+    new_v = initial_v[:, :1].clone()
+    assert not torch.equal(initial_k[:, -1:], new_k)
+    assert not torch.equal(initial_v[:, -1:], new_v)
+    with torch.inference_mode():
+        k_cache = initial_k.clone()
+        v_cache = initial_v.clone()
+
+    assert k_cache.is_inference()
+    assert v_cache.is_inference()
+    with pytest.raises(RuntimeError, match="while torch.inference_mode.*enabled"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            k=new_k,
+            v=new_v,
+            cache_seqlens=spec.seqlen_k - 1,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+    assert torch.equal(k_cache, initial_k)
+    assert torch.equal(v_cache, initial_v)
+
+    # The same inference caches remain appendable in their valid lifecycle.
+    with torch.inference_mode():
+        result = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            k=new_k,
+            v=new_v,
+            cache_seqlens=spec.seqlen_k - 1,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+    assert isinstance(result, torch.Tensor)
+    assert torch.equal(k_cache[:, -1:], new_k)
+    assert torch.equal(v_cache[:, -1:], new_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES[:1],
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+)
 def test_kvcache_one_token_append_supports_cuda_graph_capture(
     entry: dict[str, object],
 ) -> None:

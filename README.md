@@ -124,7 +124,8 @@ The append mutates both caches in place and attends over the updated full cache.
 Read-only calls may omit `cache_seqlens` or pass the full cache length. Update
 lengths must be Python integers and satisfy `cache_seqlens + 1 == S_CACHE`;
 unpaired or multi-token updates and tensor-valued, partial, ragged, paged, or
-rotary-embedded caches are rejected explicitly.
+rotary-embedded caches are rejected explicitly. Caches created inside
+`torch.inference_mode()` must be updated while that mode remains enabled.
 
 `shape` accepts:
 

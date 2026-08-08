@@ -342,8 +342,9 @@ def flash_attn_with_kvcache(
     exactly one less than that length; the update is copied into the final
     cache slot before attention runs. If ``return_softmax_lse=True``, the result
     is ``(out, softmax_lse)`` with LSE shape ``[batch, nheads_q, 1]`` and fp32
-    dtype, matching FlashAttention. Tensor-valued/ragged lengths, multi-token
-    updates, rotary embeddings, and paged caches fail explicitly.
+    dtype, matching FlashAttention. Cache tensors created in inference mode
+    must also be updated in inference mode. Tensor-valued/ragged lengths,
+    multi-token updates, rotary embeddings, and paged caches fail explicitly.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
@@ -446,6 +447,16 @@ def flash_attn_with_kvcache(
                     f"{name} must be contiguous in "
                     "[batch, 1, nheads_kv, head_dim] layout"
                 )
+        if not torch.is_inference_mode_enabled() and (
+            k_cache.is_inference() or v_cache.is_inference()
+        ):
+            # PyTorch mutates an inference tensor's data before raising when an
+            # in-place operation is attempted outside inference mode. Reject
+            # before either copy so K and V cannot become desynchronized.
+            raise RuntimeError(
+                "KV caches created in torch.inference_mode() must be updated "
+                "while torch.inference_mode() is enabled"
+            )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     kernel = lookup(spec)
