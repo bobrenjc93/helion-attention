@@ -6,13 +6,18 @@ Regenerate with:
 paged page_size=16 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True
 
 Autotuning provenance:
-    Helion version: 1.4.0
+    Helion version: unknown (legacy artifact)
     Config selection: incumbent
-    Autotuning wall time: 66.590 s
+    Autotuning wall time: unknown (legacy artifact)
     Measured time: 0.071170 ms
+    Artifact origin selection: autotuned
     Config: helion.Config(atomic_indexing=[], block_sizes=[1], indexing=['pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer'], l2_groupings=[1], load_eviction_policies=['', '', '', '', '', '', ''], loop_orders=[[0, 1]], num_sm_multiplier=1, num_stages=5, num_warps=4, pid_type='persistent_interleaved', range_flattens=[None, False, True], range_multi_buffers=[None, None, None], range_num_stages=[0, 0, 0], range_unroll_factors=[0, 0, 0], range_warp_specializes=[], static_ranges=[False])
-    Rejected candidate time: 0.094370 ms
-    Rejected candidate: helion.Config(atomic_indexing=[], block_sizes=[4], indexing=['pointer', 'pointer', 'pointer', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer'], l2_groupings=[1], load_eviction_policies=['', '', '', '', '', '', ''], loop_orders=[[0, 1]], num_stages=1, num_warps=1, pid_type='flat', range_flattens=[None, None, None], range_multi_buffers=[None, None, None], range_num_stages=[0, 0, 0], range_unroll_factors=[0, 0, 0], range_warp_specializes=[], static_ranges=[False])
+    Rejected search:
+        Helion version: 1.4.0
+        Autotuning wall time: 66.590 s
+        Candidate time: 0.094370 ms
+        Incumbent validation time: 0.071170 ms
+        Candidate config: helion.Config(atomic_indexing=[], block_sizes=[4], indexing=['pointer', 'pointer', 'pointer', 'pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor', 'pointer'], l2_groupings=[1], load_eviction_policies=['', '', '', '', '', '', ''], loop_orders=[[0, 1]], num_stages=1, num_warps=1, pid_type='flat', range_flattens=[None, None, None], range_multi_buffers=[None, None, None], range_num_stages=[0, 0, 0], range_unroll_factors=[0, 0, 0], range_warp_specializes=[], static_ranges=[False])
 """
 
 from __future__ import annotations

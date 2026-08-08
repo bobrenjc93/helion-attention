@@ -47,7 +47,9 @@ def shape_table() -> str:
     return "\n".join(lines)
 
 
-def _format_duration(seconds: float) -> str:
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
     if seconds == 0:
         return "0 s"
     if seconds >= 60:
@@ -56,6 +58,8 @@ def _format_duration(seconds: float) -> str:
 
 
 def _format_configs(configs: list[dict[str, object]]) -> str:
+    if not configs:
+        return "unknown (legacy artifact)"
     rendered = []
     for item in configs:
         config = item["config"]
@@ -68,12 +72,35 @@ def _format_configs(configs: list[dict[str, object]]) -> str:
     return "<br>".join(rendered)
 
 
+def _format_rejected_search(provenance: dict[str, object]) -> str:
+    rejected = provenance.get("rejected_search")
+    if not isinstance(rejected, dict):
+        return "—"
+    configs = rejected["configs"]
+    assert isinstance(configs, list)
+    return (
+        f"Helion {rejected['helion_version']}, "
+        f"{_format_duration(float(rejected['autotuning_wall_time_seconds']))}; "
+        f"candidate {float(rejected['candidate_measured_time_ms']):.6f} ms, "
+        f"incumbent {float(rejected['incumbent_measured_time_ms']):.6f} ms"
+        f"<br>{_format_configs(configs)}"
+    )
+
+
+def _format_selection(provenance: dict[str, object]) -> str:
+    selection = str(provenance["selection"])
+    if "artifact_origin_selection" not in provenance:
+        return selection
+    origin = provenance["artifact_origin_selection"]
+    return f"{selection} (origin: {origin or 'unknown'})"
+
+
 def autotuning_table() -> str:
     """Render generation provenance for every checked-in kernel module."""
     manifest = json.loads(MANIFEST.read_text())
     lines = [
-        "| kernel | Helion | selection | tuning wall time | measured time | chosen config |",
-        "| --- | --- | --- | ---: | ---: | --- |",
+        "| kernel | Helion | selection | tuning wall time | measured time | chosen config | rejected search |",
+        "| --- | --- | --- | ---: | ---: | --- | --- |",
     ]
     for section in ("kernels", "varlen_kernels", "paged_kernels"):
         for entry in manifest.get(section, []):
@@ -96,12 +123,15 @@ def autotuning_table() -> str:
                 assert isinstance(provenance, dict)
                 configs = provenance["configs"]
                 assert isinstance(configs, list)
+                wall_time = provenance.get("autotuning_wall_time_seconds")
                 lines.append(
                     f"| [`{name}`]({module_path}) "
-                    f"| {provenance['helion_version']} | {provenance['selection']} "
-                    f"| {_format_duration(float(provenance['autotuning_wall_time_seconds']))} "
+                    f"| {provenance.get('helion_version') or 'unknown'} "
+                    f"| {_format_selection(provenance)} "
+                    f"| {_format_duration(None if wall_time is None else float(wall_time))} "
                     f"| {float(provenance['measured_time_ms']):.6f} ms "
-                    f"| {_format_configs(configs)} |"
+                    f"| {_format_configs(configs)} "
+                    f"| {_format_rejected_search(provenance)} |"
                 )
     return "\n".join(lines)
 

@@ -14,14 +14,17 @@ from __future__ import annotations
 
 import argparse
 import ast
+import copy
 import fcntl
 import importlib
 from importlib.metadata import version as package_version
 import json
 import math
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable
@@ -394,18 +397,15 @@ def make_provenance(
     configs: list[tuple[str, object]],
     wall_time_seconds: float,
     measured_time_ms: float,
-    rejected_candidate: tuple[str, object, float] | None = None,
 ) -> dict[str, object]:
     """Build the stable, JSON-compatible provenance schema."""
-    if selection not in {"autotuned", "fixed", "incumbent"}:
+    if selection not in {"autotuned", "fixed"}:
         raise ValueError(f"unknown config selection mode: {selection}")
     if not configs:
         raise ValueError("at least one Helion config is required")
     if wall_time_seconds < 0 or measured_time_ms <= 0:
         raise ValueError("provenance timings must be non-negative and non-zero")
-    if rejected_candidate is not None and selection != "incumbent":
-        raise ValueError("only retained incumbents can record a rejected candidate")
-    provenance: dict[str, object] = {
+    return {
         "helion_version": helion_version,
         "selection": selection,
         "configs": [
@@ -415,48 +415,112 @@ def make_provenance(
         "autotuning_wall_time_seconds": round(wall_time_seconds, 3),
         "measured_time_ms": round(measured_time_ms, 6),
     }
-    if rejected_candidate is not None:
-        kernel_name, config, candidate_time_ms = rejected_candidate
-        if candidate_time_ms <= 0:
-            raise ValueError("the rejected candidate timing must be positive")
-        provenance["rejected_candidate"] = {
-            "kernel": kernel_name,
-            "config": config_dict(config),
-            "measured_time_ms": round(candidate_time_ms, 6),
+
+
+def retain_incumbent_provenance(
+    incumbent_provenance: dict[str, object] | None,
+    *,
+    helion_version: str,
+    candidate_configs: list[tuple[str, object]],
+    wall_time_seconds: float,
+    incumbent_time_ms: float,
+    candidate_time_ms: float,
+) -> dict[str, object]:
+    """Keep artifact-origin metadata and attach the rejected search separately."""
+    if wall_time_seconds < 0 or min(incumbent_time_ms, candidate_time_ms) <= 0:
+        raise ValueError("search and acceptance timings must be non-negative")
+    if not candidate_configs:
+        raise ValueError("at least one rejected Helion config is required")
+    rejected_search = {
+        "helion_version": helion_version,
+        "configs": [
+            {"kernel": kernel_name, "config": config_dict(config)}
+            for kernel_name, config in candidate_configs
+        ],
+        "autotuning_wall_time_seconds": round(wall_time_seconds, 3),
+        "candidate_measured_time_ms": round(candidate_time_ms, 6),
+        "incumbent_measured_time_ms": round(incumbent_time_ms, 6),
+    }
+    if incumbent_provenance is None:
+        # A pre-provenance checked-in module can still be protected by the
+        # acceptance benchmark. Do not invent the Helion version, search time,
+        # or config that produced that legacy executable.
+        return {
+            "helion_version": None,
+            "selection": "incumbent",
+            "artifact_origin_selection": None,
+            "configs": [],
+            "autotuning_wall_time_seconds": None,
+            "measured_time_ms": round(incumbent_time_ms, 6),
+            "artifact_origin_unrecorded": True,
+            "rejected_search": rejected_search,
         }
-    return provenance
+    retained = copy.deepcopy(incumbent_provenance)
+    retained.setdefault("artifact_origin_selection", retained.get("selection"))
+    retained["selection"] = "incumbent"
+    retained["rejected_search"] = rejected_search
+    return retained
 
 
 def format_provenance(provenance: dict[str, object]) -> str:
     """Format manifest provenance for a generated module docstring."""
     configs = provenance["configs"]
     assert isinstance(configs, list)
+    helion_version = provenance.get("helion_version")
+    wall_time = provenance.get("autotuning_wall_time_seconds")
     lines = [
         "Autotuning provenance:",
-        f"    Helion version: {provenance['helion_version']}",
+        f"    Helion version: {helion_version or 'unknown (legacy artifact)'}",
         f"    Config selection: {provenance['selection']}",
         "    Autotuning wall time: "
-        f"{float(provenance['autotuning_wall_time_seconds']):.3f} s",
+        + (
+            "unknown (legacy artifact)"
+            if wall_time is None
+            else f"{float(wall_time):.3f} s"
+        ),
         f"    Measured time: {float(provenance['measured_time_ms']):.6f} ms",
     ]
+    if "artifact_origin_selection" in provenance:
+        origin_selection = provenance["artifact_origin_selection"]
+        lines.append(
+            "    Artifact origin selection: "
+            + (str(origin_selection) if origin_selection is not None else "unknown")
+        )
     for item in configs:
         assert isinstance(item, dict)
         label = "Config" if len(configs) == 1 else f"Config ({item['kernel']})"
         config = item["config"]
         assert isinstance(config, dict)
         lines.append(f"    {label}: {render_helion_config(config)}")
-    rejected = provenance.get("rejected_candidate")
+    if not configs:
+        lines.append("    Config: unknown (legacy artifact)")
+    rejected = provenance.get("rejected_search")
     if rejected is not None:
         assert isinstance(rejected, dict)
-        rejected_config = rejected["config"]
-        assert isinstance(rejected_config, dict)
+        rejected_configs = rejected["configs"]
+        assert isinstance(rejected_configs, list)
         lines.extend(
             [
-                "    Rejected candidate time: "
-                f"{float(rejected['measured_time_ms']):.6f} ms",
-                "    Rejected candidate: " f"{render_helion_config(rejected_config)}",
+                "    Rejected search:",
+                f"        Helion version: {rejected['helion_version']}",
+                "        Autotuning wall time: "
+                f"{float(rejected['autotuning_wall_time_seconds']):.3f} s",
+                "        Candidate time: "
+                f"{float(rejected['candidate_measured_time_ms']):.6f} ms",
+                "        Incumbent validation time: "
+                f"{float(rejected['incumbent_measured_time_ms']):.6f} ms",
             ]
         )
+        for item in rejected_configs:
+            assert isinstance(item, dict)
+            config = item["config"]
+            assert isinstance(config, dict)
+            label = (
+                "Candidate config"
+                if len(rejected_configs) == 1
+                else f"Candidate config ({item['kernel']})"
+            )
+            lines.append(f"        {label}: {render_helion_config(config)}")
     return "\n".join(lines)
 
 
@@ -492,15 +556,23 @@ def candidate_is_faster(
     return candidate_time_ms < incumbent_time_ms * (1.0 - minimum_speedup)
 
 
-def seed_incumbent_config(kernel, config: dict[str, object]):  # noqa: ANN001, ANN201
+def seed_incumbent_config(
+    kernel,  # noqa: ANN001
+    config: dict[str, object],
+    *,
+    config_factory: Callable[..., object] | None = None,
+):  # noqa: ANN201
     """Put the checked-in config in Helion's initial search population."""
-    from helion import Config
+    if config_factory is None:
+        from helion import Config
 
-    incumbent = Config(**config)
+        config_factory = Config
+
+    incumbent = config_factory(**config)
     seeds = kernel.settings.autotune_seed_configs
     if seeds is None:
         existing = []
-    elif isinstance(seeds, (Config, dict)):
+    elif isinstance(seeds, dict) or hasattr(seeds, "to_json"):
         existing = [seeds]
     else:
         existing = list(seeds)
@@ -517,89 +589,90 @@ def run_with_provenance(
     helion_version: str,
     incumbent_provenance: dict[str, object] | None = None,
     incumbent: Callable[[], object] | None = None,
+    replace_incumbent: bool = False,
 ):  # noqa: ANN201
     """Select a config, run the kernel, and capture tuning provenance."""
     from helion.autotuner.benchmarking import do_bench
     from helion.autotuner.benchmarking import interleaved_bench
-    from helion.autotuner.metrics import register_post_autotune_hook
-    from helion.autotuner.metrics import remove_post_autotune_hook
 
-    if (incumbent_provenance is None) != (incumbent is None):
-        raise ValueError("incumbent provenance and runner must be provided together")
-    incumbent_config = None
+    if replace_incumbent:
+        incumbent = None
+        incumbent_provenance = None
+    if incumbent_provenance is not None and incumbent is None:
+        raise ValueError("incumbent provenance requires an incumbent runner")
     if len(kernel.configs) != 1 and incumbent_provenance is not None:
         incumbent_config_dict = provenance_config(incumbent_provenance, kernel.name)
         if incumbent_config_dict is not None:
-            incumbent_config = seed_incumbent_config(kernel, incumbent_config_dict)
+            seed_incumbent_config(kernel, incumbent_config_dict)
 
     bound = kernel.bind(args)
     if len(kernel.configs) == 1:
         config = kernel.configs[0]
-        result = bound(*args)
-        measured_time_ms = float(
-            do_bench(lambda: bound(*args), return_mode="mean")
-        )
-        provenance = make_provenance(
-            helion_version=helion_version,
-            selection="fixed",
-            configs=[(kernel.name, config)],
-            wall_time_seconds=0.0,
-            measured_time_ms=measured_time_ms,
-        )
-        return result, provenance
+        wall_time_seconds = 0.0
+        selection = "fixed"
+        candidate_time_without_incumbent = None
+    else:
+        from helion.autotuner.metrics import register_post_autotune_hook
+        from helion.autotuner.metrics import remove_post_autotune_hook
 
-    captured_metrics = []
-    capture_metrics = captured_metrics.append
-    register_post_autotune_hook(capture_metrics)
-    started = time.perf_counter()
-    try:
-        # Generation is the authoritative search for a checked-in artifact. Do
-        # not silently substitute a local cache hit whose original wall time
-        # and winning measurement are unavailable.
-        config = bound.autotune(args, force=not kernel.configs)
-    finally:
-        wall_time_seconds = time.perf_counter() - started
-        remove_post_autotune_hook(capture_metrics)
-    if len(captured_metrics) != 1:
-        raise RuntimeError(
-            "Helion did not report exactly one set of autotuning metrics"
-        )
-    metrics = captured_metrics[0]
-    selection = "autotuned"
-    selected_config = config
-    rejected_candidate = None
-    if incumbent_config is not None:
-        assert incumbent is not None
+        captured_metrics = []
+        capture_metrics = captured_metrics.append
+        register_post_autotune_hook(capture_metrics)
+        started = time.perf_counter()
+        try:
+            # Generation is the authoritative search for a checked-in artifact.
+            # Do not silently substitute a cache hit whose original wall time
+            # and winning measurement are unavailable.
+            config = bound.autotune(args, force=not kernel.configs)
+        finally:
+            wall_time_seconds = time.perf_counter() - started
+            remove_post_autotune_hook(capture_metrics)
+        if len(captured_metrics) != 1:
+            raise RuntimeError(
+                "Helion did not report exactly one set of autotuning metrics"
+            )
+        selection = "autotuned"
+        candidate_time_without_incumbent = float(captured_metrics[0].best_perf_ms)
+
+    candidate = lambda: bound(*args)
+    if incumbent is not None:
         incumbent_time_ms, candidate_time_ms = interleaved_bench(
-            [incumbent, lambda: bound(*args)],
+            [incumbent, candidate],
             repeat=AUTOTUNE_ACCEPTANCE_REPEAT,
-            desc="validating autotuned candidate against incumbent",
+            desc="validating generated candidate against incumbent",
         )
         if candidate_is_faster(incumbent_time_ms, candidate_time_ms):
             measured_time_ms = candidate_time_ms
-            result = bound(*args)
+            result = candidate()
         else:
-            selection = "incumbent"
-            selected_config = incumbent_config
-            measured_time_ms = incumbent_time_ms
             result = incumbent()
-            rejected_candidate = (kernel.name, config, candidate_time_ms)
+            provenance = retain_incumbent_provenance(
+                incumbent_provenance,
+                helion_version=helion_version,
+                candidate_configs=[(kernel.name, config)],
+                wall_time_seconds=wall_time_seconds,
+                incumbent_time_ms=incumbent_time_ms,
+                candidate_time_ms=candidate_time_ms,
+            )
             print(
                 "retaining incumbent: candidate "
                 f"{candidate_time_ms:.6f} ms vs incumbent "
                 f"{incumbent_time_ms:.6f} ms",
                 flush=True,
             )
+            return result, provenance
+    elif candidate_time_without_incumbent is None:
+        measured_time_ms = float(do_bench(candidate, return_mode="mean"))
+        result = candidate()
     else:
-        measured_time_ms = float(metrics.best_perf_ms)
-        result = bound(*args)
+        measured_time_ms = candidate_time_without_incumbent
+        result = candidate()
     provenance = make_provenance(
         helion_version=helion_version,
         selection=selection,
-        configs=[(kernel.name, selected_config)],
+        configs=[(kernel.name, config)],
         wall_time_seconds=wall_time_seconds,
         measured_time_ms=measured_time_ms,
-        rejected_candidate=rejected_candidate,
     )
     return result, provenance
 
@@ -638,7 +711,7 @@ def refresh_module_provenance(module: str, provenance: dict[str, object]) -> str
         raise ValueError("generated module has no leading docstring")
     if parsed.body[0].end_lineno is None:
         raise ValueError("generated module docstring has no source location")
-    description = value.value.split("\n\nAutotuning provenance:", 1)[0]
+    description = value.value.split("\n\nAutotuning provenance:", 1)[0].rstrip()
     suffix = "".join(
         module.splitlines(keepends=True)[parsed.body[0].end_lineno :]
     ).lstrip("\n")
@@ -646,13 +719,11 @@ def refresh_module_provenance(module: str, provenance: dict[str, object]) -> str
 
 
 def manifest_entry(key: str, section: str = "kernels") -> dict[str, object] | None:
-    """Read one manifest entry while excluding concurrent manifest writers."""
+    """Read one entry from an atomically published manifest snapshot."""
     if not MANIFEST.exists():
         return None
-    with MANIFEST.open() as handle:
-        fcntl.flock(handle, fcntl.LOCK_SH)
-        contents = handle.read()
-        payload = json.loads(contents) if contents else {"kernels": []}
+    contents = MANIFEST.read_text()
+    payload = json.loads(contents) if contents else {"kernels": []}
     for item in payload.get(section, []):
         if item["key"] == key:
             return item
@@ -675,6 +746,30 @@ def load_incumbent_runner(
     return lambda: function(*args)
 
 
+def incumbent_artifact_inputs(
+    *,
+    artifact: Path,
+    provenance: object,
+    kernel_key: str,
+    entry_point: str,
+    args: tuple[object, ...],
+    backward: bool = False,
+    replace_incumbent: bool = False,
+) -> dict[str, object]:
+    """Load an existing executable even when its legacy provenance is absent."""
+    if replace_incumbent or not artifact.exists():
+        return {}
+    return {
+        "incumbent_provenance": provenance if isinstance(provenance, dict) else None,
+        "incumbent": load_incumbent_runner(
+            kernel_key,
+            entry_point,
+            args,
+            backward=backward,
+        ),
+    }
+
+
 _ANY_MANIFEST_ENTRY = object()
 
 
@@ -687,11 +782,17 @@ def _replace_manifest_entry(
 ) -> tuple[dict[str, object] | None, bool]:
     """Atomically replace one key, optionally only if its current value matches."""
     MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    MANIFEST.touch(exist_ok=True)
-    with MANIFEST.open("r+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
-        handle.seek(0)
-        contents = handle.read()
+    # The manifest inode changes on every publication, so use the stable parent
+    # directory inode to serialize writers. Readers need no lock: os.replace()
+    # exposes either the complete old JSON document or the complete new one.
+    lock_fd = os.open(
+        MANIFEST.parent,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    temporary_path: Path | None = None
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        contents = MANIFEST.read_text() if MANIFEST.exists() else ""
         payload = json.loads(contents) if contents else {"kernels": []}
         items = payload.get(section, [])
         previous = next((item for item in items if item["key"] == key), None)
@@ -702,21 +803,38 @@ def _replace_manifest_entry(
             updated.append(replacement)
         updated.sort(key=lambda item: item["key"])
         payload[section] = updated
-        handle.seek(0)
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-        handle.truncate()
-        handle.flush()
+        mode = (MANIFEST.stat().st_mode & 0o777) if MANIFEST.exists() else 0o644
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=MANIFEST.parent,
+            prefix=f".{MANIFEST.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, MANIFEST)
+        temporary_path = None
+        os.fsync(lock_fd)
         return previous, True
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
 
 
 def upsert_manifest(
     entry: dict[str, object], section: str = "kernels"
 ) -> dict[str, object] | None:
     """Install one entry and return the value replaced under the manifest lock."""
-    # generate_all.py has one process per GPU. Lock the shared manifest while
-    # reading and rewriting it so two shapes that finish together cannot drop
-    # each other's entries or observe a partially-written JSON document.
+    # generate_all.py has one process per GPU. Serialize read/modify/publish so
+    # two shapes that finish together cannot drop each other's entries.
     previous, updated = _replace_manifest_entry(
         key=str(entry["key"]), replacement=entry, section=section
     )
@@ -828,6 +946,11 @@ def main() -> int:
         help="KV cache page size for --paged (vLLM defaults to 16)",
     )
     parser.add_argument("--label", default="", help="human note stored in the manifest")
+    parser.add_argument(
+        "--replace-incumbent",
+        action="store_true",
+        help="install the generated executable without the performance acceptance gate",
+    )
     args = parser.parse_args()
 
     from helion_attention._shape import AttnShape
@@ -885,22 +1008,16 @@ def main() -> int:
         provenance = (
             prior_entry.get(provenance_name) if prior_entry is not None else None
         )
-        if not isinstance(provenance, dict):
-            return {}
-        if provenance_config(provenance, kernel.name) is None:
-            return {}
         artifact = backward_target if backward else target
-        if not artifact.exists():
-            return {}
-        return {
-            "incumbent_provenance": provenance,
-            "incumbent": load_incumbent_runner(
-                kernel_key,
-                entry_point,
-                kernel_args,
-                backward=backward,
-            ),
-        }
+        return incumbent_artifact_inputs(
+            artifact=artifact,
+            provenance=provenance,
+            kernel_key=kernel_key,
+            entry_point=entry_point,
+            args=kernel_args,
+            backward=backward,
+            replace_incumbent=args.replace_incumbent,
+        )
 
     helion_version = package_version("helion")
     split_kv_decode = False
@@ -918,6 +1035,7 @@ def main() -> int:
             kernel,
             forward_args,
             helion_version=helion_version,
+            replace_incumbent=args.replace_incumbent,
             **incumbent_inputs(kernel, forward_args, "attention_paged"),
         )
         expected = helion_kernels._paged_sdpa_reference(*forward_args)
@@ -931,6 +1049,7 @@ def main() -> int:
             kernel,
             forward_args,
             helion_version=helion_version,
+            replace_incumbent=args.replace_incumbent,
             **incumbent_inputs(kernel, forward_args, "attention_varlen"),
         )
         expected = helion_kernels._varlen_sdpa_reference(*forward_args)
@@ -953,6 +1072,7 @@ def main() -> int:
                 kernel,
                 forward_args,
                 helion_version=helion_version,
+                replace_incumbent=args.replace_incumbent,
                 **incumbent_inputs(kernel, forward_args, "attention"),
             )
         expected = reference(q, k, v, sm_scale, spec.causal)
@@ -979,6 +1099,7 @@ def main() -> int:
             backward_kernel,
             backward_args,
             helion_version=helion_version,
+            replace_incumbent=args.replace_incumbent,
             **incumbent_inputs(
                 backward_kernel,
                 backward_args,
@@ -1054,20 +1175,52 @@ def main() -> int:
             + _SPLIT_KV_DECODE_ENTRY_POINT
         )
         from helion.autotuner.benchmarking import do_bench
+        from helion.autotuner.benchmarking import interleaved_bench
 
-        measured_time_ms = float(
-            do_bench(lambda: kernel(*forward_args), return_mode="mean")
-        )
-        forward_provenance = make_provenance(
-            helion_version=helion_version,
-            selection="fixed",
-            configs=[
-                (partial_kernel.name, partial_kernel.configs[0]),
-                (combine_kernel.name, combine_kernel.configs[0]),
-            ],
-            wall_time_seconds=0.0,
-            measured_time_ms=measured_time_ms,
-        )
+        candidate_configs = [
+            (partial_kernel.name, partial_kernel.configs[0]),
+            (combine_kernel.name, combine_kernel.configs[0]),
+        ]
+        candidate = lambda: kernel(*forward_args)
+        incumbent_data = incumbent_inputs(kernel, forward_args, "attention")
+        incumbent = incumbent_data.get("incumbent")
+        incumbent_provenance = incumbent_data.get("incumbent_provenance")
+        if callable(incumbent):
+            incumbent_time_ms, candidate_time_ms = interleaved_bench(
+                [incumbent, candidate],
+                repeat=AUTOTUNE_ACCEPTANCE_REPEAT,
+                desc="validating generated candidate against incumbent",
+            )
+            if candidate_is_faster(incumbent_time_ms, candidate_time_ms):
+                forward_provenance = make_provenance(
+                    helion_version=helion_version,
+                    selection="fixed",
+                    configs=candidate_configs,
+                    wall_time_seconds=0.0,
+                    measured_time_ms=candidate_time_ms,
+                )
+            else:
+                forward_provenance = retain_incumbent_provenance(
+                    (
+                        incumbent_provenance
+                        if isinstance(incumbent_provenance, dict)
+                        else None
+                    ),
+                    helion_version=helion_version,
+                    candidate_configs=candidate_configs,
+                    wall_time_seconds=0.0,
+                    incumbent_time_ms=incumbent_time_ms,
+                    candidate_time_ms=candidate_time_ms,
+                )
+        else:
+            measured_time_ms = float(do_bench(candidate, return_mode="mean"))
+            forward_provenance = make_provenance(
+                helion_version=helion_version,
+                selection="fixed",
+                configs=candidate_configs,
+                wall_time_seconds=0.0,
+                measured_time_ms=measured_time_ms,
+            )
     elif forward_provenance["selection"] != "incumbent":
         bound = kernel.bind(forward_args)
         code = strip_helion(bound.to_triton_code())
@@ -1091,6 +1244,7 @@ def main() -> int:
         + (["--backward"] if args.backward else [])
         + (["--varlen"] if args.varlen else [])
         + ([f"--paged --page-size {args.page_size}"] if args.paged else [])
+        + (["--replace-incumbent"] if args.replace_incumbent else [])
     )
     description = (
         f"paged page_size={args.page_size} {spec.describe()}"

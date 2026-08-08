@@ -8,7 +8,9 @@ from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import threading
+from types import ModuleType
 from types import SimpleNamespace
 
 import pytest
@@ -71,26 +73,41 @@ def test_provenance_is_structured_and_rendered_in_module_docstring() -> None:
     )
 
 
-def test_retained_incumbent_records_the_rejected_candidate() -> None:
+def test_retained_incumbent_preserves_origin_and_records_rejected_search() -> None:
     incumbent = {"block_sizes": [256, 64], "num_warps": 8}
     candidate = {"block_sizes": [256, 32], "num_warps": 8}
-    provenance = generate.make_provenance(
-        helion_version="1.4.0",
-        selection="incumbent",
+    origin = generate.make_provenance(
+        helion_version="1.3.0",
+        selection="autotuned",
         configs=[("attention_bshd", incumbent)],
-        wall_time_seconds=779.924,
+        wall_time_seconds=412.25,
         measured_time_ms=0.293216,
-        rejected_candidate=("attention_bshd", candidate, 0.34879),
+    )
+    provenance = generate.retain_incumbent_provenance(
+        origin,
+        helion_version="1.4.0",
+        candidate_configs=[("attention_bshd", candidate)],
+        wall_time_seconds=779.924,
+        incumbent_time_ms=0.29598,
+        candidate_time_ms=0.34879,
     )
 
-    assert provenance["rejected_candidate"] == {
-        "kernel": "attention_bshd",
-        "config": candidate,
-        "measured_time_ms": 0.34879,
+    assert provenance["helion_version"] == "1.3.0"
+    assert provenance["artifact_origin_selection"] == "autotuned"
+    assert provenance["autotuning_wall_time_seconds"] == 412.25
+    assert provenance["measured_time_ms"] == 0.293216
+    assert provenance["rejected_search"] == {
+        "helion_version": "1.4.0",
+        "configs": [{"kernel": "attention_bshd", "config": candidate}],
+        "autotuning_wall_time_seconds": 779.924,
+        "candidate_measured_time_ms": 0.34879,
+        "incumbent_measured_time_ms": 0.29598,
     }
     rendered = generate.format_provenance(provenance)
     assert "Config selection: incumbent" in rendered
-    assert "Rejected candidate time: 0.348790 ms" in rendered
+    assert "Helion version: 1.3.0" in rendered
+    assert "Rejected search:\n        Helion version: 1.4.0" in rendered
+    assert "Candidate time: 0.348790 ms" in rendered
     assert generate.provenance_config(provenance, "attention_bshd") == incumbent
 
 
@@ -105,12 +122,152 @@ def test_incumbent_config_is_prepended_to_existing_search_seeds() -> None:
     incumbent = {"block_sizes": [128], "num_warps": 8}
     kernel = SimpleNamespace(settings=SimpleNamespace(autotune_seed_configs=existing))
 
-    selected = generate.seed_incumbent_config(kernel, incumbent)
+    selected = generate.seed_incumbent_config(
+        kernel, incumbent, config_factory=lambda **values: values
+    )
 
     assert generate.config_dict(selected) == incumbent
     assert [
         generate.config_dict(config) for config in kernel.settings.autotune_seed_configs
     ] == [incumbent, existing]
+
+
+def install_fake_benchmarking(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    do_bench,  # noqa: ANN001
+    interleaved_bench,  # noqa: ANN001
+) -> None:
+    helion = ModuleType("helion")
+    autotuner = ModuleType("helion.autotuner")
+    benchmarking = ModuleType("helion.autotuner.benchmarking")
+    benchmarking.do_bench = do_bench  # type: ignore[attr-defined]
+    benchmarking.interleaved_bench = interleaved_bench  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "helion", helion)
+    monkeypatch.setitem(sys.modules, "helion.autotuner", autotuner)
+    monkeypatch.setitem(sys.modules, "helion.autotuner.benchmarking", benchmarking)
+
+
+def test_legacy_fixed_artifact_is_compared_without_helion_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = []
+
+    def interleaved(runners, *, repeat, desc):  # noqa: ANN001, ANN202
+        assert repeat == generate.AUTOTUNE_ACCEPTANCE_REPEAT
+        assert "incumbent" in desc
+        observed.extend(runner() for runner in runners)
+        return 1.0, 1.2
+
+    install_fake_benchmarking(
+        monkeypatch,
+        do_bench=lambda runner, **kwargs: 1.2,
+        interleaved_bench=interleaved,
+    )
+
+    class Bound:
+        def __call__(self):  # noqa: ANN204
+            return "candidate"
+
+    kernel = SimpleNamespace(
+        name="fixed_attention",
+        configs=[{"block_sizes": [64]}],
+        bind=lambda args: Bound(),
+    )
+    result, provenance = generate.run_with_provenance(
+        kernel,
+        (),
+        helion_version="1.4.0",
+        incumbent=lambda: "incumbent",
+    )
+
+    assert observed == ["incumbent", "candidate"]
+    assert result == "incumbent"
+    assert provenance["artifact_origin_unrecorded"] is True
+    assert provenance["artifact_origin_selection"] is None
+    assert provenance["helion_version"] is None
+    assert provenance["configs"] == []
+    assert provenance["rejected_search"]["helion_version"] == "1.4.0"
+
+
+def test_explicit_replacement_override_skips_incumbent_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_interleaved(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        raise AssertionError("replacement override must skip incumbent benchmarking")
+
+    def benchmark(runner, **kwargs):  # noqa: ANN001, ANN003, ANN202
+        assert runner() == "candidate"
+        return 0.2
+
+    install_fake_benchmarking(
+        monkeypatch,
+        do_bench=benchmark,
+        interleaved_bench=fail_interleaved,
+    )
+    kernel = SimpleNamespace(
+        name="fixed_attention",
+        configs=[{"block_sizes": [64]}],
+        bind=lambda args: lambda: "candidate",
+    )
+    origin = generate.make_provenance(
+        helion_version="1.3.0",
+        selection="fixed",
+        configs=[("fixed_attention", {"block_sizes": [128]})],
+        wall_time_seconds=0.0,
+        measured_time_ms=0.1,
+    )
+
+    result, provenance = generate.run_with_provenance(
+        kernel,
+        (),
+        helion_version="1.4.0",
+        incumbent_provenance=origin,
+        incumbent=lambda: "incumbent",
+        replace_incumbent=True,
+    )
+
+    assert result == "candidate"
+    assert provenance["helion_version"] == "1.4.0"
+    assert provenance["selection"] == "fixed"
+
+
+def test_incumbent_loader_keeps_legacy_artifact_without_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    artifact = tmp_path / "shape.py"
+    artifact.write_text("generated module\n")
+    runner = lambda: "incumbent"
+    monkeypatch.setattr(generate, "load_incumbent_runner", lambda *args, **kwargs: runner)
+
+    inputs = generate.incumbent_artifact_inputs(
+        artifact=artifact,
+        provenance=None,
+        kernel_key="shape",
+        entry_point="attention",
+        args=(),
+    )
+
+    assert inputs == {"incumbent_provenance": None, "incumbent": runner}
+    assert generate.incumbent_artifact_inputs(
+        artifact=artifact,
+        provenance=None,
+        kernel_key="shape",
+        entry_point="attention",
+        args=(),
+        replace_incumbent=True,
+    ) == {}
+
+
+def test_generate_all_force_forwards_replacement_override() -> None:
+    request = generate_all.ShapeRequest(1, 64, 8, 128)
+
+    ordinary = generate_all.generation_command(request)
+    forced = generate_all.generation_command(request, replace_incumbent=True)
+
+    assert "--replace-incumbent" not in ordinary
+    assert forced[:-1] == ordinary
+    assert forced[-1] == "--replace-incumbent"
 
 
 def test_refresh_module_provenance_preserves_executable_body() -> None:
@@ -121,13 +278,13 @@ def test_refresh_module_provenance_preserves_executable_body() -> None:
         wall_time_seconds=10.0,
         measured_time_ms=0.2,
     )
-    retained = generate.make_provenance(
+    retained = generate.retain_incumbent_provenance(
+        original,
         helion_version="1.4.0",
-        selection="incumbent",
-        configs=[("attention_bshd", {"block_sizes": [128]})],
+        candidate_configs=[("attention_bshd", {"block_sizes": [128]})],
         wall_time_seconds=20.0,
-        measured_time_ms=0.1,
-        rejected_candidate=("attention_bshd", {"block_sizes": [64]}, 0.2),
+        incumbent_time_ms=0.1,
+        candidate_time_ms=0.2,
     )
     module = generate.build_module(
         "from __future__ import annotations\n\nVALUE = 1\n",
@@ -166,15 +323,31 @@ def test_checked_in_modules_publish_manifest_provenance() -> None:
                     )
                 )
             for path, provenance in artifacts:
-                assert provenance["helion_version"]
                 assert provenance["selection"] in {
                     "autotuned",
                     "fixed",
                     "incumbent",
                 }
                 assert provenance["configs"]
-                assert provenance["autotuning_wall_time_seconds"] >= 0
+                if provenance.get("artifact_origin_unrecorded"):
+                    assert provenance["helion_version"] is None
+                    wall_time = provenance["autotuning_wall_time_seconds"]
+                    assert wall_time is None or wall_time == 0
+                else:
+                    assert provenance["helion_version"]
+                    assert provenance["autotuning_wall_time_seconds"] >= 0
                 assert provenance["measured_time_ms"] > 0
+                if provenance["selection"] == "incumbent":
+                    assert provenance["artifact_origin_selection"] in {
+                        "autotuned",
+                        "fixed",
+                    }
+                    rejected = provenance["rejected_search"]
+                    assert rejected["helion_version"]
+                    assert rejected["configs"]
+                    assert rejected["autotuning_wall_time_seconds"] >= 0
+                    assert rejected["candidate_measured_time_ms"] > 0
+                    assert rejected["incumbent_measured_time_ms"] > 0
                 docstring = ast.get_docstring(ast.parse(path.read_text()))
                 assert docstring is not None
                 assert generate.format_provenance(provenance) in docstring
@@ -395,6 +568,67 @@ def test_failed_parallel_verification_preserves_successful_manifest_update(
         old_a,
         {"key": "shape_b", "note": "candidate b"},
     ]
+
+
+def test_manifest_publication_is_atomic_for_unlocked_readers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel_dir = tmp_path / "kernels"
+    kernel_dir.mkdir()
+    manifest = kernel_dir / "manifest.json"
+    old_payload = {"kernels": [{"key": "shape_a", "note": "old"}]}
+    old_text = json.dumps(old_payload) + "\n"
+    manifest.write_text(old_text)
+    monkeypatch.setattr(generate, "MANIFEST", manifest)
+    first_half_written = threading.Event()
+    allow_publication = threading.Event()
+    real_dumps = json.dumps
+
+    def split_dump(payload, handle, **kwargs):  # noqa: ANN001, ANN202
+        serialized = real_dumps(payload, **kwargs)
+        midpoint = len(serialized) // 2
+        handle.write(serialized[:midpoint])
+        handle.flush()
+        first_half_written.set()
+        assert allow_publication.wait(timeout=5)
+        handle.write(serialized[midpoint:])
+
+    monkeypatch.setattr(generate.json, "dump", split_dump)
+    replacement = {"key": "shape_a", "note": "new"}
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        writer = executor.submit(generate.upsert_manifest, replacement)
+        assert first_half_written.wait(timeout=5)
+        # Runtime registry readers do not take the writer lock. They must still
+        # see a complete old snapshot while the new temporary file is partial.
+        assert manifest.read_text() == old_text
+        assert json.loads(manifest.read_text()) == old_payload
+        allow_publication.set()
+        assert writer.result(timeout=5) == old_payload["kernels"][0]
+
+    assert json.loads(manifest.read_text()) == {"kernels": [replacement]}
+
+
+def test_atomic_manifest_publication_serializes_concurrent_writers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    kernel_dir = tmp_path / "kernels"
+    kernel_dir.mkdir()
+    manifest = kernel_dir / "manifest.json"
+    manifest.write_text('{"kernels": []}\n')
+    monkeypatch.setattr(generate, "MANIFEST", manifest)
+    start = threading.Barrier(2)
+
+    def publish(entry: dict[str, object]) -> None:
+        start.wait(timeout=5)
+        generate.upsert_manifest(entry)
+
+    entries = [{"key": "shape_a"}, {"key": "shape_b"}]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(publish, entry) for entry in entries]
+        for future in futures:
+            future.result(timeout=5)
+
+    assert json.loads(manifest.read_text()) == {"kernels": entries}
 
 
 def test_forward_only_upgrade_removes_stale_backward_artifact(

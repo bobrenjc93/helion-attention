@@ -18,9 +18,9 @@
       "note": "16k context, single sequence",
       "implementations": {
         "helion-attention": {
-          "us": 3315.1868835824434,
-          "tflops": 331.67926130661385,
-          "max_abs_error": 0.008774995803833008
+          "max_abs_error": 0.013725638389587402,
+          "tflops": 387.48239946572255,
+          "us": 2837.751438919927
         },
         "flash-attn": {
           "us": 3404.7857310090744,
@@ -393,9 +393,9 @@
       "note": "Qwen2-7B GQA 7:1",
       "implementations": {
         "helion-attention": {
-          "us": 5884.970633188884,
-          "tflops": 81.74978048230453,
-          "max_abs_error": 0.00818490982055664
+          "max_abs_error": 0.012372970581054688,
+          "tflops": 93.32652484614997,
+          "us": 5154.965945652553
         },
         "flash-attn": {
           "us": 1498.072693667074,
@@ -502,9 +502,9 @@
       "note": "GPT-2 medium style, causal",
       "implementations": {
         "helion-attention": {
-          "us": 127.7381381715223,
-          "tflops": 67.31210680755714,
-          "max_abs_error": 0.007910013198852539
+          "max_abs_error": 0.01050710678100586,
+          "tflops": 78.4882431624461,
+          "us": 109.54918664957455
         },
         "flash-attn": {
           "us": 197.743974661713,
