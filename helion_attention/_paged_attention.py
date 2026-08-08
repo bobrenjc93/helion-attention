@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -267,7 +268,9 @@ def _varlen_attention_kernel(
                 )
         scores *= softmax_scale
         if HAS_SOFTCAP:
-            scores = softcap * (2.0 * tl.sigmoid(2.0 * scores / softcap) - 1.0)
+            # The equivalent sigmoid identity loses small logits to cancellation
+            # when the cap is large; libdevice tanh remains stable in that limit.
+            scores = softcap * libdevice.tanh(scores / softcap)
 
         score_mask = (
             valid_m[:, None]

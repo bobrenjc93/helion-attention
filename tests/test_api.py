@@ -263,6 +263,27 @@ def test_dense_softcap_matches_fp32_oracle(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+def test_dense_large_softcap_preserves_small_logits(dtype: torch.dtype) -> None:
+    q = torch.tensor([[[[1.0]]]], device="cuda", dtype=dtype)
+    k = torch.tensor([[[[1.0]], [[-1.0]]]], device="cuda", dtype=dtype)
+    v = torch.tensor([[[[1.0]], [[-1.0]]]], device="cuda", dtype=dtype)
+
+    result = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0,
+        softcap=1e8,
+        shape=(1, 1, 2, 1, 1, 1),
+    )
+
+    assert result.item() == pytest.approx(math.tanh(1.0), abs=5e-4)
+
+
+@requires_cuda
 def test_softcap_zero_retains_specialized_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
