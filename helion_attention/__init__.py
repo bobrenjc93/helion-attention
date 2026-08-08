@@ -8,14 +8,16 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization; compatible unregistered dense shapes, dense
 ALiBi calls, and ALiBi on one shipped causal varlen profile use a generic
-Triton forward kernel. Grad-enabled dense calls without a generated backward
-use PyTorch SDPA autograd. The explicit shape validates these paths and makes
-specialization introspection independent of fallback coverage.
+Triton forward kernel. Positive dropout on the shipped encoder-training
+profile and grad-enabled dense calls without a generated backward use PyTorch
+SDPA autograd. The explicit shape validates these paths and makes specialization
+introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
 
 import math
+from numbers import Real
 
 import torch
 
@@ -76,6 +78,7 @@ _CORE_PAGED_VARLEN_SHAPES = frozenset(
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
+_DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _VARLEN_ALIBI_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
@@ -92,10 +95,16 @@ def _reject_unsupported(
     alibi_slopes: torch.Tensor | None,
     return_attn_probs: bool,
     *,
+    allow_dropout: bool = False,
     allow_alibi: bool = False,
     allow_return_attn_probs: bool = False,
-) -> None:
-    if dropout_p != 0.0:
+) -> float:
+    if isinstance(dropout_p, bool) or not isinstance(dropout_p, Real):
+        raise TypeError("dropout_p must be a real number")
+    probability = float(dropout_p)
+    if not math.isfinite(probability) or not 0.0 <= probability < 1.0:
+        raise ValueError("dropout_p must satisfy 0.0 <= dropout_p < 1.0")
+    if probability != 0.0 and not allow_dropout:
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
     if tuple(window_size) != (-1, -1):
         raise NotImplementedError("sliding-window attention is not implemented")
@@ -103,8 +112,17 @@ def _reject_unsupported(
         raise NotImplementedError("softcap is not implemented")
     if alibi_slopes is not None and not allow_alibi:
         raise NotImplementedError("ALiBi slopes are not implemented")
+    if probability != 0.0 and alibi_slopes is not None:
+        raise NotImplementedError(
+            "dropout combined with ALiBi slopes is not implemented"
+        )
+    if probability != 0.0 and return_attn_probs:
+        raise NotImplementedError(
+            "return_attn_probs=True is not implemented with dropout"
+        )
     if return_attn_probs and not allow_return_attn_probs:
         raise NotImplementedError("return_attn_probs is not implemented")
+    return probability
 
 
 def _supports_diagnostic_return(spec: AttnShape) -> bool:
@@ -501,6 +519,8 @@ def flash_attn_func(
         q: ``[batch, seqlen_q, nheads_q, head_dim]``, contiguous, fp16 or bf16.
         k: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
+        dropout_p: values in ``(0, 1)`` are supported only for the shipped
+            noncausal bf16 ``(8, 512, 512, 16, 16, 64)`` profile.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
@@ -523,20 +543,32 @@ def flash_attn_func(
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
     use a generic packed Triton forward kernel. Grad-enabled calls without
-    ALiBi or a generated backward use PyTorch SDPA autograd.
+    ALiBi or a generated backward, plus supported positive-dropout calls, use
+    PyTorch SDPA autograd.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
-    _reject_unsupported(
+    dropout = _reject_unsupported(
         dropout_p,
         window_size,
         softcap,
         alibi_slopes,
         return_attn_probs,
+        allow_dropout=True,
         allow_alibi=True,
         allow_return_attn_probs=True,
     )
     spec = normalize_shape(shape, q.dtype, causal)
+    if dropout != 0.0:
+        if spec.key != _DROPOUT_SDPA_KEY:
+            raise NotImplementedError(
+                "dropout is implemented only for the shipped encoder-training "
+                f"profile {_DROPOUT_SDPA_KEY}; got {spec.key}"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "deterministic=True is not supported with dropout"
+            )
     check_tensors(q, k, v, spec)
     if alibi_slopes is not None:
         _validate_alibi_slopes(alibi_slopes, q, spec)
@@ -575,6 +607,8 @@ def flash_attn_func(
         raise NotImplementedError(
             "ALiBi backward is not implemented; ALiBi calls are forward-only"
         )
+    if dropout != 0.0:
+        return dense_attention_sdpa(q, k, v, scale, spec, dropout)
     if needs_backward:
         if has_backward(spec):
             return attention_autograd(q, k, v, scale, spec)

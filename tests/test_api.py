@@ -34,6 +34,7 @@ LONG_DECODE = next(
     entry for entry in DECODE_SHAPES if int(entry["seqlen_k"]) == 16384
 )
 BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
+ENCODER_TRAINING = spec_from_manifest_entry(BACKWARD_SHAPES[0])
 QWEN_PREFILL = AttnShape(
     batch=1,
     seqlen_q=2048,
@@ -346,7 +347,9 @@ def test_generated_backward_retains_exact_dispatch(
     monkeypatch.setattr(helion_attention, "attention_autograd", generated)
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
 
-    out = helion_attention.flash_attn_func(q, k, v, shape=spec)
+    out = helion_attention.flash_attn_func(
+        q, k, v, dropout_p=0.0, shape=spec
+    )
 
     assert out is sentinel
     assert dispatched == [spec]
@@ -607,6 +610,113 @@ def test_dense_packed_entry_points_propagate_sdpa_gradients() -> None:
     torch.testing.assert_close(
         kv_grad.float(), kv_expected_grad, atol=5e-2, rtol=2e-2
     )
+
+
+@requires_cuda
+def test_encoder_dropout_dense_forward_and_qkv_gradients_match_direct_sdpa() -> None:
+    spec = ENCODER_TRAINING
+    q, k, v = make_inputs(spec, seed=244949)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    grad_out = make_inputs(spec, seed=264575)[0]
+    dropout_p = 0.25
+    scale = 0.137
+
+    torch.cuda.manual_seed_all(20260808)
+    got = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        softmax_scale=scale,
+        shape=spec,
+    )
+    torch.cuda.manual_seed_all(20260808)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        dropout_p=dropout_p,
+        scale=scale,
+    ).transpose(1, 2).contiguous()
+
+    got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
+    expected_grads = torch.autograd.grad(expected, (q, k, v), grad_out)
+
+    torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(actual, reference, atol=2e-3, rtol=1e-2)
+
+
+@requires_cuda
+def test_encoder_dropout_qkvpacked_forward_and_gradient_match_direct_sdpa() -> None:
+    spec = ENCODER_TRAINING
+    q, k, v = make_inputs(spec, seed=282842)
+    qkv = torch.stack((q, k, v), dim=2).requires_grad_()
+    grad_out = make_inputs(spec, seed=316227)[0]
+    dropout_p = 0.25
+    scale = 1.0 / math.sqrt(spec.head_dim)
+
+    torch.cuda.manual_seed_all(20260808)
+    got = helion_attention.flash_attn_qkvpacked_func(
+        qkv,
+        dropout_p=dropout_p,
+        shape=spec,
+    )
+    q_ref, k_ref, v_ref = (
+        qkv[:, :, index].contiguous() for index in range(3)
+    )
+    torch.cuda.manual_seed_all(20260808)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q_ref.transpose(1, 2),
+        k_ref.transpose(1, 2),
+        v_ref.transpose(1, 2),
+        dropout_p=dropout_p,
+        scale=scale,
+    ).transpose(1, 2).contiguous()
+
+    got_grad = torch.autograd.grad(got, qkv, grad_out)[0]
+    expected_grad = torch.autograd.grad(expected, qkv, grad_out)[0]
+
+    torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(got_grad, expected_grad, atol=2e-3, rtol=1e-2)
+
+
+@requires_cuda
+def test_encoder_dropout_dispatches_to_sdpa(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = ENCODER_TRAINING
+    q, k, v = make_inputs(spec, seed=331662)
+    sentinel = torch.empty_like(q)
+    dispatched: list[tuple[AttnShape, float]] = []
+
+    def fallback(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        dropout_arg: float,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        dispatched.append((spec_arg, dropout_arg))
+        return sentinel
+
+    def reject_generated(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("dropout call reached a generated specialization")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", fallback)
+    monkeypatch.setattr(helion_attention, "attention_autograd", reject_generated)
+    monkeypatch.setattr(helion_attention, "lookup", reject_generated)
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, dropout_p=0.25, shape=spec
+    )
+
+    assert out is sentinel
+    assert dispatched == [(spec, 0.25)]
 
 
 @requires_cuda
@@ -1106,6 +1216,89 @@ def test_rejects_unimplemented_features() -> None:
     ):
         with pytest.raises(NotImplementedError):
             helion_attention.flash_attn_func(q, q, q, shape=(1, 7, 2, 32), **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("dropout_p", "error", "message"),
+    [
+        (-0.1, ValueError, r"0\.0 <= dropout_p < 1\.0"),
+        (1.0, ValueError, r"0\.0 <= dropout_p < 1\.0"),
+        (float("nan"), ValueError, r"0\.0 <= dropout_p < 1\.0"),
+        (float("inf"), ValueError, r"0\.0 <= dropout_p < 1\.0"),
+        (True, TypeError, "real number"),
+        ("0.1", TypeError, "real number"),
+    ],
+    ids=["negative", "one", "nan", "infinity", "bool", "string"],
+)
+def test_dense_dropout_rejects_invalid_probability(
+    dropout_p: object, error: type[Exception], message: str
+) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    with pytest.raises(error, match=message):
+        helion_attention.flash_attn_func(
+            q,
+            q,
+            q,
+            dropout_p=dropout_p,  # type: ignore[arg-type]
+            shape=(1, 1, 1, 1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("other-shape", "only for the shipped encoder-training profile"),
+        ("causal", "only for the shipped encoder-training profile"),
+        ("deterministic", "deterministic=True"),
+        ("alibi", "dropout combined with ALiBi"),
+        ("window", "sliding-window"),
+        ("softcap", "softcap"),
+        ("return-probs", "return_attn_probs=True"),
+    ],
+)
+def test_dense_dropout_rejects_out_of_scope_calls_before_dispatch(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    kwargs: dict[str, object] = {
+        "dropout_p": 0.25,
+        "shape": (
+            ENCODER_TRAINING.batch,
+            ENCODER_TRAINING.seqlen_q,
+            ENCODER_TRAINING.nheads_q,
+            ENCODER_TRAINING.head_dim,
+        ),
+    }
+    if case == "other-shape":
+        kwargs["shape"] = (1, 1, 1, 1)
+    elif case == "causal":
+        kwargs["causal"] = True
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(ENCODER_TRAINING.nheads_q)
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 1.0
+    else:
+        kwargs["return_attn_probs"] = True
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope dropout call reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "attention_autograd", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_func(
+            q,
+            q,
+            q,
+            **kwargs,  # type: ignore[arg-type]
+        )
 
 
 @requires_cuda
