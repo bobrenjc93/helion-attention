@@ -45,10 +45,6 @@ PERSISTENT_CAUSAL_16K_KEY = (
 )
 SPLIT_KV_DECODE_16K_KEY = "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
 SPLIT_KV_DECODE_SPLITS = 8
-DIRECT_LSE_DECODE_KEYS = {
-    "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal",
-    "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal",
-}
 AUTOTUNE_ACCEPTANCE_REPEAT = 100
 MIN_CANDIDATE_SPEEDUP = 0.02
 
@@ -151,33 +147,90 @@ def _replace_generated_once(
     return code.replace(old, new, 1)
 
 
-def add_direct_decode_lse_support(code: str) -> str:
-    """Expose the single-token kernel's online-softmax state as fp32 LSE."""
+def should_add_direct_decode_lse(
+    spec: "AttnShape", *, paged: bool, varlen: bool, split_kv: bool
+) -> bool:
+    """Whether this artifact is the ordinary dense single-token cache path."""
+    return not (paged or varlen or split_kv) and spec.is_decode
+
+
+def add_direct_decode_lse_support(code: str, spec: "AttnShape") -> str:
+    """Expose any dense single-token kernel's online-softmax state as fp32 LSE."""
+    if not spec.is_decode:
+        raise ValueError("direct decode LSE support requires seqlen_q=1")
+
+    triton_name = (
+        "_helion_causal_attention_bshd"
+        if spec.causal
+        else "_helion_attention_bshd"
+    )
+    signature_pattern = rf"^def {re.escape(triton_name)}\(([^\n]+)\):$"
+    signature_match = re.search(signature_pattern, code, flags=re.MULTILINE)
+    if signature_match is None:
+        raise RuntimeError(
+            f"generated dense decode has no {triton_name} Triton signature"
+        )
+    triton_args = signature_match.group(1)
+    if triton_args.count("out, qk_scale") != 1:
+        raise RuntimeError("generated dense decode has unexpected Triton arguments")
+    triton_args = triton_args.replace(
+        "out, qk_scale", "out, softmax_lse, qk_scale", 1
+    )
+    rewritten_signature = (
+        f"def {triton_name}({triton_args}, STORE_LSE: tl.constexpr):"
+    )
+    code = re.sub(
+        signature_pattern,
+        rewritten_signature,
+        code,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    # Helion may lower the output through either a pointer or a tensor
+    # descriptor. Find the store inside the Triton function rather than a
+    # source-location comment: descriptor lowering emits that comment once for
+    # descriptor construction and again for the actual store.
+    lines = code.splitlines(keepends=True)
+    signature_line = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith(f"def {triton_name}(")
+    )
+    output_stores = []
+    for index in range(signature_line + 1, len(lines)):
+        stripped = lines[index].lstrip()
+        if stripped.startswith("tl.store(out +") or stripped.startswith(
+            "out_desc.store("
+        ):
+            output_stores.append(index)
+        if lines[index].startswith("def "):
+            break
+    if len(output_stores) != 1:
+        raise RuntimeError(
+            "expected one dense decode output store, found "
+            f"{len(output_stores)}"
+        )
+    output_store = output_stores[0]
+
+    indent = lines[output_store][: -len(lines[output_store].lstrip())]
+    batch_offset = (
+        "" if spec.batch == 1 else f"offset_0 * {spec.nheads_q} + "
+    )
+    lse_store = (
+        f"{indent}if STORE_LSE:\n"
+        f"{indent}    # qk_scale uses log2(e), so the online state is base-2. "
+        "FlashAttention\n"
+        f"{indent}    # exposes the natural-log normalization factor.\n"
+        f"{indent}    lse = (m_i + libdevice.log2(l_i)) * "
+        "0.6931471805599453\n"
+        f"{indent}    tl.store(softmax_lse + {batch_offset}offset_1 + "
+        "indices_2, lse, indices_2 < 1)\n"
+    )
+    lines.insert(output_store + 1, lse_store)
+    code = "".join(lines)
+
     rewrites = (
-        (
-            "def _helion_causal_attention_bshd(q, k, v, out, qk_scale, "
-            "_RDIM_SIZE_3: tl.constexpr):",
-            "def _helion_causal_attention_bshd(q, k, v, out, softmax_lse, "
-            "qk_scale, _RDIM_SIZE_3: tl.constexpr, STORE_LSE: tl.constexpr):",
-            "direct-decode Triton signature",
-        ),
-        (
-            "        tl.store(out + tl.broadcast_to(offset_1 * 128 + "
-            "(0 + indices_3)[None, :] * 1, [_BLOCK_SIZE_2, _RDIM_SIZE_3]), "
-            "v_20, None)\n",
-            "        tl.store(out + tl.broadcast_to(offset_1 * 128 + "
-            "(0 + indices_3)[None, :] * 1, [_BLOCK_SIZE_2, _RDIM_SIZE_3]), "
-            "v_20, None)\n"
-            "        if STORE_LSE:\n"
-            "            # qk_scale uses log2(e), so the online state is base-2. "
-            "FlashAttention\n"
-            "            # exposes the natural-log normalization factor.\n"
-            "            lse = (m_i + libdevice.log2(l_i)) * "
-            "0.6931471805599453\n"
-            "            tl.store(softmax_lse + offset_1 + indices_2, lse, "
-            "None)\n",
-            "direct-decode output store",
-        ),
         (
             "def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, "
             "sm_scale: float, *, _launcher=_default_launcher):",
@@ -201,10 +254,9 @@ def add_direct_decode_lse_support(code: str) -> str:
             "direct-decode output allocation",
         ),
         (
-            "q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=",
-            "q, k, v, out, softmax_lse, qk_scale, _RDIM_SIZE_3, "
-            "STORE_LSE=return_softmax_lse, num_warps=",
-            "direct-decode launch arguments",
+            "q, k, v, out, qk_scale,",
+            "q, k, v, out, softmax_lse, qk_scale,",
+            "direct-decode LSE launch argument",
         ),
         (
             "    return out",
@@ -216,6 +268,30 @@ def add_direct_decode_lse_support(code: str) -> str:
         code = _replace_generated_once(
             code, old, new, description=description
         )
+
+    # Scope the constexpr insertion to the launcher. The rendered provenance
+    # can also contain `, num_warps=`, so a module-wide replacement would
+    # corrupt the generated module's docstring.
+    lines = code.splitlines(keepends=True)
+    launch_lines = [
+        index
+        for index, line in enumerate(lines)
+        if line.lstrip().startswith(f"_launcher({triton_name},")
+    ]
+    if len(launch_lines) != 1:
+        raise RuntimeError(
+            "expected one dense decode launcher, found "
+            f"{len(launch_lines)}"
+        )
+    launch_line = lines[launch_lines[0]]
+    if launch_line.count(", num_warps=") != 1:
+        raise RuntimeError("generated dense decode launcher has no num_warps")
+    lines[launch_lines[0]] = launch_line.replace(
+        ", num_warps=",
+        ", STORE_LSE=return_softmax_lse, num_warps=",
+        1,
+    )
+    code = "".join(lines)
     return code if code.endswith("\n") else code + "\n"
 
 
@@ -1408,8 +1484,13 @@ def main() -> int:
                 else "attention_varlen" if args.varlen else "attention"
             ),
         )
-        if spec.key in DIRECT_LSE_DECODE_KEYS:
-            code = add_direct_decode_lse_support(code)
+        if should_add_direct_decode_lse(
+            spec,
+            paged=args.paged,
+            varlen=args.varlen,
+            split_kv=split_kv_decode,
+        ):
+            code = add_direct_decode_lse_support(code, spec)
 
     command = " ".join(
         ["python tools/generate.py", f"--batch {spec.batch}", f"--seqlen {spec.seqlen_q}"]

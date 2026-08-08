@@ -162,7 +162,7 @@ def _helion_causal_attention_bshd(q, k, v, out, softmax_lse, qk_scale, _RDIM_SIZ
             # qk_scale uses log2(e), so the online state is base-2. FlashAttention
             # exposes the natural-log normalization factor.
             lse = (m_i + libdevice.log2(l_i)) * 0.6931471805599453
-            tl.store(softmax_lse + offset_1 + indices_2, lse, None)
+            tl.store(softmax_lse + offset_1 + indices_2, lse, indices_2 < 1)
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, return_softmax_lse: bool = False, _launcher=_default_launcher):
     """Bottom-right causal attention over ``[batch, seq, heads, dim]``.
