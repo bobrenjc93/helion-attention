@@ -353,6 +353,45 @@ def test_shape_argument_is_required() -> None:
         helion_attention.flash_attn_func(q, q, q)  # type: ignore[call-arg]
 
 
+@pytest.mark.parametrize(
+    ("packed_shape", "message"),
+    [
+        ((1, 1, 3, 1), r"rank 5.*got rank 4"),
+        ((1, 1, 2, 1, 1), r"packed axis \(dimension 2\).*exactly 3.*got 2"),
+        ((1, 1, 4, 1, 1), r"packed axis \(dimension 2\).*exactly 3.*got 4"),
+    ],
+    ids=["wrong-rank", "undersized-axis", "oversized-axis"],
+)
+def test_qkvpacked_validates_dense_layout_before_slicing(
+    packed_shape: tuple[int, ...], message: str
+) -> None:
+    qkv = torch.zeros(packed_shape)
+    with pytest.raises(ValueError, match=message):
+        helion_attention.flash_attn_qkvpacked_func(
+            qkv, shape=(1, 1, 1, 1)
+        )
+
+
+@pytest.mark.parametrize(
+    ("packed_shape", "message"),
+    [
+        ((1, 1, 2, 1), r"rank 5.*got rank 4"),
+        ((1, 1, 1, 1, 1), r"packed axis \(dimension 2\).*exactly 2.*got 1"),
+        ((1, 1, 3, 1, 1), r"packed axis \(dimension 2\).*exactly 2.*got 3"),
+    ],
+    ids=["wrong-rank", "undersized-axis", "oversized-axis"],
+)
+def test_kvpacked_validates_dense_layout_before_slicing(
+    packed_shape: tuple[int, ...], message: str
+) -> None:
+    q = torch.zeros(1, 1, 1, 1)
+    kv = torch.zeros(packed_shape)
+    with pytest.raises(ValueError, match=message):
+        helion_attention.flash_attn_kvpacked_func(
+            q, kv, shape=(1, 1, 1, 1)
+        )
+
+
 def test_kvcache_shape_argument_is_required() -> None:
     q = torch.zeros(1, 1, 1, 1)
     with pytest.raises(TypeError):

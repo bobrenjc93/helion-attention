@@ -594,6 +594,17 @@ def flash_attn_qkvpacked_func(
     shape: ShapeLike,
 ) -> torch.Tensor:
     """``qkv`` is ``[batch, seqlen, 3, nheads, head_dim]``; see :func:`flash_attn_func`."""
+    if qkv.ndim != 5:
+        raise ValueError(
+            "qkv must be rank 5 with shape "
+            "[batch, seqlen, 3, nheads, head_dim]; "
+            f"got rank {qkv.ndim} and shape {tuple(qkv.shape)}"
+        )
+    if qkv.shape[2] != 3:
+        raise ValueError(
+            "qkv packed axis (dimension 2) must contain exactly 3 entries "
+            f"(Q, K, V); got {qkv.shape[2]} in shape {tuple(qkv.shape)}"
+        )
     q, k, v = (qkv[:, :, i].contiguous() for i in range(3))
     return flash_attn_func(
         q,
@@ -626,6 +637,17 @@ def flash_attn_kvpacked_func(
     shape: ShapeLike,
 ) -> torch.Tensor:
     """``kv`` is ``[batch, seqlen_k, 2, nheads_kv, head_dim]``; see :func:`flash_attn_func`."""
+    if kv.ndim != 5:
+        raise ValueError(
+            "kv must be rank 5 with shape "
+            "[batch, seqlen_k, 2, nheads_kv, head_dim]; "
+            f"got rank {kv.ndim} and shape {tuple(kv.shape)}"
+        )
+    if kv.shape[2] != 2:
+        raise ValueError(
+            "kv packed axis (dimension 2) must contain exactly 2 entries "
+            f"(K, V); got {kv.shape[2]} in shape {tuple(kv.shape)}"
+        )
     k, v = (kv[:, :, i].contiguous() for i in range(2))
     return flash_attn_func(
         q,
