@@ -658,6 +658,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:e00b4aa8db03c24a12bbd6c6df9dd7eeb5a502ef",
+      "commit": "e00b4aa8db03c24a12bbd6c6df9dd7eeb5a502ef",
+      "recordedAt": "2026-08-08T12:45:46.129Z",
+      "label": "base e00b4aa",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 71,
+        "eval_1afd133e": 55,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:31",
+      "recordedAt": "2026-08-08T12:45:46.129Z",
+      "label": "PR #31",
+      "kind": "leaf",
+      "prNumber": 31,
+      "title": "Add a dense SDPA autograd fallback",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 71,
+        "eval_1afd133e": 66,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
