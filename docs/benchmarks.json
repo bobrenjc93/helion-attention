@@ -208,9 +208,9 @@
       "note": "single-sequence 7B prefill",
       "implementations": {
         "helion-attention": {
-          "us": 429.602077956927,
-          "tflops": 80.0194350723012,
-          "max_abs_error": 0.007561683654785156
+          "us": 387.34463305460747,
+          "tflops": 88.74917231434476,
+          "max_abs_error": 0.011789083480834961
         },
         "flash-attn": {
           "us": 227.72363641045308,
@@ -844,9 +844,9 @@
       "note": "fp16 causal coverage",
       "implementations": {
         "helion-attention": {
-          "us": 1862.7822344456245,
-          "tflops": 295.19823704978086,
-          "max_abs_error": 0.0012814998626708984
+          "us": 1655.003477697787,
+          "tflops": 332.2591396490183,
+          "max_abs_error": 0.0018554925918579102
         },
         "flash-attn": {
           "us": 1734.0293797579677,
@@ -958,9 +958,9 @@
       "note": "Llama-3-8B GQA 4:1",
       "implementations": {
         "helion-attention": {
-          "us": 6195.898277418954,
-          "tflops": 354.95929605935464,
-          "max_abs_error": 0.009353160858154297
+          "us": 5742.220769609724,
+          "tflops": 383.00368084898224,
+          "max_abs_error": 0.01282191276550293
         },
         "flash-attn": {
           "us": 6539.972257614136,
@@ -1072,8 +1072,8 @@
       "note": "short-sequence encoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 3741.1487913131714,
-          "tflops": 5.7401717167368185,
+          "us": 3505.7495419795696,
+          "tflops": 6.125604873608267,
           "max_abs_error": 0.00380098819732666
         },
         "flash-attn": {
@@ -1138,8 +1138,8 @@
       "note": "ragged decoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 81.95411182400505,
-          "tflops": 12.314872036772911,
+          "us": 78.26477111459592,
+          "tflops": 12.895385569099046,
           "max_abs_error": 0.007879257202148438
         },
         "flash-attn": {
