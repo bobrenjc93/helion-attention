@@ -42,6 +42,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
 PERSISTENT_CAUSAL_KEYS = {
     "b1_sq2048_sk2048_hq28_hkv4_d128_bf16_causal",
+    "b1_sq2048_sk2048_hq32_hkv32_d128_bf16_causal",
     "b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal",
 }
 SPLIT_KV_DECODE_16K_KEY = "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"

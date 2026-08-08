@@ -405,132 +405,32 @@
     },
     {
       "autotuning_provenance": {
-        "artifact_origin_selection": "autotuned",
-        "artifact_origin_unrecorded": true,
-        "autotuning_wall_time_seconds": null,
+        "autotuning_wall_time_seconds": 0.0,
         "configs": [
           {
             "config": {
-              "atomic_indexing": [],
               "block_sizes": [
                 128,
-                64
+                128
               ],
               "indexing": [
                 "pointer",
                 "tensor_descriptor",
+                "block_ptr",
                 "pointer",
-                "tensor_descriptor"
-              ],
-              "l2_groupings": [
-                32
-              ],
-              "load_eviction_policies": [
-                "first",
-                "last",
-                "first"
-              ],
-              "loop_orders": [
-                [
-                  1,
-                  0
-                ]
+                "pointer"
               ],
               "num_sm_multiplier": 1,
               "num_stages": 3,
               "num_warps": 8,
-              "pid_type": "persistent_interleaved",
-              "range_flattens": [
-                null,
-                null,
-                null
-              ],
-              "range_multi_buffers": [
-                null,
-                null,
-                true
-              ],
-              "range_num_stages": [
-                0,
-                3,
-                1
-              ],
-              "range_unroll_factors": [
-                0,
-                2,
-                3
-              ],
-              "range_warp_specializes": []
+              "pid_type": "persistent_interleaved"
             },
-            "kernel": "causal_attention_bshd"
+            "kernel": "causal_attention_bshd_16k"
           }
         ],
-        "helion_version": null,
-        "measured_time_ms": 0.387584,
-        "rejected_search": {
-          "autotuning_wall_time_seconds": 526.449,
-          "candidate_measured_time_ms": 0.428128,
-          "configs": [
-            {
-              "config": {
-                "atomic_indexing": [],
-                "block_sizes": [
-                  128,
-                  64
-                ],
-                "indexing": [
-                  "tensor_descriptor",
-                  "tensor_descriptor",
-                  "pointer",
-                  "pointer"
-                ],
-                "l2_groupings": [
-                  64
-                ],
-                "load_eviction_policies": [
-                  "first",
-                  "first",
-                  ""
-                ],
-                "loop_orders": [
-                  [
-                    1,
-                    0
-                  ]
-                ],
-                "num_sm_multiplier": 1,
-                "num_stages": 5,
-                "num_warps": 8,
-                "pid_type": "persistent_interleaved",
-                "range_flattens": [
-                  null,
-                  null,
-                  true
-                ],
-                "range_multi_buffers": [
-                  null,
-                  false,
-                  true
-                ],
-                "range_num_stages": [
-                  0,
-                  4,
-                  1
-                ],
-                "range_unroll_factors": [
-                  0,
-                  1,
-                  4
-                ],
-                "range_warp_specializes": []
-              },
-              "kernel": "causal_attention_bshd"
-            }
-          ],
-          "helion_version": "1.4.0",
-          "incumbent_measured_time_ms": 0.387584
-        },
-        "selection": "incumbent"
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.138368,
+        "selection": "fixed"
       },
       "backward": false,
       "batch": 1,
