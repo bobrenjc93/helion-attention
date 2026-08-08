@@ -329,21 +329,25 @@ def flash_attn_with_kvcache(
     *,
     shape: ShapeLike,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Read a full KV cache with FlashAttention's decode entry-point shape.
+    """Read or append one token to a dense FlashAttention-style KV cache.
 
-    The supported path is a dense, contiguous, read-only cache and exactly one
-    query token. As with every entry point in this package, ``shape`` is
-    required and describes ``q`` plus the cache:
+    The supported path is a dense, contiguous cache and exactly one query
+    token. As with every entry point in this package, ``shape`` is required and
+    describes ``q`` plus the cache:
     ``(batch, 1, cache_len, nheads_q, nheads_kv, head_dim)``.
 
     ``cache_seqlens`` may be omitted or supplied as a Python integer equal to
-    the declared cache length. If ``return_softmax_lse=True``, the result is
-    ``(out, softmax_lse)`` with LSE shape ``[batch, nheads_q, 1]`` and fp32
-    dtype, matching FlashAttention. Tensor-valued lengths, cache appends,
-    partial/ragged caches, rotary embeddings, and paged caches fail explicitly.
+    the declared cache length for a read-only call. A paired, one-token ``k``
+    and ``v`` update is supported when the Python integer ``cache_seqlens`` is
+    exactly one less than that length; the update is copied into the final
+    cache slot before attention runs. If ``return_softmax_lse=True``, the result
+    is ``(out, softmax_lse)`` with LSE shape ``[batch, nheads_q, 1]`` and fp32
+    dtype, matching FlashAttention. Tensor-valued/ragged lengths, multi-token
+    updates, rotary embeddings, and paged caches fail explicitly.
     """
-    if k is not None or v is not None:
-        raise NotImplementedError("updating the KV cache with k/v is not implemented")
+    if (k is None) != (v is None):
+        raise ValueError("k and v must be provided together when updating the KV cache")
+    append_kv = k is not None
     if rotary_cos is not None or rotary_sin is not None:
         raise NotImplementedError(
             "rotary embeddings in the KV-cache entry point are not implemented"
@@ -369,38 +373,100 @@ def flash_attn_with_kvcache(
             "flash_attn_with_kvcache currently supports only seqlen_q=1 "
             "with a non-empty cache"
         )
-    if cache_seqlens is not None:
-        if isinstance(cache_seqlens, int):
-            if cache_seqlens != spec.seqlen_k:
-                raise NotImplementedError(
-                    "partial or ragged KV caches are not implemented; cache_seqlens "
-                    "must equal the cache length declared by shape"
-                )
-        elif isinstance(cache_seqlens, torch.Tensor):
-            # Reading a CUDA tensor on the host would synchronize and break
-            # graph capture, while a device assertion would poison the CUDA
-            # context for an ordinary input error. Reject this unsupported
-            # dynamic form recoverably before launching any CUDA work.
-            raise NotImplementedError(
-                "tensor-valued cache_seqlens are not implemented; omit "
-                "cache_seqlens or pass the full cache length as a Python int"
+    if isinstance(cache_seqlens, torch.Tensor):
+        # Reading a CUDA tensor on the host would synchronize and break graph
+        # capture, while a device assertion would poison the CUDA context for
+        # an ordinary input error. Reject this unsupported dynamic/ragged form
+        # recoverably before launching any CUDA work.
+        raise NotImplementedError(
+            "tensor-valued cache_seqlens are not implemented; pass a Python int"
+        )
+    if cache_seqlens is not None and type(cache_seqlens) is not int:
+        raise TypeError("cache_seqlens must be a Python int, a torch.Tensor, or None")
+
+    if append_kv:
+        if cache_seqlens is None:
+            raise ValueError(
+                "cache_seqlens must be a Python int when updating the KV cache"
             )
-        else:
-            raise TypeError("cache_seqlens must be an int, a torch.Tensor, or None")
+        if cache_seqlens < 0 or cache_seqlens >= spec.seqlen_k:
+            raise ValueError(
+                f"cache_seqlens={cache_seqlens} is out of range for a cache "
+                f"of length {spec.seqlen_k}"
+            )
+        if cache_seqlens + 1 != spec.seqlen_k:
+            raise NotImplementedError(
+                "only a one-token update that fills the final cache slot is "
+                "implemented; cache_seqlens + 1 must equal the cache length "
+                "declared by shape"
+            )
+    elif cache_seqlens is not None and cache_seqlens != spec.seqlen_k:
+        raise NotImplementedError(
+            "partial or ragged KV caches are not implemented for read-only "
+            "calls; cache_seqlens must equal the cache length declared by shape"
+        )
+
     # Dispatch directly after the KV-cache-specific checks. Routing back
     # through flash_attn_func would repeat normalization and validation on
     # every latency-sensitive decode step.
     check_tensors(q, k_cache, v_cache, spec)
+    if k_cache.device != q.device or v_cache.device != q.device:
+        raise ValueError("q, k_cache, and v_cache must be on the same CUDA device")
+    if append_kv:
+        assert k is not None and v is not None
+        expected_update = (spec.batch, 1, spec.nheads_kv, spec.head_dim)
+        for name, tensor in (("k", k), ("v", v)):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor")
+            if tensor.ndim == 4 and tensor.shape[1] != 1:
+                raise NotImplementedError(
+                    "multi-token KV-cache updates are not implemented; "
+                    f"{name} must contain exactly one token"
+                )
+            if tuple(tensor.shape) != expected_update:
+                raise ValueError(
+                    f"{name} has shape {tuple(tensor.shape)} but a one-token "
+                    f"update for the declared shape requires {expected_update}"
+                )
+            if tensor.dtype != spec.dtype:
+                raise ValueError(
+                    f"{name} has dtype {tensor.dtype} but shape declares {spec.dtype}"
+                )
+            if not tensor.is_cuda:
+                raise ValueError(
+                    f"{name} must be a CUDA tensor, got device {tensor.device}"
+                )
+            if tensor.device != q.device:
+                raise ValueError(
+                    "q, k_cache, v_cache, and update k/v must be on the same "
+                    "CUDA device"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"{name} must be contiguous in "
+                    "[batch, 1, nheads_kv, head_dim] layout"
+                )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     kernel = lookup(spec)
     scale = float(softmax_scale)
     needs_backward = torch.is_grad_enabled() and any(
-        tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        tensor.requires_grad
+        for tensor in (q, k_cache, v_cache, k, v)
+        if tensor is not None
     )
     if needs_backward:
+        if append_kv:
+            raise NotImplementedError("KV-cache updates do not support autograd")
         lookup_backward(spec)
         return attention_autograd(q, k_cache, v_cache, scale, spec)
+
+    # All input, feature, dispatch, and autograd validation must precede both
+    # writes so a rejected call cannot leave a half-updated cache.
+    if append_kv:
+        assert k is not None and v is not None and cache_seqlens is not None
+        k_cache[:, cache_seqlens : cache_seqlens + 1].copy_(k)
+        v_cache[:, cache_seqlens : cache_seqlens + 1].copy_(v)
     if return_softmax_lse:
         return kernel(
             q,

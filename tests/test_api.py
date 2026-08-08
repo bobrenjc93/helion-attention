@@ -529,24 +529,203 @@ def test_kvcache_softmax_lse_has_bounded_peak_allocation() -> None:
 @requires_cuda
 @pytest.mark.parametrize(
     "entry",
+    DECODE_SHAPES,
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES],
+)
+@pytest.mark.parametrize("return_softmax_lse", [False, True], ids=["out", "out-lse"])
+def test_kvcache_appends_one_token_in_place_and_attends_to_it(
+    entry: dict[str, object], return_softmax_lse: bool
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec, seed=8675309)
+    generator = torch.Generator(device=q.device).manual_seed(314159)
+    update_shape = (spec.batch, 1, spec.nheads_kv, spec.head_dim)
+    new_k = torch.randn(
+        update_shape,
+        device=q.device,
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    new_v = torch.randn(
+        update_shape,
+        device=q.device,
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    expected_k = k_cache.clone()
+    expected_v = v_cache.clone()
+    expected_k[:, -1:] = new_k
+    expected_v[:, -1:] = new_v
+    k_pointer = k_cache.data_ptr()
+    v_pointer = v_cache.data_ptr()
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=new_k,
+        v=new_v,
+        cache_seqlens=spec.seqlen_k - 1,
+        causal=spec.causal,
+        return_softmax_lse=return_softmax_lse,
+        shape=spec,
+    )
+    if return_softmax_lse:
+        out, lse = result
+    else:
+        assert isinstance(result, torch.Tensor)
+        out = result
+
+    assert k_cache.data_ptr() == k_pointer
+    assert v_cache.data_ptr() == v_pointer
+    assert torch.equal(k_cache, expected_k)
+    assert torch.equal(v_cache, expected_v)
+    scale = 1.0 / math.sqrt(spec.head_dim)
+    expected_out = reference_attention(q, expected_k, expected_v, spec, scale)
+    torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
+    if return_softmax_lse:
+        expected_lse = reference_single_token_lse(q, expected_k, spec, scale)
+        torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
     DECODE_SHAPES[:1],
     ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
 )
-def test_kvcache_entry_point_rejects_cache_mutation_and_partial_cache(
+def test_kvcache_rejects_invalid_updates_before_mutating_either_cache(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec, seed=271828)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    new_k = k_cache[:, :1].clone()
+    new_v = v_cache[:, :1].clone()
+    base_kwargs: dict[str, object] = {
+        "k": new_k,
+        "v": new_v,
+        "cache_seqlens": spec.seqlen_k - 1,
+    }
+
+    def reject(
+        error: type[Exception],
+        match: str,
+        *,
+        q_arg: torch.Tensor = q,
+        **overrides: object,
+    ) -> None:
+        kwargs = {**base_kwargs, **overrides}
+        with pytest.raises(error, match=match):
+            helion_attention.flash_attn_with_kvcache(
+                q_arg,
+                k_cache,
+                v_cache,
+                causal=spec.causal,
+                shape=spec,
+                **kwargs,
+            )
+        assert torch.equal(k_cache, original_k)
+        assert torch.equal(v_cache, original_v)
+
+    reject(ValueError, "provided together", v=None)
+    reject(ValueError, "provided together", k=None)
+
+    multi_k = torch.cat((new_k, new_k), dim=1)
+    multi_v = torch.cat((new_v, new_v), dim=1)
+    reject(NotImplementedError, "multi-token", k=multi_k, v=multi_v)
+    reject(
+        NotImplementedError,
+        "tensor-valued cache_seqlens",
+        cache_seqlens=torch.tensor(
+            [spec.seqlen_k - 1], device=q.device, dtype=torch.int32
+        ),
+    )
+    reject(ValueError, "must be a Python int", cache_seqlens=None)
+    reject(NotImplementedError, "final cache slot", cache_seqlens=spec.seqlen_k - 2)
+    reject(ValueError, "out of range", cache_seqlens=-1)
+    reject(ValueError, "out of range", cache_seqlens=spec.seqlen_k)
+    reject(ValueError, "dtype", v=new_v.to(torch.float16))
+
+    noncontiguous_v = torch.randn(
+        (spec.batch, 1, spec.head_dim, spec.nheads_kv),
+        device=q.device,
+        dtype=spec.dtype,
+    ).transpose(-1, -2)
+    assert not noncontiguous_v.is_contiguous()
+    reject(ValueError, "contiguous", v=noncontiguous_v)
+
+    grad_q = q.detach().requires_grad_()
+    reject(NotImplementedError, "autograd", q_arg=grad_q)
+    reject(TypeError, "float", softmax_scale=object())
+
+    reject(
+        NotImplementedError,
+        "partial or ragged",
+        k=None,
+        v=None,
+        cache_seqlens=spec.seqlen_k - 1,
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES[:1],
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+)
+def test_kvcache_one_token_append_supports_cuda_graph_capture(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec, seed=161803)
+    new_k = k_cache[:, :1].clone()
+    new_v = v_cache[:, :1].clone()
+
+    def append() -> torch.Tensor:
+        result = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            k=new_k,
+            v=new_v,
+            cache_seqlens=spec.seqlen_k - 1,
+            causal=spec.causal,
+            shape=spec,
+        )
+        assert isinstance(result, torch.Tensor)
+        return result
+
+    # Warm Triton's JIT before capture, as callers do for the read-only path.
+    expected = append().clone()
+    torch.cuda.synchronize(q.device)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = append()
+
+    k_cache[:, -1:].zero_()
+    v_cache[:, -1:].zero_()
+    graph.replay()
+    torch.cuda.synchronize(q.device)
+
+    assert torch.equal(k_cache[:, -1:], new_k)
+    assert torch.equal(v_cache[:, -1:], new_v)
+    torch.testing.assert_close(captured, expected)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES[:1],
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+)
+def test_kvcache_read_only_partial_cache_is_rejected(
     entry: dict[str, object],
 ) -> None:
     spec = spec_from_manifest_entry(entry)
     q, k_cache, v_cache = make_inputs(spec)
-    with pytest.raises(NotImplementedError, match="updating"):
-        helion_attention.flash_attn_with_kvcache(
-            q,
-            k_cache,
-            v_cache,
-            k=k_cache[:, :1],
-            v=v_cache[:, :1],
-            causal=spec.causal,
-            shape=spec,
-        )
     with pytest.raises(NotImplementedError, match="partial or ragged"):
         helion_attention.flash_attn_with_kvcache(
             q,
