@@ -82,7 +82,9 @@ out = helion_attention.flash_attn_varlen_func(
 
 `cu_seqlens_q` and `cu_seqlens_k` remain on the GPU and may describe different
 query and key lengths. Causal masking follows FlashAttention's bottom-right
-alignment, including zero output for fully masked query rows.
+alignment, including zero output for fully masked query rows. Grad-enabled
+calls to these two shipped profiles run each request through PyTorch SDPA
+autograd; no-grad calls retain the generated packed kernels.
 
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus
@@ -370,12 +372,14 @@ same page-16 logical cache as Helion.
 The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape uses
 its checked-in generated backward. Default-option dense MHA, GQA, and
 cross-attention calls without a generated backward use PyTorch SDPA autograd,
-including fp16/bf16 and bottom-right causal masking. Packed varlen and KV-cache
-calls remain forward-only. These unsupported FlashAttention features also
-raise `NotImplementedError` rather than silently doing something else:
+including fp16/bf16 and bottom-right causal masking. The two checked-in packed
+varlen profiles use the same fallback independently per request. KV-cache and
+paged-varlen calls remain forward-only. These unsupported FlashAttention
+features also raise `NotImplementedError` rather than silently doing something
+else:
 
-- backward for dense ALiBi, varlen, and KV-cache calls
-- `deterministic=True` when using the dense SDPA autograd fallback
+- backward for dense ALiBi, paged-varlen, and KV-cache calls
+- `deterministic=True` when using a dense or packed-varlen SDPA autograd fallback
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes for varlen and KV-cache calls
