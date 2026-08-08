@@ -598,6 +598,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:d2e6c36750b8765a933453d1f0f8d9ef357d7a62",
+      "commit": "d2e6c36750b8765a933453d1f0f8d9ef357d7a62",
+      "recordedAt": "2026-08-08T10:36:49.304Z",
+      "label": "base d2e6c36",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 65,
+        "eval_1afd133e": 52,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:26",
+      "recordedAt": "2026-08-08T10:36:49.304Z",
+      "label": "PR #26",
+      "kind": "leaf",
+      "prNumber": 26,
+      "title": "Fallback for unregistered dense forward shapes",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 67,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
