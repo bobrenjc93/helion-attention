@@ -1003,6 +1003,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:84b2ee74dd344648b71053d5242834febc14adee",
+      "commit": "84b2ee74dd344648b71053d5242834febc14adee",
+      "recordedAt": "2026-08-08T23:10:31.773Z",
+      "label": "base 84b2ee7",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:44",
+      "recordedAt": "2026-08-08T23:10:31.773Z",
+      "label": "PR #44",
+      "kind": "leaf",
+      "prNumber": 44,
+      "title": "Enable ALiBi on the shipped causal varlen profile",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
