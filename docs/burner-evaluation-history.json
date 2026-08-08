@@ -733,6 +733,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:fcc6354f803eaf085700dba47e9caae628fe7d4f",
+      "commit": "fcc6354f803eaf085700dba47e9caae628fe7d4f",
+      "recordedAt": "2026-08-08T13:51:57.147Z",
+      "label": "base fcc6354",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 75,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:34",
+      "recordedAt": "2026-08-08T13:51:57.147Z",
+      "label": "PR #34",
+      "kind": "leaf",
+      "prNumber": 34,
+      "title": "Enable dense ALiBi through the generic packed runtime",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 77,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
