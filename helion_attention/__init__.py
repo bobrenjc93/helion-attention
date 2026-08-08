@@ -125,6 +125,26 @@ def _dense_cumulative_offsets(
     return (request_ids * seqlen).to(torch.int32)
 
 
+def _check_dense_packed_addressing(spec: AttnShape) -> None:
+    """Reject layouts whose element offsets can overflow signed int32."""
+    element_counts = (
+        (
+            "query/output",
+            spec.batch * spec.seqlen_q * spec.nheads_q * spec.head_dim,
+        ),
+        (
+            "key/value",
+            spec.batch * spec.seqlen_k * spec.nheads_kv * spec.head_dim,
+        ),
+    )
+    for label, count in element_counts:
+        if count > _INT32_MAX:
+            raise ValueError(
+                f"dense {label} element count {count} exceeds INT32_MAX "
+                f"({_INT32_MAX}) addressable by the packed runtime"
+            )
+
+
 def _dense_softcap_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -134,6 +154,7 @@ def _dense_softcap_forward(
     spec: AttnShape,
 ) -> torch.Tensor:
     """Run validated dense inputs through the generic packed Triton forward."""
+    _check_dense_packed_addressing(spec)
     cu_seqlens_q = _dense_cumulative_offsets(
         spec.batch, spec.seqlen_q, label="query", device=q.device
     )

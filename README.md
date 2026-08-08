@@ -46,7 +46,8 @@ mask alignment. Positive, normal-float32 `softcap` values are supported for
 dense forward MHA and GQA in fp16 or bf16; smaller positive values and values
 above `torch.finfo(torch.float32).max` raise `ValueError` before launch. This
 path applies `softcap * tanh(scores / softcap)` before softmax and is
-forward-only.
+forward-only. The generic packed runtime rejects query/output or K/V layouts
+with more than `torch.iinfo(torch.int32).max` elements.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;

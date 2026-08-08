@@ -407,6 +407,42 @@ def test_dense_cumulative_offsets_reject_int32_overflow(
         )
 
 
+def test_dense_packed_addressing_allows_int32_element_boundary() -> None:
+    spec = AttnShape(
+        1,
+        torch.iinfo(torch.int32).max,
+        1,
+        1,
+        1,
+        1,
+        torch.bfloat16,
+        False,
+    )
+
+    helion_attention._check_dense_packed_addressing(spec)
+
+
+@pytest.mark.parametrize(
+    ("spec", "label"),
+    [
+        (
+            AttnShape(8_388_609, 1, 1, 1, 1, 256, torch.bfloat16, False),
+            "query/output",
+        ),
+        (
+            AttnShape(1, 1, 8_388_609, 1, 1, 256, torch.bfloat16, False),
+            "key/value",
+        ),
+    ],
+    ids=["query-output", "key-value"],
+)
+def test_dense_packed_addressing_rejects_int32_element_overflow(
+    spec: AttnShape, label: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"dense {label}.*INT32_MAX"):
+        helion_attention._check_dense_packed_addressing(spec)
+
+
 @requires_cuda
 def test_unequal_causal_mask_includes_bottom_right_boundary() -> None:
     entry = next(item for item in SHAPES if item["key"] == CHUNKED_PREFILL_KEY)
