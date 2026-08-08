@@ -64,6 +64,12 @@ _CORE_PAGED_VARLEN_SHAPE = (4, 1, 1024, 8, 2, 128, torch.bfloat16)
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
+_DIAGNOSTIC_DECODE_PROFILES = frozenset(
+    {
+        (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
+        for cache_length in (1024, 4096, 16384)
+    }
+)
 
 
 def _reject_unsupported(
@@ -74,6 +80,7 @@ def _reject_unsupported(
     return_attn_probs: bool,
     *,
     allow_alibi: bool = False,
+    allow_return_attn_probs: bool = False,
 ) -> None:
     if dropout_p != 0.0:
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
@@ -83,8 +90,24 @@ def _reject_unsupported(
         raise NotImplementedError("softcap is not implemented")
     if alibi_slopes is not None and not allow_alibi:
         raise NotImplementedError("ALiBi slopes are not implemented")
-    if return_attn_probs:
+    if return_attn_probs and not allow_return_attn_probs:
         raise NotImplementedError("return_attn_probs is not implemented")
+
+
+def _supports_diagnostic_return(spec: AttnShape) -> bool:
+    """Whether ``spec`` has one of the three LSE-capable decode kernels."""
+    profile = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    )
+    # Causal and non-causal are equivalent for a bottom-right single-token
+    # query, and the registry maps both modes to the same checked-in kernel.
+    return profile in _DIAGNOSTIC_DECODE_PROFILES and has_kernel(spec)
 
 
 def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
@@ -394,7 +417,7 @@ def flash_attn_func(
     return_attn_probs: bool = False,
     *,
     shape: ShapeLike,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Drop-in replacement for ``flash_attn.flash_attn_func``.
 
     Args:
@@ -405,12 +428,21 @@ def flash_attn_func(
         causal: bottom-right causal masking, including unequal sequence lengths.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
+        return_attn_probs: for the three shipped bf16 Llama GQA decode
+            profiles, return FlashAttention's diagnostic tuple. This is
+            available only when no backward is needed and all options other
+            than ``softmax_scale`` and the equivalent decode ``causal`` mode
+            retain their defaults.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
 
     Returns:
-        ``[batch, seqlen_q, nheads_q, head_dim]``.
+        ``[batch, seqlen_q, nheads_q, head_dim]``. With the supported
+        ``return_attn_probs=True`` subset, returns ``(out, softmax_lse,
+        S_dmask)``. The LSE is fp32 with shape ``[batch, nheads_q, 1]`` and
+        ``S_dmask`` is an empty input-dtype tensor, matching FlashAttention
+        when dropout is zero.
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
     use a generic packed Triton forward kernel. Grad-enabled calls without
@@ -425,6 +457,7 @@ def flash_attn_func(
         alibi_slopes,
         return_attn_probs,
         allow_alibi=True,
+        allow_return_attn_probs=True,
     )
     spec = normalize_shape(shape, q.dtype, causal)
     check_tensors(q, k, v, spec)
@@ -436,6 +469,29 @@ def flash_attn_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
     )
+    if return_attn_probs:
+        if needs_backward:
+            raise NotImplementedError(
+                "return_attn_probs=True is not implemented for grad-enabled "
+                "calls"
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "return_attn_probs=True is not implemented with ALiBi slopes"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "return_attn_probs=True requires deterministic=False"
+            )
+        if not _supports_diagnostic_return(spec):
+            raise NotImplementedError(
+                "return_attn_probs=True is implemented only for the three "
+                "shipped batch-1, single-token bf16 Llama GQA decode profiles"
+            )
+        out, softmax_lse = lookup(spec)(
+            q, k, v, scale, return_softmax_lse=True
+        )
+        return out, softmax_lse, q.new_empty((0,))
     if alibi_slopes is not None and torch.is_grad_enabled() and (
         needs_backward or alibi_slopes.requires_grad
     ):
@@ -1020,7 +1076,7 @@ def flash_attn_qkvpacked_func(
     return_attn_probs: bool = False,
     *,
     shape: ShapeLike,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``qkv`` is ``[batch, seqlen, 3, nheads, head_dim]``; see :func:`flash_attn_func`."""
     if qkv.ndim != 5:
         raise ValueError(
@@ -1063,7 +1119,7 @@ def flash_attn_kvpacked_func(
     return_attn_probs: bool = False,
     *,
     shape: ShapeLike,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``kv`` is ``[batch, seqlen_k, 2, nheads_kv, head_dim]``; see :func:`flash_attn_func`."""
     if kv.ndim != 5:
         raise ValueError(

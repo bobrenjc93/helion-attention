@@ -42,16 +42,25 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
 
+The three checked-in batch-1 Llama GQA decode profiles (one query token and a
+1K, 4K, or 16K KV sequence) support `return_attn_probs=True` through both
+`flash_attn_func` and `flash_attn_kvpacked_func`. For calls that do not require
+backward and otherwise use the default options, this returns `(out,
+softmax_lse, S_dmask)`. The LSE is fp32 with shape `[batch, heads_q, 1]`;
+because dropout is zero, `S_dmask` is an empty tensor with the input dtype,
+matching FA2. A custom `softmax_scale` is supported, and either causal flag may
+be used because they are equivalent for bottom-right single-token decode.
+
 Dense calls do not need a checked-in specialization. Contiguous CUDA fp16 and
 bf16 MHA/GQA inputs with `head_dim <= 256` use the generic Triton forward when
 their exact shape is absent, including unequal query/key lengths and
 bottom-right causal masking. Grad-enabled calls without a generated backward
 use PyTorch SDPA autograd instead. Dense ALiBi forward calls accept fp32 slopes
 shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
-ALiBi backward is not implemented. Dropout, local windows, softcap, attention
-probabilities, and `deterministic=True` on the SDPA backward path still fail
-explicitly as described below. Unregistered calls must also fit the generic
-kernel's signed 32-bit Q/output and K/V element offsets.
+ALiBi backward is not implemented. Dropout, local windows, softcap, diagnostic
+returns outside the decode subset above, and `deterministic=True` on the SDPA
+backward path still fail explicitly as described below. Unregistered calls must
+also fit the generic kernel's signed 32-bit Q/output and K/V element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -422,7 +431,8 @@ raise `NotImplementedError` rather than silently doing something else:
   dense partial/ragged caches, paged profiles other than the exact read-only
   page-size-16 profile above, paged LSE, and KV-cache rotary outside the
   full-head interleaved final-slot append
-- `return_attn_probs`
+- `return_attn_probs=True` outside the no-backward, default-option dense and
+  KV-packed calls for the three Llama GQA decode profiles described above
 
 ## How the kernels are made
 

@@ -842,6 +842,183 @@ def test_decode_custom_softmax_scale(entry: dict[str, object]) -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES,
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES],
+)
+@pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_decode_return_attn_probs_matches_fa2(
+    entry: dict[str, object],
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(entry)
+    q, k, v = make_inputs(spec, seed=20260808)
+    declared_shape = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+    )
+
+    with torch.no_grad():
+        if entry_point == "dense":
+            got = helion_attention.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                return_attn_probs=True,
+            )
+        else:
+            kv = torch.stack((k, v), dim=2)
+            got = helion_attention.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                return_attn_probs=True,
+            )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == q.dtype
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.batch,
+        spec.nheads_q,
+        spec.seqlen_q,
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == q.dtype
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+def test_decode_return_attn_probs_false_retains_exact_dispatch(
+    entry_point: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = spec_from_manifest_entry(DECODE_SHAPES[0])
+    q, k, v = make_inputs(spec, seed=1701)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def kernel(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append((args, kwargs))
+        return sentinel
+
+    monkeypatch.setattr(helion_attention, "lookup", lambda _spec: kernel)
+    if entry_point == "dense":
+        out = helion_attention.flash_attn_func(
+            q, k, v, causal=spec.causal, return_attn_probs=False, shape=spec
+        )
+    else:
+        kv = torch.stack((k, v), dim=2)
+        out = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            causal=spec.causal,
+            return_attn_probs=False,
+            shape=spec,
+        )
+
+    assert out is sentinel
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert len(args) == 4
+    assert kwargs == {}
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("grad", "grad-enabled"),
+        ("alibi", "ALiBi"),
+        ("non-decode", "three shipped"),
+        ("deterministic", "deterministic=False"),
+        ("dropout", "dropout"),
+        ("window", "sliding-window"),
+        ("softcap", "softcap"),
+    ],
+)
+def test_return_attn_probs_rejects_unsupported_calls_before_dispatch(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    decode_spec = spec_from_manifest_entry(DECODE_SHAPES[0])
+    q, k, v = make_inputs(decode_spec, seed=31415)
+    kwargs: dict[str, object] = {
+        "causal": decode_spec.causal,
+        "return_attn_probs": True,
+        "shape": decode_spec,
+    }
+    if case == "grad":
+        q = q.requires_grad_()
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            decode_spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "non-decode":
+        prefill_spec = spec_from_manifest_entry(
+            next(entry for entry in SHAPES if entry["key"] == CHUNKED_PREFILL_KEY)
+        )
+        q, k, v = make_inputs(prefill_spec, seed=31415)
+        kwargs["causal"] = prefill_spec.causal
+        kwargs["shape"] = prefill_spec
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    elif case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    else:
+        kwargs["softcap"] = 30.0
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported diagnostic call reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_func(q, k, v, **kwargs)
+
+
+@requires_cuda
 def test_preloaded_kernel_launches_in_worker_thread() -> None:
     assert helion_attention.is_shape_supported(
         QWEN_PREFILL, dtype=QWEN_PREFILL.dtype, causal=QWEN_PREFILL.causal
