@@ -478,6 +478,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:5713a5f4a9883e7f89437d35ad3287219d2fe866",
+      "commit": "5713a5f4a9883e7f89437d35ad3287219d2fe866",
+      "recordedAt": "2026-08-08T06:44:26.375Z",
+      "label": "base 5713a5f",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 68,
+        "eval_1afd133e": 46,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:19",
+      "recordedAt": "2026-08-08T06:44:26.375Z",
+      "label": "PR #19",
+      "kind": "leaf",
+      "prNumber": 19,
+      "title": "Return LSE from the core read-only KV-cache API",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 68,
+        "eval_1afd133e": 47,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
