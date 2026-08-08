@@ -4,6 +4,13 @@ Regenerate with:
     python tools/generate.py --batch 1 --seqlen 64 --seqlen-k 320 --nheads 8 --nheads-kv 2 --head-dim 128 --dtype bf16 --causal
 
 batch=1 seqlen_q=64 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True
+
+Autotuning provenance:
+    Helion version: 1.4.0
+    Config selection: autotuned
+    Autotuning wall time: 307.195 s
+    Measured time: 0.010752 ms
+    Config: helion.Config(atomic_indexing=[], block_sizes=[64, 64], indexing=['pointer', 'pointer', 'pointer', 'pointer'], l2_groupings=[64], load_eviction_policies=['', '', 'first'], loop_orders=[[0, 1]], num_stages=3, num_warps=4, pid_type='flat', range_flattens=[None, False, True], range_multi_buffers=[None, False, None], range_num_stages=[0, 4, 0], range_unroll_factors=[0, 3, 0], range_warp_specializes=[])
 """
 
 from __future__ import annotations
@@ -37,7 +44,7 @@ _BLOCK_SIZE_4 = tl.constexpr(64)
 
 @triton.jit
 def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.constexpr):
-    # src[helion_kernels.py:237]: for b, h in hl.grid([batch, nheads_q]):
+    # src[helion_kernels.py:233]: for b, h in hl.grid([batch, nheads_q]):
     num_pid_m = 1
     num_pid_n = 8
     inner_2d_pid = tl.program_id(0)
@@ -48,30 +55,28 @@ def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.const
     pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
     offset_1 = pid_1
     indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
-    # src[helion_kernels.py:246]: k_blk = k[b, tile_n, h_kv, :]
-    symnode_1 = triton_helpers.div_floor_integer(offset_1, 4)
-    # src[helion_kernels.py:239]: for tile_m in hl.tile(m_dim):
-    # src[helion_kernels.py:240]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
-    # src[helion_kernels.py:241]:     l_i = hl.zeros([tile_m], dtype=torch.float32)
-    # src[helion_kernels.py:239-268]: ...
-    for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2, loop_unroll_factor=3, num_stages=1):
+    # src[helion_kernels.py:248]: k_blk = k[b, tile_n, h_kv, :]
+    symnode_0 = triton_helpers.div_floor_integer(offset_1, 4)
+    # src[helion_kernels.py:235]: for tile_m in hl.tile(m_dim):
+    # src[helion_kernels.py:236]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+    # src[helion_kernels.py:237]:     l_i = hl.zeros([tile_m], dtype=torch.float32)
+    # src[helion_kernels.py:235-270]: ...
+    for offset_2 in tl.range(0, 64, _BLOCK_SIZE_2, loop_unroll_factor=3, num_stages=1, disallow_acc_multi_buffer=True, flatten=False):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
-        # src[helion_kernels.py:240]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
+        # src[helion_kernels.py:236]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
         m_i = tl.full([_BLOCK_SIZE_2], float('-inf'), tl.float32)
-        # src[helion_kernels.py:241]: l_i = hl.zeros([tile_m], dtype=torch.float32)
+        # src[helion_kernels.py:237]: l_i = hl.zeros([tile_m], dtype=torch.float32)
         l_i = tl.full([_BLOCK_SIZE_2], 0.0, tl.float32)
-        # src[helion_kernels.py:242]: acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
+        # src[helion_kernels.py:238]: acc = hl.zeros([tile_m, head_dim], dtype=torch.float32)
         acc = tl.full([_BLOCK_SIZE_2, _RDIM_SIZE_3], 0.0, tl.float32)
-        # src[helion_kernels.py:243]: q_blk = q[b, tile_m, h, :]
-        q_blk = tl.load(q + (indices_2[:, None] * 1024 + offset_1 * 128 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
-        # src[helion_kernels.py:245]: for tile_n in hl.tile(0, key_stop):
-        # src[helion_kernels.py:246]:     k_blk = k[b, tile_n, h_kv, :]
-        # src[helion_kernels.py:247]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
-        # src[helion_kernels.py:245-262]: ...
-        symnode_0 = 320 * (320 <= 320 + offset_2) + (320 + offset_2) * (320 + offset_2 < 320)
-        for offset_4 in tl.range(0, tl.cast(symnode_0, tl.int32), _BLOCK_SIZE_4, num_stages=3, disallow_acc_multi_buffer=True):
+        # src[helion_kernels.py:239]: q_blk = q[b, tile_m, h, :]
+        q_blk = tl.load(q + (indices_2[:, None] * 1024 + offset_1 * 128 + (0 + indices_3)[None, :] * 1), None)
+        # src[helion_kernels.py:247]: for tile_n in hl.tile(0, key_stop):
+        # src[helion_kernels.py:248]:     k_blk = k[b, tile_n, h_kv, :]
+        # src[helion_kernels.py:249]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+        # src[helion_kernels.py:247-264]: ...
+        for offset_4 in tl.range(0, 320, _BLOCK_SIZE_4, flatten=True):
             indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
-            mask_4 = indices_4 < symnode_0
             q_blk_copy = q_blk
             m_i_copy = m_i
             l_i_copy = l_i
@@ -80,79 +85,77 @@ def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.const
             m_i_copy_0 = m_i_copy
             l_i_copy_0 = l_i_copy
             acc_copy_0 = acc_copy
-            # src[helion_kernels.py:246]: k_blk = k[b, tile_n, h_kv, :]
-            k_blk = tl.load(k + (indices_4[:, None] * 256 + symnode_1 * 128 + (0 + indices_3)[None, :] * 1), mask_4[:, None], other=0)
-            # src[helion_kernels.py:247]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
+            # src[helion_kernels.py:248]: k_blk = k[b, tile_n, h_kv, :]
+            k_blk = tl.load(k + (indices_4[:, None] * 256 + symnode_0 * 128 + (0 + indices_3)[None, :] * 1), None)
+            # src[helion_kernels.py:249]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
             permute = tl.permute(k_blk, [1, 0])
             dot = tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
             v_0 = dot * qk_scale
-            # src[helion_kernels.py:248]: score_mask = tile_n.index[None, :] <= (
+            # src[helion_kernels.py:250]: score_mask = tile_n.index[None, :] <= (
             subscript = indices_4[None, :]
-            # src[helion_kernels.py:249]: tile_m.index + causal_offset
+            # src[helion_kernels.py:251]: tile_m.index + causal_offset
             v_1 = tl.full([], 256, tl.int32)
             v_2 = indices_2 + v_1
-            # src[helion_kernels.py:248]: score_mask = tile_n.index[None, :] <= (
-            # src[helion_kernels.py:249]:     tile_m.index + causal_offset
-            # src[helion_kernels.py:250]: )[:, None]
+            # src[helion_kernels.py:250]: score_mask = tile_n.index[None, :] <= (
+            # src[helion_kernels.py:251]:     tile_m.index + causal_offset
+            # src[helion_kernels.py:252]: )[:, None]
             subscript_1 = v_2[:, None]
             v_3 = subscript <= subscript_1
-            # src[helion_kernels.py:251]: qk = torch.where(score_mask, qk, float("-inf"))
+            # src[helion_kernels.py:253]: qk = torch.where(score_mask, qk, float("-inf"))
             scalar_tensor = tl.full([], float('-inf'), tl.float32)
             qk_1 = tl.where(v_3, v_0, scalar_tensor)
-            # src[helion_kernels.py:252]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-            _mask_to = tl.where(tl.broadcast_to(mask_4[None, :], [_BLOCK_SIZE_2, _BLOCK_SIZE_4]), qk_1, tl.full([], float('-inf'), tl.float32))
-            amax = tl.cast(tl.max(_mask_to, 1), tl.float32)
+            # src[helion_kernels.py:254]: m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+            amax = tl.cast(tl.max(qk_1, 1), tl.float32)
             v_4 = tl.maximum(m_i_copy_0, amax, tl.PropagateNan.ALL)
-            # src[helion_kernels.py:253]: has_key = m_ij != float("-inf")
+            # src[helion_kernels.py:255]: has_key = m_ij != float("-inf")
             v_5 = tl.full([], float('-inf'), tl.float32)
             v_6 = v_4 != v_5
-            # src[helion_kernels.py:255]: torch.where(score_mask, qk - m_ij[:, None], float("-inf"))
+            # src[helion_kernels.py:257]: torch.where(score_mask, qk - m_ij[:, None], float("-inf"))
             subscript_2 = v_4[:, None]
             v_7 = qk_1 - subscript_2
             scalar_tensor_1 = tl.full([], float('-inf'), tl.float32)
             where_1 = tl.where(v_3, v_7, scalar_tensor_1)
-            # src[helion_kernels.py:254]: p = torch.exp2(
-            # src[helion_kernels.py:255]:     torch.where(score_mask, qk - m_ij[:, None], float("-inf"))
-            # src[helion_kernels.py:256]: )
+            # src[helion_kernels.py:256]: p = torch.exp2(
+            # src[helion_kernels.py:257]:     torch.where(score_mask, qk - m_ij[:, None], float("-inf"))
+            # src[helion_kernels.py:258]: )
             v_8 = libdevice.exp2(where_1)
-            # src[helion_kernels.py:257]: alpha = torch.where(has_key, torch.exp2(m_i - m_ij), 1.0)
+            # src[helion_kernels.py:259]: alpha = torch.where(has_key, torch.exp2(m_i - m_ij), 1.0)
             v_9 = m_i_copy_0 - v_4
             v_10 = libdevice.exp2(v_9)
             scalar_tensor_2 = tl.full([], 1.0, tl.float32)
             alpha = tl.where(v_6, v_10, scalar_tensor_2)
-            # src[helion_kernels.py:258]: l_i = l_i * alpha + torch.sum(p, -1)
+            # src[helion_kernels.py:260]: l_i = l_i * alpha + torch.sum(p, -1)
             v_11 = l_i_copy_0 * alpha
-            _mask_to_1 = tl.where(tl.broadcast_to(mask_4[None, :], [_BLOCK_SIZE_2, _BLOCK_SIZE_4]), v_8, tl.full([], 0, tl.float32))
-            sum_1 = tl.cast(tl.sum(_mask_to_1, 1), tl.float32)
+            sum_1 = tl.cast(tl.sum(v_8, 1), tl.float32)
             l_i = v_11 + sum_1
-            # src[helion_kernels.py:259]: acc = acc * alpha[:, None]
+            # src[helion_kernels.py:261]: acc = acc * alpha[:, None]
             subscript_3 = alpha[:, None]
             v_13 = acc_copy_0 * subscript_3
-            # src[helion_kernels.py:260]: v_blk = v[b, tile_n, h_kv, :]
-            v_blk = tl.load(v + (indices_4[:, None] * 256 + symnode_1 * 128 + (0 + indices_3)[None, :] * 1), mask_4[:, None], other=0)
-            # src[helion_kernels.py:261]: acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
+            # src[helion_kernels.py:262]: v_blk = v[b, tile_n, h_kv, :]
+            v_blk = tl.load(v + (indices_4[:, None] * 256 + symnode_0 * 128 + (0 + indices_3)[None, :] * 1), None, eviction_policy='evict_first')
+            # src[helion_kernels.py:263]: acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
             v_14 = tl.cast(v_8, tl.bfloat16)
             acc = tl.dot(tl.cast(v_14, tl.bfloat16), tl.cast(v_blk, tl.bfloat16), acc=v_13, input_precision='tf32', out_dtype=tl.float32)
-            # src[helion_kernels.py:262]: m_i = m_ij
+            # src[helion_kernels.py:264]: m_i = m_ij
             m_i = v_4
-        # src[helion_kernels.py:264]: (l_i > 0)[:, None],
+        # src[helion_kernels.py:266]: (l_i > 0)[:, None],
         v_15 = tl.full([], 0.0, tl.float32)
         v_16 = l_i > v_15
         subscript_4 = v_16[:, None]
-        # src[helion_kernels.py:265]: acc / torch.where(l_i > 0, l_i, 1.0)[:, None],
+        # src[helion_kernels.py:267]: acc / torch.where(l_i > 0, l_i, 1.0)[:, None],
         v_17 = tl.full([], 0.0, tl.float32)
         v_18 = l_i > v_17
         scalar_tensor_3 = tl.full([], 1.0, tl.float32)
         where = tl.where(v_18, l_i, scalar_tensor_3)
         subscript_5 = where[:, None]
         v_19 = acc / subscript_5
-        # src[helion_kernels.py:263]: result = torch.where(
-        # src[helion_kernels.py:264]:     (l_i > 0)[:, None],
-        # src[helion_kernels.py:265]:     acc / torch.where(l_i > 0, l_i, 1.0)[:, None],
-        # src[helion_kernels.py:263-267]: ...
+        # src[helion_kernels.py:265]: result = torch.where(
+        # src[helion_kernels.py:266]:     (l_i > 0)[:, None],
+        # src[helion_kernels.py:267]:     acc / torch.where(l_i > 0, l_i, 1.0)[:, None],
+        # src[helion_kernels.py:265-269]: ...
         scalar_tensor_4 = tl.full([], 0.0, tl.float32)
         result = tl.where(subscript_4, v_19, scalar_tensor_4)
-        # src[helion_kernels.py:268]: out[b, tile_m, h, :] = result.to(out.dtype)
+        # src[helion_kernels.py:270]: out[b, tile_m, h, :] = result.to(out.dtype)
         v_20 = tl.cast(result, tl.bfloat16)
         tl.store(out + (indices_2[:, None] * 1024 + offset_1 * 128 + (0 + indices_3)[None, :] * 1), v_20, None)
 
@@ -166,24 +169,16 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
     """
     # src[helion_kernels.py:223]: batch = q.size(0)
     batch = q.size(0)
-    # src[helion_kernels.py:224]: m_dim = hl.specialize(q.size(1))
-    m_dim = 64
-    # src[helion_kernels.py:227]: n_dim = hl.specialize(k.size(1))
-    n_dim = 320
     # src[helion_kernels.py:230]: out = torch.empty_like(q)
     out = torch.empty_like(q)
     # src[helion_kernels.py:231]: qk_scale = sm_scale * 1.44269504088896340736
     qk_scale = sm_scale * 1.4426950408889634
-    # src[helion_kernels.py:232]: causal_offset = n_dim - m_dim
-    causal_offset = n_dim - m_dim
-    # src[helion_kernels.py:236]: unequal_key_padding = min(1, abs(causal_offset)) * n_dim
-    unequal_key_padding = min(1, abs(causal_offset)) * n_dim
-    # src[helion_kernels.py:237]: for b, h in hl.grid([batch, nheads_q]):
+    # src[helion_kernels.py:233]: for b, h in hl.grid([batch, nheads_q]):
     _RDIM_SIZE_3 = 128
-    # src[helion_kernels.py:237]: for b, h in hl.grid([batch, nheads_q]):
-    # src[helion_kernels.py:238]:     h_kv = h // group
-    # src[helion_kernels.py:239]:     for tile_m in hl.tile(m_dim):
-    # src[helion_kernels.py:237-268]: ...
-    _launcher(_helion_causal_attention_bshd, (1 * 8,), q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=4, num_stages=5)
-    # src[helion_kernels.py:269]: return out
+    # src[helion_kernels.py:233]: for b, h in hl.grid([batch, nheads_q]):
+    # src[helion_kernels.py:234]:     h_kv = h // group
+    # src[helion_kernels.py:235]:     for tile_m in hl.tile(m_dim):
+    # src[helion_kernels.py:233-270]: ...
+    _launcher(_helion_causal_attention_bshd, (1 * 8,), q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=4, num_stages=3)
+    # src[helion_kernels.py:271]: return out
     return out

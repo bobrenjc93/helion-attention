@@ -50,11 +50,43 @@ def expected_key(request: ShapeRequest) -> str:
     ) + suffix
 
 
+def entry_is_complete(
+    request: ShapeRequest, entry: dict[str, object] | None
+) -> bool:
+    """Return whether an existing artifact includes all required provenance."""
+    if entry is None or "autotuning_provenance" not in entry:
+        return False
+    if request.backward and (
+        not entry.get("backward")
+        or "backward_autotuning_provenance" not in entry
+    ):
+        return False
+    return True
+
+
+def generation_command(
+    request: ShapeRequest, *, replace_incumbent: bool = False
+) -> list[str]:
+    """Build one generator command, including an explicit replacement override."""
+    command = [
+        sys.executable,
+        str(REPO_ROOT / "tools" / "generate.py"),
+        *request.args,
+    ]
+    if replace_incumbent:
+        command.append("--replace-incumbent")
+    return command
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gpus", type=int, default=8)
     parser.add_argument("--only", default="", help="substring filter on the shape name")
-    parser.add_argument("--force", action="store_true", help="regenerate existing kernels")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="regenerate and replace existing kernels without the acceptance gate",
+    )
     args = parser.parse_args()
 
     LOG_DIR.mkdir(exist_ok=True)
@@ -63,10 +95,7 @@ def main() -> int:
         request
         for request in CATALOGUE
         if args.only in request.name
-        and (
-            expected_key(request) not in have
-            or (request.backward and not have[expected_key(request)].get("backward"))
-        )
+        and not entry_is_complete(request, have.get(expected_key(request)))
     ]
     if not pending:
         print("nothing to do")
@@ -83,7 +112,7 @@ def main() -> int:
             log_path = LOG_DIR / f"{request.name}.log"
             handle = log_path.open("wb")
             process = subprocess.Popen(
-                [sys.executable, str(REPO_ROOT / "tools" / "generate.py"), *request.args],
+                generation_command(request, replace_incumbent=args.force),
                 cwd=REPO_ROOT,
                 stdout=handle,
                 stderr=subprocess.STDOUT,

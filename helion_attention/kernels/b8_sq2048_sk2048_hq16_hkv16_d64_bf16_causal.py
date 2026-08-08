@@ -4,6 +4,20 @@ Regenerate with:
     python tools/generate.py --batch 8 --seqlen 2048 --nheads 16 --head-dim 64 --dtype bf16 --causal
 
 batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True
+
+Autotuning provenance:
+    Helion version: unknown (legacy artifact)
+    Config selection: incumbent
+    Autotuning wall time: unknown (legacy artifact)
+    Measured time: 0.295980 ms
+    Artifact origin selection: autotuned
+    Config: helion.Config(atomic_indexing=[], block_sizes=[256, 64], indexing=['pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], l2_groupings=[32], load_eviction_policies=['first', 'last', ''], loop_orders=[[1, 0]], num_stages=4, num_warps=8, pid_type='flat', range_flattens=[None, True, None], range_multi_buffers=[None, None, False], range_num_stages=[0, 2, 3], range_unroll_factors=[0, 3, 3], range_warp_specializes=[])
+    Rejected search:
+        Helion version: 1.4.0
+        Autotuning wall time: 779.924 s
+        Candidate time: 0.348790 ms
+        Incumbent validation time: 0.295980 ms
+        Candidate config: helion.Config(atomic_indexing=[], block_sizes=[256, 32], indexing=['tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor', 'tensor_descriptor'], l2_groupings=[1], load_eviction_policies=['first', 'first', 'last'], loop_orders=[[0, 1]], num_stages=3, num_warps=8, pid_type='flat', range_flattens=[None, None, None], range_multi_buffers=[None, True, True], range_num_stages=[0, 2, 0], range_unroll_factors=[0, 2, 3], range_warp_specializes=[])
 """
 
 from __future__ import annotations

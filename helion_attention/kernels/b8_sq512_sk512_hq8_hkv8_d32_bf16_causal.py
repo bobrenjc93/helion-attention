@@ -4,6 +4,13 @@ Regenerate with:
     python tools/generate.py --batch 8 --seqlen 512 --nheads 8 --head-dim 32 --dtype bf16 --causal
 
 batch=8 seqlen_q=512 seqlen_k=512 nheads=8 head_dim=32 dtype=bf16 causal=True
+
+Autotuning provenance:
+    Helion version: 1.4.0
+    Config selection: autotuned
+    Autotuning wall time: 664.847 s
+    Measured time: 0.026272 ms
+    Config: helion.Config(atomic_indexing=[], block_sizes=[128, 128], indexing=['pointer', 'pointer', 'pointer', 'pointer'], l2_groupings=[1], load_eviction_policies=['last', 'last', 'last'], loop_orders=[[1, 0]], num_stages=3, num_warps=8, pid_type='flat', range_flattens=[None, True, False], range_multi_buffers=[None, None, True], range_num_stages=[0, 1, 3], range_unroll_factors=[0, 3, 2], range_warp_specializes=[])
 """
 
 from __future__ import annotations
@@ -37,15 +44,9 @@ _BLOCK_SIZE_4 = tl.constexpr(128)
 @triton.jit
 def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.constexpr):
     # src[helion_kernels.py:233]: for b, h in hl.grid([batch, nheads_q]):
-    num_pid_m = 8
-    num_pid_n = 8
-    inner_2d_pid = tl.program_id(0)
-    num_pid_in_group = 2 * num_pid_n
-    group_id = inner_2d_pid // num_pid_in_group
-    first_pid_m = group_id * 2
-    group_size_m = min(num_pid_m - first_pid_m, 2)
-    pid_0 = first_pid_m + inner_2d_pid % num_pid_in_group % group_size_m
-    pid_1 = inner_2d_pid % num_pid_in_group // group_size_m
+    num_blocks_0 = 8
+    pid_0 = tl.program_id(0) % num_blocks_0
+    pid_1 = tl.program_id(0) // num_blocks_0
     offset_1 = pid_0
     offset_0 = pid_1
     indices_3 = tl.arange(0, _RDIM_SIZE_3).to(tl.int32)
@@ -53,7 +54,7 @@ def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.const
     # src[helion_kernels.py:236]:     m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
     # src[helion_kernels.py:237]:     l_i = hl.zeros([tile_m], dtype=torch.float32)
     # src[helion_kernels.py:235-270]: ...
-    for offset_2 in tl.range(0, 512, _BLOCK_SIZE_2, loop_unroll_factor=3, num_stages=1, disallow_acc_multi_buffer=True, flatten=False):
+    for offset_2 in tl.range(0, 512, _BLOCK_SIZE_2, loop_unroll_factor=3, num_stages=1, flatten=True):
         indices_2 = offset_2 + tl.arange(0, _BLOCK_SIZE_2).to(tl.int32)
         # src[helion_kernels.py:236]: m_i = hl.full([tile_m], float("-inf"), dtype=torch.float32)
         m_i = tl.full([_BLOCK_SIZE_2], float('-inf'), tl.float32)
@@ -69,7 +70,7 @@ def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.const
         # src[helion_kernels.py:248]:     k_blk = k[b, tile_n, h_kv, :]
         # src[helion_kernels.py:249]:     qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
         # src[helion_kernels.py:247-264]: ...
-        for offset_4 in tl.range(0, tl.cast(tile_end, tl.int32), _BLOCK_SIZE_4, loop_unroll_factor=2, num_stages=3, disallow_acc_multi_buffer=True, flatten=True):
+        for offset_4 in tl.range(0, tl.cast(tile_end, tl.int32), _BLOCK_SIZE_4, loop_unroll_factor=2, num_stages=3, disallow_acc_multi_buffer=False, flatten=False):
             indices_4 = offset_4 + tl.arange(0, _BLOCK_SIZE_4).to(tl.int32)
             mask_4 = indices_4 < tile_end
             q_blk_copy = q_blk
@@ -81,7 +82,7 @@ def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.const
             l_i_copy_0 = l_i_copy
             acc_copy_0 = acc_copy
             # src[helion_kernels.py:248]: k_blk = k[b, tile_n, h_kv, :]
-            k_blk = tl.load(k + (offset_0 * 131072 + indices_4[:, None] * 256 + offset_1 * 32 + (0 + indices_3)[None, :] * 1), mask_4[:, None], other=0, eviction_policy='evict_first')
+            k_blk = tl.load(k + (offset_0 * 131072 + indices_4[:, None] * 256 + offset_1 * 32 + (0 + indices_3)[None, :] * 1), mask_4[:, None], other=0, eviction_policy='evict_last')
             # src[helion_kernels.py:249]: qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
             permute = tl.permute(k_blk, [1, 0])
             dot = tl.dot(tl.cast(q_blk_copy_0, tl.bfloat16), tl.cast(permute, tl.bfloat16), input_precision='tf32', out_dtype=tl.float32)
@@ -129,7 +130,7 @@ def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.const
             subscript_3 = alpha[:, None]
             v_13 = acc_copy_0 * subscript_3
             # src[helion_kernels.py:262]: v_blk = v[b, tile_n, h_kv, :]
-            v_blk = tl.load(v + (offset_0 * 131072 + indices_4[:, None] * 256 + offset_1 * 32 + (0 + indices_3)[None, :] * 1), mask_4[:, None], other=0)
+            v_blk = tl.load(v + (offset_0 * 131072 + indices_4[:, None] * 256 + offset_1 * 32 + (0 + indices_3)[None, :] * 1), mask_4[:, None], other=0, eviction_policy='evict_last')
             # src[helion_kernels.py:263]: acc = hl.dot(p.to(v_blk.dtype), v_blk, acc=acc)
             v_14 = tl.cast(v_8, tl.bfloat16)
             acc = tl.dot(tl.cast(v_14, tl.bfloat16), tl.cast(v_blk, tl.bfloat16), acc=v_13, input_precision='tf32', out_dtype=tl.float32)
@@ -176,6 +177,6 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
     # src[helion_kernels.py:234]:     h_kv = h // group
     # src[helion_kernels.py:235]:     for tile_m in hl.tile(m_dim):
     # src[helion_kernels.py:233-270]: ...
-    _launcher(_helion_causal_attention_bshd, (8 * 8,), q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=8, num_stages=1)
+    _launcher(_helion_causal_attention_bshd, (8 * 8,), q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=8, num_stages=3)
     # src[helion_kernels.py:271]: return out
     return out

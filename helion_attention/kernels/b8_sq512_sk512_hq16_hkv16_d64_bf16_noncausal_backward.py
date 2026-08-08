@@ -4,6 +4,20 @@ Regenerate with:
     python tools/generate.py --batch 8 --seqlen 512 --nheads 16 --head-dim 64 --dtype bf16 --backward
 
 batch=8 seqlen_q=512 seqlen_k=512 nheads=16 head_dim=64 dtype=bf16 causal=False backward
+
+Autotuning provenance:
+    Helion version: unknown (legacy artifact)
+    Config selection: incumbent
+    Autotuning wall time: unknown (legacy artifact)
+    Measured time: 3.516672 ms
+    Artifact origin selection: autotuned
+    Config: helion.Config(atomic_indexing=[], block_sizes=[32, 64, 16, 64, 64, 32, 64, 16], indexing=['pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer'], l2_groupings=[1, 1, 1, 1], load_eviction_policies=['', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''], loop_orders=[[0, 1], [0, 1], [0, 1], [0, 1]], maxnreg=None, num_sm_multiplier=1, num_stages=1, num_warps=4, pid_type='persistent_blocked', range_flattens=[None, None, None, None, None, None, None, None, None, None, None, None], range_multi_buffers=[None, None, True, None, None, None, None, None, None, None, None, None], range_num_stages=[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2], range_unroll_factors=[2, 0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 0], range_warp_specializes=[])
+    Rejected search:
+        Helion version: 1.4.0
+        Autotuning wall time: 171.228 s
+        Candidate time: 3.671376 ms
+        Incumbent validation time: 3.516672 ms
+        Candidate config: helion.Config(atomic_indexing=[], block_sizes=[64, 64, 16, 256, 16, 128, 128, 16], indexing=['pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer'], l2_groupings=[1, 1, 1, 1], load_eviction_policies=['', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', '', ''], loop_orders=[[0, 1], [0, 1], [1, 0], [0, 1]], maxnreg=None, num_sm_multiplier=1, num_stages=1, num_warps=8, pid_type='persistent_blocked', range_flattens=[None, None, None, None, None, None, None, None, None, None, None, False], range_multi_buffers=[None, None, None, None, None, None, None, None, None, None, None, None], range_num_stages=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], range_unroll_factors=[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], range_warp_specializes=[])
 """
 
 from __future__ import annotations

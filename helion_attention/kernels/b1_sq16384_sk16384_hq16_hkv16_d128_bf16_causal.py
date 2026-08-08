@@ -4,6 +4,20 @@ Regenerate with:
     python tools/generate.py --batch 1 --seqlen 16384 --nheads 16 --head-dim 128 --dtype bf16 --causal
 
 batch=1 seqlen_q=16384 seqlen_k=16384 nheads=16 head_dim=128 dtype=bf16 causal=True
+
+Autotuning provenance:
+    Helion version: unknown (legacy artifact)
+    Config selection: incumbent
+    Autotuning wall time: 0.000 s
+    Measured time: 2.615888 ms
+    Artifact origin selection: fixed
+    Config: helion.Config(block_sizes=[128, 128], indexing=['pointer', 'tensor_descriptor', 'block_ptr', 'pointer', 'pointer'], num_sm_multiplier=1, num_stages=3, num_warps=8, pid_type='persistent_interleaved')
+    Rejected search:
+        Helion version: 1.4.0
+        Autotuning wall time: 0.000 s
+        Candidate time: 3.060256 ms
+        Incumbent validation time: 2.615888 ms
+        Candidate config: helion.Config(block_sizes=[128, 128], indexing=['pointer', 'tensor_descriptor', 'block_ptr', 'pointer', 'pointer'], num_sm_multiplier=1, num_stages=3, num_warps=8, pid_type='persistent_interleaved')
 """
 
 from __future__ import annotations

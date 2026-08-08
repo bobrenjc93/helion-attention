@@ -4,6 +4,20 @@ Regenerate with:
     python tools/generate.py --batch 1 --seqlen 2048 --nheads 32 --head-dim 128 --dtype bf16 --causal
 
 batch=1 seqlen_q=2048 seqlen_k=2048 nheads=32 head_dim=128 dtype=bf16 causal=True
+
+Autotuning provenance:
+    Helion version: unknown (legacy artifact)
+    Config selection: incumbent
+    Autotuning wall time: unknown (legacy artifact)
+    Measured time: 0.387584 ms
+    Artifact origin selection: autotuned
+    Config: helion.Config(atomic_indexing=[], block_sizes=[128, 64], indexing=['pointer', 'tensor_descriptor', 'pointer', 'tensor_descriptor'], l2_groupings=[32], load_eviction_policies=['first', 'last', 'first'], loop_orders=[[1, 0]], num_sm_multiplier=1, num_stages=3, num_warps=8, pid_type='persistent_interleaved', range_flattens=[None, None, None], range_multi_buffers=[None, None, True], range_num_stages=[0, 3, 1], range_unroll_factors=[0, 2, 3], range_warp_specializes=[])
+    Rejected search:
+        Helion version: 1.4.0
+        Autotuning wall time: 526.449 s
+        Candidate time: 0.428128 ms
+        Incumbent validation time: 0.387584 ms
+        Candidate config: helion.Config(atomic_indexing=[], block_sizes=[128, 64], indexing=['tensor_descriptor', 'tensor_descriptor', 'pointer', 'pointer'], l2_groupings=[64], load_eviction_policies=['first', 'first', ''], loop_orders=[[1, 0]], num_sm_multiplier=1, num_stages=5, num_warps=8, pid_type='persistent_interleaved', range_flattens=[None, None, True], range_multi_buffers=[None, False, True], range_num_stages=[0, 4, 1], range_unroll_factors=[0, 1, 4], range_warp_specializes=[])
 """
 
 from __future__ import annotations

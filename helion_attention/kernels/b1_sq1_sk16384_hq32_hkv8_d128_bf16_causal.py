@@ -4,6 +4,14 @@ Regenerate with:
     python tools/generate.py --batch 1 --seqlen 1 --seqlen-k 16384 --nheads 32 --nheads-kv 8 --head-dim 128 --dtype bf16 --causal
 
 batch=1 seqlen_q=1 seqlen_k=16384 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True
+
+Autotuning provenance:
+    Helion version: 1.4.0
+    Config selection: fixed
+    Autotuning wall time: 0.000 s
+    Measured time: 0.116448 ms
+    Config (decode_attention_bshd_split_kv_partials): helion.Config(block_sizes=[128], loop_orders=[[1, 2, 0]], num_stages=3, num_warps=4, pid_type='flat')
+    Config (decode_attention_bshd_split_kv_combine): helion.Config(num_stages=3, num_warps=1, pid_type='flat')
 """
 
 from __future__ import annotations

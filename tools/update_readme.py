@@ -47,6 +47,95 @@ def shape_table() -> str:
     return "\n".join(lines)
 
 
+def _format_duration(seconds: float | None) -> str:
+    if seconds is None:
+        return "unknown"
+    if seconds == 0:
+        return "0 s"
+    if seconds >= 60:
+        return f"{seconds / 60:.1f} min"
+    return f"{seconds:.1f} s"
+
+
+def _format_configs(configs: list[dict[str, object]]) -> str:
+    if not configs:
+        return "unknown (legacy artifact)"
+    rendered = []
+    for item in configs:
+        config = item["config"]
+        assert isinstance(config, dict)
+        arguments = ", ".join(
+            f"{name}={value!r}" for name, value in sorted(config.items())
+        )
+        label = f"{item['kernel']}: " if len(configs) > 1 else ""
+        rendered.append(f"{label}`helion.Config({arguments})`")
+    return "<br>".join(rendered)
+
+
+def _format_rejected_search(provenance: dict[str, object]) -> str:
+    rejected = provenance.get("rejected_search")
+    if not isinstance(rejected, dict):
+        return "—"
+    configs = rejected["configs"]
+    assert isinstance(configs, list)
+    return (
+        f"Helion {rejected['helion_version']}, "
+        f"{_format_duration(float(rejected['autotuning_wall_time_seconds']))}; "
+        f"candidate {float(rejected['candidate_measured_time_ms']):.6f} ms, "
+        f"incumbent {float(rejected['incumbent_measured_time_ms']):.6f} ms"
+        f"<br>{_format_configs(configs)}"
+    )
+
+
+def _format_selection(provenance: dict[str, object]) -> str:
+    selection = str(provenance["selection"])
+    if "artifact_origin_selection" not in provenance:
+        return selection
+    origin = provenance["artifact_origin_selection"]
+    return f"{selection} (origin: {origin or 'unknown'})"
+
+
+def autotuning_table() -> str:
+    """Render generation provenance for every checked-in kernel module."""
+    manifest = json.loads(MANIFEST.read_text())
+    lines = [
+        "| kernel | Helion | selection | tuning wall time | measured time | chosen config | rejected search |",
+        "| --- | --- | --- | ---: | ---: | --- | --- |",
+    ]
+    for section in ("kernels", "varlen_kernels", "paged_kernels"):
+        for entry in manifest.get(section, []):
+            rows = [
+                (
+                    str(entry["key"]),
+                    entry["autotuning_provenance"],
+                    f"helion_attention/kernels/{entry['key']}.py",
+                )
+            ]
+            if entry.get("backward"):
+                rows.append(
+                    (
+                        f"{entry['key']}_backward",
+                        entry["backward_autotuning_provenance"],
+                        f"helion_attention/kernels/{entry['key']}_backward.py",
+                    )
+                )
+            for name, provenance, module_path in rows:
+                assert isinstance(provenance, dict)
+                configs = provenance["configs"]
+                assert isinstance(configs, list)
+                wall_time = provenance.get("autotuning_wall_time_seconds")
+                lines.append(
+                    f"| [`{name}`]({module_path}) "
+                    f"| {provenance.get('helion_version') or 'unknown'} "
+                    f"| {_format_selection(provenance)} "
+                    f"| {_format_duration(None if wall_time is None else float(wall_time))} "
+                    f"| {float(provenance['measured_time_ms']):.6f} ms "
+                    f"| {_format_configs(configs)} "
+                    f"| {_format_rejected_search(provenance)} |"
+                )
+    return "\n".join(lines)
+
+
 def benchmark_table() -> str:
     if not BENCHMARKS.exists():
         return "_No benchmark run recorded yet._"
@@ -154,6 +243,7 @@ def benchmark_table() -> str:
 def main() -> int:
     text = README.read_text()
     text = replace_section(text, "SHAPES", shape_table())
+    text = replace_section(text, "AUTOTUNING", autotuning_table())
     text = replace_section(text, "BENCHMARKS", benchmark_table())
     README.write_text(text)
     print("README.md updated")
