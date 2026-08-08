@@ -1063,6 +1063,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:5db48a7f2cddbfd15973f4bd823ca2e40d9903bb",
+      "commit": "5db48a7f2cddbfd15973f4bd823ca2e40d9903bb",
+      "recordedAt": "2026-08-08T23:50:02.198Z",
+      "label": "base 5db48a7",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 79,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:46",
+      "recordedAt": "2026-08-08T23:50:02.198Z",
+      "label": "PR #46",
+      "kind": "leaf",
+      "prNumber": 46,
+      "title": "Accept half-head rotary on final-slot KV appends",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
