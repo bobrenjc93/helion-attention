@@ -42,13 +42,14 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
 
-Dense forward calls do not need a checked-in specialization. Contiguous CUDA
-fp16 and bf16 MHA/GQA inputs with `head_dim <= 256` use the generic fallback
-when their exact shape is absent, including unequal query/key lengths and
-bottom-right causal masking. Dropout, local windows, softcap, ALiBi, attention
-probabilities, and gradients through this fallback still fail explicitly as
-described below. The flattened Q/output and K/V layouts must also fit the
-generic kernel's signed 32-bit element offsets.
+Dense calls do not need a checked-in specialization. Contiguous CUDA fp16 and
+bf16 MHA/GQA inputs with `head_dim <= 256` use the generic Triton forward when
+their exact shape is absent, including unequal query/key lengths and
+bottom-right causal masking. Grad-enabled calls without a generated backward
+use PyTorch SDPA autograd instead. Dropout, local windows, softcap, ALiBi,
+attention probabilities, and `deterministic=True` on the SDPA backward path
+still fail explicitly as described below. Unregistered calls must also fit the
+generic kernel's signed 32-bit Q/output and K/V element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -364,14 +365,15 @@ same page-16 logical cache as Helion.
 
 ## What is not implemented
 
-Backward/training is implemented for the non-causal bf16
-`(batch=8, seqlen=512, nheads=16, head_dim=64)` shape. The generic dense
-fallback, other dense specializations, and packed varlen kernels are
-forward-only and reject grad-enabled calls at the call site. These unsupported
-FlashAttention features also raise `NotImplementedError` rather than silently
-doing something else:
+The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape uses
+its checked-in generated backward. Default-option dense MHA, GQA, and
+cross-attention calls without a generated backward use PyTorch SDPA autograd,
+including fp16/bf16 and bottom-right causal masking. Packed varlen and KV-cache
+calls remain forward-only. These unsupported FlashAttention features also
+raise `NotImplementedError` rather than silently doing something else:
 
-- backward for varlen, causal, cross-attention, GQA, fp16, and other shapes
+- backward for varlen and KV-cache calls
+- `deterministic=True` when using the dense SDPA autograd fallback
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes

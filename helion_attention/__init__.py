@@ -7,8 +7,9 @@ time they are checked in: importing this package pulls in ``torch`` and
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization; compatible unregistered dense shapes use a
-generic forward-only Triton kernel. The explicit shape validates both paths and
-makes specialization introspection independent of fallback coverage.
+generic Triton forward kernel. Grad-enabled dense calls without a generated
+backward use PyTorch SDPA autograd. The explicit shape validates these paths
+and makes specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from ._registry import UnsupportedShapeError
 from ._registry import available_paged_shapes
 from ._registry import available_shapes
 from ._registry import available_varlen_shapes
+from ._registry import has_backward
 from ._registry import has_kernel
 from ._registry import has_paged_kernel
 from ._registry import has_varlen_kernel
@@ -29,6 +31,7 @@ from ._registry import lookup
 from ._registry import lookup_backward
 from ._registry import lookup_paged
 from ._registry import lookup_varlen
+from ._sdpa import dense_attention_sdpa
 from ._shape import AttnShape
 from ._shape import ShapeLike
 from ._shape import check_paged_varlen_tensors
@@ -279,9 +282,10 @@ def flash_attn_func(
     Returns:
         ``[batch, seqlen_q, nheads_q, head_dim]``.
 
-    Unregistered, forward-only fp16/bf16 shapes with ``head_dim <= 256`` use a
-    generic packed Triton kernel. :func:`is_shape_supported` remains ``False``
-    for those calls because it reports checked-in acceleration only.
+    Unregistered fp16/bf16 shapes with ``head_dim <= 256`` use a generic packed
+    Triton forward kernel. Grad-enabled calls without a generated backward use
+    PyTorch SDPA autograd. :func:`is_shape_supported` remains ``False`` for
+    unregistered calls because it reports checked-in acceleration only.
     """
     _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
     spec = normalize_shape(shape, q.dtype, causal)
@@ -293,10 +297,18 @@ def flash_attn_func(
         tensor.requires_grad for tensor in (q, k, v)
     )
     if needs_backward:
-        # Resolve this before launching the forward so unsupported training
-        # shapes fail at the call site rather than later during loss.backward().
-        lookup_backward(spec)
-        return attention_autograd(q, k, v, scale, spec)
+        if has_backward(spec):
+            return attention_autograd(q, k, v, scale, spec)
+        if deterministic:
+            raise NotImplementedError(
+                "deterministic=True is not supported by the PyTorch SDPA "
+                "autograd fallback"
+            )
+        # Preserve the generic dense forward's documented shape envelope for
+        # unregistered calls even though SDPA itself may accept more shapes.
+        if not has_kernel(spec):
+            _validate_generic_dense_layout(spec)
+        return dense_attention_sdpa(q, k, v, scale, spec)
     if has_kernel(spec):
         return lookup(spec)(q, k, v, scale)
     return _generic_dense_forward(q, k, v, scale, spec)
