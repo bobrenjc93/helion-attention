@@ -853,6 +853,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:86bf7df470424caa48ca9467cdcad9f9cc6cce0f",
+      "commit": "86bf7df470424caa48ca9467cdcad9f9cc6cce0f",
+      "recordedAt": "2026-08-08T21:16:45.972Z",
+      "label": "base 86bf7df",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:39",
+      "recordedAt": "2026-08-08T21:16:45.972Z",
+      "label": "PR #39",
+      "kind": "leaf",
+      "prNumber": 39,
+      "title": "Expose paged decode through the core KV-cache API",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
