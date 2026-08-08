@@ -426,10 +426,89 @@ def test_dense_sdpa_fallback_gradients_match_fp32(
     assert got.shape == q.shape
     assert got.dtype == spec.dtype
     assert got.is_contiguous()
+    torch.testing.assert_close(
+        got.float(), expected, atol=5e-2, rtol=2e-2
+    )
     for actual, reference in zip(got_grads, expected_grads):
         torch.testing.assert_close(
             actual.float(), reference, atol=5e-2, rtol=2e-2
         )
+    if spec.causal and spec.seqlen_q > spec.seqlen_k:
+        masked_rows = spec.seqlen_q - spec.seqlen_k
+        assert torch.count_nonzero(got[:, :masked_rows]).item() == 0
+        assert torch.count_nonzero(got_grads[0][:, :masked_rows]).item() == 0
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("input_dtype", "autocast_dtype"),
+    [
+        (torch.bfloat16, torch.float16),
+        (torch.float16, torch.bfloat16),
+    ],
+    ids=["bf16-input-fp16-autocast", "fp16-input-bf16-autocast"],
+)
+def test_dense_sdpa_fallback_preserves_dtype_under_cross_dtype_autocast(
+    input_dtype: torch.dtype, autocast_dtype: torch.dtype
+) -> None:
+    spec = AttnShape(1, 17, 19, 4, 4, 32, input_dtype, True)
+    q, k, v = make_inputs(spec, seed=2468)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    grad_out = make_inputs(spec, seed=1357)[0]
+
+    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+        got = helion_attention.flash_attn_func(
+            q, k, v, causal=True, shape=spec
+        )
+    got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
+
+    q_ref = q.float().detach().requires_grad_()
+    k_ref = k.float().detach().requires_grad_()
+    v_ref = v.float().detach().requires_grad_()
+    expected = reference_attention(
+        q_ref, k_ref, v_ref, spec, 1.0 / math.sqrt(spec.head_dim)
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    assert got.dtype == input_dtype
+    assert all(grad.dtype == input_dtype for grad in got_grads)
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=5e-2, rtol=2e-2
+        )
+
+
+@requires_cuda
+def test_unequal_causal_sdpa_fallback_has_bounded_peak_allocation() -> None:
+    # A materialized [8191, 8192] bool mask alone is about 64 MiB. The lazy
+    # lower-right bias should leave only fused-SDPA output/autograd storage.
+    spec = AttnShape(1, 8191, 8192, 4, 1, 32, torch.float16, True)
+    q, k, v = make_inputs(spec, seed=8642)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+
+    torch.cuda.synchronize(q.device)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(q.device)
+    allocated_before = torch.cuda.memory_allocated(q.device)
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    torch.cuda.synchronize(q.device)
+    incremental_peak = (
+        torch.cuda.max_memory_allocated(q.device) - allocated_before
+    )
+
+    assert out.shape == q.shape
+    assert out.grad_fn is not None
+    assert incremental_peak < 32 * 1024 * 1024, incremental_peak
 
 
 @requires_cuda

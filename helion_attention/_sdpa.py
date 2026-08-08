@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import TypeVar
 
 import torch
+from torch.nn.attention.bias import causal_lower_right
 
 from ._shape import AttnShape
 
@@ -32,23 +33,51 @@ def dense_attention_sdpa(
     spec: AttnShape,
 ) -> torch.Tensor:
     """Run a validated dense call through PyTorch's native SDPA autograd."""
-    causal_mask = None
-    if spec.causal and spec.seqlen_q != spec.seqlen_k and not spec.is_decode:
-        query_index = torch.arange(spec.seqlen_q, device=q.device)[:, None]
-        key_index = torch.arange(spec.seqlen_k, device=q.device)[None, :]
-        causal_mask = (
-            key_index <= query_index + spec.seqlen_k - spec.seqlen_q
-        )
-    causal_mask, is_causal = sdpa_causal_options(spec, causal_mask)
+    query = q.transpose(1, 2)
+    key = k.transpose(1, 2)
+    value = v.transpose(1, 2)
+    enable_gqa = spec.nheads_q != spec.nheads_kv
 
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q.transpose(1, 2),
-        k.transpose(1, 2),
-        v.transpose(1, 2),
-        attn_mask=causal_mask,
-        dropout_p=0.0,
-        is_causal=is_causal,
-        scale=softmax_scale,
-        enable_gqa=spec.nheads_q != spec.nheads_kv,
-    )
+    # FlashAttention returns the input dtype even under cross-dtype autocast.
+    # SDPA is autocast-eligible, so keep its native fp16/bf16 contract explicit.
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        if spec.causal and spec.seqlen_q > spec.seqlen_k:
+            # Bottom-right alignment leaves the first Sq-Sk query rows fully
+            # masked. PyTorch's lower-right bias warns that those rows may be
+            # NaN on some backends. The remaining Sk rows are exactly ordinary
+            # equal-length causal attention, so compute that fused subproblem
+            # and prepend constant zeros without allocating an Sq x Sk mask.
+            masked_rows = spec.seqlen_q - spec.seqlen_k
+            visible_out = torch.nn.functional.scaled_dot_product_attention(
+                query[:, :, masked_rows:],
+                key,
+                value,
+                dropout_p=0.0,
+                is_causal=True,
+                scale=softmax_scale,
+                enable_gqa=enable_gqa,
+            )
+            out = torch.cat(
+                (torch.zeros_like(query[:, :, :masked_rows]), visible_out),
+                dim=2,
+            )
+        else:
+            causal_bias = (
+                causal_lower_right(spec.seqlen_q, spec.seqlen_k)
+                if spec.causal
+                and spec.seqlen_q != spec.seqlen_k
+                and not spec.is_decode
+                else None
+            )
+            causal_bias, is_causal = sdpa_causal_options(spec, causal_bias)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=causal_bias,
+                dropout_p=0.0,
+                is_causal=is_causal,
+                scale=softmax_scale,
+                enable_gqa=enable_gqa,
+            )
     return out.transpose(1, 2).contiguous()
