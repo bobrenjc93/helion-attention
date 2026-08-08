@@ -654,9 +654,9 @@
       "note": "Qwen2-7B GQA 7:1",
       "implementations": {
         "helion-attention": {
-          "us": 410.50728940301474,
-          "tflops": 293.0954154772103,
-          "max_abs_error": 0.008772134780883789
+          "us": 399.88799852293886,
+          "tflops": 300.8787585234274,
+          "max_abs_error": 0.014467954635620117
         },
         "flash-attn": {
           "us": 405.1785490342549,
