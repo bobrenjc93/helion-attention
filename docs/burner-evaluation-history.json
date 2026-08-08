@@ -688,6 +688,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:f1f1b59f3b7e967991ae89bf575f23269f6648d0",
+      "commit": "f1f1b59f3b7e967991ae89bf575f23269f6648d0",
+      "recordedAt": "2026-08-08T13:06:23.322Z",
+      "label": "base f1f1b59",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 71,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:32",
+      "recordedAt": "2026-08-08T13:06:23.322Z",
+      "label": "PR #32",
+      "kind": "leaf",
+      "prNumber": 32,
+      "title": "Use the persistent schedule for the 2K Qwen GQA kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 74,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
