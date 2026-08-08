@@ -352,7 +352,8 @@ def flash_attn_with_kvcache(
     cache slot before attention runs. If ``return_softmax_lse=True``, the result
     is ``(out, softmax_lse)`` with LSE shape ``[batch, nheads_q, 1]`` and fp32
     dtype, matching FlashAttention. Cache tensors created in inference mode
-    must also be updated in inference mode. Tensor-valued/ragged lengths,
+    must also be updated in inference mode, and an append requires disjoint
+    query, K-cache, and V-cache memory. Tensor-valued/ragged lengths,
     multi-token updates, rotary embeddings, and paged caches fail explicitly.
     """
     if (k is None) != (v is None):
@@ -456,6 +457,12 @@ def flash_attn_with_kvcache(
                     f"{name} must be contiguous in "
                     "[batch, 1, nheads_kv, head_dim] layout"
                 )
+        if _contiguous_tensors_overlap(k_cache, v_cache):
+            raise ValueError("k_cache and v_cache must not overlap when updating")
+        if _contiguous_tensors_overlap(q, k_cache) or _contiguous_tensors_overlap(
+            q, v_cache
+        ):
+            raise ValueError("q must not overlap k_cache or v_cache when updating")
         if not torch.is_inference_mode_enabled() and (
             k_cache.is_inference() or v_cache.is_inference()
         ):
