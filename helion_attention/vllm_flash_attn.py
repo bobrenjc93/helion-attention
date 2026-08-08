@@ -61,6 +61,91 @@ _GENERIC_CUDA_DTYPES: frozenset[torch.dtype] = _FP8_DTYPES | {
 # launch count but not numerical semantics.
 _QUERY_TILE_SIZE = 16
 _KEY_TILE_SIZE = 128
+_PAGED_B4_SQ1_SK1024_DEFAULT_SCALE = 0.08838834764831843
+_paged_b4_sq1_sk1024_kernel: Any = None
+
+
+def _get_paged_b4_sq1_sk1024_kernel() -> Any:
+    """Load and cache the generated kernel only after its fast path matches."""
+    global _paged_b4_sq1_sk1024_kernel
+    kernel = _paged_b4_sq1_sk1024_kernel
+    if kernel is None:
+        from .kernels.paged_b4_sq1_sk1024_hq8_hkv2_d128_bf16_causal_ps16 import (
+            attention_paged,
+        )
+
+        kernel = attention_paged
+        _paged_b4_sq1_sk1024_kernel = kernel
+    return kernel
+
+
+def _valid_paged_b4_sq1_sk1024_tensors(
+    q: object,
+    k: object,
+    v: object,
+    cu_seqlens_q: object,
+    seqused_k: object,
+    block_table: object,
+    out: object,
+) -> bool:
+    """Check every tensor property required by the direct generated launch."""
+    if not (
+        isinstance(q, torch.Tensor)
+        and isinstance(k, torch.Tensor)
+        and isinstance(v, torch.Tensor)
+        and isinstance(cu_seqlens_q, torch.Tensor)
+        and isinstance(seqused_k, torch.Tensor)
+        and isinstance(block_table, torch.Tensor)
+    ):
+        return False
+
+    device = q.device
+    dtype = q.dtype
+    q_shape = q.shape
+    k_shape = k.shape
+    v_shape = v.shape
+    cu_shape = cu_seqlens_q.shape
+    lengths_shape = seqused_k.shape
+    table_shape = block_table.shape
+    return (
+        q.is_cuda
+        and len(q_shape) == 3
+        and q_shape[1:] == (8, 128)
+        and dtype == torch.bfloat16
+        and len(k_shape) == 4
+        and k_shape[0] > 0
+        and k_shape[1:] == (16, 2, 128)
+        and k.dtype == dtype
+        and k.device == device
+        and v_shape == k_shape
+        and v.dtype == dtype
+        and v.device == device
+        and cu_shape == (5,)
+        and cu_seqlens_q.dtype == torch.int32
+        and cu_seqlens_q.device == device
+        and cu_seqlens_q.is_contiguous()
+        and lengths_shape == (4,)
+        and seqused_k.dtype == torch.int32
+        and seqused_k.device == device
+        and seqused_k.is_contiguous()
+        and len(table_shape) == 2
+        and table_shape[0] >= 4
+        and table_shape[1] >= 64
+        and block_table.dtype == torch.int32
+        and block_table.device == device
+        and (
+            out is None
+            or (
+                isinstance(out, torch.Tensor)
+                and out.shape == q_shape
+                and out.device == device
+            )
+        )
+        and not (
+            torch.is_grad_enabled()
+            and (q.requires_grad or k.requires_grad or v.requires_grad)
+        )
+    )
 
 
 def _paged_attention(*args: Any, **kwargs: Any) -> Any:
@@ -533,6 +618,73 @@ def flash_attn_varlen_func(
     positions, local windows, softcap, ALiBi, FP8 descales, attention sinks,
     optional LSE output, and ``out=`` semantics.
     """
+    # Bypass the general adapter setup for the latency-sensitive checked-in
+    # decode specialization.  This gate is deliberately exact: unsupported
+    # features and malformed metadata fall through to the unchanged validation
+    # path below rather than reaching the generated kernel.
+    if (
+        type(max_seqlen_q) is int
+        and max_seqlen_q == 1
+        and type(max_seqlen_k) is int
+        and max_seqlen_k == 1024
+        and causal is True
+        and window_size is None
+        and type(dropout_p) in (int, float)
+        and dropout_p == 0.0
+        and type(softcap) in (int, float)
+        and softcap == 0.0
+        and (softmax_scale is None or type(softmax_scale) in (int, float))
+        and type(fa_version) is int
+        and fa_version in _SUPPORTED_FA_VERSIONS
+        and deterministic is False
+        and return_attn_probs is False
+        and return_softmax_lse is False
+        and type(cp_world_size) is int
+        and cp_world_size == 1
+        and type(cp_rank) is int
+        and cp_rank == 0
+        # vLLM's expanded K/V descales are inert for this BF16 cache, just as
+        # they are in the general paged-specialization path below.
+        and all(
+            value is None
+            for value in (
+                cu_seqlens_k,
+                q_v,
+                alibi_slopes,
+                output_scale,
+                q_descale,
+                s_aux,
+                cp_tot_seqused_k,
+                mask_mod,
+                block_sparse_tensors,
+                aux_tensors,
+                aux_tensor_leading_dims,
+                dynamic_causal,
+            )
+        )
+        and _valid_paged_b4_sq1_sk1024_tensors(
+            q, k, v, cu_seqlens_q, seqused_k, block_table, out
+        )
+    ):
+        scale = (
+            _PAGED_B4_SQ1_SK1024_DEFAULT_SCALE
+            if softmax_scale is None
+            else float(softmax_scale)
+        )
+        result = _get_paged_b4_sq1_sk1024_kernel()(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            1,
+            1024,
+            scale,
+            True,
+        )
+        return _copy_or_return(result, out)
+
     if not is_fa_version_supported(fa_version):
         reason = fa_version_unsupported_reason(fa_version)
         raise ValueError(f"unsupported fa_version={fa_version}: {reason}")

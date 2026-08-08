@@ -448,6 +448,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:f9cc1ec4757296f717ab2128c7cacfb4ca07a0de",
+      "commit": "f9cc1ec4757296f717ab2128c7cacfb4ca07a0de",
+      "recordedAt": "2026-08-08T05:30:08.599Z",
+      "label": "base f9cc1ec",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 63,
+        "eval_1afd133e": 46,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:18",
+      "recordedAt": "2026-08-08T05:30:08.599Z",
+      "label": "PR #18",
+      "kind": "leaf",
+      "prNumber": 18,
+      "title": "Fast-path the checked-in paged decode specialization",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 68,
+        "eval_1afd133e": 46,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

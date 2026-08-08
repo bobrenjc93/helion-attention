@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import inspect
 import math
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -52,6 +55,8 @@ VLLM_KEYWORDS = {
     "aux_tensors",
     "aux_tensor_leading_dims",
 }
+
+REPO_ROOT = Path(__file__).parents[1]
 
 
 def _reference_one(
@@ -126,6 +131,52 @@ def test_vllm_surface_has_no_shape_argument() -> None:
         headdim=8,
         cache_seqlens=torch.tensor([4], dtype=torch.int32),
     )
+
+
+def test_adapter_import_does_not_require_generated_kernel_internals() -> None:
+    script = """
+import importlib.abc
+import sys
+
+BLOCKED = "torch._inductor.runtime.triton_compat"
+KERNEL = (
+    "helion_attention.kernels."
+    "paged_b4_sq1_sk1024_hq8_hkv2_d128_bf16_causal_ps16"
+)
+
+class BlockInternalModule(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        if fullname == BLOCKED:
+            raise ModuleNotFoundError(f"blocked test dependency: {fullname}")
+        return None
+
+sys.meta_path.insert(0, BlockInternalModule())
+import torch
+import helion_attention.vllm_flash_attn as adapter
+assert KERNEL not in sys.modules
+
+tensor = torch.zeros(1, 1, 1)
+cumulative = torch.tensor([0, 1], dtype=torch.int32)
+result = adapter.flash_attn_varlen_func(
+    tensor,
+    tensor,
+    tensor,
+    1,
+    cumulative,
+    1,
+    cu_seqlens_k=cumulative,
+)
+assert result.shape == tensor.shape
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_nonzero_dropout_is_rejected_explicitly() -> None:
@@ -1250,7 +1301,7 @@ def test_exact_shape_dispatch_infers_specialization(
 
 
 @requires_cuda
-def test_exact_paged_shape_dispatch_infers_specialization(
+def test_exact_paged_shape_dispatches_before_generic_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     qkv = torch.zeros(4, 12 * 128, device="cuda", dtype=torch.bfloat16)
@@ -1271,27 +1322,16 @@ def test_exact_paged_shape_dispatch_infers_specialization(
     v_descale = torch.ones(1, device="cuda").expand(4, 2)
     seen: dict[str, object] = {}
 
-    def fake_has_kernel(spec: object, page_size: int) -> bool:
-        seen["spec"] = spec
-        seen["page_size"] = page_size
-        return True
-
     def fake_kernel(*args: object) -> torch.Tensor:
         seen["kernel_args"] = args
         return torch.full_like(q, 9)
 
-    def fake_lookup(spec: object, page_size: int) -> object:
-        assert spec is seen["spec"]
-        assert page_size == 16
-        return fake_kernel
-
-    monkeypatch.setattr(compat, "has_paged_kernel", fake_has_kernel)
-    monkeypatch.setattr(compat, "lookup_paged", fake_lookup)
+    monkeypatch.setattr(compat, "_paged_b4_sq1_sk1024_kernel", fake_kernel)
 
     def reject_generic(*args: object, **kwargs: object) -> object:
-        raise AssertionError("vLLM-shaped inputs missed the paged specialization")
+        raise AssertionError("exact paged decode reached generic adapter setup")
 
-    monkeypatch.setattr(compat, "_paged_attention", reject_generic)
+    monkeypatch.setattr(compat, "_normalize_maximum", reject_generic)
     result = compat.flash_attn_varlen_func(
         q=q,
         k=k,
@@ -1307,21 +1347,69 @@ def test_exact_paged_shape_dispatch_infers_specialization(
         fa_version=3,
     )
 
-    spec = seen["spec"]
-    assert isinstance(spec, AttnShape)
-    assert spec.batch == 4
-    assert spec.seqlen_q == 1
-    assert spec.seqlen_k == 1024
-    assert spec.nheads_q == 8
-    assert spec.nheads_kv == 2
-    assert spec.head_dim == 128
-    assert spec.causal is True
-    assert seen["page_size"] == 16
     kernel_args = seen["kernel_args"]
     assert isinstance(kernel_args, tuple)
+    assert kernel_args[0] is q
+    assert kernel_args[1] is k
+    assert kernel_args[2] is v
+    assert kernel_args[3] is cumulative
     assert kernel_args[4] is seqused_k
     assert kernel_args[5] is block_table
+    assert kernel_args[6:8] == (1, 1024)
+    assert kernel_args[8] == pytest.approx(1.0 / math.sqrt(128))
+    assert kernel_args[9] is True
     torch.testing.assert_close(result, torch.full_like(q, 9))
+
+
+@requires_cuda
+def test_exact_paged_fast_path_retains_metadata_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.zeros(4, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(1, 16, 2, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.zeros_like(k)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "max_seqlen_q": 1,
+        "cu_seqlens_q": torch.arange(5, device="cuda", dtype=torch.int32),
+        "max_seqlen_k": 1024,
+        "seqused_k": torch.ones(4, device="cuda", dtype=torch.int32),
+        "block_table": torch.zeros(4, 64, device="cuda", dtype=torch.int32),
+        "causal": True,
+    }
+
+    def reject_fast_launch(*args: object, **call_kwargs: object) -> object:
+        raise AssertionError("invalid metadata reached the direct kernel")
+
+    monkeypatch.setattr(
+        compat, "_paged_b4_sq1_sk1024_kernel", reject_fast_launch
+    )
+
+    noncontiguous_cu = torch.arange(10, device="cuda", dtype=torch.int32)[::2]
+    with pytest.raises(ValueError, match="cu_seqlens_q must be contiguous"):
+        compat.flash_attn_varlen_func(
+            **{**kwargs, "cu_seqlens_q": noncontiguous_cu}
+        )
+
+    with pytest.raises(ValueError, match=r"seqused_k must have shape \(4,\)"):
+        compat.flash_attn_varlen_func(
+            **{
+                **kwargs,
+                "seqused_k": torch.ones(3, device="cuda", dtype=torch.int32),
+            }
+        )
+
+    with pytest.raises(ValueError, match="block_table does not have capacity"):
+        compat.flash_attn_varlen_func(
+            **{
+                **kwargs,
+                "block_table": torch.zeros(
+                    4, 63, device="cuda", dtype=torch.int32
+                ),
+            }
+        )
 
 
 @requires_cuda
