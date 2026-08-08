@@ -350,19 +350,43 @@ same page-16 logical cache as Helion.
 
 ## What is not implemented
 
-Backward/training is implemented for the non-causal bf16
-`(batch=8, seqlen=512, nheads=16, head_dim=64)` shape. Other shapes remain
-forward-only, including packed varlen kernels, and reject grad-enabled calls at
-the call site. These unsupported FlashAttention features also raise
-`NotImplementedError` rather than silently doing something else:
+The following limitations apply specifically to the core `flash_attn_*` APIs
+exported directly from `helion_attention`; they do not apply to the separate
+`helion_attention.vllm_flash_attn` adapter. Core backward/training is implemented
+for the non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape.
+Other checked-in core shapes remain forward-only, including packed varlen
+kernels, and reject grad-enabled calls at the call site. Unsupported core
+features raise `NotImplementedError` rather than silently doing something else:
 
 - backward for varlen, causal, cross-attention, GQA, fp16, and other shapes
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes
-- KV-cache mutation beyond the paired one-token final-slot append above;
-  partial/ragged caches, paged caches, and fused rotary embeddings
+- `flash_attn_with_kvcache` mutation beyond the paired one-token final-slot
+  append above; that entry point also lacks partial/ragged caches, paged caches,
+  and fused rotary embeddings
 - `return_attn_probs`
+
+The core `flash_attn_varlen_func` has one read-only paged-cache exception: the
+checked-in page-size-16 decode specialization listed above. It has no generic
+paged fallback, so other core paged shapes raise `UnsupportedShapeError`.
+
+The vLLM adapter has a broader coverage contract and does not take `shape`.
+Exact packed or paged calls use checked-in specializations; other compatible
+forward CUDA packed or block-table paged calls in fp16, bf16, or supported FP8
+dtypes use generic single-launch Triton kernels. The generic path covers packed
+variable-length and block-table paged attention, bottom-right causal and local
+masks, GQA/MQA, softcap, ALiBi, FP8 descales, attention sinks, MLA's `q_v`, FA3
+context-parallel key positions, optional LSE output, and `out=`. Other valid
+tensor/layout calls, including grad-enabled inputs, use the tiled PyTorch
+correctness fallback instead of generic Triton.
+
+The adapter's remaining unsupported features are dropout, `deterministic=True`,
+and `return_attn_probs=True`. It accepts FA2 and FA3 calls, not FA4 or FA4-only
+options such as `output_scale`, `dynamic_causal`, `mask_mod`,
+`block_sparse_tensors`, `aux_tensors`, and `aux_tensor_leading_dims`. `q_v` and
+context parallelism require FA3, and context parallelism cannot be combined
+with local-window attention.
 
 ## How the kernels are made
 
