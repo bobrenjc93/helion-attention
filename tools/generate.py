@@ -223,7 +223,9 @@ def add_direct_decode_lse_support(code: str, spec: "AttnShape") -> str:
         )
     if spec.nheads_q > 1:
         lse_offset_terms.append("offset_1")
-    lse_offset_terms.append("indices_2")
+    # Decode always has one query lane. Use an explicit lane instead of the
+    # generated query index, which noncausal lowering can constant-fold away.
+    lse_offset_terms.append("tl.arange(0, 1)")
     lse_offset = " + ".join(lse_offset_terms)
     lse_store = (
         f"{indent}if STORE_LSE:\n"
@@ -232,8 +234,7 @@ def add_direct_decode_lse_support(code: str, spec: "AttnShape") -> str:
         f"{indent}    # exposes the natural-log normalization factor.\n"
         f"{indent}    lse = (m_i + libdevice.log2(l_i)) * "
         "0.6931471805599453\n"
-        f"{indent}    tl.store(softmax_lse + {lse_offset}, lse, "
-        "indices_2 < 1)\n"
+        f"{indent}    tl.store(softmax_lse + {lse_offset}, lse, None)\n"
     )
     lines.insert(output_store + 1, lse_store)
     code = "".join(lines)

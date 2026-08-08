@@ -735,7 +735,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
     assert "STORE_LSE: tl.constexpr" in rewritten
     assert "libdevice.log2(l_i)" in rewritten
     assert "STORE_LSE=return_softmax_lse" in rewritten
-    assert "indices_2 < 1" in rewritten
+    assert "offset_1 + tl.arange(0, 1), lse, None" in rewritten
     assert "return (out, softmax_lse)" in rewritten
     assert "helion.Config(block_sizes=[8, 128], num_warps=4)" in rewritten
 
@@ -756,8 +756,59 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
     rewritten = generate.add_direct_decode_lse_support(source, spec)
 
     assert "_helion_attention_bshd" in rewritten
-    assert "softmax_lse + offset_0 * 12 + offset_1 + indices_2" in rewritten
+    assert (
+        "softmax_lse + offset_0 * 12 + offset_1 + tl.arange(0, 1)"
+        in rewritten
+    )
     assert "return_softmax_lse: bool = False" in rewritten
+
+
+def test_rewritten_noncausal_decode_executes_without_query_index() -> None:
+    source = """def _helion_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.constexpr):
+    offset_1 = 0
+    m_i = torch.tensor([2.0])
+    l_i = torch.tensor([4.0])
+    tl.store(out + tl.arange(0, 1), torch.zeros(1), None)
+
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):
+    out = torch.empty_like(q)
+    qk_scale = sm_scale
+    _RDIM_SIZE_3 = q.size(3)
+    _launcher(_helion_attention_bshd, q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=4)
+    return out"""
+    spec = AttnShape(1, 1, 128, 2, 1, 8, torch.float16, False)
+    rewritten = generate.add_direct_decode_lse_support(source, spec)
+    # Execute the kernel body with a tiny TL shim so name resolution is tested
+    # hermetically; the former `indices_2` rewrite raises NameError here.
+    stores = []
+    fake_tl = SimpleNamespace(
+        constexpr=object(),
+        arange=lambda start, stop: torch.arange(start, stop),
+        store=lambda pointer, value, mask: stores.append((pointer, value, mask)),
+    )
+
+    def fake_launcher(kernel, *args, **kwargs):  # noqa: ANN001, ANN202
+        kwargs.pop("num_warps")
+        kernel(*args, **kwargs)
+
+    namespace = {
+        "_default_launcher": fake_launcher,
+        "libdevice": SimpleNamespace(log2=torch.log2),
+        "tl": fake_tl,
+        "torch": torch,
+    }
+    exec(compile(rewritten, "<rewritten-noncausal-decode>", "exec"), namespace)
+    q = torch.ones((1, 1, 2, 8), dtype=torch.float16)
+    k = v = torch.ones((1, 128, 1, 8), dtype=torch.float16)
+
+    out, softmax_lse = namespace["attention"](
+        q, k, v, 0.5, return_softmax_lse=True
+    )
+
+    assert out.shape == q.shape
+    assert softmax_lse.shape == (1, 2, 1)
+    assert softmax_lse.dtype == torch.float32
+    assert len(stores) == 2
 
 
 def test_single_head_decode_generation_omits_folded_head_offset() -> None:
@@ -773,7 +824,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
 
     rewritten = generate.add_direct_decode_lse_support(source, spec)
 
-    assert "tl.store(softmax_lse + indices_2, lse, indices_2 < 1)" in rewritten
+    assert "tl.store(softmax_lse + tl.arange(0, 1), lse, None)" in rewritten
     assert "offset_1" not in rewritten
 
 
