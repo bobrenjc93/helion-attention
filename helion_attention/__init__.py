@@ -74,6 +74,15 @@ def _reject_unsupported(
         raise NotImplementedError("return_attn_probs is not implemented")
 
 
+def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
+    """Whether two validated contiguous tensors share any device memory."""
+    first_start = first.data_ptr()
+    first_end = first_start + first.numel() * first.element_size()
+    second_start = second.data_ptr()
+    second_end = second_start + second.numel() * second.element_size()
+    return first_start < second_end and second_start < first_end
+
+
 def is_shape_supported(
     shape: ShapeLike, dtype: torch.dtype = torch.bfloat16, causal: bool = False
 ) -> bool:
@@ -476,8 +485,19 @@ def flash_attn_with_kvcache(
     # writes so a rejected call cannot leave a half-updated cache.
     if append_kv:
         assert k is not None and v is not None and cache_seqlens is not None
-        k_cache[:, cache_seqlens : cache_seqlens + 1].copy_(k)
-        v_cache[:, cache_seqlens : cache_seqlens + 1].copy_(v)
+        cache_tensors = (k_cache, v_cache)
+        update_k = (
+            k.clone()
+            if any(_contiguous_tensors_overlap(k, cache) for cache in cache_tensors)
+            else k
+        )
+        update_v = (
+            v.clone()
+            if any(_contiguous_tensors_overlap(v, cache) for cache in cache_tensors)
+            else v
+        )
+        k_cache[:, cache_seqlens : cache_seqlens + 1].copy_(update_k)
+        v_cache[:, cache_seqlens : cache_seqlens + 1].copy_(update_v)
     if return_softmax_lse:
         return kernel(
             q,

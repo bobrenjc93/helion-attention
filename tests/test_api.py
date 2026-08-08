@@ -735,6 +735,84 @@ def test_kvcache_inference_tensor_lifecycle_cannot_half_apply_update(
     DECODE_SHAPES[:1],
     ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
 )
+def test_kvcache_stages_v_update_aliased_to_k_cache(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec, seed=173205)
+    q.fill_(1.0)
+    k_cache.zero_()
+    v_cache.zero_()
+    update_shape = (spec.batch, 1, spec.nheads_kv, spec.head_dim)
+    new_k = torch.full(update_shape, 4.0, device=q.device, dtype=spec.dtype)
+    aliased_v = k_cache[:, -1:]
+    aliased_v.fill_(7.0)
+    expected_v = aliased_v.clone()
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=new_k,
+        v=aliased_v,
+        cache_seqlens=spec.seqlen_k - 1,
+        causal=spec.causal,
+        shape=spec,
+    )
+
+    assert isinstance(result, torch.Tensor)
+    assert torch.equal(k_cache[:, -1:], new_k)
+    assert torch.equal(v_cache[:, -1:], expected_v)
+    assert result.float().amin().item() > 6.5
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES[:1],
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+)
+def test_kvcache_stages_partially_overlapping_v_update(
+    entry: dict[str, object],
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec, seed=223607)
+    update_shape = (spec.batch, 1, spec.nheads_kv, spec.head_dim)
+    elements_per_token = spec.nheads_kv * spec.head_dim
+    target_offset = (
+        v_cache.storage_offset() + (spec.seqlen_k - 1) * elements_per_token
+    )
+    overlapping_v = v_cache.as_strided(
+        update_shape,
+        v_cache.stride(),
+        storage_offset=target_offset - 1,
+    )
+    assert overlapping_v.is_contiguous()
+    expected_v = overlapping_v.clone()
+    new_k = k_cache[:, :1].clone()
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=new_k,
+        v=overlapping_v,
+        cache_seqlens=spec.seqlen_k - 1,
+        causal=spec.causal,
+        shape=spec,
+    )
+
+    assert isinstance(result, torch.Tensor)
+    assert torch.equal(k_cache[:, -1:], new_k)
+    assert torch.equal(v_cache[:, -1:], expected_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES[:1],
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES[:1]],
+)
 def test_kvcache_one_token_append_supports_cuda_graph_capture(
     entry: dict[str, object],
 ) -> None:
