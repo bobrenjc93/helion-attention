@@ -403,6 +403,66 @@ def test_catalogue_backfills_missing_forward_and_backward_metadata() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("prior_entry", "expected"),
+    [
+        (None, False),
+        ({}, False),
+        ({"backward_deterministic": False}, False),
+        ({"backward_deterministic": True}, True),
+    ],
+)
+def test_retained_backward_inherits_only_an_existing_determinism_certificate(
+    prior_entry: dict[str, object] | None, expected: bool
+) -> None:
+    provenance: dict[str, object] = {"selection": "incumbent"}
+
+    assert (
+        generate.backward_determinism_for_publication(prior_entry, provenance)
+        is expected
+    )
+
+
+def test_uncertified_backward_incumbents_are_replaced_before_the_gate() -> None:
+    for prior_entry in (
+        None,
+        {},
+        {"backward_deterministic": False},
+    ):
+        assert generate.should_replace_incumbent(
+            requested=False,
+            backward=True,
+            prior_entry=prior_entry,
+        )
+
+    certified = {"backward_deterministic": True}
+    assert not generate.should_replace_incumbent(
+        requested=False,
+        backward=True,
+        prior_entry=certified,
+    )
+    assert not generate.should_replace_incumbent(
+        requested=False,
+        backward=False,
+        prior_entry=None,
+    )
+    assert generate.should_replace_incumbent(
+        requested=True,
+        backward=False,
+        prior_entry=certified,
+    )
+
+
+@pytest.mark.parametrize("selection", ["autotuned", "fixed"])
+def test_fresh_backward_artifacts_receive_determinism_certificate(
+    selection: str,
+) -> None:
+    assert generate.backward_determinism_for_publication(
+        {"backward_deterministic": False},
+        {"selection": selection},
+    )
+
+
 def test_persistent_16k_kernel_is_selected_only_for_its_complete_shape() -> None:
     exact = AttnShape(
         batch=1,
