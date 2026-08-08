@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import platform
 import statistics
 import sys
@@ -22,6 +23,11 @@ from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version
 from pathlib import Path
 from typing import Callable
+
+# GPUs 0-3 on this host are reserved for another campaign's timing runs, and a
+# foreign process on those devices makes its whole sweep unusable. Default to
+# the free half of the box; an explicit CUDA_VISIBLE_DEVICES still wins.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "4,5,6,7")
 
 import torch
 import triton

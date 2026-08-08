@@ -11,10 +11,16 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import statistics
 import subprocess
 import sys
 from pathlib import Path
+
+# Mirrors the default in benchmarks/bench.py so the child process inherits it:
+# GPUs 0-3 belong to another campaign's timing runs, and sharing them corrupts
+# that campaign's measurements. An explicit CUDA_VISIBLE_DEVICES still wins.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "4,5,6,7")
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COVERAGE_TARGET = 24  # kernels at which the coverage half of the score saturates
