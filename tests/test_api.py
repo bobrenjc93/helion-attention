@@ -89,6 +89,25 @@ def reference_attention(
     ).transpose(1, 2)
 
 
+def reference_single_token_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    spec: AttnShape,
+    scale: float,
+) -> torch.Tensor:
+    grouped_q = q[:, 0].reshape(
+        spec.batch,
+        spec.nheads_kv,
+        spec.nheads_q // spec.nheads_kv,
+        spec.head_dim,
+    ).float()
+    grouped_k_t = k.float().permute(0, 2, 3, 1)
+    scores = torch.matmul(grouped_q, grouped_k_t) * scale
+    return torch.logsumexp(scores, dim=-1).reshape(
+        spec.batch, spec.nheads_q, spec.seqlen_q
+    )
+
+
 def test_package_does_not_import_helion() -> None:
     assert "helion" not in sys.modules
 
@@ -378,6 +397,133 @@ def test_kvcache_entry_point_matches_plain_attention(
         shape=spec,
     )
     torch.testing.assert_close(cached, plain)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES,
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES],
+)
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.37],
+    ids=["default-scale", "custom-scale"],
+)
+def test_kvcache_returns_flash_compatible_softmax_lse(
+    entry: dict[str, object], softmax_scale: float | None
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260807)
+    out, lse = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        return_softmax_lse=True,
+        shape=spec,
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    expected_out = reference_attention(q, k_cache, v_cache, spec, scale)
+    expected_lse = reference_single_token_lse(q, k_cache, spec, scale)
+
+    assert out.shape == q.shape
+    assert out.dtype == q.dtype
+    assert lse.shape == (spec.batch, spec.nheads_q, spec.seqlen_q)
+    assert lse.dtype == torch.float32
+    assert lse.device == q.device
+    torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry",
+    DECODE_SHAPES,
+    ids=[str(entry["key"]) for entry in DECODE_SHAPES],
+)
+@pytest.mark.parametrize(
+    "autocast_dtype",
+    [torch.bfloat16, torch.float16],
+    ids=["bf16-autocast", "fp16-autocast"],
+)
+def test_kvcache_softmax_lse_is_not_changed_by_autocast(
+    entry: dict[str, object], autocast_dtype: torch.dtype
+) -> None:
+    spec = spec_from_manifest_entry(entry)
+    q = torch.full(
+        (spec.batch, 1, spec.nheads_q, spec.head_dim),
+        32.0,
+        dtype=spec.dtype,
+        device="cuda",
+    )
+    k_cache = torch.full(
+        (spec.batch, spec.seqlen_k, spec.nheads_kv, spec.head_dim),
+        32.0,
+        dtype=spec.dtype,
+        device="cuda",
+    )
+    v_cache = torch.zeros_like(k_cache)
+    scale = 0.1
+
+    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+        _, lse = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            softmax_scale=scale,
+            causal=spec.causal,
+            return_softmax_lse=True,
+            shape=spec,
+        )
+
+    # Every score is identical, so this reference is independent of the
+    # implementation and remains finite even though fp16 matmul would overflow.
+    expected_value = (
+        32.0 * 32.0 * spec.head_dim * scale + math.log(spec.seqlen_k)
+    )
+    expected = torch.full_like(lse, expected_value)
+    assert torch.isfinite(lse).all()
+    torch.testing.assert_close(lse, expected, atol=2e-3, rtol=0.0)
+
+
+@requires_cuda
+def test_kvcache_softmax_lse_has_bounded_peak_allocation() -> None:
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=4815)
+
+    def invoke() -> tuple[torch.Tensor, torch.Tensor]:
+        return helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            causal=spec.causal,
+            return_softmax_lse=True,
+            shape=spec,
+        )
+
+    # Warm Triton's compilation and allocator setup before measuring only the
+    # per-call tensors. The split kernel needs about 128 KiB of fp32 partials.
+    invoke()
+    torch.cuda.synchronize(q.device)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(q.device)
+    allocated_before = torch.cuda.memory_allocated(q.device)
+
+    out, lse = invoke()
+    torch.cuda.synchronize(q.device)
+    incremental_peak = (
+        torch.cuda.max_memory_allocated(q.device) - allocated_before
+    )
+
+    assert out.shape == q.shape
+    assert lse.shape == (spec.batch, spec.nheads_q, 1)
+    assert incremental_peak < 1024 * 1024
 
 
 @requires_cuda

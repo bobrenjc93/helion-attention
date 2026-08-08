@@ -135,6 +135,265 @@ def merge_generated_modules(*modules: str) -> str:
     return "from __future__ import annotations\n" + "\n".join(bodies)
 
 
+def _replace_generated_once(
+    code: str, old: str, new: str, *, description: str
+) -> str:
+    """Apply one required generated-code rewrite or fail regeneration loudly."""
+    count = code.count(old)
+    if count != 1:
+        raise RuntimeError(
+            f"expected one {description} in generated code, found {count}"
+        )
+    return code.replace(old, new, 1)
+
+
+def should_add_direct_decode_lse(
+    spec: "AttnShape", *, paged: bool, varlen: bool, split_kv: bool
+) -> bool:
+    """Whether this artifact is the ordinary dense single-token cache path."""
+    return not (paged or varlen or split_kv) and spec.is_decode
+
+
+def add_direct_decode_lse_support(code: str, spec: "AttnShape") -> str:
+    """Expose any dense single-token kernel's online-softmax state as fp32 LSE."""
+    if not spec.is_decode:
+        raise ValueError("direct decode LSE support requires seqlen_q=1")
+
+    triton_name = (
+        "_helion_causal_attention_bshd"
+        if spec.causal
+        else "_helion_attention_bshd"
+    )
+    signature_pattern = rf"^def {re.escape(triton_name)}\(([^\n]+)\):$"
+    signature_match = re.search(signature_pattern, code, flags=re.MULTILINE)
+    if signature_match is None:
+        raise RuntimeError(
+            f"generated dense decode has no {triton_name} Triton signature"
+        )
+    triton_args = signature_match.group(1)
+    if triton_args.count("out, qk_scale") != 1:
+        raise RuntimeError("generated dense decode has unexpected Triton arguments")
+    triton_args = triton_args.replace(
+        "out, qk_scale", "out, softmax_lse, qk_scale", 1
+    )
+    rewritten_signature = (
+        f"def {triton_name}({triton_args}, STORE_LSE: tl.constexpr):"
+    )
+    code = re.sub(
+        signature_pattern,
+        rewritten_signature,
+        code,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+    # Helion may lower the output through either a pointer or a tensor
+    # descriptor. Find the store inside the Triton function rather than a
+    # source-location comment: descriptor lowering emits that comment once for
+    # descriptor construction and again for the actual store.
+    lines = code.splitlines(keepends=True)
+    signature_line = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith(f"def {triton_name}(")
+    )
+    output_stores = []
+    for index in range(signature_line + 1, len(lines)):
+        stripped = lines[index].lstrip()
+        if stripped.startswith("tl.store(out +") or stripped.startswith(
+            "out_desc.store("
+        ):
+            output_stores.append(index)
+        if lines[index].startswith("def "):
+            break
+    if len(output_stores) != 1:
+        raise RuntimeError(
+            "expected one dense decode output store, found "
+            f"{len(output_stores)}"
+        )
+    output_store = output_stores[0]
+
+    indent = lines[output_store][: -len(lines[output_store].lstrip())]
+    lse_offset_terms = []
+    if spec.batch > 1:
+        lse_offset_terms.append(
+            "offset_0"
+            if spec.nheads_q == 1
+            else f"offset_0 * {spec.nheads_q}"
+        )
+    if spec.nheads_q > 1:
+        lse_offset_terms.append("offset_1")
+    # Decode always has one query lane. Use an explicit lane instead of the
+    # generated query index, which noncausal lowering can constant-fold away.
+    lse_offset_terms.append("tl.arange(0, 1)")
+    lse_offset = " + ".join(lse_offset_terms)
+    lse_store = (
+        f"{indent}if STORE_LSE:\n"
+        f"{indent}    # qk_scale uses log2(e), so the online state is base-2. "
+        "FlashAttention\n"
+        f"{indent}    # exposes the natural-log normalization factor.\n"
+        f"{indent}    lse = (m_i + libdevice.log2(l_i)) * "
+        "0.6931471805599453\n"
+        f"{indent}    tl.store(softmax_lse + {lse_offset}, lse, None)\n"
+    )
+    lines.insert(output_store + 1, lse_store)
+    code = "".join(lines)
+
+    rewrites = (
+        (
+            "def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, "
+            "sm_scale: float, *, _launcher=_default_launcher):",
+            "def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, "
+            "sm_scale: float, *, return_softmax_lse: bool = False, "
+            "_launcher=_default_launcher):",
+            "direct-decode host signature",
+        ),
+        (
+            "    out = torch.empty_like(q)\n",
+            "    out = torch.empty_like(q)\n"
+            "    softmax_lse = (\n"
+            "        torch.empty(\n"
+            "            (q.size(0), q.size(2), q.size(1)),\n"
+            "            dtype=torch.float32,\n"
+            "            device=q.device,\n"
+            "        )\n"
+            "        if return_softmax_lse\n"
+            "        else out\n"
+            "    )\n",
+            "direct-decode output allocation",
+        ),
+        (
+            "q, k, v, out, qk_scale,",
+            "q, k, v, out, softmax_lse, qk_scale,",
+            "direct-decode LSE launch argument",
+        ),
+        (
+            "    return out",
+            "    return (out, softmax_lse) if return_softmax_lse else out",
+            "direct-decode host return",
+        ),
+    )
+    for old, new, description in rewrites:
+        code = _replace_generated_once(
+            code, old, new, description=description
+        )
+
+    # Scope the constexpr insertion to the launcher. The rendered provenance
+    # can also contain `, num_warps=`, so a module-wide replacement would
+    # corrupt the generated module's docstring.
+    lines = code.splitlines(keepends=True)
+    launch_lines = [
+        index
+        for index, line in enumerate(lines)
+        if line.lstrip().startswith(f"_launcher({triton_name},")
+    ]
+    if len(launch_lines) != 1:
+        raise RuntimeError(
+            "expected one dense decode launcher, found "
+            f"{len(launch_lines)}"
+        )
+    launch_line = lines[launch_lines[0]]
+    if launch_line.count(", num_warps=") != 1:
+        raise RuntimeError("generated dense decode launcher has no num_warps")
+    lines[launch_lines[0]] = launch_line.replace(
+        ", num_warps=",
+        ", STORE_LSE=return_softmax_lse, num_warps=",
+        1,
+    )
+    code = "".join(lines)
+    return code if code.endswith("\n") else code + "\n"
+
+
+def add_split_decode_lse_support(code: str) -> str:
+    """Store LSE while the split-KV combine kernel has its fp32 statistics."""
+    rewrites = (
+        (
+            "def _helion_decode_attention_bshd_split_kv_combine(partial_stats, "
+            "partial_acc, out, _RDIM_SIZE_2: tl.constexpr, "
+            "_RDIM_SIZE_3: tl.constexpr):",
+            "def _helion_decode_attention_bshd_split_kv_combine(partial_stats, "
+            "partial_acc, out, softmax_lse, _RDIM_SIZE_2: tl.constexpr, "
+            "_RDIM_SIZE_3: tl.constexpr, STORE_LSE: tl.constexpr):",
+            "split-decode Triton signature",
+        ),
+        (
+            "    tl.store(out + (offset_1 * 128 + "
+            "(0 + indices_3)[None, :] * 1), v_6, None)\n",
+            "    tl.store(out + (offset_1 * 128 + "
+            "(0 + indices_3)[None, :] * 1), v_6, None)\n"
+            "    if STORE_LSE:\n"
+            "        # The split statistics use base-2 exponentials. Convert "
+            "their combined\n"
+            "        # normalization factor to FlashAttention's natural-log "
+            "convention.\n"
+            "        lse = (global_max + libdevice.log2(denominator)) * "
+            "0.6931471805599453\n"
+            "        tl.store(softmax_lse + offset_1 + tl.arange(0, 1), lse, "
+            "None)\n",
+            "split-decode output store",
+        ),
+        (
+            "def _attention_split_kv_combine(partial_acc: torch.Tensor, "
+            "partial_stats: torch.Tensor, out: torch.Tensor, *, "
+            "_launcher=_default_launcher):",
+            "def _attention_split_kv_combine(partial_acc: torch.Tensor, "
+            "partial_stats: torch.Tensor, out: torch.Tensor, "
+            "softmax_lse: torch.Tensor, return_softmax_lse: bool, *, "
+            "_launcher=_default_launcher):",
+            "split-decode combine host signature",
+        ),
+        (
+            "partial_stats, partial_acc, out, _RDIM_SIZE_2, _RDIM_SIZE_3, "
+            "num_warps=",
+            "partial_stats, partial_acc, out, softmax_lse, _RDIM_SIZE_2, "
+            "_RDIM_SIZE_3, STORE_LSE=return_softmax_lse, num_warps=",
+            "split-decode combine launch arguments",
+        ),
+        (
+            "def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, "
+            "sm_scale: float, *, _launcher=_default_launcher):",
+            "def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, "
+            "sm_scale: float, *, return_softmax_lse: bool = False, "
+            "_launcher=_default_launcher):",
+            "split-decode host signature",
+        ),
+        (
+            "    out = torch.empty_like(q)\n",
+            "    out = torch.empty_like(q)\n"
+            "    softmax_lse = (\n"
+            "        torch.empty(\n"
+            "            (q.size(0), q.size(2), q.size(1)),\n"
+            "            dtype=torch.float32,\n"
+            "            device=q.device,\n"
+            "        )\n"
+            "        if return_softmax_lse\n"
+            "        else out\n"
+            "    )\n",
+            "split-decode output allocation",
+        ),
+        (
+            "        return _attention_split_kv_combine(\n"
+            "            partial_acc, partial_stats, out, _launcher=launch\n"
+            "        )",
+            "        out = _attention_split_kv_combine(\n"
+            "            partial_acc,\n"
+            "            partial_stats,\n"
+            "            out,\n"
+            "            softmax_lse,\n"
+            "            return_softmax_lse,\n"
+            "            _launcher=launch,\n"
+            "        )\n"
+            "    return (out, softmax_lse) if return_softmax_lse else out",
+            "split-decode host return",
+        ),
+    )
+    for old, new, description in rewrites:
+        code = _replace_generated_once(
+            code, old, new, description=description
+        )
+    return code if code.endswith("\n") else code + "\n"
+
+
 _SPLIT_KV_DECODE_ENTRY_POINT = f'''
 from .._launcher import launcher_context as _launcher_context
 
@@ -1174,6 +1433,7 @@ def main() -> int:
             merge_generated_modules(partial_code, combine_code)
             + _SPLIT_KV_DECODE_ENTRY_POINT
         )
+        code = add_split_decode_lse_support(code)
         from helion.autotuner.benchmarking import do_bench
         from helion.autotuner.benchmarking import interleaved_bench
 
@@ -1233,6 +1493,13 @@ def main() -> int:
                 else "attention_varlen" if args.varlen else "attention"
             ),
         )
+        if should_add_direct_decode_lse(
+            spec,
+            paged=args.paged,
+            varlen=args.varlen,
+            split_kv=split_kv_decode,
+        ):
+            code = add_direct_decode_lse_support(code, spec)
 
     command = " ".join(
         ["python tools/generate.py", f"--batch {spec.batch}", f"--seqlen {spec.seqlen_q}"]

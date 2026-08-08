@@ -99,6 +99,9 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
+Pass `return_softmax_lse=True` to receive `(out, softmax_lse)`. The LSE is fp32
+with shape `[batch, heads_q, 1]`, matching FlashAttention's KV-cache API.
+
 This decode path reads a full, contiguous cache. `cache_seqlens` may be omitted
 or passed as a Python integer equal to the full cache length. Tensor-valued
 lengths, cache appends, and partial, ragged, paged, or rotary-embedded caches are
@@ -336,7 +339,7 @@ the call site. These unsupported FlashAttention features also raise
 - sliding-window attention and softcap
 - ALiBi slopes
 - KV-cache mutation, partial/ragged caches, paged caches, and fused rotary embeddings
-- `return_attn_probs` and KV-cache `return_softmax_lse`
+- `return_attn_probs`
 
 ## How the kernels are made
 

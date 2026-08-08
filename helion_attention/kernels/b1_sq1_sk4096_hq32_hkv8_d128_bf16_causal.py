@@ -43,7 +43,7 @@ _BLOCK_SIZE_2 = tl.constexpr(1)
 _BLOCK_SIZE_4 = tl.constexpr(128)
 
 @triton.jit
-def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.constexpr):
+def _helion_causal_attention_bshd(q, k, v, out, softmax_lse, qk_scale, _RDIM_SIZE_3: tl.constexpr, STORE_LSE: tl.constexpr):
     # src[helion_kernels.py:233]: for b, h in hl.grid([batch, nheads_q]):
     num_pid_m = 1
     num_pid_n = 32
@@ -158,8 +158,13 @@ def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.const
         # src[helion_kernels.py:270]: out[b, tile_m, h, :] = result.to(out.dtype)
         v_20 = tl.cast(result, tl.bfloat16)
         tl.store(out + tl.broadcast_to(offset_1 * 128 + (0 + indices_3)[None, :] * 1, [_BLOCK_SIZE_2, _RDIM_SIZE_3]), v_20, None)
+        if STORE_LSE:
+            # qk_scale uses log2(e), so the online state is base-2. FlashAttention
+            # exposes the natural-log normalization factor.
+            lse = (m_i + libdevice.log2(l_i)) * 0.6931471805599453
+            tl.store(softmax_lse + offset_1 + tl.arange(0, 1), lse, None)
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, return_softmax_lse: bool = False, _launcher=_default_launcher):
     """Bottom-right causal attention over ``[batch, seq, heads, dim]``.
 
     Query row ``i`` attends through key ``i + seqlen_k - seqlen_q``, matching
@@ -171,6 +176,15 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
     batch = q.size(0)
     # src[helion_kernels.py:230]: out = torch.empty_like(q)
     out = torch.empty_like(q)
+    softmax_lse = (
+        torch.empty(
+            (q.size(0), q.size(2), q.size(1)),
+            dtype=torch.float32,
+            device=q.device,
+        )
+        if return_softmax_lse
+        else out
+    )
     # src[helion_kernels.py:231]: qk_scale = sm_scale * 1.44269504088896340736
     qk_scale = sm_scale * 1.4426950408889634
     # src[helion_kernels.py:233]: for b, h in hl.grid([batch, nheads_q]):
@@ -179,6 +193,6 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
     # src[helion_kernels.py:234]:     h_kv = h // group
     # src[helion_kernels.py:235]:     for tile_m in hl.tile(m_dim):
     # src[helion_kernels.py:233-270]: ...
-    _launcher(_helion_causal_attention_bshd, (1 * 32,), q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=4, num_stages=3)
+    _launcher(_helion_causal_attention_bshd, (1 * 32,), q, k, v, out, softmax_lse, qk_scale, _RDIM_SIZE_3, STORE_LSE=return_softmax_lse, num_warps=4, num_stages=3)
     # src[helion_kernels.py:271]: return out
-    return out
+    return (out, softmax_lse) if return_softmax_lse else out
