@@ -132,6 +132,8 @@ def check_tensors(
                 f"{name} must be contiguous in [batch, seqlen, nheads, head_dim] layout; "
                 "the generated kernels bake in the strides of that layout"
             )
+    if k.device != q.device or v.device != q.device:
+        raise ValueError("q, k, and v must be on the same CUDA device")
 
 
 def check_varlen_tensors(

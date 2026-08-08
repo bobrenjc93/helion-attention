@@ -10,10 +10,12 @@ nothing else, and `import helion_attention` never imports Helion.
 The one API difference from FlashAttention is that **`shape` is a required
 argument**. Helion only beats FlashAttention when a kernel is specialized to one
 exact problem size — block sizes, warp counts, pipelining stages, indexing mode
-and the tensor strides are all baked into the generated Triton — so this library
-ships one autotuned kernel per shape rather than one kernel for everything.
-Declaring the shape at the call site makes that contract explicit and turns a
-missing kernel into a clear error instead of a silent slow path.
+and the tensor strides are all baked into the generated Triton — so uncapped
+calls use one autotuned kernel per checked-in shape. Declaring the shape at the
+call site makes that contract explicit and turns a missing specialization into
+a clear error. Dense forward calls with a positive softcap are the exception:
+they reuse the generic packed Triton runtime, while retaining the same required
+shape validation.
 
 ## Install
 
@@ -40,7 +42,13 @@ out = helion_attention.flash_attn_func(q, k, v, causal=True, shape=(B, S, H, D))
 Everything else matches `flash_attn.flash_attn_func`: the layout is
 `[batch, seqlen, nheads, head_dim]`, `softmax_scale` defaults to
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
-mask alignment.
+mask alignment. Positive, normal-float32 `softcap` values are supported for
+dense forward MHA and GQA in fp16 or bf16 with head dimensions up to 256;
+smaller positive values and values above `torch.finfo(torch.float32).max` raise
+`ValueError` before launch. This path applies
+`softcap * tanh(scores / softcap)` before softmax and is forward-only. The
+generic packed runtime rejects query/output or K/V layouts with more than
+`torch.iinfo(torch.int32).max` elements.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -350,15 +358,18 @@ same page-16 logical cache as Helion.
 
 ## What is not implemented
 
-Backward/training is implemented for the non-causal bf16
+Uncapped backward/training is implemented for the non-causal bf16
 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape. Other shapes remain
 forward-only, including packed varlen kernels, and reject grad-enabled calls at
 the call site. These unsupported FlashAttention features also raise
 `NotImplementedError` rather than silently doing something else:
 
-- backward for varlen, causal, cross-attention, GQA, fp16, and other shapes
+- backward for softcap, varlen, causal, cross-attention, GQA, fp16, and other
+  shapes
 - dropout
-- sliding-window attention and softcap
+- sliding-window attention
+- dense softcap with head dimensions above 256
+- softcap in varlen and KV-cache entry points
 - ALiBi slopes
 - KV-cache mutation beyond the paired one-token final-slot append above;
   partial/ragged caches, paged caches, and fused rotary embeddings

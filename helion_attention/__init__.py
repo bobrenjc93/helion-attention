@@ -5,15 +5,16 @@ The kernels in :mod:`helion_attention.kernels` were generated and autotuned by
 time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
-Every entry point takes a required ``shape`` argument. Helion only wins against
-FlashAttention when a kernel is specialized to one exact problem size, so the
-shape is part of the call contract rather than something discovered from the
-tensors at runtime.
+Every entry point takes a required ``shape`` argument. Uncapped calls use a
+kernel specialized to that exact problem size. Dense forward calls with a
+positive softcap reuse the package's generic packed Triton runtime, with
+``shape`` still providing the checked tensor contract.
 """
 
 from __future__ import annotations
 
 import math
+from numbers import Real
 
 import torch
 
@@ -54,6 +55,11 @@ __all__ = [
 
 __version__ = "0.1.0"
 
+_INT32_MAX = torch.iinfo(torch.int32).max
+_FLOAT32_TINY = torch.finfo(torch.float32).tiny
+_FLOAT32_MAX = torch.finfo(torch.float32).max
+_GENERIC_MAX_HEAD_DIM = 256
+
 
 def _reject_unsupported(
     dropout_p: float,
@@ -61,17 +67,39 @@ def _reject_unsupported(
     softcap: float,
     alibi_slopes: torch.Tensor | None,
     return_attn_probs: bool,
-) -> None:
+    *,
+    allow_softcap: bool = False,
+) -> float:
     if dropout_p != 0.0:
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
     if tuple(window_size) != (-1, -1):
         raise NotImplementedError("sliding-window attention is not implemented")
-    if softcap != 0.0:
-        raise NotImplementedError("softcap is not implemented")
+    if isinstance(softcap, bool) or not isinstance(softcap, Real):
+        raise TypeError("softcap must be a finite non-negative real number")
+    if softcap != softcap or softcap in (math.inf, -math.inf):
+        raise ValueError("softcap must be finite")
+    if softcap < 0:
+        raise ValueError("softcap must be non-negative")
+    is_zero_softcap = softcap == 0
+    if not is_zero_softcap:
+        if not allow_softcap:
+            raise NotImplementedError("softcap is not implemented")
+        if softcap < _FLOAT32_TINY or softcap > _FLOAT32_MAX:
+            raise ValueError(
+                "positive softcap must be representable as a normal float32 value "
+                f"in [{_FLOAT32_TINY}, {_FLOAT32_MAX}]"
+            )
+    try:
+        normalized_softcap = float(softcap)
+    except OverflowError as exc:
+        raise ValueError("softcap must be finite") from exc
+    if not math.isfinite(normalized_softcap):
+        raise ValueError("softcap must be finite")
     if alibi_slopes is not None:
         raise NotImplementedError("ALiBi slopes are not implemented")
     if return_attn_probs:
         raise NotImplementedError("return_attn_probs is not implemented")
+    return normalized_softcap
 
 
 def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
@@ -81,6 +109,102 @@ def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bo
     second_start = second.data_ptr()
     second_end = second_start + second.numel() * second.element_size()
     return first_start < second_end and second_start < first_end
+
+
+def _dense_cumulative_offsets(
+    batch: int,
+    seqlen: int,
+    *,
+    label: str,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build packed offsets after proving every value fits signed int32."""
+    total = batch * seqlen
+    if total > _INT32_MAX:
+        raise ValueError(
+            f"dense {label} token total batch * seqlen = {total} exceeds "
+            f"INT32_MAX ({_INT32_MAX}) required by the packed runtime"
+        )
+    request_ids = torch.arange(batch + 1, device=device, dtype=torch.int64)
+    return (request_ids * seqlen).to(torch.int32)
+
+
+def _check_dense_packed_addressing(spec: AttnShape) -> None:
+    """Reject layouts whose element offsets can overflow signed int32."""
+    element_counts = (
+        (
+            "query/output",
+            spec.batch * spec.seqlen_q * spec.nheads_q * spec.head_dim,
+        ),
+        (
+            "key/value",
+            spec.batch * spec.seqlen_k * spec.nheads_kv * spec.head_dim,
+        ),
+    )
+    for label, count in element_counts:
+        if count > _INT32_MAX:
+            raise ValueError(
+                f"dense {label} element count {count} exceeds INT32_MAX "
+                f"({_INT32_MAX}) addressable by the packed runtime"
+            )
+
+
+def _dense_softcap_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float,
+    softcap: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Run validated dense inputs through the generic packed Triton forward."""
+    if spec.head_dim > _GENERIC_MAX_HEAD_DIM:
+        raise NotImplementedError(
+            "dense softcap attention supports head_dim <= "
+            f"{_GENERIC_MAX_HEAD_DIM}; got {spec.head_dim}"
+        )
+    _check_dense_packed_addressing(spec)
+    cu_seqlens_q = _dense_cumulative_offsets(
+        spec.batch, spec.seqlen_q, label="query", device=q.device
+    )
+    cu_seqlens_k = _dense_cumulative_offsets(
+        spec.batch, spec.seqlen_k, label="key", device=q.device
+    )
+
+    from ._paged_attention import packed_attention
+
+    packed = packed_attention(
+        q.reshape(-1, spec.nheads_q, spec.head_dim),
+        k.reshape(-1, spec.nheads_kv, spec.head_dim),
+        v.reshape(-1, spec.nheads_kv, spec.head_dim),
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=scale,
+        causal=spec.causal,
+        window_size=(-1, -1),
+        softcap=softcap,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    assert isinstance(packed, torch.Tensor)
+    return packed.reshape(
+        spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
+    )
 
 
 def is_shape_supported(
@@ -130,6 +254,8 @@ def flash_attn_func(
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
+        softcap: 0 disables capping; positive values must be representable as
+            normal finite float32 values.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -138,18 +264,35 @@ def flash_attn_func(
         ``[batch, seqlen_q, nheads_q, head_dim]``.
 
     Raises:
-        UnsupportedShapeError: no kernel is checked in for this shape.
+        UnsupportedShapeError: ``softcap=0`` and no kernel is checked in for
+            this shape.
+        NotImplementedError: a softcapped call requests autograd.
     """
-    _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
+    normalized_softcap = _reject_unsupported(
+        dropout_p,
+        window_size,
+        softcap,
+        alibi_slopes,
+        return_attn_probs,
+        allow_softcap=True,
+    )
     spec = normalize_shape(shape, q.dtype, causal)
     check_tensors(q, k, v, spec)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
-    kernel = lookup(spec)
     scale = float(softmax_scale)
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
     )
+    if normalized_softcap > 0.0:
+        if needs_backward:
+            raise NotImplementedError(
+                "softcapped dense attention is currently forward-only; "
+                "no softcap backward kernel is checked in"
+            )
+        return _dense_softcap_forward(q, k, v, scale, normalized_softcap, spec)
+
+    kernel = lookup(spec)
     if needs_backward:
         # Resolve this before launching the forward so unsupported training
         # shapes fail at the call site rather than later during loss.backward().

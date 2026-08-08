@@ -5,6 +5,8 @@ from __future__ import annotations
 import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from fractions import Fraction
+from numbers import Real
 
 import pytest
 import torch
@@ -87,6 +89,28 @@ def reference_attention(
         scale=scale,
         enable_gqa=spec.nheads_q != spec.nheads_kv,
     ).transpose(1, 2)
+
+
+def reference_softcap_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    spec: AttnShape,
+    scale: float,
+    softcap: float,
+) -> torch.Tensor:
+    group_size = spec.nheads_q // spec.nheads_kv
+    query = q.float().transpose(1, 2)
+    key = k.float().transpose(1, 2).repeat_interleave(group_size, dim=1)
+    value = v.float().transpose(1, 2).repeat_interleave(group_size, dim=1)
+    scores = torch.matmul(query, key.transpose(-1, -2)) * scale
+    scores = softcap * torch.tanh(scores / softcap)
+    if spec.causal:
+        rows = torch.arange(spec.seqlen_q, device=q.device)[:, None]
+        columns = torch.arange(spec.seqlen_k, device=q.device)[None, :]
+        keep = columns <= rows + spec.seqlen_k - spec.seqlen_q
+        scores.masked_fill_(~keep, float("-inf"))
+    return torch.matmul(torch.softmax(scores, dim=-1), value).transpose(1, 2)
 
 
 def reference_single_token_lse(
@@ -209,6 +233,258 @@ def test_custom_softmax_scale(entry: dict[str, object]) -> None:
     )
     expected = reference_attention(q, k, v, spec, scale)
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+@pytest.mark.parametrize("nheads_kv", [4, 2], ids=["mha", "gqa"])
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+def test_dense_softcap_matches_fp32_oracle(
+    dtype: torch.dtype, nheads_kv: int, causal: bool
+) -> None:
+    spec = AttnShape(2, 7, 11, 4, nheads_kv, 32, dtype, causal)
+    q, k, v = make_inputs(spec, seed=9821)
+    scale = 0.37
+    softcap = 1.5
+
+    got = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=scale,
+        causal=causal,
+        softcap=softcap,
+        shape=spec,
+    )
+    expected = reference_softcap_attention(q, k, v, spec, scale, softcap)
+
+    assert got.dtype == dtype
+    torch.testing.assert_close(got.float(), expected, atol=1e-2, rtol=2e-3)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"]
+)
+def test_dense_large_softcap_preserves_small_logits(dtype: torch.dtype) -> None:
+    q = torch.tensor([[[[1.0]]]], device="cuda", dtype=dtype)
+    k = torch.tensor([[[[1.0]], [[-1.0]]]], device="cuda", dtype=dtype)
+    v = torch.tensor([[[[1.0]], [[-1.0]]]], device="cuda", dtype=dtype)
+
+    result = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0,
+        softcap=3e38,
+        shape=(1, 1, 2, 1, 1, 1),
+    )
+
+    assert result.item() == pytest.approx(math.tanh(1.0), abs=5e-4)
+
+
+@requires_cuda
+def test_dense_minimum_normal_softcap_preserves_uniform_logits() -> None:
+    q = torch.zeros(1, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros(1, 2, 1, 1, device="cuda", dtype=torch.bfloat16)
+    v = torch.tensor([[[[1.0]], [[3.0]]]], device="cuda", dtype=torch.bfloat16)
+
+    result = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softcap=torch.finfo(torch.float32).tiny,
+        shape=(1, 1, 2, 1, 1, 1),
+    )
+
+    assert result.item() == 2.0
+
+
+@requires_cuda
+def test_dense_softcap_supports_head_dim_256() -> None:
+    q = torch.zeros(1, 1, 1, 256, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    v = torch.randn_like(q)
+
+    result = helion_attention.flash_attn_func(
+        q, k, v, softcap=1.0, shape=(1, 1, 1, 256)
+    )
+
+    torch.testing.assert_close(result, v)
+
+
+@requires_cuda
+def test_dense_softcap_rejects_head_dim_above_256() -> None:
+    q = torch.zeros(1, 1, 1, 257, device="cuda", dtype=torch.bfloat16)
+
+    with pytest.raises(NotImplementedError, match="head_dim <= 256"):
+        helion_attention.flash_attn_func(
+            q, q, q, softcap=1.0, shape=(1, 1, 1, 257)
+        )
+
+
+@requires_cuda
+def test_softcap_zero_retains_specialized_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = AttnShape(1, 3, 3, 2, 2, 16, torch.bfloat16, False)
+    q, k, v = make_inputs(spec)
+    calls = 0
+
+    def specialized(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+    ) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        assert scale == 0.25
+        return torch.zeros_like(query)
+
+    monkeypatch.setattr(helion_attention, "lookup", lambda ignored: specialized)
+
+    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("softcap=0 reached the generic runtime")
+
+    monkeypatch.setattr(helion_attention, "_dense_softcap_forward", reject_generic)
+    result = helion_attention.flash_attn_func(
+        q, k, v, softmax_scale=0.25, softcap=0.0, shape=spec
+    )
+
+    assert calls == 1
+    torch.testing.assert_close(result, torch.zeros_like(q))
+
+
+@requires_cuda
+def test_dense_softcap_rejects_autograd() -> None:
+    spec = AttnShape(1, 3, 5, 4, 2, 16, torch.bfloat16, True)
+    q, k, v = make_inputs(spec)
+    q.requires_grad_()
+
+    with pytest.raises(NotImplementedError, match="softcapped.*forward-only"):
+        helion_attention.flash_attn_func(
+            q, k, v, causal=True, softcap=1.0, shape=spec
+        )
+
+
+@pytest.mark.parametrize(
+    "softcap", [-1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_dense_softcap_rejects_invalid_values(softcap: float) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="softcap"):
+        helion_attention.flash_attn_func(
+            q, q, q, softcap=softcap, shape=(1, 1, 1, 1)
+        )
+
+
+@pytest.mark.parametrize(
+    "softcap",
+    [1e-46, torch.finfo(torch.float32).max * 2.0],
+    ids=["below-float32-normal", "above-float32-maximum"],
+)
+def test_dense_softcap_rejects_unrepresentable_values(softcap: float) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="normal float32"):
+        helion_attention.flash_attn_func(
+            q, q, q, softcap=softcap, shape=(1, 1, 1, 1)
+        )
+
+
+@pytest.mark.parametrize(
+    ("softcap", "message"),
+    [
+        (int(torch.finfo(torch.float32).max) + 1, "normal float32"),
+        (Fraction(1, 10**1000), "normal float32"),
+        (Fraction(-1, 10**1000), "non-negative"),
+    ],
+    ids=["integer-above-maximum", "positive-underflow", "negative-underflow"],
+)
+def test_dense_softcap_validates_exact_value_before_float_conversion(
+    softcap: Real, message: str
+) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=message):
+        helion_attention.flash_attn_func(  # type: ignore[arg-type]
+            q, q, q, softcap=softcap, shape=(1, 1, 1, 1)
+        )
+
+
+@pytest.mark.parametrize("softcap", [True, "1.0", None])
+def test_dense_softcap_rejects_invalid_types(softcap: object) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match="softcap"):
+        helion_attention.flash_attn_func(  # type: ignore[arg-type]
+            q, q, q, softcap=softcap, shape=(1, 1, 1, 1)
+        )
+
+
+def test_dense_cumulative_offsets_allow_int32_maximum() -> None:
+    int32_max = torch.iinfo(torch.int32).max
+    offsets = helion_attention._dense_cumulative_offsets(
+        1,
+        int32_max,
+        label="query",
+        device=torch.device("cpu"),
+    )
+
+    assert offsets.dtype == torch.int32
+    assert offsets.tolist() == [0, int32_max]
+
+
+@pytest.mark.parametrize(
+    ("batch", "seqlen", "label"),
+    [(3, 800_000_000, "query"), (2, 1_073_741_824, "key")],
+)
+def test_dense_cumulative_offsets_reject_int32_overflow(
+    batch: int, seqlen: int, label: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"dense {label}.*INT32_MAX"):
+        helion_attention._dense_cumulative_offsets(
+            batch,
+            seqlen,
+            label=label,
+            device=torch.device("cpu"),
+        )
+
+
+def test_dense_packed_addressing_allows_int32_element_boundary() -> None:
+    spec = AttnShape(
+        1,
+        torch.iinfo(torch.int32).max,
+        1,
+        1,
+        1,
+        1,
+        torch.bfloat16,
+        False,
+    )
+
+    helion_attention._check_dense_packed_addressing(spec)
+
+
+@pytest.mark.parametrize(
+    ("spec", "label"),
+    [
+        (
+            AttnShape(8_388_609, 1, 1, 1, 1, 256, torch.bfloat16, False),
+            "query/output",
+        ),
+        (
+            AttnShape(1, 1, 8_388_609, 1, 1, 256, torch.bfloat16, False),
+            "key/value",
+        ),
+    ],
+    ids=["query-output", "key-value"],
+)
+def test_dense_packed_addressing_rejects_int32_element_overflow(
+    spec: AttnShape, label: str
+) -> None:
+    with pytest.raises(ValueError, match=rf"dense {label}.*INT32_MAX"):
+        helion_attention._check_dense_packed_addressing(spec)
 
 
 @requires_cuda
@@ -340,7 +616,6 @@ def test_rejects_unimplemented_features() -> None:
     for kwargs in (
         {"dropout_p": 0.1},
         {"window_size": (128, 0)},
-        {"softcap": 30.0},
         {"return_attn_probs": True},
     ):
         with pytest.raises(NotImplementedError):
