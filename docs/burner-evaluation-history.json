@@ -973,6 +973,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:25f8b775b6369715979245287fb3d7da225d2438",
+      "commit": "25f8b775b6369715979245287fb3d7da225d2438",
+      "recordedAt": "2026-08-08T22:42:59.238Z",
+      "label": "base 25f8b77",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:43",
+      "recordedAt": "2026-08-08T22:42:59.238Z",
+      "label": "PR #43",
+      "kind": "leaf",
+      "prNumber": 43,
+      "title": "Expose the shipped paged chunked-prefill kernel in core varlen",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
