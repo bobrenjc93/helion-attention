@@ -62,6 +62,7 @@ class ShapeRequest(NamedTuple):
 
 
 CATALOGUE: list[ShapeRequest] = [
+    ShapeRequest(16, 512, 12, 64, label="BERT-base encoder"),
     ShapeRequest(8, 512, 8, 32, causal=True, label="small-model decoder"),
     ShapeRequest(2, 1024, 32, 64, label="GPT-2 medium style prefill"),
     ShapeRequest(2, 1024, 32, 64, causal=True, label="GPT-2 medium style, causal"),
