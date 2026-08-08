@@ -1,14 +1,14 @@
-"""helion-attention: FlashAttention's API, served by checked-in Triton kernels.
+"""helion-attention: FlashAttention's API, served by Triton kernels.
 
 The kernels in :mod:`helion_attention.kernels` were generated and autotuned by
 `Helion <https://github.com/pytorch/helion>`_, but they are plain Triton by the
 time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
-Every entry point takes a required ``shape`` argument. Helion only wins against
-FlashAttention when a kernel is specialized to one exact problem size, so the
-shape is part of the call contract rather than something discovered from the
-tensors at runtime.
+Every entry point takes a required ``shape`` argument. Registered shapes use an
+exact generated specialization; compatible unregistered dense shapes use a
+generic forward-only Triton kernel. The explicit shape validates both paths and
+makes specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -58,6 +58,8 @@ __version__ = "0.1.0"
 
 _CORE_PAGED_VARLEN_SHAPE = (4, 1, 1024, 8, 2, 128, torch.bfloat16)
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
+_GENERIC_DENSE_MAX_HEAD_DIM = 256
+_INT32_MAX = 2**31 - 1
 
 
 def _reject_unsupported(
@@ -111,10 +113,122 @@ def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
         )
 
 
+def _validate_generic_dense_layout(spec: AttnShape) -> tuple[int, int]:
+    """Validate signed-int32 indices and return packed Q/K token totals."""
+    if spec.head_dim > _GENERIC_DENSE_MAX_HEAD_DIM:
+        raise UnsupportedShapeError(
+            "no checked-in dense specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic dense fallback supports head_dim <= "
+            f"{_GENERIC_DENSE_MAX_HEAD_DIM}. To request a specialization, file "
+            "an issue at https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    total_q = spec.batch * spec.seqlen_q
+    total_k = spec.batch * spec.seqlen_k
+    if max(total_q, total_k) > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in dense specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic dense fallback requires packed token offsets to fit "
+            "in int32. To request a specialization, file an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    # The packed kernel forms pointers with signed-int32 element arithmetic.
+    # Token offsets alone are insufficient: token * stride can overflow first
+    # for a large head count or dimension. Q and output share one layout, as do
+    # K and V, so bound the maximum valid relative element offset for each.
+    layout_numels = (
+        ("Q/output", total_q * spec.nheads_q * spec.head_dim),
+        ("K/V", total_k * spec.nheads_kv * spec.head_dim),
+    )
+    for layout, numel in layout_numels:
+        max_element_offset = numel - 1
+        if max_element_offset > _INT32_MAX:
+            raise UnsupportedShapeError(
+                "no checked-in dense specialization exists for:\n"
+                f"    {spec.describe()}\n"
+                "the generic dense fallback uses signed int32 element offsets, "
+                f"but {layout} requires maximum offset {max_element_offset} "
+                f"(limit {_INT32_MAX}). To request a specialization, file an "
+                "issue at https://github.com/bobrenjc93/helion-attention/issues"
+            )
+    return total_q, total_k
+
+
+def _generic_dense_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Adapt a validated dense batch to the generic packed Triton runtime."""
+    total_q, total_k = _validate_generic_dense_layout(spec)
+
+    # The dense inputs were validated as contiguous, so these views retain the
+    # packed runtime's [total, heads, head_dim] layout without copying data.
+    packed_q = q.view(total_q, spec.nheads_q, spec.head_dim)
+    packed_k = k.view(total_k, spec.nheads_kv, spec.head_dim)
+    packed_v = v.view(total_k, spec.nheads_kv, spec.head_dim)
+    request_ids = torch.arange(
+        spec.batch + 1, device=q.device, dtype=torch.int32
+    )
+    cu_seqlens_q = request_ids * spec.seqlen_q
+    cu_seqlens_k = (
+        cu_seqlens_q
+        if spec.seqlen_q == spec.seqlen_k
+        else request_ids * spec.seqlen_k
+    )
+
+    # Keep the Triton dependency lazy for callers that only inspect the
+    # specialization manifest.
+    from ._paged_attention import packed_attention
+
+    packed_out = packed_attention(
+        packed_q,
+        packed_k,
+        packed_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
+    return packed_out.view(
+        spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
+    )
+
+
 def is_shape_supported(
     shape: ShapeLike, dtype: torch.dtype = torch.bfloat16, causal: bool = False
 ) -> bool:
-    """True when a kernel for this exact shape is checked in."""
+    """True when an accelerated kernel for this exact shape is checked in.
+
+    This intentionally reports specialization availability, not whether the
+    generic dense forward fallback can execute the shape.
+    """
     return has_kernel(normalize_shape(shape, dtype, causal))
 
 
@@ -165,15 +279,15 @@ def flash_attn_func(
     Returns:
         ``[batch, seqlen_q, nheads_q, head_dim]``.
 
-    Raises:
-        UnsupportedShapeError: no kernel is checked in for this shape.
+    Unregistered, forward-only fp16/bf16 shapes with ``head_dim <= 256`` use a
+    generic packed Triton kernel. :func:`is_shape_supported` remains ``False``
+    for those calls because it reports checked-in acceleration only.
     """
     _reject_unsupported(dropout_p, window_size, softcap, alibi_slopes, return_attn_probs)
     spec = normalize_shape(shape, q.dtype, causal)
     check_tensors(q, k, v, spec)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
-    kernel = lookup(spec)
     scale = float(softmax_scale)
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
@@ -183,7 +297,9 @@ def flash_attn_func(
         # shapes fail at the call site rather than later during loss.backward().
         lookup_backward(spec)
         return attention_autograd(q, k, v, scale, spec)
-    return kernel(q, k, v, scale)
+    if has_kernel(spec):
+        return lookup(spec)(q, k, v, scale)
+    return _generic_dense_forward(q, k, v, scale, spec)
 
 
 def flash_attn_varlen_func(
