@@ -47,13 +47,21 @@ def main() -> int:
     for row in report["results"]:
         impls = row["implementations"]
         helion = impls.get("helion-attention")
-        flash = impls.get("flash-attn") or impls.get("sdpa-flash")
+        flash_name = "flash-attn-3"
+        flash = impls.get(flash_name)
+        if flash is None:
+            flash_name = "flash-attn"
+            flash = impls.get(flash_name)
+        if flash is None:
+            flash_name = "sdpa-flash"
+            flash = impls.get(flash_name)
         if helion is None or flash is None:
             continue
         speedup = flash["us"] / helion["us"]
         speedups.append(speedup)
         rows.append(
-            f"{row['key']}: helion {helion['us']:.0f}us vs flash {flash['us']:.0f}us "
+            f"{row['key']}: helion {helion['us']:.0f}us vs {flash_name} "
+            f"{flash['us']:.0f}us "
             f"({speedup:.2f}x, {helion['tflops']:.0f} TFLOP/s)"
         )
         if speedup < 1.0:
@@ -65,7 +73,9 @@ def main() -> int:
                 "score": 0,
                 "summary": "no comparable measurements",
                 "evidence": [completed.stdout[-4000:]],
-                "suggestions": ["check that flash-attn is installed in the benchmark environment"],
+                "suggestions": [
+                    "check that FlashAttention 3 or 2 is installed in the benchmark environment"
+                ],
             },
             sys.stdout,
         )

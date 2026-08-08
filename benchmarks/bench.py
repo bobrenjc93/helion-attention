@@ -1,4 +1,4 @@
-"""Benchmark every checked-in kernel against FlashAttention and PyTorch SDPA.
+"""Benchmark every checked-in kernel against FlashAttention 2/3 and PyTorch SDPA.
 
 Usage:
     python benchmarks/bench.py                 # markdown table on stdout
@@ -18,6 +18,8 @@ import math
 import platform
 import statistics
 import sys
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version
 from pathlib import Path
 from typing import Callable
 
@@ -51,12 +53,46 @@ try:
 except ImportError:  # pragma: no cover - benchmark-only dependency
     _flash_attn_with_kvcache = None
 
+# Current FA3 wheels expose the Hopper interface inside the ``flash_attn_3``
+# package.  Older source installs exposed the same module at the top level.
+try:  # pragma: no cover - benchmark-only dependency
+    from flash_attn_3 import flash_attn_interface as _flash_attn_3_interface
+except ImportError:  # pragma: no cover - legacy Hopper source install
+    try:
+        import flash_attn_interface as _flash_attn_3_interface
+    except ImportError:
+        _flash_attn_3_interface = None
+
+_flash_attn_3_func = getattr(
+    _flash_attn_3_interface, "flash_attn_func", None
+)
+_flash_attn_3_varlen_func = getattr(
+    _flash_attn_3_interface, "flash_attn_varlen_func", None
+)
+_flash_attn_3_with_kvcache = getattr(
+    _flash_attn_3_interface, "flash_attn_with_kvcache", None
+)
+
 from torch.nn.attention import SDPBackend  # noqa: E402
 from torch.nn.attention import sdpa_kernel  # noqa: E402
 
 BenchmarkOutput = torch.Tensor | tuple[torch.Tensor, ...]
 Candidate = Callable[[], BenchmarkOutput]
 FLASH_ATTN_PAGE_SIZE = 256
+IMPLEMENTATION_NAMES = [
+    "helion-attention",
+    "flash-attn-3",
+    "flash-attn",
+    "sdpa-flash",
+    "sdpa-cudnn",
+]
+
+
+def installed_version(distribution: str) -> str | None:
+    try:
+        return version(distribution)
+    except PackageNotFoundError:
+        return None
 
 
 def attended_pairs(seqlen_q: int, seqlen_k: int, causal: bool) -> int:
@@ -133,6 +169,16 @@ def build_candidates(
             candidates["flash-attn"] = lambda: _flash_attn_with_kvcache(
                 q, k, v, causal=spec.causal
             )
+        if _flash_attn_3_with_kvcache is not None:
+            candidates["flash-attn-3"] = lambda: _flash_attn_3_with_kvcache(
+                q, k, v, causal=spec.causal
+            )
+        elif _flash_attn_3_func is not None:
+            # Early FA3 betas did not expose the KV-cache wrapper.  Its dense
+            # kernel still computes the same bottom-right-aligned decode.
+            candidates["flash-attn-3"] = lambda: _flash_attn_3_func(
+                q, k, v, causal=spec.causal
+            )
     else:
         candidates = {
             "helion-attention": lambda: helion_attention.flash_attn_func(
@@ -141,6 +187,10 @@ def build_candidates(
         }
         if _flash_attn_func is not None:
             candidates["flash-attn"] = lambda: _flash_attn_func(
+                q, k, v, causal=spec.causal
+            )
+        if _flash_attn_3_func is not None:
+            candidates["flash-attn-3"] = lambda: _flash_attn_3_func(
                 q, k, v, causal=spec.causal
             )
     candidates["sdpa-flash"] = sdpa(SDPBackend.FLASH_ATTENTION)
@@ -245,6 +295,10 @@ def build_varlen_candidates(
     }
     if _flash_attn_varlen_func is not None:
         candidates["flash-attn"] = lambda: _flash_attn_varlen_func(
+            *args, causal=spec.causal
+        )
+    if _flash_attn_3_varlen_func is not None:
+        candidates["flash-attn-3"] = lambda: _flash_attn_3_varlen_func(
             *args, causal=spec.causal
         )
 
@@ -376,6 +430,33 @@ def build_paged_candidates(
                 block_table=flash_blocks,
             )
 
+    if _flash_attn_3_with_kvcache is not None:
+        if spec.is_decode:
+            flash_3_q = q.reshape(
+                spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
+            )
+            candidates["flash-attn-3"] = lambda: _flash_attn_3_with_kvcache(
+                flash_3_q,
+                helion_k,
+                helion_v,
+                cache_seqlens=seqused_k,
+                page_table=helion_blocks,
+                causal=spec.causal,
+            ).reshape_as(q)
+        else:
+            # FA3's KV-cache API accepts packed queries and arbitrary page
+            # sizes, so the exact page-16 cache used by Helion can be shared.
+            candidates["flash-attn-3"] = lambda: _flash_attn_3_with_kvcache(
+                q,
+                helion_k,
+                helion_v,
+                cache_seqlens=seqused_k,
+                page_table=helion_blocks,
+                cu_seqlens_q=cu_q,
+                max_seqlen_q=spec.seqlen_q,
+                causal=spec.causal,
+            )
+
     reference, operation_count = packed_reference(
         q, keys, values, lengths_q, spec
     )
@@ -416,6 +497,9 @@ def build_backward_candidates(
     if _flash_attn_func is not None:
         flash_output = _flash_attn_func(q, k, v, causal=spec.causal)
         candidates["flash-attn"] = backward(flash_output)
+    if _flash_attn_3_func is not None:
+        flash_3_output = _flash_attn_3_func(q, k, v, causal=spec.causal)
+        candidates["flash-attn-3"] = backward(flash_3_output)
 
     q_ref = q.detach().float().requires_grad_()
     k_ref = k.detach().float().requires_grad_()
@@ -502,6 +586,8 @@ def main() -> int:
         "device": device_name,
         "torch": torch.__version__,
         "triton": triton.__version__,
+        "flash_attn": installed_version("flash-attn"),
+        "flash_attn_3": installed_version("flash-attn-3"),
         "python": platform.python_version(),
         "results": [],
     }
@@ -540,6 +626,16 @@ def main() -> int:
                 if kind == "backward"
                 else "flash_attn_func"
             ),
+            "flash_attn_3_api": (
+                "flash_attn_with_kvcache"
+                if kind == "paged"
+                or (spec.is_decode and _flash_attn_3_with_kvcache is not None)
+                else "flash_attn_varlen_func"
+                if kind == "varlen"
+                else "flash_attn_func backward"
+                if kind == "backward"
+                else "flash_attn_func"
+            ),
             "note": entry.get("note", ""),
             "implementations": {
                 name: {
@@ -564,9 +660,16 @@ def main() -> int:
 
 
 def render_markdown(report: dict[str, object]) -> str:
-    names = ["helion-attention", "flash-attn", "sdpa-flash", "sdpa-cudnn"]
+    names = IMPLEMENTATION_NAMES
+    flash_versions = []
+    if report.get("flash_attn"):
+        flash_versions.append(f"FA2 {report['flash_attn']}")
+    if report.get("flash_attn_3"):
+        flash_versions.append(f"FA3 {report['flash_attn_3']}")
+    version_suffix = f", {', '.join(flash_versions)}" if flash_versions else ""
     lines = [
-        f"Measured on {report['device']}, torch {report['torch']}, triton {report['triton']}.",
+        f"Measured on {report['device']}, torch {report['torch']}, "
+        f"triton {report['triton']}{version_suffix}.",
         "",
     ]
     kinds = {row.get("kind") for row in report["results"]}  # type: ignore[index]
@@ -574,9 +677,9 @@ def render_markdown(report: dict[str, object]) -> str:
     if "paged" in kinds:
         notes.append(
             "Paged rows use identical logical caches with native page sizes "
-            f"(Helion: 16; FlashAttention: {FLASH_ATTN_PAGE_SIZE}); paged decode "
-            "uses flash_attn_with_kvcache and chunked prefill uses "
-            "flash_attn_varlen_func."
+            f"(Helion and FA3: 16; FA2: {FLASH_ATTN_PAGE_SIZE}); FA2 paged "
+            "decode uses flash_attn_with_kvcache and chunked prefill uses "
+            "flash_attn_varlen_func; FA3 uses flash_attn_with_kvcache."
         )
     if "backward" in kinds:
         notes.append(
@@ -589,7 +692,7 @@ def render_markdown(report: dict[str, object]) -> str:
         [
             "| shape | "
             + " | ".join(f"{n} (µs)" for n in names)
-            + " | helion vs flash-attn |",
+            + " | helion vs flash-attn-3 |",
             "| --- | " + " | ".join("---:" for _ in names) + " | ---: |",
         ]
     )
@@ -600,9 +703,9 @@ def render_markdown(report: dict[str, object]) -> str:
             entry = impls.get(name)
             cells.append("n/a" if entry is None else f"{entry['us']:.0f}")
         helion = impls.get("helion-attention")
-        flash = impls.get("flash-attn")
-        if helion is not None and flash is not None:
-            speedup = flash["us"] / helion["us"]
+        flash_3 = impls.get("flash-attn-3")
+        if helion is not None and flash_3 is not None:
+            speedup = flash_3["us"] / helion["us"]
             comparison = (
                 f"{speedup:.2f}x faster"
                 if speedup >= 1
