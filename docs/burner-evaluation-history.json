@@ -883,6 +883,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:010c22a5fb97a18a537c879a28211ee74c1d21e1",
+      "commit": "010c22a5fb97a18a537c879a28211ee74c1d21e1",
+      "recordedAt": "2026-08-08T21:40:39.240Z",
+      "label": "base 010c22a",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:40",
+      "recordedAt": "2026-08-08T21:40:39.240Z",
+      "label": "PR #40",
+      "kind": "leaf",
+      "prNumber": 40,
+      "title": "Rotate the existing final-slot KV append",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
