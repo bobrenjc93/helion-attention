@@ -1585,67 +1585,32 @@
     },
     {
       "autotuning_provenance": {
-        "autotuning_wall_time_seconds": 1385.067,
+        "autotuning_wall_time_seconds": 0.0,
         "configs": [
           {
             "config": {
-              "atomic_indexing": [],
               "block_sizes": [
                 128,
-                64
+                128
               ],
               "indexing": [
+                "pointer",
                 "tensor_descriptor",
-                "tensor_descriptor",
-                "tensor_descriptor",
-                "tensor_descriptor"
-              ],
-              "l2_groupings": [
-                1
-              ],
-              "load_eviction_policies": [
-                "last",
-                "last",
-                "last"
-              ],
-              "loop_orders": [
-                [
-                  1,
-                  0
-                ]
+                "block_ptr",
+                "pointer",
+                "pointer"
               ],
               "num_sm_multiplier": 1,
               "num_stages": 3,
               "num_warps": 8,
-              "pid_type": "persistent_blocked",
-              "range_flattens": [
-                false,
-                null,
-                null
-              ],
-              "range_multi_buffers": [
-                null,
-                false,
-                false
-              ],
-              "range_num_stages": [
-                1,
-                3,
-                0
-              ],
-              "range_unroll_factors": [
-                2,
-                2,
-                4
-              ],
-              "range_warp_specializes": []
+              "pid_type": "persistent_interleaved"
             },
-            "kernel": "causal_attention_bshd"
+            "kernel": "causal_attention_bshd_16k"
           }
         ],
         "helion_version": "1.4.0",
-        "measured_time_ms": 1.402624,
-        "selection": "autotuned"
+        "measured_time_ms": 1.309696,
+        "selection": "fixed"
       },
       "backward": false,
       "batch": 4,

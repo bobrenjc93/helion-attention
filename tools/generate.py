@@ -46,6 +46,7 @@ PERSISTENT_CAUSAL_KEYS = {
     "b1_sq2048_sk2048_hq32_hkv32_d128_bf16_causal",
     "b1_sq4096_sk4096_hq28_hkv4_d128_bf16_causal",
     "b1_sq16384_sk16384_hq16_hkv16_d128_bf16_causal",
+    "b4_sq4096_sk4096_hq28_hkv4_d128_bf16_causal",
     "b4_sq8192_sk8192_hq28_hkv4_d128_bf16_causal",
 }
 SPLIT_KV_DECODE_16K_KEY = "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"

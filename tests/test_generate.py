@@ -409,9 +409,12 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
         seqlen_q=4096,
         seqlen_k=4096,
     )
-    persistent_qwen_b4_8k = replace(
-        persistent_qwen_2k,
+    persistent_qwen_b4_4k = replace(
+        persistent_qwen_4k,
         batch=4,
+    )
+    persistent_qwen_b4_8k = replace(
+        persistent_qwen_b4_4k,
         seqlen_q=8192,
         seqlen_k=8192,
     )
@@ -433,6 +436,7 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
         persistent_16k,
         persistent_qwen_2k,
         persistent_qwen_4k,
+        persistent_qwen_b4_4k,
         persistent_qwen_b4_8k,
         persistent_llama_2k,
         persistent_mha_2k,
@@ -458,8 +462,12 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
         replace(persistent_qwen_4k, nheads_q=32, nheads_kv=8),
         replace(persistent_qwen_4k, head_dim=64),
         replace(persistent_qwen_4k, dtype=torch.float16),
+        replace(persistent_qwen_b4_4k, batch=2),
+        replace(persistent_qwen_b4_4k, seqlen_q=2048, seqlen_k=2048),
+        replace(persistent_qwen_b4_4k, nheads_q=32, nheads_kv=8),
+        replace(persistent_qwen_b4_4k, head_dim=64),
+        replace(persistent_qwen_b4_4k, dtype=torch.float16),
         replace(persistent_qwen_b4_8k, batch=1),
-        replace(persistent_qwen_b4_8k, seqlen_q=4096, seqlen_k=4096),
         replace(persistent_qwen_b4_8k, nheads_q=32, nheads_kv=8),
         replace(persistent_qwen_b4_8k, head_dim=64),
         replace(persistent_qwen_b4_8k, dtype=torch.float16),
