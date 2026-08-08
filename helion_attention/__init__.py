@@ -119,6 +119,30 @@ def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
         )
 
 
+def _check_core_paged_kvcache_spec(spec: AttnShape, page_size: int) -> None:
+    """Require the one paged specialization exposed by the KV-cache API."""
+    requested = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    )
+    if (
+        requested != _CORE_PAGED_VARLEN_SHAPE
+        or page_size != _CORE_PAGED_VARLEN_PAGE_SIZE
+        or not spec.causal
+    ):
+        raise UnsupportedShapeError(
+            "flash_attn_with_kvcache with block_table currently supports only:\n"
+            "    batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
+            "head_dim=128 dtype=bf16 causal=True page_size=16\n"
+            f"got:\n    {spec.describe()}, page_size={page_size}"
+        )
+
+
 def _validate_generic_dense_layout(spec: AttnShape) -> tuple[int, int]:
     """Validate signed-int32 indices and return packed Q/K token totals."""
     if spec.head_dim > _GENERIC_DENSE_MAX_HEAD_DIM:
@@ -558,6 +582,116 @@ def flash_attn_varlen_kvpacked_func(
     )
 
 
+def _paged_kvcache_forward(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    *,
+    append_kv: bool,
+    cache_seqlens: int | torch.Tensor | None,
+    block_table: torch.Tensor,
+    softmax_scale: float | None,
+    causal: bool,
+    return_softmax_lse: bool,
+    shape: ShapeLike,
+) -> torch.Tensor:
+    """Adapt the exact read-only paged decode profile to core varlen."""
+    if append_kv:
+        raise NotImplementedError(
+            "paged KV-cache updates are not implemented; paged caches are read-only"
+        )
+    if return_softmax_lse:
+        raise NotImplementedError(
+            "return_softmax_lse is not implemented for paged KV caches"
+        )
+
+    spec = normalize_shape(shape, q.dtype, causal)
+    for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
+        if not isinstance(cache, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if cache.ndim != 4:
+            raise ValueError(
+                f"{name} must be a paged KV cache with rank 4, got "
+                f"shape {tuple(cache.shape)}"
+            )
+    if k_cache.shape[1] != v_cache.shape[1]:
+        raise ValueError(
+            "k_cache and v_cache must have the same page size, got "
+            f"{k_cache.shape[1]} and {v_cache.shape[1]}"
+        )
+    page_size = k_cache.shape[1]
+    _check_core_paged_kvcache_spec(spec, page_size)
+
+    expected_q = (spec.batch, 1, spec.nheads_q, spec.head_dim)
+    if tuple(q.shape) != expected_q:
+        raise ValueError(
+            f"q has shape {tuple(q.shape)} but the declared paged KV-cache "
+            f"shape requires {expected_q}"
+        )
+    if not isinstance(cache_seqlens, torch.Tensor):
+        raise NotImplementedError(
+            "paged KV caches require cache_seqlens as a CUDA int32 tensor "
+            "with shape [batch]"
+        )
+    if cache_seqlens.layout != torch.strided:
+        raise ValueError("cache_seqlens must use torch.strided layout")
+    if tuple(cache_seqlens.shape) != (spec.batch,):
+        raise ValueError(
+            f"cache_seqlens must have shape ({spec.batch},), got "
+            f"{tuple(cache_seqlens.shape)}"
+        )
+    if cache_seqlens.dtype != torch.int32:
+        raise ValueError("cache_seqlens must have dtype torch.int32")
+    if not cache_seqlens.is_cuda:
+        raise ValueError(
+            "cache_seqlens must be a CUDA tensor, got device "
+            f"{cache_seqlens.device}"
+        )
+    if cache_seqlens.device != q.device:
+        raise ValueError(
+            "cache_seqlens must be on the same CUDA device as q, k_cache, "
+            "and v_cache"
+        )
+
+    if torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (q, k_cache, v_cache)
+    ):
+        raise NotImplementedError(
+            "paged KV-cache calls do not support autograd; use inference mode "
+            "or detach the inputs"
+        )
+
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else float(softmax_scale)
+    )
+    packed_q = q.squeeze(1)
+    cu_seqlens_q = torch.arange(
+        spec.batch + 1, device=q.device, dtype=torch.int32
+    )
+    cu_seqlens_k = torch.cat(
+        (
+            cache_seqlens.new_zeros(1),
+            cache_seqlens.cumsum(dim=0, dtype=torch.int32),
+        )
+    )
+    packed_out = flash_attn_varlen_func(
+        packed_q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        softmax_scale=scale,
+        causal=causal,
+        block_table=block_table,
+        shape=spec,
+    )
+    return packed_out.unsqueeze(1)
+
+
 def flash_attn_with_kvcache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -581,23 +715,29 @@ def flash_attn_with_kvcache(
     *,
     shape: ShapeLike,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Read or append one token to a dense FlashAttention-style KV cache.
+    """Read or append one token to a FlashAttention-style KV cache.
 
-    The supported path is a dense, contiguous cache and exactly one query
-    token. As with every entry point in this package, ``shape`` is required and
-    describes ``q`` plus the cache:
+    The general supported path is a dense, contiguous cache and exactly one
+    query token. As with every entry point in this package, ``shape`` is
+    required and describes ``q`` plus the cache:
     ``(batch, 1, cache_len, nheads_q, nheads_kv, head_dim)``.
 
-    ``cache_seqlens`` may be omitted or supplied as a Python integer equal to
-    the declared cache length for a read-only call. A paired, one-token ``k``
-    and ``v`` update is supported when the Python integer ``cache_seqlens`` is
-    exactly one less than that length; the update is copied into the final
-    cache slot before attention runs. If ``return_softmax_lse=True``, the result
-    is ``(out, softmax_lse)`` with LSE shape ``[batch, nheads_q, 1]`` and fp32
-    dtype, matching FlashAttention. Cache tensors created in inference mode
-    must also be updated in inference mode, and an append requires disjoint
-    query, K-cache, and V-cache memory. Tensor-valued/ragged lengths,
-    multi-token updates, rotary embeddings, and paged caches fail explicitly.
+    One read-only paged specialization is also exposed: causal bf16
+    ``(4, 1, 1024, 8, 2, 128)`` with page-size-16 caches, an int32 CUDA
+    ``cache_seqlens`` tensor shaped ``[4]``, and ``block_table``. It routes
+    through :func:`flash_attn_varlen_func` and supports ragged logical caches.
+
+    For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
+    integer equal to the declared cache length for a read-only call. A paired,
+    one-token ``k`` and ``v`` update is supported when the Python integer
+    ``cache_seqlens`` is exactly one less than that length; the update is copied
+    into the final cache slot before attention runs. On this dense path,
+    ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
+    ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. Cache
+    tensors created in inference mode must also be updated in inference mode,
+    and an append requires disjoint query, K-cache, and V-cache memory. Dense
+    tensor-valued/partial lengths, multi-token updates, rotary embeddings, and
+    other paged profiles fail explicitly.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
@@ -610,8 +750,6 @@ def flash_attn_with_kvcache(
         raise NotImplementedError("cache_batch_idx is not implemented")
     if cache_leftpad is not None:
         raise NotImplementedError("cache_leftpad is not implemented")
-    if block_table is not None:
-        raise NotImplementedError("paged KV caches are not implemented")
     if num_splits != 0:
         raise NotImplementedError(
             "explicit num_splits is not implemented; pass num_splits=0"
@@ -621,6 +759,20 @@ def flash_attn_with_kvcache(
     del rotary_interleaved
 
     _reject_unsupported(0.0, window_size, softcap, alibi_slopes, False)
+    if block_table is not None:
+        return _paged_kvcache_forward(
+            q,
+            k_cache,
+            v_cache,
+            append_kv=append_kv,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            return_softmax_lse=return_softmax_lse,
+            shape=shape,
+        )
+
     spec = normalize_shape(shape, q.dtype, causal)
     if not spec.is_decode:
         raise NotImplementedError(

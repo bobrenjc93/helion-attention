@@ -91,9 +91,9 @@ vLLM's unified paged-cache path is available through
 the common decode and chunked-prefill profiles below; other compatible CUDA
 shapes retain the generic single-launch path.
 
-Single-token decode reads a dense KV cache through the matching FlashAttention
-entry point. The six-field shape remains required and describes the query and
-the cache separately:
+Single-token decode reads a KV cache through the matching FlashAttention entry
+point. The six-field shape remains required and describes the query and the
+cache separately. The general path uses a dense cache:
 
 ```python
 B, S_CACHE, H_Q, H_KV, D = 1, 4096, 32, 8, 128
@@ -110,11 +110,43 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-Pass `return_softmax_lse=True` to receive `(out, softmax_lse)`. The LSE is fp32
-with shape `[batch, heads_q, 1]`, matching FlashAttention's KV-cache API.
+For dense caches, pass `return_softmax_lse=True` to receive
+`(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
+FlashAttention's KV-cache API.
 
-This decode path also appends one paired K/V token when a scalar cache length
-points at the final slot declared by `shape`:
+The exact causal bf16 profile `(4, 1, 1024, 8, 2, 128)` also accepts a
+read-only page-size-16 cache. `cache_seqlens` must be a CUDA int32 tensor shaped
+`[4]`; each row may select a different used length. Logical pages can map to
+physical cache pages in any order:
+
+```python
+B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 16
+q = torch.randn(B, 1, H_Q, D, device="cuda", dtype=torch.bfloat16)
+k_cache = torch.randn(256, PAGE_SIZE, H_KV, D, device="cuda", dtype=torch.bfloat16)
+v_cache = torch.randn_like(k_cache)
+cache_seqlens = torch.tensor([37, 128, 1024, 5], device="cuda", dtype=torch.int32)
+block_table = torch.randperm(
+    k_cache.shape[0], device="cuda", dtype=torch.int32
+).view(B, MAX_CACHE // PAGE_SIZE)
+
+out = helion_attention.flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    cache_seqlens=cache_seqlens,
+    block_table=block_table,
+    softmax_scale=0.37,
+    causal=True,
+    shape=(B, 1, MAX_CACHE, H_Q, H_KV, D),
+)
+```
+
+This narrow paged path routes through the checked-in paged-varlen kernel. It
+does not mutate the cache; paged updates, LSE, rotary, and autograd are rejected
+before dispatch.
+
+The dense decode path also appends one paired K/V token when a scalar cache
+length points at the final slot declared by `shape`:
 
 ```python
 new_k = torch.randn(B, 1, H_KV, D, device="cuda", dtype=torch.bfloat16)
@@ -131,14 +163,14 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-The append mutates both caches in place and attends over the updated full cache.
-Read-only calls may omit `cache_seqlens` or pass the full cache length. Update
-lengths must be Python integers and satisfy `cache_seqlens + 1 == S_CACHE`;
-unpaired or multi-token updates and tensor-valued, partial, ragged, paged, or
-rotary-embedded caches are rejected explicitly. Caches created inside
-`torch.inference_mode()` must be updated while that mode remains enabled. For
-an append, `q`, `k_cache`, and `v_cache` must occupy disjoint memory; update
-`k`/`v` aliases are staged safely.
+The append mutates both dense caches in place and attends over the updated full
+cache. Dense read-only calls may omit `cache_seqlens` or pass the full cache
+length. Dense update lengths must be Python integers and satisfy
+`cache_seqlens + 1 == S_CACHE`; unpaired or multi-token updates and dense
+tensor-valued, partial, or ragged lengths are rejected explicitly. Caches
+created inside `torch.inference_mode()` must be updated while that mode remains
+enabled. For an append, `q`, `k_cache`, and `v_cache` must occupy disjoint
+memory; update `k`/`v` aliases are staged safely.
 
 `shape` accepts:
 
@@ -379,8 +411,9 @@ raise `NotImplementedError` rather than silently doing something else:
 - dropout
 - sliding-window attention and softcap
 - ALiBi slopes for varlen and KV-cache calls
-- KV-cache mutation beyond the paired one-token final-slot append above;
-  partial/ragged caches, paged caches, and fused rotary embeddings
+- KV-cache mutation beyond the dense paired one-token final-slot append above;
+  dense partial/ragged caches, paged profiles other than the exact read-only
+  page-size-16 profile above, paged LSE, and fused rotary embeddings
 - `return_attn_probs`
 
 ## How the kernels are made
