@@ -823,6 +823,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:70ed7a91d59c4cbc07cdd031ae6a6ca8bcd6882d",
+      "commit": "70ed7a91d59c4cbc07cdd031ae6a6ca8bcd6882d",
+      "recordedAt": "2026-08-08T20:44:59.022Z",
+      "label": "base 70ed7a9",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 78,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:38",
+      "recordedAt": "2026-08-08T20:44:59.022Z",
+      "label": "PR #38",
+      "kind": "leaf",
+      "prNumber": 38,
+      "title": "Use the fixed persistent source for B4 8K Qwen GQA",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
