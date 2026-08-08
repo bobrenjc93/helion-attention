@@ -760,6 +760,23 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
     assert "return_softmax_lse: bool = False" in rewritten
 
 
+def test_single_head_decode_generation_omits_folded_head_offset() -> None:
+    source = """def _helion_causal_attention_bshd(q, k, v, out, qk_scale, _RDIM_SIZE_3: tl.constexpr):
+        # src[helion_kernels.py:270]: out[b, tile_m, h, :] = result.to(out.dtype)
+        tl.store(out + indices_3, value, None)
+
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):
+    out = torch.empty_like(q)
+    _launcher(_helion_causal_attention_bshd, q, k, v, out, qk_scale, _RDIM_SIZE_3, num_warps=4)
+    return out"""
+    spec = AttnShape(1, 1, 128, 1, 1, 64, torch.bfloat16, True)
+
+    rewritten = generate.add_direct_decode_lse_support(source, spec)
+
+    assert "tl.store(softmax_lse + indices_2, lse, indices_2 < 1)" in rewritten
+    assert "offset_1" not in rewritten
+
+
 def test_decode_lse_generation_is_gated_by_layout_not_shape_key() -> None:
     decode = AttnShape(3, 1, 3072, 12, 3, 80, torch.float16, False)
 

@@ -214,9 +214,17 @@ def add_direct_decode_lse_support(code: str, spec: "AttnShape") -> str:
     output_store = output_stores[0]
 
     indent = lines[output_store][: -len(lines[output_store].lstrip())]
-    batch_offset = (
-        "" if spec.batch == 1 else f"offset_0 * {spec.nheads_q} + "
-    )
+    lse_offset_terms = []
+    if spec.batch > 1:
+        lse_offset_terms.append(
+            "offset_0"
+            if spec.nheads_q == 1
+            else f"offset_0 * {spec.nheads_q}"
+        )
+    if spec.nheads_q > 1:
+        lse_offset_terms.append("offset_1")
+    lse_offset_terms.append("indices_2")
+    lse_offset = " + ".join(lse_offset_terms)
     lse_store = (
         f"{indent}if STORE_LSE:\n"
         f"{indent}    # qk_scale uses log2(e), so the online state is base-2. "
@@ -224,8 +232,8 @@ def add_direct_decode_lse_support(code: str, spec: "AttnShape") -> str:
         f"{indent}    # exposes the natural-log normalization factor.\n"
         f"{indent}    lse = (m_i + libdevice.log2(l_i)) * "
         "0.6931471805599453\n"
-        f"{indent}    tl.store(softmax_lse + {batch_offset}offset_1 + "
-        "indices_2, lse, indices_2 < 1)\n"
+        f"{indent}    tl.store(softmax_lse + {lse_offset}, lse, "
+        "indices_2 < 1)\n"
     )
     lines.insert(output_store + 1, lse_store)
     code = "".join(lines)
