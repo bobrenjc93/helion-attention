@@ -3991,6 +3991,48 @@ def test_kvcache_16k_tensor_length_rejects_cuda_graph_capture() -> None:
 
 
 @requires_cuda
+def test_kvcache_16k_tensor_length_external_stream_memory_is_reclaimed() -> None:
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260809)
+    cache_seqlens = torch.tensor(
+        [spec.seqlen_k // 2], device=q.device, dtype=torch.int32
+    )
+
+    def invoke() -> torch.Tensor:
+        result = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            causal=spec.causal,
+            shape=spec,
+        )
+        assert isinstance(result, torch.Tensor)
+        return result
+
+    # Warm compilation and module initialization on the default stream before
+    # measuring only allocations induced by external-stream calls.
+    invoke()
+    torch.cuda.synchronize(q.device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    allocated_before = torch.cuda.memory_allocated(q.device)
+
+    streams = [torch.cuda.Stream(device=q.device) for _ in range(8)]
+    outputs = []
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            outputs.append(invoke())
+    torch.cuda.synchronize(q.device)
+    del outputs, stream, streams
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    retained = torch.cuda.memory_allocated(q.device) - allocated_before
+    assert retained < 1024 * 1024
+
+
+@requires_cuda
 def test_split_kv_decode_cuda_graph_captures_own_scratch() -> None:
     from helion_attention.kernels import (
         b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal as kernel_module,

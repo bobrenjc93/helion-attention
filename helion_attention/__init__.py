@@ -572,30 +572,50 @@ def _tensor_length_dense_kvcache_forward(
     *,
     return_softmax_lse: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Read a device-selected prefix through the fp32 tiled fallback."""
-    # Import lazily so ordinary generated-kernel calls do not initialize the
-    # vLLM compatibility surface or its fallback dependencies.
-    from .vllm_flash_attn import flash_attn_varlen_func as vllm_varlen_attention
+    """Read a device-selected prefix with one generic Triton attention launch."""
+    # Batch one makes the dense cache row identical to packed token storage.
+    # Express its used prefix as cumulative offsets so the generic packed
+    # runtime can stay in one attention kernel without invoking torch.einsum
+    # (and its per-stream cuBLAS workspace).
+    from ._paged_attention import packed_attention
 
     packed_q = q.view(spec.batch, spec.nheads_q, spec.head_dim)
+    packed_k = k_cache.view(spec.seqlen_k, spec.nheads_kv, spec.head_dim)
+    packed_v = v_cache.view(spec.seqlen_k, spec.nheads_kv, spec.head_dim)
     cu_seqlens_q = torch.arange(
         spec.batch + 1, device=q.device, dtype=torch.int32
     )
-    # The fallback accumulates scores, probabilities, and LSE in fp32. Keep
-    # that contract even when the caller has CUDA autocast enabled.
-    with torch.autocast(device_type="cuda", enabled=False):
-        result = vllm_varlen_attention(
-            packed_q,
-            k_cache,
-            v_cache,
-            max_seqlen_q=1,
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_k=spec.seqlen_k,
-            seqused_k=cache_seqlens,
-            softmax_scale=softmax_scale,
-            causal=spec.causal,
-            return_softmax_lse=return_softmax_lse,
-        )
+    cu_seqlens_k = torch.cat(
+        (cache_seqlens.new_zeros(1), cache_seqlens)
+    )
+    result = packed_attention(
+        packed_q,
+        packed_k,
+        packed_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=return_softmax_lse,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
 
     output_shape = (
         spec.batch,
