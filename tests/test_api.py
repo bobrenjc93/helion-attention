@@ -2042,6 +2042,200 @@ def test_bert_dropout_packed_forward_and_gradients_match_direct_sdpa(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["dense", "qkvpacked", "kvpacked"],
+    ids=["dense", "qkv-packed", "kv-packed"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
+)
+def test_bert_deterministic_training_is_repeatable_and_matches_fp32(
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    spec = BERT_DIAGNOSTIC
+    base_q, base_k, base_v = make_inputs(spec, seed=271828)
+    grad_out = make_inputs(spec, seed=314159)[0]
+
+    def run() -> tuple[torch.Tensor, ...]:
+        if entry_point == "dense":
+            q = base_q.detach().requires_grad_()
+            k = base_k.detach().requires_grad_()
+            v = base_v.detach().requires_grad_()
+            out = helion_attention.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                deterministic=True,
+                shape=spec,
+            )
+            grads = torch.autograd.grad(out, (q, k, v), grad_out)
+        elif entry_point == "qkvpacked":
+            packed = torch.stack(
+                (base_q, base_k, base_v), dim=2
+            ).requires_grad_()
+            out = helion_attention.flash_attn_qkvpacked_func(
+                packed,
+                softmax_scale=softmax_scale,
+                deterministic=True,
+                shape=spec,
+            )
+            packed_grad = torch.autograd.grad(out, packed, grad_out)[0]
+            grads = tuple(packed_grad[:, :, index] for index in range(3))
+        else:
+            q = base_q.detach().requires_grad_()
+            packed = torch.stack((base_k, base_v), dim=2).requires_grad_()
+            out = helion_attention.flash_attn_kvpacked_func(
+                q,
+                packed,
+                softmax_scale=softmax_scale,
+                deterministic=True,
+                shape=spec,
+            )
+            q_grad, packed_grad = torch.autograd.grad(
+                out, (q, packed), grad_out
+            )
+            grads = (q_grad, packed_grad[:, :, 0], packed_grad[:, :, 1])
+        return (out.detach(), *(grad.detach() for grad in grads))
+
+    first = run()
+    second = run()
+    assert all(
+        torch.equal(actual, repeated)
+        for actual, repeated in zip(first, second)
+    )
+
+    q_ref = base_q.float().requires_grad_()
+    k_ref = base_k.float().requires_grad_()
+    v_ref = base_v.float().requires_grad_()
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    expected = reference_attention(q_ref, k_ref, v_ref, spec, scale)
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    assert first[0].dtype == spec.dtype
+    assert first[0].is_contiguous()
+    torch.testing.assert_close(
+        first[0].float(), expected, atol=5e-2, rtol=2e-2
+    )
+    for actual, reference in zip(first[1:], expected_grads):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=5e-2, rtol=2e-2
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("deterministic", "expected_dispatch"),
+    [(False, "ordinary"), (True, "math")],
+)
+def test_bert_deterministic_training_dispatch_is_narrow(
+    deterministic: bool,
+    expected_dispatch: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = BERT_DIAGNOSTIC
+    q, k, v = make_inputs(spec, seed=161803)
+    q.requires_grad_()
+    sentinel = torch.empty_like(q)
+    dispatched: list[str] = []
+
+    def bridge(name: str):
+        def run(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+            spec_arg: AttnShape,
+        ) -> torch.Tensor:
+            del q_arg, k_arg, v_arg
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            assert spec_arg == spec
+            dispatched.append(name)
+            return sentinel
+
+        return run
+
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_sdpa", bridge("ordinary")
+    )
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", bridge("math")
+    )
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, deterministic=deterministic, shape=spec
+    )
+
+    assert out is sentinel
+    assert dispatched == [expected_dispatch]
+
+
+def test_math_sdpa_backend_selection_is_scoped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = AttnShape(1, 2, 2, 1, 1, 8, torch.bfloat16, False)
+    q = torch.randn(1, 2, 1, 8, dtype=torch.bfloat16)
+    flags_before = (
+        torch.backends.cuda.flash_sdp_enabled(),
+        torch.backends.cuda.mem_efficient_sdp_enabled(),
+        torch.backends.cuda.math_sdp_enabled(),
+        torch.backends.cuda.cudnn_sdp_enabled(),
+    )
+    configured_flags = (False, True, False, True)
+    observed_flags: list[tuple[bool, bool, bool, bool]] = []
+    original_sdpa = torch.nn.functional.scaled_dot_product_attention
+
+    def observing_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
+        observed_flags.append(
+            (
+                torch.backends.cuda.flash_sdp_enabled(),
+                torch.backends.cuda.mem_efficient_sdp_enabled(),
+                torch.backends.cuda.math_sdp_enabled(),
+                torch.backends.cuda.cudnn_sdp_enabled(),
+            )
+        )
+        return original_sdpa(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "scaled_dot_product_attention",
+        observing_sdpa,
+    )
+    try:
+        torch.backends.cuda.enable_flash_sdp(configured_flags[0])
+        torch.backends.cuda.enable_mem_efficient_sdp(configured_flags[1])
+        torch.backends.cuda.enable_math_sdp(configured_flags[2])
+        torch.backends.cuda.enable_cudnn_sdp(configured_flags[3])
+
+        out = helion_attention.dense_attention_math_sdpa(
+            q, q, q, 1.0 / math.sqrt(spec.head_dim), spec
+        )
+        flags_after = (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+        )
+    finally:
+        torch.backends.cuda.enable_flash_sdp(flags_before[0])
+        torch.backends.cuda.enable_mem_efficient_sdp(flags_before[1])
+        torch.backends.cuda.enable_math_sdp(flags_before[2])
+        torch.backends.cuda.enable_cudnn_sdp(flags_before[3])
+
+    assert out.shape == q.shape
+    assert observed_flags == [(False, False, True, False)]
+    assert flags_after == configured_flags
+
+
+@requires_cuda
 def test_registered_dense_shape_does_not_use_generic_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2351,12 +2545,17 @@ def test_bert_return_attn_probs_matches_fa2(
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
 )
+@pytest.mark.parametrize("deterministic", [False, True])
 def test_bert_zero_dropout_retains_generated_dispatch(
     entry_point: str,
+    deterministic: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = BERT_DIAGNOSTIC
     q, k, v = make_inputs(spec, seed=1701)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
     sentinel = torch.empty_like(q)
     calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
@@ -2374,25 +2573,37 @@ def test_bert_zero_dropout_retains_generated_dispatch(
         reject_diagnostic,
     )
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_diagnostic)
-    if entry_point == "dense":
-        out = helion_attention.flash_attn_func(
-            q, k, v, dropout_p=0.0, return_attn_probs=False, shape=spec
-        )
-    elif entry_point == "qkvpacked":
-        out = helion_attention.flash_attn_qkvpacked_func(
-            torch.stack((q, k, v), dim=2),
-            dropout_p=0.0,
-            return_attn_probs=False,
-            shape=spec,
-        )
-    else:
-        out = helion_attention.flash_attn_kvpacked_func(
-            q,
-            torch.stack((k, v), dim=2),
-            dropout_p=0.0,
-            return_attn_probs=False,
-            shape=spec,
-        )
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", reject_diagnostic
+    )
+    with torch.no_grad():
+        if entry_point == "dense":
+            out = helion_attention.flash_attn_func(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                deterministic=deterministic,
+                return_attn_probs=False,
+                shape=spec,
+            )
+        elif entry_point == "qkvpacked":
+            out = helion_attention.flash_attn_qkvpacked_func(
+                torch.stack((q, k, v), dim=2),
+                dropout_p=0.0,
+                deterministic=deterministic,
+                return_attn_probs=False,
+                shape=spec,
+            )
+        else:
+            out = helion_attention.flash_attn_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=2),
+                dropout_p=0.0,
+                deterministic=deterministic,
+                return_attn_probs=False,
+                shape=spec,
+            )
 
     assert out is sentinel
     assert len(calls) == 1

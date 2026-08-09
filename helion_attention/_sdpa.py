@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import TypeVar
 
 import torch
+from torch.nn.attention import SDPBackend
+from torch.nn.attention import sdpa_kernel
 from torch.nn.attention.bias import causal_lower_right
 
 from ._shape import AttnShape
@@ -265,3 +267,15 @@ def dense_attention_sdpa(
                 enable_gqa=enable_gqa,
             )
     return out.transpose(1, 2).contiguous()
+
+
+def dense_attention_math_sdpa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Run SDPA autograd with only its deterministic math backend enabled."""
+    with sdpa_kernel(SDPBackend.MATH):
+        return dense_attention_sdpa(q, k, v, softmax_scale, spec)
