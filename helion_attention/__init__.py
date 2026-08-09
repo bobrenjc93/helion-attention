@@ -12,7 +12,7 @@ ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
 profiles, and diagnostics on the shipped causal varlen profile use a generic
 Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
 forward-only Gemma-2 profile. The exposed page-16 decode cache uses the generic
-paged runtime when ALiBi is supplied.
+paged runtime when ALiBi or a finite left window is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -143,6 +143,7 @@ def _reject_unsupported(
     *,
     allow_dropout: bool = False,
     allow_alibi: bool = False,
+    allow_window: bool = False,
     allow_return_attn_probs: bool = False,
     allowed_softcap: float | None = None,
 ) -> float:
@@ -153,7 +154,7 @@ def _reject_unsupported(
         raise ValueError("dropout_p must satisfy 0.0 <= dropout_p < 1.0")
     if probability != 0.0 and not allow_dropout:
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
-    if tuple(window_size) != (-1, -1):
+    if tuple(window_size) != (-1, -1) and not allow_window:
         raise NotImplementedError("sliding-window attention is not implemented")
     has_softcap = softcap != 0.0
     if has_softcap and softcap != allowed_softcap:
@@ -1391,6 +1392,7 @@ def _paged_kvcache_forward(
     block_table: torch.Tensor,
     softmax_scale: float | None,
     causal: bool,
+    window_size: tuple[int, int],
     alibi_slopes: torch.Tensor | None,
     return_softmax_lse: bool,
     shape: ShapeLike,
@@ -1425,6 +1427,35 @@ def _paged_kvcache_forward(
         spec.head_dim,
         spec.dtype,
     )
+    window = tuple(window_size)
+    windowed = window != (-1, -1)
+    if windowed:
+        valid_left_window = (
+            len(window) == 2
+            and isinstance(window[0], int)
+            and not isinstance(window[0], bool)
+            and window[0] >= 0
+            and isinstance(window[1], int)
+            and not isinstance(window[1], bool)
+            and window[1] == 0
+        )
+        if requested != _CORE_PAGED_KVCACHE_SHAPE or not valid_left_window:
+            raise NotImplementedError(
+                "sliding-window paged KV-cache attention is implemented only "
+                "for the bf16 page-size-16 batch=4 seqlen_q=1 "
+                "seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 decode "
+                "profile with finite window_size=(left, 0) and left >= 0"
+            )
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "return_softmax_lse=True is not implemented with sliding-window "
+                "paged KV-cache attention"
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "ALiBi is not implemented with sliding-window paged KV-cache "
+                "attention"
+            )
     if return_softmax_lse and requested != _CORE_PAGED_KVCACHE_SHAPE:
         raise NotImplementedError(
             "return_softmax_lse=True for paged KV caches is implemented only "
@@ -1519,11 +1550,11 @@ def _paged_kvcache_forward(
             cache_seqlens.cumsum(dim=0, dtype=torch.int32),
         )
     )
-    if return_softmax_lse or alibi_slopes is not None:
+    if windowed or return_softmax_lse or alibi_slopes is not None:
         # The generated paged specialization intentionally stays on the lean
-        # slope-free output-only contract. Reuse the vLLM-compatible
-        # single-launch runtime for ALiBi or the diagnostic return it already
-        # computes.
+        # global, slope-free output-only contract. Reuse the vLLM-compatible
+        # single-launch runtime for a finite left window, ALiBi, or the
+        # diagnostic return it already computes.
         check_paged_varlen_tensors(
             packed_q,
             k_cache,
@@ -1552,7 +1583,7 @@ def _paged_kvcache_forward(
             dynamic_max_seqlen_k=None,
             softmax_scale=scale,
             causal=spec.causal,
-            window_size=(-1, -1),
+            window_size=window,
             softcap=0.0,
             alibi_slopes=alibi_slopes,
             q_descale=None,
@@ -1635,11 +1666,11 @@ def flash_attn_with_kvcache(
     ``block_table``. Bf16 ``(2, 200, 320, 8, 2, 128)`` supports only
     ``causal=True`` and uses bottom-right causal alignment for chunked prefill.
     Bf16 ``(4, 1, 1024, 8, 2, 128)`` supports both causal modes, which are
-    equivalent for single-token bottom-right decode. Slope-free output-only
-    calls route through :func:`flash_attn_varlen_func`; both profiles support
-    ragged logical caches. The decode profile additionally accepts forward-only
-    fp32 ALiBi slopes shaped ``[8]`` or ``[4, 8]`` through the generic paged
-    runtime.
+    equivalent for single-token bottom-right decode. Global, slope-free,
+    output-only calls route through :func:`flash_attn_varlen_func`; both
+    profiles support ragged logical caches. The decode profile additionally
+    accepts either a finite ``window_size=(left, 0)`` or forward-only fp32
+    ALiBi slopes shaped ``[8]`` or ``[4, 8]`` through the generic paged runtime.
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
@@ -1653,8 +1684,9 @@ def flash_attn_with_kvcache(
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
     decode profile supports the same return through the generic single-launch
-    paged runtime; slope-free output-only calls retain the generated
-    specialization. ALiBi cannot be combined with that LSE return. Cache tensors
+    paged runtime; global slope-free output-only calls retain the generated
+    specialization. Windowed calls cannot request LSE or ALiBi. ALiBi cannot be
+    combined with that LSE return. Cache tensors
     created in inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
     lengths on updates and other dense profiles, scalar partial lengths, and
@@ -1665,10 +1697,12 @@ def flash_attn_with_kvcache(
     GPT-NeoX layout requires full-head rotation. Both layouts rotate ``q`` and
     the appended ``k`` at ``cache_seqlens``. Read-only rotary calls and other
     paged profiles fail explicitly. Paged updates, rotary, and autograd are
-    unsupported for both paged profiles. Paged ALiBi is unsupported for chunked
-    prefill, updates, LSE returns, other profiles, and other page sizes. Paged
-    softmax LSE is unsupported for chunked prefill, other profiles, and other
-    page sizes.
+    unsupported for both paged profiles. Paged sliding-window attention is
+    unsupported for chunked prefill, updates, LSE or ALiBi calls, autograd,
+    other window forms, other profiles, and other page sizes. Paged ALiBi is
+    unsupported for chunked prefill, updates, LSE returns, other profiles, and
+    other page sizes. Paged softmax LSE is unsupported for chunked prefill,
+    other profiles, and other page sizes.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
@@ -1699,6 +1733,7 @@ def flash_attn_with_kvcache(
         alibi_slopes,
         False,
         allow_alibi=block_table is not None,
+        allow_window=block_table is not None,
     )
     if block_table is not None:
         return _paged_kvcache_forward(
@@ -1710,6 +1745,7 @@ def flash_attn_with_kvcache(
             block_table=block_table,
             softmax_scale=softmax_scale,
             causal=causal,
+            window_size=tuple(window_size),
             alibi_slopes=alibi_slopes,
             return_softmax_lse=return_softmax_lse,
             shape=shape,

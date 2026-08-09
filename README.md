@@ -219,7 +219,9 @@ select a different used length. Logical pages can map to physical cache pages
 in any order. Queries use dense BSHD layout and results are returned in that
 same layout. Chunked prefill uses bottom-right causal alignment. For decode,
 the default `causal=False` is equivalent to `causal=True`. That decode profile
-also accepts forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]`:
+also accepts a finite `window_size=(left, 0)`, selecting up to the final
+`left + 1` logical cache tokens, or forward-only fp32 ALiBi slopes shaped `[8]`
+or `[4, 8]`:
 
 ```python
 B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 16
@@ -244,14 +246,15 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-Slope-free output-only calls on these narrow paged paths route through their
-checked-in paged-varlen kernels. ALiBi decode calls use the generic single-launch
-paged runtime, as does requesting LSE without ALiBi; the latter returns fp32
-`[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. Neither path mutates the
-cache. ALiBi with LSE, paged updates, rotary, and autograd are rejected before
-dispatch. ALiBi on chunked prefill, LSE on chunked prefill, non-causal chunked
-prefill, every other paged profile, and every other page size are also rejected
-before dispatch.
+Global slope-free output-only calls on these narrow paged paths route through
+their checked-in paged-varlen kernels. Windowed and ALiBi decode calls use the
+generic single-launch paged runtime, as does requesting LSE without ALiBi; the
+latter returns fp32 `[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. None
+of these paths mutates the cache. A window cannot be combined with LSE or ALiBi.
+Windowed or ALiBi updates, rotary, and autograd are rejected before dispatch.
+Windows on chunked prefill, other window forms, ALiBi on chunked prefill, LSE on
+chunked prefill, non-causal chunked prefill, every other paged profile, and every
+other page size are also rejected before dispatch.
 
 The dense decode path also appends one paired K/V token when a scalar cache
 length points at the final slot declared by `shape`:
@@ -533,7 +536,8 @@ doing something else:
   fallback
 - dropout outside the exact encoder-training profile above, or combined with
   ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
-- sliding-window attention
+- sliding-window attention outside finite `(left, 0)` windows on the exact
+  read-only page-size-16 KV-cache decode profile above
 - softcap except for no-backward dense/KV-packed causal bf16
   `(1, 4096, 4096, 16, 8, 256)` calls with exactly `softcap=50.0`; the supported
   softcap cannot be combined with dropout, ALiBi, or diagnostic returns

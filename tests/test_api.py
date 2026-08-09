@@ -2509,6 +2509,89 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
+def test_paged_kvcache_left_window_matches_fa2_and_fp32_for_ragged_pages(
+    causal: bool,
+    softmax_scale: float | None,
+) -> None:
+    q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
+        make_paged_kvcache_inputs(seed=20260809)
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    window_size = (31, 0)
+    scale = (
+        1.0 / math.sqrt(PAGED_KVCACHE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    declared_shape = (
+        PAGED_KVCACHE if causal else (4, 1, 1024, 8, 2, 128)
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        shape=declared_shape,
+    )
+    expected_fp32 = torch.stack(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                query.float().transpose(0, 1).unsqueeze(0),
+                logical_k[-(window_size[0] + 1) :]
+                .float()
+                .transpose(0, 1)
+                .unsqueeze(0),
+                logical_v[-(window_size[0] + 1) :]
+                .float()
+                .transpose(0, 1)
+                .unsqueeze(0),
+                scale=scale,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+            for query, (logical_k, logical_v) in zip(q, logical_caches)
+        ]
+    )
+
+    assert got.shape == q.shape
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+    # FA2 requires its paged cache blocks to be a multiple of 256, so compare
+    # the same logical cache after re-paging it to FA2's native minimum.
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    fa2_k, fa2_v, fa2_block_table = page_logical_caches(
+        PAGED_KVCACHE, logical_caches, page_size=256
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        fa2_k,
+        fa2_v,
+        cache_seqlens=cache_seqlens,
+        block_table=fa2_block_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+    )
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
 @pytest.mark.parametrize(
     "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
 )
@@ -2789,6 +2872,211 @@ def test_paged_kvcache_routes_through_core_varlen(
     assert kwargs["shape"] is spec
     assert got.shape == q.shape
     torch.testing.assert_close(got.flatten(0, 1), sentinel)
+
+
+@requires_cuda
+def test_paged_kvcache_left_window_uses_generic_paged_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs()
+    )
+    sentinel = torch.full_like(q.flatten(0, 1), 11.0)
+    seen: dict[str, object] = {}
+
+    def reject_generated(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("windowed paged call reached generated dispatch")
+
+    def fake_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_generated
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", fake_generic)
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=0.19,
+        causal=False,
+        window_size=(31, 0),
+        shape=(4, 1, 1024, 8, 2, 128),
+    )
+
+    args = seen["args"]
+    kwargs = seen["kwargs"]
+    assert isinstance(args, tuple)
+    assert isinstance(kwargs, dict)
+    assert args[0].data_ptr() == q.data_ptr()
+    assert args[1] is k_cache
+    assert args[2] is v_cache
+    assert args[5] is block_table
+    assert args[4].is_contiguous()
+    torch.testing.assert_close(args[4], cache_seqlens)
+    assert kwargs["softmax_scale"] == 0.19
+    assert kwargs["causal"] is False
+    assert kwargs["window_size"] == (31, 0)
+    assert kwargs["alibi_slopes"] is None
+    assert kwargs["return_softmax_lse"] is False
+    assert got.shape == q.shape
+    torch.testing.assert_close(got.flatten(0, 1), sentinel)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("lse", "return_softmax_lse", id="lse"),
+        pytest.param("alibi", "ALiBi", id="alibi"),
+        pytest.param("update", "read-only", id="update"),
+        pytest.param("autograd", "autograd", id="autograd"),
+    ],
+)
+def test_paged_kvcache_left_window_rejects_incompatible_modes_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs()
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    kwargs: dict[str, object] = {
+        "cache_seqlens": cache_seqlens,
+        "block_table": block_table,
+        "window_size": (31, 0),
+        "shape": (4, 1, 1024, 8, 2, 128),
+    }
+    if case == "lse":
+        kwargs["return_softmax_lse"] = True
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            PAGED_KVCACHE.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "update":
+        update_shape = (
+            PAGED_KVCACHE.batch,
+            1,
+            PAGED_KVCACHE.nheads_kv,
+            PAGED_KVCACHE.head_dim,
+        )
+        kwargs["k"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
+        kwargs["v"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
+    else:
+        q.requires_grad_()
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported windowed paged call reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_dispatch
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q, k_cache, v_cache, **kwargs
+        )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "window_size",
+    [
+        pytest.param((-1, 0), id="unbounded-left"),
+        pytest.param((31, -1), id="unbounded-right"),
+        pytest.param((31, 1), id="positive-right"),
+        pytest.param((-2, 0), id="negative-left"),
+        pytest.param((31.0, 0), id="noninteger-left"),
+        pytest.param((31, 0, 0), id="rank-three"),
+    ],
+)
+def test_paged_kvcache_rejects_other_window_forms_before_dispatch(
+    window_size: tuple[object, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs()
+    )
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("invalid paged window reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_dispatch
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_dispatch)
+    with pytest.raises(NotImplementedError, match="finite window_size"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            window_size=window_size,  # type: ignore[arg-type]
+            shape=(4, 1, 1024, 8, 2, 128),
+        )
+
+
+@requires_cuda
+def test_paged_kvcache_left_window_rejects_other_profile_and_page_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope paged window reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_dispatch
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_dispatch)
+
+    prefill = PAGED_CHUNKED_PREFILL
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs(spec=prefill, lengths=[113, 271])
+    )
+    with pytest.raises(NotImplementedError, match="decode profile"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            causal=True,
+            window_size=(31, 0),
+            shape=prefill,
+        )
+
+    q, _, _, cache_seqlens, block_table, _ = make_paged_kvcache_inputs()
+    page_32_k = torch.empty(
+        1, 32, 2, 128, device=q.device, dtype=torch.bfloat16
+    )
+    page_32_v = torch.empty_like(page_32_k)
+    with pytest.raises(UnsupportedShapeError, match="page_size=16"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            page_32_k,
+            page_32_v,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            window_size=(31, 0),
+            shape=(4, 1, 1024, 8, 2, 128),
+        )
 
 
 @requires_cuda
