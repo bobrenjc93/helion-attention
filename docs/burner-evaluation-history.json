@@ -1618,6 +1618,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:f9f24c6d03da584b7462a5915476d7015b8fbdac",
+      "commit": "f9f24c6d03da584b7462a5915476d7015b8fbdac",
+      "recordedAt": "2026-08-09T13:53:05.623Z",
+      "label": "base f9f24c6",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 88,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:82",
+      "recordedAt": "2026-08-09T13:53:05.623Z",
+      "label": "PR #82",
+      "kind": "leaf",
+      "prNumber": 82,
+      "title": "Read a left-padded span from the 16K dense cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 88,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
