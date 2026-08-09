@@ -13,10 +13,9 @@ profiles, symmetric windows on the shipped noncausal varlen profile, and
 diagnostics on the shipped causal varlen profile use a generic Triton forward
 kernel. That runtime also provides ``softcap=50.0`` for one forward-only
 Gemma-2 profile, the shipped causal varlen profile, and read-only page-256
-paged decode. Both exposed page-16 paged KV-cache profiles use the generic
-paged runtime when ALiBi is supplied. The decode profile also accepts page-256
-caches through that generic runtime, without expanding the core paged-varlen
-API.
+paged decode. Both exposed page-16 paged KV-cache profiles and page-256 decode
+use the generic paged runtime when ALiBi is supplied, without expanding the
+core paged-varlen API.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -2001,17 +2000,22 @@ def _paged_kvcache_forward(
             "nheads=8 (GQA 8:2) head_dim=128 decode profile"
         )
     if alibi_slopes is not None:
-        if page_size != _CORE_PAGED_VARLEN_PAGE_SIZE:
+        supports_alibi_page_size = (
+            page_size == _CORE_PAGED_VARLEN_PAGE_SIZE
+            or (requested == _CORE_PAGED_KVCACHE_SHAPE and page_size == 256)
+        )
+        if not supports_alibi_page_size:
             raise NotImplementedError(
                 "paged KV-cache ALiBi is implemented only with page-size-16 "
-                "caches; page-size-256 decode supports slope-free attention only"
+                "caches or page-size-256 caches for the decode profile"
             )
         if requested not in _CORE_PAGED_KVCACHE_SHAPES:
             raise NotImplementedError(
                 "paged KV-cache ALiBi is implemented only for the bf16 "
                 "page-size-16 batch=2 seqlen_q=200 seqlen_k=320 "
-                "chunked-prefill and batch=4 seqlen_q=1 seqlen_k=1024 "
-                "decode profiles with nheads=8 (GQA 8:2) head_dim=128"
+                "chunked-prefill and page-size-16 or page-size-256 batch=4 "
+                "seqlen_q=1 seqlen_k=1024 decode profiles with nheads=8 "
+                "(GQA 8:2) head_dim=128"
             )
         if return_softmax_lse:
             raise NotImplementedError(
@@ -2228,10 +2232,10 @@ def flash_attn_with_kvcache(
     single-token bottom-right decode. Page-16 slope-free output-only calls
     route through :func:`flash_attn_varlen_func`; page-256 calls use the generic
     paged runtime and accept exactly ``softcap=50.0`` for forward-only calls.
-    Both profiles support ragged logical caches. The page-16 profiles
-    additionally accept forward-only fp32 ALiBi slopes shaped ``[8]`` or
-    ``[batch, 8]`` through the generic paged runtime (``[2, 8]`` for chunked
-    prefill and ``[4, 8]`` for decode).
+    Both profiles support ragged logical caches. The page-16 profiles and the
+    page-256 decode profile additionally accept forward-only fp32 ALiBi slopes
+    shaped ``[8]`` or ``[batch, 8]`` through the generic paged runtime
+    (``[2, 8]`` for chunked prefill and ``[4, 8]`` for decode).
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
@@ -2250,8 +2254,8 @@ def flash_attn_with_kvcache(
     decode profile supports the same return for page sizes 16 and 256 through
     the generic single-launch paged runtime; page-16 slope-free output-only
     calls retain the generated specialization. ALiBi cannot be combined with
-    that LSE return and is not supported for page-size-256 caches. Cache tensors
-    created in inference mode must also be updated in inference mode, and an
+    that LSE return. Cache tensors created in inference mode must also be updated
+    in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
     lengths and left padding on updates and other dense profiles, scalar partial
     lengths, and multi-token updates outside the exact two-token profile fail
@@ -2264,10 +2268,11 @@ def flash_attn_with_kvcache(
     tokens at consecutive positions. Read-only rotary calls and other paged
     profiles fail explicitly. Paged updates, rotary, and autograd are
     unsupported for both paged profiles. Paged ALiBi is unsupported for updates,
-    LSE returns, other profiles, and page sizes other than 16. Paged softcap is
-    unsupported for updates, page-size-16 caches, other profiles, ALiBi,
-    windows, and autograd. Paged softmax LSE is unsupported for chunked
-    prefill, other profiles, and page sizes other than 16 or 256.
+    LSE returns, other profiles, and page sizes other than 16 or 256; page 256 is
+    limited to the decode profile. Paged softcap is unsupported for updates,
+    page-size-16 caches, other profiles, ALiBi, windows, and autograd. Paged
+    softmax LSE is unsupported for chunked prefill, other profiles, and page
+    sizes other than 16 or 256.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
