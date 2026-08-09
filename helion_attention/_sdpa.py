@@ -21,6 +21,7 @@ def dense_attention_cudnn_default_scale(
     query = q.transpose(1, 2)
     key = k.transpose(1, 2)
     value = v.transpose(1, 2)
+    enable_gqa = query.shape[1] != key.shape[1]
 
     # sdpa_kernel mutates process-wide backend flags and races with concurrent
     # callers. Ask PyTorch whether this exact call is supported, then invoke
@@ -48,13 +49,31 @@ def dense_attention_cudnn_default_scale(
         # than deriving all device properties from the tensors. Preserve the
         # caller's device while making both the probe and launch tensor-local.
         with torch.cuda.device(q.device):
-            params = params_type(query, key, value, None, 0.0, True, False)
+            params = params_type(
+                query, key, value, None, 0.0, True, enable_gqa
+            )
             if not can_use_cudnn(params):
                 return None
             cudnn_attention = (
                 torch.ops.aten._scaled_dot_product_cudnn_attention.default
             )
-            with torch.autocast(device_type=q.device.type, enabled=False):
+            if torch.is_autocast_enabled(q.device.type):
+                # The raw operator is autocast-eligible. Preserve the input
+                # dtype under an active cross-dtype autocast context, without
+                # paying for a redundant context in the latency-critical
+                # default case.
+                with torch.autocast(device_type=q.device.type, enabled=False):
+                    out = cudnn_attention(
+                        query,
+                        key,
+                        value,
+                        None,
+                        False,
+                        0.0,
+                        True,
+                        False,
+                    )[0]
+            else:
                 out = cudnn_attention(
                     query,
                     key,

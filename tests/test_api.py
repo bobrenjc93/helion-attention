@@ -36,7 +36,9 @@ LONG_DECODE = next(
 )
 BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
 ENCODER_TRAINING = spec_from_manifest_entry(BACKWARD_SHAPES[0])
+CUDNN_GQA_FAST_PATH_KEY = "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal"
 CUDNN_FAST_PATH_KEYS = (
+    CUDNN_GQA_FAST_PATH_KEY,
     "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
     "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
 )
@@ -364,13 +366,36 @@ def test_decode_cache_lengths_are_checked_in() -> None:
 
 @requires_cuda
 @pytest.mark.parametrize("entry", SHAPES, ids=IDS)
-def test_matches_fp32_sdpa(entry: dict[str, object]) -> None:
+def test_matches_fp32_sdpa(
+    monkeypatch: pytest.MonkeyPatch, entry: dict[str, object]
+) -> None:
     spec = spec_from_manifest_entry(entry)
     q, k, v = make_inputs(spec)
     got = helion_attention.flash_attn_func(q, k, v, causal=spec.causal, shape=spec)
     expected = reference_attention(q, k, v, spec, 1.0 / math.sqrt(spec.head_dim))
     assert got.is_contiguous()
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+    if spec.key == CUDNN_GQA_FAST_PATH_KEY:
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            autocast_got = helion_attention.flash_attn_func(
+                q, k, v, causal=spec.causal, shape=spec
+            )
+        assert autocast_got.dtype == q.dtype
+        torch.testing.assert_close(
+            autocast_got.float(), expected, atol=5e-2, rtol=2e-2
+        )
+        monkeypatch.setattr(
+            helion_attention,
+            "dense_attention_cudnn_default_scale",
+            lambda q_arg, k_arg, v_arg: None,
+        )
+        fallback = helion_attention.flash_attn_func(
+            q, k, v, causal=spec.causal, shape=spec
+        )
+        assert fallback.is_contiguous()
+        torch.testing.assert_close(
+            fallback.float(), expected, atol=5e-2, rtol=2e-2
+        )
 
 
 @requires_cuda
@@ -684,16 +709,23 @@ def test_cudnn_fast_path_falls_back_when_ineligible(
     assert out is sentinel
     assert generated_calls == 1
 
+    eligibility_gqa: list[bool] = []
+
+    def reject_cudnn(params: object) -> bool:
+        eligibility_gqa.append(bool(getattr(params, "enable_gqa")))
+        return False
+
     monkeypatch.setattr(
         torch.backends.cuda,
         "can_use_cudnn_attention",
-        lambda params: False,
+        reject_cudnn,
     )
     out = helion_attention.flash_attn_func(
         q, k, v, causal=True, shape=spec
     )
     assert out is sentinel
     assert generated_calls == 2
+    assert eligibility_gqa == [spec.nheads_q != spec.nheads_kv]
 
 
 @requires_two_cuda_devices

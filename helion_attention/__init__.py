@@ -6,8 +6,8 @@ time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
-exact generated specialization, except two evidenced SM90 causal MHA fast
-paths that use direct cuDNN SDPA; compatible unregistered dense shapes,
+exact generated specialization, except three evidenced SM90 causal MHA/GQA
+fast paths that use direct cuDNN SDPA; compatible unregistered dense shapes,
 dense ALiBi calls, ALiBi on both shipped varlen profiles, and diagnostics on the
 shipped causal varlen profile use a generic Triton forward kernel. The exposed
 page-16 decode cache also uses the generic paged runtime when ALiBi is supplied.
@@ -20,6 +20,7 @@ paths and makes specialization introspection independent of fallback coverage.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from numbers import Real
 
 import torch
@@ -88,6 +89,7 @@ _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _CUDNN_SDPA_FAST_PATH_KEYS = frozenset(
     {
+        "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal",
         "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
         "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
     }
@@ -110,6 +112,7 @@ _DIAGNOSTIC_DECODE_PROFILES = frozenset(
 )
 
 
+@lru_cache(maxsize=None)
 def _is_sm90(device: torch.device) -> bool:
     """Whether ``device`` is exactly an SM90 CUDA GPU."""
     return torch.cuda.get_device_capability(device) == (9, 0)
@@ -666,7 +669,8 @@ def flash_attn_func(
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
     use a generic packed Triton forward kernel. The exact default-option,
-    default-scale, no-backward causal bf16 ``(2, 8192, 8192, 16, 16, 128)`` and
+    default-scale, no-backward causal bf16 ``(1, 4096, 4096, 32, 8, 128)``,
+    ``(2, 8192, 8192, 16, 16, 128)``, and
     ``(4, 4096, 4096, 32, 32, 128)`` calls use direct cuDNN SDPA on SM90 when
     eligible, falling back to their generated kernels otherwise. Grad-enabled
     calls without ALiBi or a generated backward, plus supported positive-dropout
