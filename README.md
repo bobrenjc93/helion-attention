@@ -70,8 +70,10 @@ dense, QKV-packed, and KV-packed entry points. A forward-only, dropout-free
 call returns `(out, softmax_lse, S_dmask)` with fp32 LSE shaped
 `[16, 12, 512]` and an empty bf16 `S_dmask`, matching FA2. Diagnostic calls
 use the generic packed runtime; ordinary calls retain the generated
-specialization. Causal mode, ALiBi, and other dense profiles remain outside
-this encoder diagnostic subset.
+specialization. The same three entry points accept `0 < dropout_p < 1` through
+PyTorch SDPA, with either the default or a custom `softmax_scale`. Causal mode,
+ALiBi, deterministic dropout, dropout diagnostics, and other dense profiles
+remain outside this BERT-base subset.
 
 The three checked-in batch-1 Llama GQA decode profiles (one query token and a
 1K, 4K, or 16K KV sequence) support `return_attn_probs=True` through both
@@ -93,11 +95,11 @@ ALiBi backward is not implemented. The shipped noncausal bf16
 values during zero-dropout training. On SM90, calls that omit `softmax_scale`
 use raw PyTorch BSHD Flash gradients, falling back to the generated backward
 when Flash is unavailable. Explicit-scale, non-SM90, and deterministic calls
-retain the generated backward. The same profile accepts
-`0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
-Other dropout calls, local windows, softcap outside the exact dense and varlen
-subsets described here, dense diagnostic returns outside the subsets above,
-and deterministic dropout still fail explicitly as described below.
+retain the generated backward. This profile and the BERT-base profile above
+accept `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed
+APIs. Other dropout calls, local windows, softcap outside the exact dense and
+varlen subsets described here, dense diagnostic returns outside the subsets
+above, and deterministic dropout still fail explicitly as described below.
 Unregistered calls must also fit the generic kernel's signed 32-bit Q/output
 and K/V element offsets.
 
@@ -573,20 +575,21 @@ The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape keeps
 its generated forward during zero-dropout training. Omitted-scale SM90 calls
 use raw PyTorch BSHD Flash gradients with a generated-backward fallback;
 custom-scale, non-SM90, and deterministic calls retain the checked-in generated
-backward. It uses PyTorch SDPA throughout when
+backward. It and the non-causal bf16 BERT-base profile use PyTorch SDPA when
 `0 < dropout_p < 1`. Default-option dense MHA, GQA, and cross-attention calls
 without a generated backward also use PyTorch SDPA autograd, including
 fp16/bf16 and bottom-right causal masking. Packed varlen calls remain
 forward-only except for the two exact full-length profiles and the causal
-ragged query/key contract described above; KV-cache calls remain
-forward-only. These unsupported FlashAttention features also raise
-`NotImplementedError` rather than silently doing something else:
+ragged query/key contract described above; KV-cache calls remain forward-only.
+These unsupported FlashAttention features also raise `NotImplementedError`
+rather than silently doing something else:
 
 - backward for dense or varlen ALiBi, ragged noncausal varlen batches,
   empty-sequence or graph-captured ragged batches, and KV-cache calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback
-- dropout outside the exact encoder-training profile above, or combined with
-  ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
+- dropout outside the exact encoder-training and BERT-base profiles above, or
+  combined with ALiBi, diagnostic returns, local windows, softcap, or
+  deterministic mode
 - sliding-window attention outside finite symmetric inference on the
   noncausal bf16 varlen self-attention profile above, including all windowed
   backward and KV-cache calls

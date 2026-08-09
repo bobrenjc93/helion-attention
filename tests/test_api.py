@@ -1788,6 +1788,107 @@ def test_encoder_dropout_dispatches_to_sdpa(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
+)
+def test_bert_dropout_dense_forward_and_qkv_gradients_match_direct_sdpa(
+    softmax_scale: float | None,
+) -> None:
+    spec = BERT_DIAGNOSTIC
+    q, k, v = make_inputs(spec, seed=346410)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    grad_out = make_inputs(spec, seed=374166)[0]
+    dropout_p = 0.25
+
+    torch.cuda.manual_seed_all(20260809)
+    got = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=dropout_p,
+        softmax_scale=softmax_scale,
+        shape=spec,
+    )
+    torch.cuda.manual_seed_all(20260809)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q.transpose(1, 2),
+        k.transpose(1, 2),
+        v.transpose(1, 2),
+        dropout_p=dropout_p,
+        scale=softmax_scale,
+    ).transpose(1, 2).contiguous()
+
+    got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
+    expected_grads = torch.autograd.grad(expected, (q, k, v), grad_out)
+
+    torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(actual, reference, atol=2e-3, rtol=1e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["qkvpacked", "kvpacked"], ids=["qkv-packed", "kv-packed"]
+)
+def test_bert_dropout_packed_forward_and_gradients_match_direct_sdpa(
+    entry_point: str,
+) -> None:
+    spec = BERT_DIAGNOSTIC
+    q, k, v = make_inputs(spec, seed=400000)
+    grad_out = make_inputs(spec, seed=424264)[0]
+    dropout_p = 0.25
+    scale = 0.137
+
+    if entry_point == "qkvpacked":
+        packed = torch.stack((q, k, v), dim=2).requires_grad_()
+        torch.cuda.manual_seed_all(20260809)
+        got = helion_attention.flash_attn_qkvpacked_func(
+            packed,
+            dropout_p=dropout_p,
+            softmax_scale=scale,
+            shape=spec,
+        )
+        q_ref, k_ref, v_ref = (
+            packed[:, :, index].contiguous() for index in range(3)
+        )
+        grad_inputs = (packed,)
+    else:
+        q.requires_grad_()
+        packed = torch.stack((k, v), dim=2).requires_grad_()
+        torch.cuda.manual_seed_all(20260809)
+        got = helion_attention.flash_attn_kvpacked_func(
+            q,
+            packed,
+            dropout_p=dropout_p,
+            softmax_scale=scale,
+            shape=spec,
+        )
+        q_ref = q
+        k_ref, v_ref = (
+            packed[:, :, index].contiguous() for index in range(2)
+        )
+        grad_inputs = (q, packed)
+
+    torch.cuda.manual_seed_all(20260809)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q_ref.transpose(1, 2),
+        k_ref.transpose(1, 2),
+        v_ref.transpose(1, 2),
+        dropout_p=dropout_p,
+        scale=scale,
+    ).transpose(1, 2).contiguous()
+
+    got_grads = torch.autograd.grad(got, grad_inputs, grad_out)
+    expected_grads = torch.autograd.grad(expected, grad_inputs, grad_out)
+
+    torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(actual, reference, atol=2e-3, rtol=1e-2)
+
+
+@requires_cuda
 def test_registered_dense_shape_does_not_use_generic_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2097,7 +2198,7 @@ def test_bert_return_attn_probs_matches_fa2(
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
 )
-def test_bert_return_attn_probs_false_retains_generated_dispatch(
+def test_bert_zero_dropout_retains_generated_dispatch(
     entry_point: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2119,13 +2220,15 @@ def test_bert_return_attn_probs_false_retains_generated_dispatch(
         "_generic_dense_diagnostic_forward",
         reject_diagnostic,
     )
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_diagnostic)
     if entry_point == "dense":
         out = helion_attention.flash_attn_func(
-            q, k, v, return_attn_probs=False, shape=spec
+            q, k, v, dropout_p=0.0, return_attn_probs=False, shape=spec
         )
     elif entry_point == "qkvpacked":
         out = helion_attention.flash_attn_qkvpacked_func(
             torch.stack((q, k, v), dim=2),
+            dropout_p=0.0,
             return_attn_probs=False,
             shape=spec,
         )
@@ -2133,6 +2236,7 @@ def test_bert_return_attn_probs_false_retains_generated_dispatch(
         out = helion_attention.flash_attn_kvpacked_func(
             q,
             torch.stack((k, v), dim=2),
+            dropout_p=0.0,
             return_attn_probs=False,
             shape=spec,
         )
@@ -2514,6 +2618,7 @@ def test_dense_dropout_rejects_invalid_probability(
     [
         ("other-shape", "only for the shipped encoder-training profile"),
         ("causal", "only for the shipped encoder-training profile"),
+        ("fp16", "only for the shipped encoder-training profile"),
         ("deterministic", "deterministic=True"),
         ("alibi", "dropout combined with ALiBi"),
         ("window", "sliding-window"),
@@ -2521,27 +2626,37 @@ def test_dense_dropout_rejects_invalid_probability(
         ("return-probs", "return_attn_probs=True"),
     ],
 )
+@pytest.mark.parametrize(
+    "dropout_spec",
+    [ENCODER_TRAINING, BERT_DIAGNOSTIC],
+    ids=["encoder-training", "bert-base"],
+)
 def test_dense_dropout_rejects_out_of_scope_calls_before_dispatch(
-    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+    case: str,
+    message: str,
+    dropout_spec: AttnShape,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
     kwargs: dict[str, object] = {
         "dropout_p": 0.25,
         "shape": (
-            ENCODER_TRAINING.batch,
-            ENCODER_TRAINING.seqlen_q,
-            ENCODER_TRAINING.nheads_q,
-            ENCODER_TRAINING.head_dim,
+            dropout_spec.batch,
+            dropout_spec.seqlen_q,
+            dropout_spec.nheads_q,
+            dropout_spec.head_dim,
         ),
     }
     if case == "other-shape":
         kwargs["shape"] = (1, 1, 1, 1)
     elif case == "causal":
         kwargs["causal"] = True
+    elif case == "fp16":
+        q = q.to(torch.float16)
     elif case == "deterministic":
         kwargs["deterministic"] = True
     elif case == "alibi":
-        kwargs["alibi_slopes"] = torch.ones(ENCODER_TRAINING.nheads_q)
+        kwargs["alibi_slopes"] = torch.ones(dropout_spec.nheads_q)
     elif case == "window":
         kwargs["window_size"] = (128, 0)
     elif case == "softcap":

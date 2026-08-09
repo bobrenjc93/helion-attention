@@ -16,13 +16,13 @@ Gemma-2 profile and the shipped causal varlen profile. Both exposed page-16
 paged KV-cache profiles use the generic paged runtime when ALiBi is supplied.
 The decode profile also accepts page-256 caches through that generic runtime,
 without expanding the core paged-varlen API.
-Default-scale SM90 training on the shipped encoder profile keeps its generated
-forward values and uses raw PyTorch BSHD Flash gradients, falling back to its
-generated backward when Flash is unavailable. Positive dropout on that profile,
-grad-enabled dense calls without a generated backward, both full-length varlen
-profiles, and ragged causal attention use PyTorch SDPA autograd. The
-explicit shape validates these paths and makes specialization introspection
-independent of fallback coverage.
+Default-scale SM90 training on the shipped encoder-training profile keeps its
+generated forward values and uses raw PyTorch BSHD Flash gradients, falling
+back to its generated backward when Flash is unavailable. Positive dropout on
+that profile and the checked-in BERT-base encoder, grad-enabled dense calls
+without a generated backward, both full-length varlen profiles, and ragged
+causal attention use PyTorch SDPA autograd. The explicit shape validates these
+paths and makes specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -99,6 +99,9 @@ _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
+_DROPOUT_SDPA_KEYS = frozenset(
+    {_ENCODER_TRAINING_KEY, _BERT_DIAGNOSTIC_KEY}
+)
 _GEMMA2_SOFTCAP_KEY = "b1_sq4096_sk4096_hq16_hkv8_d256_bf16_causal"
 _GEMMA2_SOFTCAP = 50.0
 _FLASH_SDPA_FAST_PATH_KEY = (
@@ -1225,7 +1228,8 @@ def flash_attn_func(
         k: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         dropout_p: values in ``(0, 1)`` are supported only for the shipped
-            noncausal bf16 ``(8, 512, 512, 16, 16, 64)`` profile.
+            noncausal bf16 ``(8, 512, 512, 16, 16, 64)`` encoder-training and
+            ``(16, 512, 512, 12, 12, 64)`` BERT-base profiles.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
         softcap: exactly ``50.0`` is supported for forward-only causal bf16
@@ -1288,10 +1292,11 @@ def flash_attn_func(
             f"got {spec.describe()}"
         )
     if dropout != 0.0:
-        if spec.key != _ENCODER_TRAINING_KEY:
+        if spec.key not in _DROPOUT_SDPA_KEYS:
             raise NotImplementedError(
                 "dropout is implemented only for the shipped encoder-training "
-                f"profile {_ENCODER_TRAINING_KEY}; got {spec.key}"
+                "profiles "
+                f"{', '.join(sorted(_DROPOUT_SDPA_KEYS))}; got {spec.key}"
             )
         if deterministic:
             raise NotImplementedError(
