@@ -242,16 +242,17 @@ check bounds recoverably, so it rejects CUDA graph capture and autograd.
 caches, or any other profile. Omitting the length or passing the full length as
 a Python integer retains the checked-in split-KV generated kernel.
 
-Two exact bf16 profiles also accept a read-only page-size-16 cache through
-`flash_attn_with_kvcache`: chunked prefill `(2, 200, 320, 8, 2, 128)` with
-`causal=True`, and decode `(4, 1, 1024, 8, 2, 128)` with either causal mode.
+Two exact bf16 profiles also accept a read-only paged cache through
+`flash_attn_with_kvcache`: page-size-16 chunked prefill
+`(2, 200, 320, 8, 2, 128)` with `causal=True`, and decode
+`(4, 1, 1024, 8, 2, 128)` with page size 16 or 256 and either causal mode.
 `cache_seqlens` must be a CUDA int32 tensor shaped `[batch]`; each row may
 select a different used length. Logical pages can map to physical cache pages
 in any order. Queries use dense BSHD layout and results are returned in that
 same layout. Chunked prefill uses bottom-right causal alignment. For decode,
-the default `causal=False` is equivalent to `causal=True`. Both profiles also
-accept forward-only fp32 ALiBi slopes shaped `[8]` or `[batch, 8]` (`[2, 8]`
-for chunked prefill and `[4, 8]` for decode):
+the default `causal=False` is equivalent to `causal=True`. The page-size-16
+profiles also accept forward-only fp32 ALiBi slopes shaped `[8]` or
+`[batch, 8]` (`[2, 8]` for chunked prefill and `[4, 8]` for decode):
 
 ```python
 B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 16
@@ -276,13 +277,15 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-Slope-free output-only calls on these narrow paged paths route through their
-checked-in paged-varlen kernels. ALiBi calls use the generic single-launch paged
-runtime, as does requesting LSE without ALiBi; the latter returns fp32
-`[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. Neither path mutates the
-cache. ALiBi with LSE, paged updates, rotary, and autograd are rejected before
-dispatch. LSE on chunked prefill, non-causal chunked prefill, every other paged
-profile, and every other page size are also rejected before dispatch.
+Slope-free output-only page-size-16 calls route through their checked-in
+paged-varlen kernels. Page-size-256 decode calls and page-size-16 ALiBi calls
+use the generic single-launch paged runtime, as does requesting LSE without
+ALiBi; the latter returns fp32 `[4, 8, 1]` LSE alongside the
+`[4, 1, 8, 128]` output for either decode page size. Neither path mutates the
+cache. Page-size-256 ALiBi, ALiBi with LSE, paged updates, rotary, and autograd
+are rejected before dispatch. LSE on chunked prefill, non-causal chunked
+prefill, every other paged profile, and every page size other than 16 or 256
+are also rejected before dispatch.
 
 The dense decode path also appends one paired K/V token when a scalar cache
 length points at the final slot declared by `shape`:
@@ -575,14 +578,14 @@ forward-only. These unsupported FlashAttention features also raise
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 profiles above; paged ALiBi cannot be combined
-  with LSE, updates, rotary, or autograd
+  with LSE, updates, rotary, or autograd and is not supported with page size 256
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
   partial caches, `cache_leftpad` outside that profile or combined with updates,
-  remapping, rotary, or autograd, paged profiles other than the exact read-only
-  page-size-16 profiles above, paged LSE outside the exact decode profile above,
-  and KV-cache rotary outside the full-head interleaved/NeoX or D128 half-head
-  interleaved final-slot append
+  remapping, rotary, or autograd, paged profiles and page sizes other than the
+  exact read-only page-size-16 profiles and page-size-256 decode above, paged LSE
+  outside the exact decode profile above, and KV-cache rotary outside the
+  full-head interleaved/NeoX or D128 half-head interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
   KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
   profiles, and the causal bf16 varlen profile described above
