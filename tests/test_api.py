@@ -43,11 +43,13 @@ BERT_DIAGNOSTIC = spec_from_manifest_entry(
 FLASH_FAST_PATH_KEY = "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
 CUDNN_GQA_FAST_PATH_KEY = "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal"
 CUDNN_QWEN_FAST_PATH_KEY = "b1_sq8192_sk8192_hq28_hkv4_d128_bf16_causal"
+CUDNN_B8_FAST_PATH_KEY = "b8_sq2048_sk2048_hq16_hkv16_d64_bf16_causal"
 CUDNN_FAST_PATH_KEYS = (
     CUDNN_GQA_FAST_PATH_KEY,
     CUDNN_QWEN_FAST_PATH_KEY,
     "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
     "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
+    CUDNN_B8_FAST_PATH_KEY,
 )
 QWEN_PREFILL = AttnShape(
     batch=1,
@@ -395,6 +397,7 @@ def test_matches_fp32_sdpa(
     if spec.key in {
         CUDNN_GQA_FAST_PATH_KEY,
         CUDNN_QWEN_FAST_PATH_KEY,
+        CUDNN_B8_FAST_PATH_KEY,
         FLASH_FAST_PATH_KEY,
     }:
         with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -849,7 +852,7 @@ def test_cudnn_fast_path_falls_back_when_ineligible(
 
 
 @requires_two_cuda_devices
-def test_cudnn_fast_path_uses_tensor_device_for_eligibility(
+def test_cudnn_fast_path_uses_tensor_device_and_caches_eligibility(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sm90_devices = [
@@ -898,9 +901,10 @@ def test_cudnn_fast_path_uses_tensor_device_for_eligibility(
     monkeypatch.setattr(helion_attention, "lookup", reject_generated)
 
     with torch.cuda.device(other_index):
-        out = helion_attention.flash_attn_func(
-            q, k, v, causal=True, shape=spec
-        )
+        for _ in range(2):
+            out = helion_attention.flash_attn_func(
+                q, k, v, causal=True, shape=spec
+            )
         assert torch.cuda.current_device() == other_index
     torch.cuda.synchronize(target)
 

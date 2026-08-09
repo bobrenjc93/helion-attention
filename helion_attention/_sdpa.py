@@ -25,6 +25,12 @@ except AttributeError:  # pragma: no cover - depends on the PyTorch build
 # determinism remain live per-call checks below.
 _FLASH_CAPABLE_DEVICES: set[tuple[int | None, object, object]] = set()
 
+# cuDNN eligibility is likewise invariant for an exact validated profile on a
+# given device and PyTorch build. Include the probe object in the key so
+# replacing it (including in tests) always causes a fresh check. Backend
+# enablement and determinism remain live per-call checks in the helper.
+_CUDNN_CAPABLE_PROFILES: set[tuple[object, ...]] = set()
+
 
 def dense_attention_flash_default_scale(
     q: torch.Tensor,
@@ -141,35 +147,35 @@ def dense_attention_cudnn_default_scale(
     ):
         return None
     try:
-        # PyTorch's eligibility probe consults the current CUDA device rather
-        # than deriving all device properties from the tensors. Preserve the
-        # caller's device while making both the probe and launch tensor-local.
-        with torch.cuda.device(q.device):
-            params = params_type(
-                query, key, value, None, 0.0, True, enable_gqa
-            )
-            if not can_use_cudnn(params):
-                return None
-            cudnn_attention = (
-                torch.ops.aten._scaled_dot_product_cudnn_attention.default
-            )
-            if torch.is_autocast_enabled(q.device.type):
-                # The raw operator is autocast-eligible. Preserve the input
-                # dtype under an active cross-dtype autocast context, without
-                # paying for a redundant context in the latency-critical
-                # default case.
-                with torch.autocast(device_type=q.device.type, enabled=False):
-                    out = cudnn_attention(
-                        query,
-                        key,
-                        value,
-                        None,
-                        False,
-                        0.0,
-                        True,
-                        False,
-                    )[0]
-            else:
+        capability_key = (
+            q.device.index,
+            q.dtype,
+            q.shape,
+            k.shape,
+            params_type,
+            can_use_cudnn,
+        )
+        capability_confirmed = capability_key in _CUDNN_CAPABLE_PROFILES
+        if not capability_confirmed:
+            # PyTorch's eligibility probe consults the current CUDA device.
+            # Temporarily select the tensor device only on this cold path; the
+            # operator itself has its own tensor-derived device guard.
+            with torch.cuda.device(q.device):
+                params = params_type(
+                    query, key, value, None, 0.0, True, enable_gqa
+                )
+                if not can_use_cudnn(params):
+                    return None
+
+        cudnn_attention = (
+            torch.ops.aten._scaled_dot_product_cudnn_attention.default
+        )
+        if torch.is_autocast_enabled(q.device.type):
+            # The raw operator is autocast-eligible. Preserve the input
+            # dtype under an active cross-dtype autocast context, without
+            # paying for a redundant context in the latency-critical
+            # default case.
+            with torch.autocast(device_type=q.device.type, enabled=False):
                 out = cudnn_attention(
                     query,
                     key,
@@ -180,6 +186,18 @@ def dense_attention_cudnn_default_scale(
                     True,
                     False,
                 )[0]
+        else:
+            out = cudnn_attention(
+                query,
+                key,
+                value,
+                None,
+                False,
+                0.0,
+                True,
+                False,
+            )[0]
+        _CUDNN_CAPABLE_PROFILES.add(capability_key)
     except torch.cuda.OutOfMemoryError:
         raise
     except (AttributeError, NotImplementedError, RuntimeError, TypeError):
