@@ -5797,6 +5797,234 @@ def test_kvcache_entry_point_matches_plain_attention(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["output", "output-lse"],
+)
+def test_kvcache_16k_explicit_splits_matches_auto_fa2_and_fp32(
+    softmax_scale: float | None,
+    return_softmax_lse: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260818)
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    kwargs: dict[str, object] = {
+        "softmax_scale": softmax_scale,
+        "causal": spec.causal,
+        "return_softmax_lse": return_softmax_lse,
+        "shape": spec,
+    }
+
+    automatic = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        num_splits=0,
+        **kwargs,  # type: ignore[arg-type]
+    )
+    explicit = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        num_splits=16,
+        **kwargs,  # type: ignore[arg-type]
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        num_splits=16,
+        return_softmax_lse=return_softmax_lse,
+    )
+    expected_fp32 = reference_attention(q, k_cache, v_cache, spec, scale)
+
+    if return_softmax_lse:
+        assert isinstance(automatic, tuple)
+        assert isinstance(explicit, tuple)
+        assert isinstance(expected_fa2, tuple)
+        automatic_out, automatic_lse = automatic
+        explicit_out, explicit_lse = explicit
+        fa2_out, fa2_lse = expected_fa2
+        expected_fp32_lse = reference_single_token_lse(q, k_cache, spec, scale)
+        assert explicit_lse.shape == (spec.batch, spec.nheads_q, spec.seqlen_q)
+        assert explicit_lse.dtype == torch.float32
+        torch.testing.assert_close(explicit_lse, automatic_lse, atol=0.0, rtol=0.0)
+        torch.testing.assert_close(explicit_lse, fa2_lse, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            explicit_lse, expected_fp32_lse, atol=1e-5, rtol=1e-5
+        )
+    else:
+        assert isinstance(automatic, torch.Tensor)
+        assert isinstance(explicit, torch.Tensor)
+        assert isinstance(expected_fa2, torch.Tensor)
+        automatic_out = automatic
+        explicit_out = explicit
+        fa2_out = expected_fa2
+
+    assert explicit_out.shape == q.shape
+    assert explicit_out.dtype == q.dtype
+    torch.testing.assert_close(explicit_out, automatic_out, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(explicit_out, fa2_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        explicit_out.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+def test_kvcache_16k_explicit_splits_reuses_generated_dispatch(
+    causal: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_spec = spec_from_manifest_entry(LONG_DECODE)
+    shape = (
+        manifest_spec.batch,
+        manifest_spec.seqlen_q,
+        manifest_spec.seqlen_k,
+        manifest_spec.nheads_q,
+        manifest_spec.nheads_kv,
+        manifest_spec.head_dim,
+    )
+    spec = AttnShape(*shape, manifest_spec.dtype, causal)
+    q = torch.empty(1, dtype=spec.dtype)
+    k_cache = torch.empty(1, dtype=spec.dtype)
+    v_cache = torch.empty(1, dtype=spec.dtype)
+    marker = torch.empty(1, dtype=spec.dtype)
+    lookup_calls: list[AttnShape] = []
+    kernel_scales: list[float] = []
+
+    def check_tensors_stub(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        spec_arg: AttnShape,
+    ) -> None:
+        assert q_arg is q
+        assert k_arg is k_cache
+        assert v_arg is v_cache
+        assert spec_arg == spec
+
+    def kernel(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+    ) -> torch.Tensor:
+        assert q_arg is q
+        assert k_arg is k_cache
+        assert v_arg is v_cache
+        kernel_scales.append(scale_arg)
+        return marker
+
+    def lookup_stub(spec_arg: AttnShape):  # noqa: ANN202
+        lookup_calls.append(spec_arg)
+        return kernel
+
+    monkeypatch.setattr(helion_attention, "check_tensors", check_tensors_stub)
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+
+    automatic = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=0.23,
+        causal=causal,
+        num_splits=0,
+        shape=shape,
+    )
+    explicit = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=0.23,
+        causal=causal,
+        num_splits=16,
+        shape=shape,
+    )
+
+    assert automatic is marker
+    assert explicit is marker
+    assert lookup_calls == [spec, spec]
+    assert kernel_scales == [0.23, 0.23]
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("split-count", "only as num_splits=16", id="split-count"),
+        pytest.param("profile", "only.*16384", id="other-profile"),
+        pytest.param("tensor-span", "tensor-valued cache spans", id="tensor-span"),
+        pytest.param("update", "read-only", id="update"),
+        pytest.param("rotary", "rotary embeddings", id="rotary"),
+        pytest.param("autograd", "does not support autograd", id="autograd"),
+        pytest.param("paged", "only for a dense KV cache", id="paged"),
+    ],
+)
+def test_kvcache_16k_explicit_splits_rejects_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    q = torch.zeros(1, dtype=spec.dtype)
+    k_cache = torch.zeros(1, dtype=spec.dtype)
+    v_cache = torch.zeros(1, dtype=spec.dtype)
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "num_splits": 16,
+        "shape": spec,
+    }
+    if case == "split-count":
+        kwargs["num_splits"] = 8
+    elif case == "profile":
+        kwargs["shape"] = AttnShape(
+            1, 1, 1024, 32, 8, 128, torch.bfloat16, True
+        )
+    elif case == "tensor-span":
+        kwargs["cache_seqlens"] = torch.tensor([spec.seqlen_k], dtype=torch.int32)
+    elif case == "update":
+        kwargs.update(k=q, v=q, cache_seqlens=spec.seqlen_k - 1)
+    elif case == "rotary":
+        kwargs.update(rotary_cos=q, rotary_sin=q)
+    elif case == "autograd":
+        q.requires_grad_()
+    else:
+        kwargs["block_table"] = torch.zeros(1, 1, dtype=torch.int32)
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("invalid explicit split selector reached dispatch")
+
+    for dispatch_name in (
+        "lookup",
+        "_paged_kvcache_forward",
+        "_tensor_length_dense_kvcache_forward",
+        "_generic_dense_forward",
+        "attention_autograd",
+    ):
+        monkeypatch.setattr(helion_attention, dispatch_name, reject_dispatch)
+
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@requires_cuda
 @pytest.mark.parametrize("length", [1, 1025, 16384], ids=["one", "split-edge", "full"])
 @pytest.mark.parametrize(
     "softmax_scale",

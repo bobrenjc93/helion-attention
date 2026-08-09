@@ -149,6 +149,16 @@ _RAGGED_VARLEN_SDPA_BACKWARD_KEY = (
 _TENSOR_LENGTH_DENSE_KVCACHE_KEY = (
     "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
 )
+_EXPLICIT_SPLIT_DENSE_KVCACHE_PROFILE = (
+    1,
+    1,
+    16384,
+    32,
+    8,
+    128,
+    torch.bfloat16,
+)
+_EXPLICIT_SPLIT_DENSE_KVCACHE_NUM_SPLITS = 16
 _TWO_TOKEN_DENSE_KVCACHE_KEY = (
     "b1_sq2_sk1024_hq32_hkv8_d128_bf16_causal"
 )
@@ -2272,10 +2282,14 @@ def flash_attn_with_kvcache(
     ``[cache_leftpad, cache_seqlens)`` when
     ``0 <= cache_leftpad < cache_seqlens <= 16384``. This tensor-span path
     synchronizes once for recoverable bounds validation and rejects CUDA graph
-    capture and autograd. For the single-token dense paths, a paired ``k`` and
-    ``v`` update is supported when a Python integer ``cache_seqlens`` is exactly
-    one less than the declared length; the update is copied into the final cache
-    slot before attention runs. On this dense path,
+    capture and autograd. A full, read-only cache for that exact 16K profile may
+    pass ``num_splits=16`` to match the generated kernel's fixed split count;
+    all other explicit split selectors are unsupported. The explicit selector
+    cannot be combined with tensor-valued cache spans, updates, rotary metadata,
+    paged caches, or autograd. For the single-token dense paths, a paired ``k``
+    and ``v`` update is supported when a Python integer ``cache_seqlens`` is
+    exactly one less than the declared length; the update is copied into the
+    final cache slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
     decode profile supports the same return for page sizes 16 and 256 through
@@ -2321,9 +2335,63 @@ def flash_attn_with_kvcache(
     if cache_leftpad is not None and tensor_cache_leftpad is None:
         raise TypeError("cache_leftpad must be a torch.Tensor or None")
     if num_splits != 0:
-        raise NotImplementedError(
-            "explicit num_splits is not implemented; pass num_splits=0"
+        if (
+            type(num_splits) is not int
+            or num_splits != _EXPLICIT_SPLIT_DENSE_KVCACHE_NUM_SPLITS
+        ):
+            raise NotImplementedError(
+                "explicit num_splits is implemented only as num_splits=16 "
+                "for the full, read-only bf16 "
+                "(1, 1, 16384, 32, 8, 128) dense KV-cache decode profile; "
+                "pass num_splits=0 for all other calls"
+            )
+        if block_table is not None:
+            raise NotImplementedError(
+                "num_splits=16 is implemented only for a dense KV cache; "
+                "paged caches are not supported"
+            )
+        if has_rotary_metadata:
+            raise NotImplementedError(
+                "num_splits=16 does not support rotary embeddings"
+            )
+        if append_kv:
+            raise NotImplementedError(
+                "num_splits=16 is implemented only for read-only KV-cache "
+                "calls; updates are not supported"
+            )
+        if (
+            isinstance(cache_seqlens, torch.Tensor)
+            or tensor_cache_leftpad is not None
+        ):
+            raise NotImplementedError(
+                "num_splits=16 does not support tensor-valued cache spans; "
+                "omit cache_seqlens or pass the full cache length as a Python int"
+            )
+        explicit_split_spec = normalize_shape(shape, q.dtype, causal)
+        requested = (
+            explicit_split_spec.batch,
+            explicit_split_spec.seqlen_q,
+            explicit_split_spec.seqlen_k,
+            explicit_split_spec.nheads_q,
+            explicit_split_spec.nheads_kv,
+            explicit_split_spec.head_dim,
+            explicit_split_spec.dtype,
         )
+        if requested != _EXPLICIT_SPLIT_DENSE_KVCACHE_PROFILE:
+            raise NotImplementedError(
+                "num_splits=16 is implemented only for the full, read-only "
+                "bf16 (1, 1, 16384, 32, 8, 128) dense KV-cache decode profile; "
+                f"got {explicit_split_spec.describe()}"
+            )
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad
+            for tensor in (q, k_cache, v_cache)
+            if isinstance(tensor, torch.Tensor)
+        ):
+            raise NotImplementedError(
+                "num_splits=16 does not support autograd; use inference mode "
+                "or detach the inputs"
+            )
     # This flag changes only how rotary pairs are laid out, so it remains
     # irrelevant when rotary_cos/rotary_sin are absent.
 
