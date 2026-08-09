@@ -2098,6 +2098,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:99",
+      "recordedAt": "2026-08-09T20:41:24.134Z",
+      "label": "PR #99",
+      "kind": "leaf",
+      "prNumber": 99,
+      "title": "Return diagnostics for Gemma-2 softcap inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
