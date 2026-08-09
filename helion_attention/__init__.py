@@ -6,8 +6,8 @@ time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
-exact generated specialization, except one evidenced SM90 long-context MHA
-fast path that uses direct cuDNN SDPA; compatible unregistered dense shapes,
+exact generated specialization, except two evidenced SM90 causal MHA fast
+paths that use direct cuDNN SDPA; compatible unregistered dense shapes,
 dense ALiBi calls, ALiBi on both shipped varlen profiles, and diagnostics on the
 shipped causal varlen profile use a generic Triton forward kernel. Positive
 dropout on the shipped encoder-training profile, grad-enabled dense calls
@@ -85,7 +85,12 @@ _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
-_CUDNN_SDPA_FAST_PATH_KEY = "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal"
+_CUDNN_SDPA_FAST_PATH_KEYS = frozenset(
+    {
+        "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
+        "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
+    }
+)
 _VARLEN_ALIBI_KEYS = frozenset(
     {
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
@@ -660,10 +665,11 @@ def flash_attn_func(
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
     use a generic packed Triton forward kernel. The exact default-option,
-    default-scale, no-backward causal bf16 ``(2, 8192, 8192, 16, 16, 128)``
-    call uses direct cuDNN SDPA on SM90 when eligible, falling back to its
-    generated kernel otherwise. Grad-enabled calls without ALiBi or a generated
-    backward, plus supported positive-dropout calls, use PyTorch SDPA autograd.
+    default-scale, no-backward causal bf16 ``(2, 8192, 8192, 16, 16, 128)`` and
+    ``(4, 4096, 4096, 32, 32, 128)`` calls use direct cuDNN SDPA on SM90 when
+    eligible, falling back to their generated kernels otherwise. Grad-enabled
+    calls without ALiBi or a generated backward, plus supported positive-dropout
+    calls, use PyTorch SDPA autograd.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
@@ -746,7 +752,7 @@ def flash_attn_func(
         default_softmax_scale
         and not deterministic
         and alibi_slopes is None
-        and spec.key == _CUDNN_SDPA_FAST_PATH_KEY
+        and spec.key in _CUDNN_SDPA_FAST_PATH_KEYS
         and _is_sm90(q.device)
     ):
         cudnn_out = dense_attention_cudnn_default_scale(q, k, v)
