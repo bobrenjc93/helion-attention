@@ -1335,6 +1335,47 @@ def test_generic_varlen_layout_accepts_maximum_flattened_grid() -> None:
     assert helion_attention._validate_generic_varlen_layout(q, k, spec) is None
 
 
+def test_generic_varlen_layout_accepts_last_safe_key_loop_endpoint() -> None:
+    # 2,147,483,584 is the final multiple of 64 representable in signed int32.
+    spec = AttnShape(1, 1, 2_147_483_584, 1, 1, 1, torch.bfloat16, False)
+    q = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+
+    assert helion_attention._validate_generic_varlen_layout(q, k, spec) is None
+
+
+@requires_cuda
+def test_unregistered_varlen_rejects_first_unsafe_key_loop_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = AttnShape(1, 1, 2_147_483_585, 1, 1, 1, torch.bfloat16, False)
+    q = torch.empty((1, 1, 1), device="cuda", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="cuda", dtype=spec.dtype)
+    v = torch.empty_like(k)
+    cumulative = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
+
+    def reject_launch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsafe key loop reached the generic runtime")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_runtime_forward", reject_launch
+    )
+    with pytest.raises(
+        helion_attention.UnsupportedShapeError,
+        match=r"rounded-up endpoint is 2147483648 .*limit 2147483647",
+    ):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cumulative,
+            cumulative,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            shape=spec,
+        )
+
+
 @pytest.mark.parametrize(
     ("spec", "message"),
     [
@@ -1349,9 +1390,9 @@ def test_generic_varlen_layout_accepts_maximum_flattened_grid() -> None:
             id="query-index",
         ),
         pytest.param(
-            AttnShape(1, 1, 2**31 + 1, 1, 1, 1, torch.bfloat16, False),
-            r"signed int32 key indices.*padded maximum is 2147483711",
-            id="key-index",
+            AttnShape(1, 1, 2_147_483_585, 1, 1, 1, torch.bfloat16, False),
+            r"signed int32 key-loop.*rounded-up endpoint is 2147483648 .*limit 2147483647",
+            id="key-loop-endpoint",
         ),
     ],
 )

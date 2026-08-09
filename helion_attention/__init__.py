@@ -419,13 +419,14 @@ def _validate_generic_varlen_layout(
     key_blocks = (
         spec.seqlen_k + _PACKED_KEY_BLOCK_SIZE - 1
     ) // _PACKED_KEY_BLOCK_SIZE
-    max_padded_key_index = key_blocks * _PACKED_KEY_BLOCK_SIZE - 1
-    if max_padded_key_index > _INT32_MAX:
+    key_loop_endpoint = key_blocks * _PACKED_KEY_BLOCK_SIZE
+    if key_loop_endpoint > _INT32_MAX:
         raise UnsupportedShapeError(
             "no checked-in varlen specialization exists for:\n"
             f"    {spec.describe()}\n"
-            "the generic varlen fallback uses signed int32 key indices, but "
-            f"the padded maximum is {max_padded_key_index} "
+            "the generic varlen fallback uses a signed int32 key-loop "
+            f"induction variable, but its rounded-up endpoint is "
+            f"{key_loop_endpoint} "
             f"(limit {_INT32_MAX}) with key block size "
             f"{_PACKED_KEY_BLOCK_SIZE}. To request a specialization, file "
             "an issue at https://github.com/bobrenjc93/helion-attention/issues"
