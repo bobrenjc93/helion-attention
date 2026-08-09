@@ -40,6 +40,10 @@ import helion_attention.vllm_flash_attn as vllm_flash_attn  # noqa: E402
 from benchmarks.inventory import BenchmarkKind  # noqa: E402
 from benchmarks.inventory import benchmark_entries  # noqa: E402
 from benchmarks.inventory import benchmark_key  # noqa: E402
+from benchmarks.timing import DEFAULT_ROUNDS  # noqa: E402
+from benchmarks.timing import MEASUREMENT_MS  # noqa: E402
+from benchmarks.timing import WARMUP_MS  # noqa: E402
+from benchmarks.timing import timing_methodology  # noqa: E402
 from helion_attention._registry import spec_from_manifest_entry  # noqa: E402
 from helion_attention._sdpa import sdpa_causal_options  # noqa: E402
 from helion_attention._shape import AttnShape  # noqa: E402
@@ -564,7 +568,11 @@ def measure(
     live = [name for name in candidates if not math.isnan(errors[name])]
     for _ in range(rounds):
         for name in live:
-            results[name].append(triton.testing.do_bench(candidates[name], warmup=50, rep=200))
+            results[name].append(
+                triton.testing.do_bench(
+                    candidates[name], warmup=WARMUP_MS, rep=MEASUREMENT_MS
+                )
+            )
     return {
         name: {
             "ms": statistics.median(results[name]),
@@ -578,7 +586,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     parser.add_argument("--markdown", type=Path, default=None, help="also write a table here")
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
     parser.add_argument("--only", default="", help="substring filter on the kernel key")
     args = parser.parse_args()
 
@@ -657,7 +665,7 @@ def main() -> int:
     if args.json:
         json.dump(report, sys.stdout, indent=2)
         sys.stdout.write("\n")
-    table = render_markdown(report)
+    table = render_markdown(report, rounds=args.rounds)
     if not args.json:
         sys.stdout.write(table)
     if args.markdown:
@@ -665,7 +673,9 @@ def main() -> int:
     return 0
 
 
-def render_markdown(report: dict[str, object]) -> str:
+def render_markdown(
+    report: dict[str, object], rounds: int = DEFAULT_ROUNDS
+) -> str:
     names = IMPLEMENTATION_NAMES
     flash_versions = []
     if report.get("flash_attn"):
@@ -675,7 +685,8 @@ def render_markdown(report: dict[str, object]) -> str:
     version_suffix = f", {', '.join(flash_versions)}" if flash_versions else ""
     lines = [
         f"Measured on {report['device']}, torch {report['torch']}, "
-        f"triton {report['triton']}{version_suffix}.",
+        f"triton {report['triton']}{version_suffix}. "
+        f"{timing_methodology(rounds)}",
         "",
     ]
     kinds = {row.get("kind") for row in report["results"]}  # type: ignore[index]

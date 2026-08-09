@@ -443,7 +443,7 @@ The generated module linked in each row contains the exact regeneration command.
 ## Benchmarks
 
 <!-- BENCHMARKS:START -->
-Measured on NVIDIA H100 (torch 2.14.0a0+git774d172, triton 3.6.0, FA2 2.8.3.post1, FA3 3.0.0). Times are the median of interleaved rounds; lower is better.
+Measured on NVIDIA H100 (torch 2.14.0a0+git774d172, triton 3.6.0, FA2 2.8.3.post1, FA3 3.0.0). Times are the median of three interleaved rounds, each with 50 ms warmup and 200 ms measurement; lower is better.
 
 Paged rows use identical logical caches with each implementation's native page size: 16 for Helion and FA3, and FA2's minimum of 256. FA2 paged decode uses `flash_attn_with_kvcache`; chunked prefill uses `flash_attn_varlen_func`. FA3 uses `flash_attn_with_kvcache`. Backward rows time dQ/dK/dV only; their forward graphs are prepared outside the timed region, and TFLOP/s uses the standard 2.5x-forward operation estimate.
 
