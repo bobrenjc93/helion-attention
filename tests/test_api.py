@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -3790,6 +3791,144 @@ def test_kvcache_full_length_supports_cuda_graph_capture(
     torch.cuda.synchronize(q.device)
 
     torch.testing.assert_close(captured, expected)
+
+
+@requires_cuda
+def test_split_kv_decode_cuda_graph_captures_own_scratch() -> None:
+    from helion_attention.kernels import (
+        b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal as kernel_module,
+    )
+
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    scale = 1.0 / math.sqrt(spec.head_dim)
+
+    def capture(
+        value: float, *, delay_after_partials: bool
+    ) -> tuple[torch.cuda.CUDAGraph, torch.Tensor, tuple[torch.Tensor, ...]]:
+        q, k_cache, v_cache = make_inputs(spec, seed=int(value))
+        q.zero_()
+        k_cache.zero_()
+        v_cache.fill_(value)
+        tensors = (q, k_cache, v_cache)
+
+        # Compile both generated kernels before capture.
+        kernel_module.attention(*tensors, scale)
+        torch.cuda.synchronize(q.device)
+
+        def launcher(kernel, grid, *args, **kwargs):  # noqa: ANN001, ANN202
+            result = kernel_module._default_launcher(
+                kernel, grid, *args, **kwargs
+            )
+            if (
+                delay_after_partials
+                and kernel
+                is kernel_module._helion_decode_attention_bshd_split_kv_partials
+            ):
+                # Keep the first graph between partial and combine long enough
+                # for the second graph to overwrite shared scratch.
+                torch.cuda._sleep(5_000_000)
+            return result
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = kernel_module.attention(
+                *tensors,
+                scale,
+                _launcher=launcher,
+            )
+        return graph, output, tensors
+
+    graph_one, output_one, inputs_one = capture(
+        1.0, delay_after_partials=True
+    )
+    graph_seven, output_seven, inputs_seven = capture(
+        7.0, delay_after_partials=False
+    )
+    replay_one = torch.cuda.Stream()
+    replay_seven = torch.cuda.Stream()
+    with torch.cuda.stream(replay_one):
+        graph_one.replay()
+    with torch.cuda.stream(replay_seven):
+        graph_seven.replay()
+    torch.cuda.synchronize()
+
+    # Keep capture inputs alive until both graph executions have completed.
+    assert inputs_one and inputs_seven
+    torch.testing.assert_close(
+        output_one,
+        torch.ones_like(output_one),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        output_seven,
+        torch.full_like(output_seven, 7.0),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
+@requires_cuda
+def test_split_kv_decode_external_stream_workspace_cache_is_bounded() -> None:
+    from helion_attention.kernels import (
+        b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal as kernel_module,
+    )
+
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260809)
+
+    # Warm compilation, then clear the eager cache so the measured live
+    # allocation contains only the test inputs.
+    helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        causal=spec.causal,
+        shape=spec,
+    )
+    torch.cuda.synchronize(q.device)
+    kernel_module._SPLIT_KV_WORKSPACES.clear()
+    gc.collect()
+    torch.cuda.empty_cache()
+    allocated_before = torch.cuda.memory_allocated(q.device)
+
+    streams = [torch.cuda.Stream(device=q.device) for _ in range(32)]
+    outputs = []
+    for stream in streams:
+        with torch.cuda.stream(stream):
+            outputs.append(
+                helion_attention.flash_attn_with_kvcache(
+                    q,
+                    k_cache,
+                    v_cache,
+                    causal=spec.causal,
+                    shape=spec,
+                )
+            )
+    torch.cuda.synchronize(q.device)
+    del outputs, stream, streams
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    cached = kernel_module._SPLIT_KV_WORKSPACES
+    cache_limit = kernel_module._SPLIT_KV_MAX_CACHED_STREAMS_PER_DEVICE
+    workspace_bytes = (
+        spec.batch
+        * spec.nheads_q
+        * 16
+        * spec.head_dim
+        * torch.float32.itemsize
+        + spec.batch
+        * spec.nheads_q
+        * 2
+        * 16
+        * torch.float32.itemsize
+    )
+    assert len(cached) == cache_limit
+    assert (
+        torch.cuda.memory_allocated(q.device) - allocated_before
+        <= cache_limit * workspace_bytes
+    )
 
 
 @requires_cuda
