@@ -267,16 +267,17 @@ slope-free calls retain the checked-in generated specialization. This narrow
 mode does not support LSE, updates, partial lengths, cache remapping, left
 padding, rotary, windows, softcap, or autograd.
 
-One strict speculative-decoding slice handles two query tokens with a dense
-cache: causal bf16 `(1, 2, 1024, 32, 8, 128)`. It accepts either the default or
-a custom `softmax_scale` and uses the generic packed Triton runtime. The
-read-only form requires the full cache. It also accepts a paired two-token K/V
-update only at `cache_seqlens=1022`, filling slots 1022 and 1023 before
-attention. Full-head interleaved rotary tables optionally rotate Q and the
-appended K at positions 1022 and 1023. This path remains output-only: LSE,
-other update positions or lengths, partial or GPT-NeoX rotary, cache remapping,
-autograd, noncausal mode, and every other multi-token KV-cache shape remain
-unsupported.
+Two strict speculative-decoding slices use the generic packed Triton runtime
+with a dense cache. Causal bf16 `(1, 2, 1024, 32, 8, 128)` accepts either the
+default or a custom `softmax_scale`; its read-only form requires the full cache.
+It also accepts a paired two-token K/V update only at `cache_seqlens=1022`,
+filling slots 1022 and 1023 before attention. Full-head interleaved rotary
+tables optionally rotate Q and the appended K at positions 1022 and 1023.
+Causal bf16 `(1, 4, 1024, 32, 8, 128)` is strictly read-only and accepts an
+omitted or full scalar cache length with either scale. The four-token path
+never mutates cache storage. It does not support LSE, updates, partial or
+tensor-valued lengths, rotary, cache remapping, autograd, or noncausal mode;
+other query lengths remain unsupported.
 
 For supported slope-free single-token dense caches, pass
 `return_softmax_lse=True` to receive `(out, softmax_lse)`. The LSE is fp32 with
@@ -369,8 +370,9 @@ The append mutates both dense caches in place and attends over the updated full
 cache. The exact two-token profile above similarly accepts paired K/V tensors
 shaped `[1, 2, 8, 128]` when the Python integer `cache_seqlens` is 1022, and
 mutates only the final two slots. Dense read-only calls may omit
-`cache_seqlens` or pass the full cache length; the exact 16K profile above
-additionally accepts its documented tensor prefix or left-padded span.
+`cache_seqlens` or pass the full cache length, including the exact four-token
+profile above; the exact 16K profile additionally accepts its documented tensor
+prefix or left-padded span.
 Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`; the
 two-token update must satisfy `cache_seqlens + 2 == 1024`. Other multi-token
 updates, scalar partial lengths, and tensor lengths on every other dense
@@ -665,7 +667,8 @@ also raise `NotImplementedError` rather than silently doing something else:
   with LSE, softcap, updates, rotary, or autograd and is not supported with
   other page sizes
 - KV-cache mutation beyond the dense paired one-token final-slot append and
-  exact two-token final-two-slot append above;
+  exact two-token final-two-slot append above; the exact four-token profile is
+  read-only;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
   partial caches, `cache_leftpad` outside that profile or combined with updates,
   remapping, rotary, or autograd, paged profiles and page sizes other than the

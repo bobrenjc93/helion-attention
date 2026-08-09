@@ -151,6 +151,9 @@ _TENSOR_LENGTH_DENSE_KVCACHE_KEY = (
 _TWO_TOKEN_DENSE_KVCACHE_KEY = (
     "b1_sq2_sk1024_hq32_hkv8_d128_bf16_causal"
 )
+_FOUR_TOKEN_DENSE_KVCACHE_KEY = (
+    "b1_sq4_sk1024_hq32_hkv8_d128_bf16_causal"
+)
 _DENSE_KVCACHE_ALIBI_PROFILE = (
     1,
     1,
@@ -2234,6 +2237,12 @@ def flash_attn_with_kvcache(
     LSE, partial read-only lengths, partial or non-interleaved rotary,
     remapping, autograd, or noncausal attention.
 
+    A separate read-only speculative-decoding slice accepts exactly four query
+    tokens: causal bf16 ``(1, 4, 1024, 32, 8, 128)`` with a full dense cache.
+    It also uses the generic packed runtime and supports the default or a custom
+    softmax scale. This profile does not support LSE, cache updates, partial or
+    tensor-valued lengths, rotary, remapping, autograd, or noncausal attention.
+
     Two read-only paged profiles are also exposed with an int32 CUDA
     ``cache_seqlens`` tensor shaped ``[batch]`` and ``block_table``. Bf16
     ``(2, 200, 320, 8, 2, 128)`` accepts page-size-16 caches and supports only
@@ -2381,12 +2390,29 @@ def flash_attn_with_kvcache(
                 "KV-cache ALiBi"
             )
     is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
-    if not spec.is_decode and not is_two_token_dense_profile:
+    is_four_token_dense_profile = spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
+    if (
+        not spec.is_decode
+        and not is_two_token_dense_profile
+        and not is_four_token_dense_profile
+    ):
         raise NotImplementedError(
             "flash_attn_with_kvcache supports multi-token dense queries only "
-            "for causal bf16 (1, 2, 1024, 32, 8, 128); all other dense "
-            "profiles require seqlen_q=1 with a non-empty cache"
+            "for causal bf16 (1, 2, 1024, 32, 8, 128) and "
+            "(1, 4, 1024, 32, 8, 128); all other dense profiles require "
+            "seqlen_q=1 with a non-empty cache"
         )
+    if is_four_token_dense_profile:
+        if append_kv:
+            raise NotImplementedError(
+                "the four-token dense KV-cache profile is read-only; cache "
+                "updates are not implemented"
+            )
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "return_softmax_lse is not implemented for the four-token "
+                "dense KV-cache profile"
+            )
     if is_two_token_dense_profile:
         if return_softmax_lse:
             raise NotImplementedError(
@@ -2585,6 +2611,22 @@ def flash_attn_with_kvcache(
             scale,
             spec,
             alibi_slopes,
+        )
+
+    if is_four_token_dense_profile:
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError(
+                "the four-token dense KV-cache profile does not support autograd"
+            )
+        return _generic_dense_forward(
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            spec,
+            None,
         )
 
     if is_two_token_dense_profile:
