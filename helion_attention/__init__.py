@@ -11,8 +11,8 @@ direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
 profiles, and diagnostics on the shipped causal varlen profile use a generic
 Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
-forward-only Gemma-2 profile. The exposed page-16 decode cache uses the generic
-paged runtime when ALiBi is supplied.
+forward-only Gemma-2 profile. Both exposed page-16 paged KV-cache profiles use
+the generic paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -1479,11 +1479,12 @@ def _paged_kvcache_forward(
             "nheads=8 (GQA 8:2) head_dim=128 decode profile"
         )
     if alibi_slopes is not None:
-        if requested != _CORE_PAGED_KVCACHE_SHAPE:
+        if requested not in _CORE_PAGED_KVCACHE_SHAPES:
             raise NotImplementedError(
                 "paged KV-cache ALiBi is implemented only for the bf16 "
-                "page-size-16 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 "
-                "(GQA 8:2) head_dim=128 decode profile"
+                "page-size-16 batch=2 seqlen_q=200 seqlen_k=320 "
+                "chunked-prefill and batch=4 seqlen_q=1 seqlen_k=1024 "
+                "decode profiles with nheads=8 (GQA 8:2) head_dim=128"
             )
         if return_softmax_lse:
             raise NotImplementedError(
@@ -1684,9 +1685,9 @@ def flash_attn_with_kvcache(
     Bf16 ``(4, 1, 1024, 8, 2, 128)`` supports both causal modes, which are
     equivalent for single-token bottom-right decode. Slope-free output-only
     calls route through :func:`flash_attn_varlen_func`; both profiles support
-    ragged logical caches. The decode profile additionally accepts forward-only
-    fp32 ALiBi slopes shaped ``[8]`` or ``[4, 8]`` through the generic paged
-    runtime.
+    ragged logical caches. Both profiles additionally accept forward-only fp32
+    ALiBi slopes shaped ``[8]`` or ``[batch, 8]`` through the generic paged
+    runtime (``[2, 8]`` for chunked prefill and ``[4, 8]`` for decode).
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
@@ -1715,10 +1716,9 @@ def flash_attn_with_kvcache(
     GPT-NeoX layout requires full-head rotation. Both layouts rotate ``q`` and
     the appended ``k`` at ``cache_seqlens``. Read-only rotary calls and other
     paged profiles fail explicitly. Paged updates, rotary, and autograd are
-    unsupported for both paged profiles. Paged ALiBi is unsupported for chunked
-    prefill, updates, LSE returns, other profiles, and other page sizes. Paged
-    softmax LSE is unsupported for chunked prefill, other profiles, and other
-    page sizes.
+    unsupported for both paged profiles. Paged ALiBi is unsupported for updates,
+    LSE returns, other profiles, and other page sizes. Paged softmax LSE is
+    unsupported for chunked prefill, other profiles, and other page sizes.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")

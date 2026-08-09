@@ -142,8 +142,8 @@ both the unpacked API and the varlen QKV/KV-packed adapters accept them, with
 either the default or a custom `softmax_scale`. ALiBi calls use the generic
 packed Triton runtime, while `alibi_slopes=None` retains the checked-in generated
 specialization. Other varlen profiles and paged calls made directly through the
-core varlen API still reject ALiBi explicitly; the narrow KV-cache decode path
-described below is the only paged exception.
+core varlen API still reject ALiBi explicitly; the narrow KV-cache paths
+described below are the only paged exceptions.
 
 Zero-dropout backward is supported for both causal modes of the bf16
 `(8, 512, 512, 16, 16, 64)` varlen profile only when all eight query and key
@@ -222,8 +222,9 @@ Two exact bf16 profiles also accept a read-only page-size-16 cache through
 select a different used length. Logical pages can map to physical cache pages
 in any order. Queries use dense BSHD layout and results are returned in that
 same layout. Chunked prefill uses bottom-right causal alignment. For decode,
-the default `causal=False` is equivalent to `causal=True`. That decode profile
-also accepts forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]`:
+the default `causal=False` is equivalent to `causal=True`. Both profiles also
+accept forward-only fp32 ALiBi slopes shaped `[8]` or `[batch, 8]` (`[2, 8]`
+for chunked prefill and `[4, 8]` for decode):
 
 ```python
 B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 16
@@ -249,13 +250,12 @@ out = helion_attention.flash_attn_with_kvcache(
 ```
 
 Slope-free output-only calls on these narrow paged paths route through their
-checked-in paged-varlen kernels. ALiBi decode calls use the generic single-launch
-paged runtime, as does requesting LSE without ALiBi; the latter returns fp32
+checked-in paged-varlen kernels. ALiBi calls use the generic single-launch paged
+runtime, as does requesting LSE without ALiBi; the latter returns fp32
 `[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. Neither path mutates the
 cache. ALiBi with LSE, paged updates, rotary, and autograd are rejected before
-dispatch. ALiBi on chunked prefill, LSE on chunked prefill, non-causal chunked
-prefill, every other paged profile, and every other page size are also rejected
-before dispatch.
+dispatch. LSE on chunked prefill, non-causal chunked prefill, every other paged
+profile, and every other page size are also rejected before dispatch.
 
 The dense decode path also appends one paired K/V token when a scalar cache
 length points at the final slot declared by `shape`:
@@ -543,8 +543,8 @@ doing something else:
   softcap cannot be combined with dropout, ALiBi, or diagnostic returns
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
-  the exact read-only page-size-16 decode profile above; paged ALiBi cannot be
-  combined with LSE, updates, rotary, or autograd
+  the exact read-only page-size-16 profiles above; paged ALiBi cannot be combined
+  with LSE, updates, rotary, or autograd
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
   partial caches, `cache_leftpad` outside that profile or combined with updates,
