@@ -125,7 +125,7 @@ specialization. Other varlen profiles and paged calls made directly through the
 core varlen API still reject ALiBi explicitly; the narrow KV-cache decode path
 described below is the only paged exception.
 
-Zero-dropout backward is supported for the noncausal bf16
+Zero-dropout backward is supported for both causal modes of the bf16
 `(8, 512, 512, 16, 16, 64)` varlen profile only when all eight query and key
 sequences have length 512 (so their valid cumulative offsets are
 `[0, 512, ..., 4096]`). That narrow case views the packed tensors as a dense
@@ -133,9 +133,9 @@ batch and uses PyTorch SDPA autograd for the forward and Q/K/V gradients; both
 the default and a custom `softmax_scale` are supported, including during CUDA
 graph capture. The varlen QKV/KV-packed adapters inherit the same support.
 Calls that do not require gradients continue to use the generated varlen
-kernel, including full-length calls. Ragged, causal, deterministic, paged,
-ALiBi, diagnostic-return, and positive-dropout varlen backward calls remain
-explicitly unsupported.
+kernel, including full-length calls. Ragged, deterministic, paged, ALiBi,
+diagnostic-return, and positive-dropout varlen backward calls remain explicitly
+unsupported.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
 profiles when `block_table` is supplied. Both use bf16 page-size-16 caches in
@@ -493,13 +493,12 @@ its checked-in generated backward when dropout is zero and PyTorch SDPA
 autograd when `0 < dropout_p < 1`. Default-option dense MHA, GQA, and
 cross-attention calls without a generated backward also use PyTorch SDPA
 autograd, including fp16/bf16 and bottom-right causal masking. Packed varlen
-calls remain forward-only except for the exact full-length noncausal profile
+calls remain forward-only except for the two exact full-length profiles
 described above; KV-cache calls remain forward-only. These unsupported
 FlashAttention features also raise `NotImplementedError` rather than silently
 doing something else:
 
-- backward for dense or varlen ALiBi, ragged or causal varlen batches, and
-  KV-cache calls
+- backward for dense or varlen ALiBi, ragged varlen batches, and KV-cache calls
 - `deterministic=True` when using the dense or full-length varlen SDPA autograd
   fallback
 - dropout outside the exact encoder-training profile above, or combined with

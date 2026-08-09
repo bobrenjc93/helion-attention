@@ -12,9 +12,9 @@ dense ALiBi calls, ALiBi on both shipped varlen profiles, and diagnostics on the
 shipped causal varlen profile use a generic Triton forward kernel. The exposed
 page-16 decode cache also uses the generic paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
-calls without a generated backward, and the full-length noncausal varlen
-encoder profile use PyTorch SDPA autograd. The explicit shape validates these
-paths and makes specialization introspection independent of fallback coverage.
+calls without a generated backward, and both full-length varlen profiles use
+PyTorch SDPA autograd. The explicit shape validates these paths and makes
+specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -101,8 +101,11 @@ _VARLEN_ALIBI_KEYS = frozenset(
     }
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
-_VARLEN_SDPA_BACKWARD_KEY = (
-    "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+_VARLEN_SDPA_BACKWARD_KEYS = frozenset(
+    {
+        "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
+        "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
+    }
 )
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
@@ -817,12 +820,12 @@ def flash_attn_varlen_func(
     and an empty bf16 ``S_dmask``, matching FlashAttention 2 when dropout is
     zero.
 
-    The noncausal version supports zero-dropout backward when all eight query
-    and key sequences have length 512. That exact full-length layout is
-    reshaped to dense BSHD and uses PyTorch SDPA autograd. Ragged, causal,
-    deterministic, paged, ALiBi, and diagnostic varlen backward remain
-    unsupported. Calls that do not need backward retain the generated packed
-    kernel, including full-length calls.
+    Both causal modes support zero-dropout backward when all eight query and
+    key sequences have length 512. That exact full-length layout is reshaped
+    to dense BSHD and uses PyTorch SDPA autograd. Ragged, deterministic, paged,
+    ALiBi, and diagnostic varlen backward remain unsupported. Calls that do
+    not need backward retain the generated packed kernel, including
+    full-length calls.
     """
     _reject_unsupported(
         dropout_p,
@@ -922,10 +925,11 @@ def flash_attn_varlen_func(
                 "ALiBi backward is not implemented; varlen ALiBi calls are "
                 "forward-only"
             )
-        if f"varlen_{spec.key}" != _VARLEN_SDPA_BACKWARD_KEY:
+        if f"varlen_{spec.key}" not in _VARLEN_SDPA_BACKWARD_KEYS:
+            supported = ", ".join(sorted(_VARLEN_SDPA_BACKWARD_KEYS))
             raise NotImplementedError(
                 "varlen backward is implemented only for "
-                f"{_VARLEN_SDPA_BACKWARD_KEY} with eight full-length "
+                f"{supported} with eight full-length "
                 "sequences"
             )
         if deterministic:
