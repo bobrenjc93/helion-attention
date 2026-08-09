@@ -1183,6 +1183,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:52f765cbca64726d38b3937d0f51897c311a3397",
+      "commit": "52f765cbca64726d38b3937d0f51897c311a3397",
+      "recordedAt": "2026-08-09T02:37:33.089Z",
+      "label": "base 52f765c",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 81,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:52",
+      "recordedAt": "2026-08-09T02:37:33.089Z",
+      "label": "PR #52",
+      "kind": "leaf",
+      "prNumber": 52,
+      "title": "Fast-path B2 8K causal MHA with cuDNN",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 82,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
