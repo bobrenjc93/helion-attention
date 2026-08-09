@@ -7,6 +7,8 @@ import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
+from threading import Event
+from threading import local
 
 import pytest
 import torch
@@ -2178,60 +2180,92 @@ def test_bert_deterministic_training_dispatch_is_narrow(
     assert dispatched == [expected_dispatch]
 
 
-def test_math_sdpa_backend_selection_is_scoped(
+@requires_cuda
+def test_deterministic_math_sdpa_is_thread_safe_and_preserves_backend_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = AttnShape(1, 2, 2, 1, 1, 8, torch.bfloat16, False)
-    q = torch.randn(1, 2, 1, 8, dtype=torch.bfloat16)
-    flags_before = (
-        torch.backends.cuda.flash_sdp_enabled(),
-        torch.backends.cuda.mem_efficient_sdp_enabled(),
-        torch.backends.cuda.math_sdp_enabled(),
-        torch.backends.cuda.cudnn_sdp_enabled(),
-    )
-    configured_flags = (False, True, False, True)
-    observed_flags: list[tuple[bool, bool, bool, bool]] = []
+    spec = BERT_DIAGNOSTIC
+    base_q, base_k, base_v = make_inputs(spec, seed=112358)
+    grad_out = make_inputs(spec, seed=132134)[0]
+
+    def sdpa_flags() -> tuple[bool, bool, bool, bool]:
+        return (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+        )
+
+    # The old sdpa_kernel context was process-wide. This wrapper would hold two
+    # context-based calls inside the public dispatcher long enough to overlap.
+    # The direct ATen math operator bypasses that dispatcher, so concurrent
+    # calls never enter it or alter the caller's disabled-backend state.
+    thread_role = local()
+    start = Barrier(2)
+    second_in_dispatch = Event()
+    first_returned = Event()
+    public_sdpa_calls: list[str] = []
     original_sdpa = torch.nn.functional.scaled_dot_product_attention
 
-    def observing_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
-        observed_flags.append(
-            (
-                torch.backends.cuda.flash_sdp_enabled(),
-                torch.backends.cuda.mem_efficient_sdp_enabled(),
-                torch.backends.cuda.math_sdp_enabled(),
-                torch.backends.cuda.cudnn_sdp_enabled(),
-            )
-        )
+    def synchronized_public_sdpa(
+        *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        role = str(thread_role.name)
+        public_sdpa_calls.append(role)
+        if role == "first":
+            assert second_in_dispatch.wait(timeout=10)
+        else:
+            second_in_dispatch.set()
+            assert first_returned.wait(timeout=10)
         return original_sdpa(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(
         torch.nn.functional,
         "scaled_dot_product_attention",
-        observing_sdpa,
+        synchronized_public_sdpa,
     )
+
+    def run(role: str) -> tuple[torch.Tensor, ...]:
+        thread_role.name = role
+        q = base_q.detach().requires_grad_()
+        k = base_k.detach().requires_grad_()
+        v = base_v.detach().requires_grad_()
+        start.wait()
+        try:
+            out = helion_attention.flash_attn_func(
+                q, k, v, deterministic=True, shape=spec
+            )
+            if role == "first":
+                first_returned.set()
+            grads = torch.autograd.grad(out, (q, k, v), grad_out)
+            return (out.detach(), *(grad.detach() for grad in grads))
+        finally:
+            if role == "first":
+                first_returned.set()
+
+    flags_before = sdpa_flags()
+    configured_flags = (False, False, False, False)
     try:
         torch.backends.cuda.enable_flash_sdp(configured_flags[0])
         torch.backends.cuda.enable_mem_efficient_sdp(configured_flags[1])
         torch.backends.cuda.enable_math_sdp(configured_flags[2])
         torch.backends.cuda.enable_cudnn_sdp(configured_flags[3])
 
-        out = helion_attention.dense_attention_math_sdpa(
-            q, q, q, 1.0 / math.sqrt(spec.head_dim), spec
-        )
-        flags_after = (
-            torch.backends.cuda.flash_sdp_enabled(),
-            torch.backends.cuda.mem_efficient_sdp_enabled(),
-            torch.backends.cuda.math_sdp_enabled(),
-            torch.backends.cuda.cudnn_sdp_enabled(),
-        )
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(run, role) for role in ("first", "second")]
+            first, second = (future.result() for future in futures)
+        flags_after = sdpa_flags()
     finally:
         torch.backends.cuda.enable_flash_sdp(flags_before[0])
         torch.backends.cuda.enable_mem_efficient_sdp(flags_before[1])
         torch.backends.cuda.enable_math_sdp(flags_before[2])
         torch.backends.cuda.enable_cudnn_sdp(flags_before[3])
 
-    assert out.shape == q.shape
-    assert observed_flags == [(False, False, True, False)]
+    assert all(
+        torch.equal(actual, repeated)
+        for actual, repeated in zip(first, second)
+    )
+    assert public_sdpa_calls == []
     assert flags_after == configured_flags
 
 

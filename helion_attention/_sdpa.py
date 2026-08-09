@@ -5,13 +5,18 @@ from __future__ import annotations
 from typing import TypeVar
 
 import torch
-from torch.nn.attention import SDPBackend
-from torch.nn.attention import sdpa_kernel
 from torch.nn.attention.bias import causal_lower_right
 
 from ._shape import AttnShape
 
 _Mask = TypeVar("_Mask")
+
+# Unlike the public SDPA dispatcher, this composite autograd operator always
+# runs the math implementation and never consults or mutates process-wide CUDA
+# backend flags. PyTorch 2.5+, the package minimum, exposes it on every backend.
+_MATH_ATTENTION_FORWARD = (
+    torch.ops.aten._scaled_dot_product_attention_math.default
+)
 
 try:
     # This is the BSHD Flash operator underlying PyTorch's fused SDPA path. It
@@ -276,6 +281,25 @@ def dense_attention_math_sdpa(
     softmax_scale: float,
     spec: AttnShape,
 ) -> torch.Tensor:
-    """Run SDPA autograd with only its deterministic math backend enabled."""
-    with sdpa_kernel(SDPBackend.MATH):
-        return dense_attention_sdpa(q, k, v, softmax_scale, spec)
+    """Run deterministic math SDPA without changing global backend flags."""
+    query = q.transpose(1, 2)
+    key = k.transpose(1, 2)
+    value = v.transpose(1, 2)
+    enable_gqa = spec.nheads_q != spec.nheads_kv
+
+    # The target profile is equal-length noncausal MHA. Pass those validated
+    # semantics explicitly while preserving FlashAttention's input dtype under
+    # any active cross-dtype autocast context.
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        out = _MATH_ATTENTION_FORWARD(
+            query,
+            key,
+            value,
+            None,
+            0.0,
+            spec.causal,
+            None,
+            scale=softmax_scale,
+            enable_gqa=enable_gqa,
+        )[0]
+    return out.transpose(1, 2).contiguous()

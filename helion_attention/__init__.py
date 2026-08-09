@@ -23,9 +23,10 @@ back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, both
 full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. Deterministic zero-dropout BERT-base training pins that fallback to
-the math backend. The explicit shape validates these paths and makes
-specialization introspection independent of fallback coverage.
+autograd. Deterministic zero-dropout BERT-base training uses the direct math
+operator without changing process-wide SDPA backend state. The explicit shape
+validates these paths and makes specialization introspection independent of
+fallback coverage.
 """
 
 from __future__ import annotations
@@ -1286,8 +1287,8 @@ def flash_attn_func(
     calls use direct cuDNN SDPA. All five paths fall back to their generated
     kernels when ineligible. Grad-enabled calls without ALiBi or a generated
     backward, plus supported positive-dropout calls, use PyTorch SDPA autograd.
-    Deterministic zero-dropout training on the exact BERT-base profile uses the
-    PyTorch math SDPA backend for repeatable output and gradients.
+    Deterministic zero-dropout training on the exact BERT-base profile uses
+    PyTorch's direct math SDPA operator for repeatable output and gradients.
     Zero-dropout training on the shipped encoder profile retains generated
     forward values. Its omitted/default-scale SM90 path uses raw BSHD PyTorch
     Flash gradients, falling back to the generated backward when Flash is
