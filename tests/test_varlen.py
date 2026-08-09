@@ -173,6 +173,56 @@ def make_ragged_self_packed(
     return q, k, v, _cumulative(lengths, q.device), lengths
 
 
+def make_ragged_cross_packed(
+    spec: AttnShape, *, seed: int = 123
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[int],
+    list[int],
+]:
+    lengths_q = [512, 401, 300, 255, 128, 63, 17, 1]
+    lengths_k = [3, 29, 97, 191, 257, 319, 443, 511]
+    assert spec.batch == len(lengths_q) == len(lengths_k)
+    assert max(lengths_q) <= spec.seqlen_q
+    assert max(lengths_k) <= spec.seqlen_k
+    assert all(
+        q_length != k_length
+        for q_length, k_length in zip(lengths_q, lengths_k)
+    )
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(
+        (sum(lengths_q), spec.nheads_q, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    k = torch.randn(
+        (sum(lengths_k), spec.nheads_kv, spec.head_dim),
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    v = torch.randn(
+        k.shape,
+        device="cuda",
+        dtype=spec.dtype,
+        generator=generator,
+    )
+    return (
+        q,
+        k,
+        v,
+        _cumulative(lengths_q, q.device),
+        _cumulative(lengths_k, q.device),
+        lengths_q,
+        lengths_k,
+    )
+
+
 def make_paged_inputs(
     spec: AttnShape,
     lengths_q: list[int],
@@ -589,21 +639,147 @@ def test_varlen_packed_entry_points_match_unpacked(
 
 
 @requires_cuda
-def test_ragged_varlen_kvpacked_rejects_cross_attention_gradients() -> None:
+@pytest.mark.parametrize(
+    "entry_point", ["unpacked", "kv-packed"], ids=["unpacked", "kv-packed"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_ragged_causal_varlen_cross_attention_backward_matches_fp32_and_fa2(
+    entry_point: str, softmax_scale: float | None
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
     spec = VARLEN_ALIBI_CAUSAL
-    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
-    kv = torch.stack((k, v), dim=1).requires_grad_()
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_ragged_cross_packed(
+        spec, seed=20260809
+    )
+    generator = torch.Generator(device=q.device).manual_seed(20260810)
+    grad_out = torch.randn(
+        q.shape,
+        device=q.device,
+        dtype=q.dtype,
+        generator=generator,
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
 
-    with pytest.raises(NotImplementedError, match="cross-attention.*forward-only"):
-        helion_attention.flash_attn_varlen_kvpacked_func(
+    if entry_point == "unpacked":
+        q.requires_grad_()
+        k.requires_grad_()
+        v.requires_grad_()
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            shape=spec,
+        )
+        got_inputs = (q, k, v)
+
+        q_ref = q.float().detach().requires_grad_()
+        k_ref = k.float().detach().requires_grad_()
+        v_ref = v.float().detach().requires_grad_()
+        expected = reference_packed(
+            q_ref,
+            k_ref,
+            v_ref,
+            lengths_q,
+            lengths_k,
+            causal=True,
+            scale=scale,
+        )
+        reference_inputs = (q_ref, k_ref, v_ref)
+
+        q_fa2 = q.detach().requires_grad_()
+        k_fa2 = k.detach().requires_grad_()
+        v_fa2 = v.detach().requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_varlen_func(
+            q_fa2,
+            k_fa2,
+            v_fa2,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+        fa2_inputs = (q_fa2, k_fa2, v_fa2)
+    else:
+        q.requires_grad_()
+        kv = torch.stack((k, v), dim=1).requires_grad_()
+        got = helion_attention.flash_attn_varlen_kvpacked_func(
             q,
             kv,
             cu_q,
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=spec.causal,
+            softmax_scale=softmax_scale,
+            causal=True,
             shape=spec,
+        )
+        got_inputs = (q, kv)
+
+        q_ref = q.float().detach().requires_grad_()
+        kv_ref = kv.float().detach().requires_grad_()
+        k_ref, v_ref = (kv_ref[:, index] for index in range(2))
+        expected = reference_packed(
+            q_ref,
+            k_ref,
+            v_ref,
+            lengths_q,
+            lengths_k,
+            causal=True,
+            scale=scale,
+        )
+        reference_inputs = (q_ref, kv_ref)
+
+        q_fa2 = q.detach().requires_grad_()
+        kv_fa2 = kv.detach().requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_varlen_kvpacked_func(
+            q_fa2,
+            kv_fa2,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+        fa2_inputs = (q_fa2, kv_fa2)
+
+    got_grads = torch.autograd.grad(got, got_inputs, grad_out)
+    expected_grads = torch.autograd.grad(
+        expected, reference_inputs, grad_out.float()
+    )
+    expected_fa2_grads = torch.autograd.grad(
+        expected_fa2, fa2_inputs, grad_out
+    )
+
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    assert got.is_contiguous()
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+    for actual, reference, reference_fa2 in zip(
+        got_grads, expected_grads, expected_fa2_grads
+    ):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=8e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            actual.float(), reference_fa2.float(), atol=5e-2, rtol=2e-2
         )
 
 
@@ -1208,6 +1384,59 @@ def test_ragged_causal_no_grad_softcap_zero_retains_generated_dispatch(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "name",
+    ["flash_attn_varlen_func", "flash_attn_varlen_kvpacked_func"],
+    ids=["unpacked", "kv-packed"],
+)
+def test_ragged_causal_cross_attention_no_grad_retains_generated_dispatch(
+    name: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = VARLEN_ALIBI_CAUSAL
+    q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(spec)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[object, ...]] = []
+
+    def generated(*args: object) -> torch.Tensor:
+        calls.append(args)
+        return sentinel
+
+    def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("no-grad ragged cross-attention reached SDPA")
+
+    monkeypatch.setattr(helion_attention, "lookup_varlen", lambda _spec: generated)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    with torch.no_grad():
+        if name == "flash_attn_varlen_func":
+            out = helion_attention.flash_attn_varlen_func(
+                q.requires_grad_(),
+                k.requires_grad_(),
+                v.requires_grad_(),
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=True,
+                shape=spec,
+            )
+        else:
+            kv = torch.stack((k, v), dim=1).requires_grad_()
+            out = helion_attention.flash_attn_varlen_kvpacked_func(
+                q.requires_grad_(),
+                kv,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=True,
+                shape=spec,
+            )
+
+    assert out is sentinel
+    assert len(calls) == 1
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
 )
 def test_full_varlen_backward_rejects_deterministic(
@@ -1240,7 +1469,6 @@ def test_full_varlen_backward_rejects_deterministic(
     ("case", "message"),
     [
         ("noncausal", "causal.*profile"),
-        ("cross-attention", "identical.*cross-attention"),
         ("empty", "nonempty"),
         ("deterministic", "deterministic=True"),
     ],
@@ -1253,15 +1481,12 @@ def test_ragged_varlen_backward_rejects_out_of_scope_calls(
         if case == "noncausal"
         else VARLEN_ALIBI_CAUSAL
     )
-    if case == "cross-attention":
-        q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
-    else:
-        q, k, v, cu_q, _ = make_ragged_self_packed(spec)
-        if case == "empty":
-            cu_q = _cumulative(
-                [512, 401, 300, 255, 128, 63, 18, 0], q.device
-            )
-        cu_k = cu_q.clone()
+    q, k, v, cu_q, _ = make_ragged_self_packed(spec)
+    if case == "empty":
+        cu_q = _cumulative(
+            [512, 401, 300, 255, 128, 63, 18, 0], q.device
+        )
+    cu_k = cu_q.clone()
     q.requires_grad_()
 
     def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
@@ -2303,11 +2528,18 @@ def test_full_varlen_grad_enabled_supports_cuda_graph_capture(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "attention", ["self", "cross"], ids=["self-attention", "cross-attention"]
+)
 def test_ragged_causal_backward_rejects_cuda_graph_capture(
-    monkeypatch: pytest.MonkeyPatch,
+    attention: str, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = VARLEN_ALIBI_CAUSAL
-    q, k, v, cu_seqlens, _ = make_ragged_self_packed(spec)
+    if attention == "self":
+        q, k, v, cu_q, _ = make_ragged_self_packed(spec)
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(spec)
     q.requires_grad_()
 
     def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
@@ -2323,8 +2555,8 @@ def test_ragged_causal_backward_rejects_cuda_graph_capture(
                 q,
                 k,
                 v,
-                cu_seqlens,
-                cu_seqlens,
+                cu_q,
+                cu_k,
                 spec.seqlen_q,
                 spec.seqlen_k,
                 causal=True,

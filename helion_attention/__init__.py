@@ -18,7 +18,7 @@ Default-scale SM90 training on the shipped encoder profile keeps its generated
 forward values and uses raw PyTorch BSHD Flash gradients, falling back to its
 generated backward when Flash is unavailable. Positive dropout on that profile,
 grad-enabled dense calls without a generated backward, both full-length varlen
-profiles, and ragged causal self-attention use PyTorch SDPA autograd. The
+profiles, and ragged causal attention use PyTorch SDPA autograd. The
 explicit shape validates these paths and makes specialization introspection
 independent of fallback coverage.
 """
@@ -510,14 +510,14 @@ def _has_full_varlen_token_totals(
     )
 
 
-def _ragged_varlen_self_attention_lengths(
+def _ragged_varlen_attention_lengths(
     q: torch.Tensor,
     k: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     spec: AttnShape,
-) -> tuple[int, ...]:
-    """Validate and return the bounded ragged self-attention lengths.
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Validate and return the bounded ragged query and key lengths.
 
     Reading cumulative offsets on the host is intentionally confined to this
     training-only fallback. Inference retains the generated packed kernel, and
@@ -532,64 +532,84 @@ def _ragged_varlen_self_attention_lengths(
         offsets_q = tuple(cu_seqlens_q.tolist())
         offsets_k = tuple(cu_seqlens_k.tolist())
 
-    if offsets_q != offsets_k:
-        raise NotImplementedError(
-            "ragged varlen backward requires identical cu_seqlens_q and "
-            "cu_seqlens_k; cross-attention offsets remain forward-only"
-        )
     if (
         offsets_q[0] != 0
         or offsets_q[-1] != q.shape[0]
-        or offsets_q[-1] != k.shape[0]
+        or offsets_k[0] != 0
+        or offsets_k[-1] != k.shape[0]
     ):
         raise ValueError(
             "cu_seqlens_q/cu_seqlens_k must start at zero and end at the "
             "corresponding packed token totals"
         )
 
-    lengths = tuple(
+    lengths_q = tuple(
         stop - start for start, stop in zip(offsets_q, offsets_q[1:])
     )
-    if any(length < 0 for length in lengths):
+    lengths_k = tuple(
+        stop - start for start, stop in zip(offsets_k, offsets_k[1:])
+    )
+    if any(length < 0 for length in (*lengths_q, *lengths_k)):
         raise ValueError(
             "cu_seqlens_q/cu_seqlens_k must be monotonically nondecreasing"
         )
-    if any(length == 0 for length in lengths):
+    if any(length == 0 for length in (*lengths_q, *lengths_k)):
         raise NotImplementedError(
-            "ragged varlen backward requires all eight sequences to be nonempty"
+            "ragged varlen backward requires all eight query and key "
+            "sequences to be nonempty"
         )
-    if any(length > spec.seqlen_q for length in lengths):
+    if any(length > spec.seqlen_q for length in lengths_q) or any(
+        length > spec.seqlen_k for length in lengths_k
+    ):
         raise ValueError(
             "cu_seqlens_q/cu_seqlens_k contain a sequence longer than the "
-            f"declared maximum {spec.seqlen_q}"
+            "corresponding declared maximum "
+            f"({spec.seqlen_q}, {spec.seqlen_k})"
         )
-    return lengths
+    return lengths_q, lengths_k
 
 
 def _ragged_varlen_attention_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    lengths: tuple[int, ...],
+    lengths_q: tuple[int, ...],
+    lengths_k: tuple[int, ...],
     softmax_scale: float,
     spec: AttnShape,
 ) -> torch.Tensor:
-    """Run the eight validated self-attention sequences through SDPA."""
-    q_sequences = torch.split(q, lengths)
-    k_sequences = torch.split(k, lengths)
-    v_sequences = torch.split(v, lengths)
-    outputs = [
-        dense_attention_sdpa(
-            q_sequence.unsqueeze(0),
-            k_sequence.unsqueeze(0),
-            v_sequence.unsqueeze(0),
-            softmax_scale,
-            spec,
-        ).squeeze(0)
-        for q_sequence, k_sequence, v_sequence in zip(
-            q_sequences, k_sequences, v_sequences
+    """Run the eight validated ragged sequences through SDPA."""
+    q_sequences = torch.split(q, lengths_q)
+    k_sequences = torch.split(k, lengths_k)
+    v_sequences = torch.split(v, lengths_k)
+    outputs: list[torch.Tensor] = []
+    for q_sequence, k_sequence, v_sequence, seqlen_q, seqlen_k in zip(
+        q_sequences, k_sequences, v_sequences, lengths_q, lengths_k
+    ):
+        # Preserve the established self-attention call exactly. Unequal
+        # sequences need their actual lengths in the SDPA adapter so causal
+        # masking uses FlashAttention's bottom-right alignment.
+        sequence_spec = spec
+        if seqlen_q != seqlen_k:
+            sequence_spec = AttnShape(
+                batch=1,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                nheads_q=spec.nheads_q,
+                nheads_kv=spec.nheads_kv,
+                head_dim=spec.head_dim,
+                dtype=spec.dtype,
+                causal=spec.causal,
+            )
+        outputs.append(
+            dense_attention_sdpa(
+                q_sequence.unsqueeze(0),
+                k_sequence.unsqueeze(0),
+                v_sequence.unsqueeze(0),
+                softmax_scale,
+                sequence_spec,
+            ).squeeze(0)
         )
-    ]
     return torch.cat(outputs)
 
 
@@ -1328,13 +1348,13 @@ def flash_attn_varlen_func(
 
     Both causal modes support zero-dropout backward when all eight query and
     key sequences have length 512. The causal profile additionally supports
-    eight nonempty self-attention sequences of length at most 512 when query
-    and key cumulative offsets are identical. Full-length inputs are reshaped
-    to one dense BSHD call; ragged inputs use eight bounded PyTorch SDPA calls.
-    Ragged noncausal and cross-attention offsets, graph-captured ragged calls,
-    deterministic mode, paged caches, ALiBi, and diagnostic varlen backward
-    remain unsupported. Calls that do not need backward retain the generated
-    packed kernel, including ragged and full-length calls.
+    independent query and key cumulative offsets describing eight nonempty
+    sequences of length at most 512. Full-length inputs are reshaped to one
+    dense BSHD call; ragged inputs use eight bounded PyTorch SDPA calls. Ragged
+    noncausal, graph-captured ragged, deterministic, paged, ALiBi, and
+    diagnostic varlen backward remain unsupported. Calls that do not need
+    backward retain the generated packed kernel, including ragged and
+    full-length calls.
     """
     _reject_unsupported(
         dropout_p,
@@ -1470,17 +1490,19 @@ def flash_attn_varlen_func(
         ):
             raise NotImplementedError(
                 "ragged varlen backward is implemented only for the causal "
-                "bf16 (8, 512, 512, 16, 16, 64) self-attention profile; "
+                "bf16 (8, 512, 512, 16, 16, 64) profile; "
                 "ragged noncausal calls remain forward-only"
             )
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(spec.head_dim)
         scale = float(softmax_scale)
         if not full_length:
-            lengths = _ragged_varlen_self_attention_lengths(
+            lengths_q, lengths_k = _ragged_varlen_attention_lengths(
                 q, k, cu_seqlens_q, cu_seqlens_k, spec
             )
-            return _ragged_varlen_attention_sdpa(q, k, v, lengths, scale, spec)
+            return _ragged_varlen_attention_sdpa(
+                q, k, v, lengths_q, lengths_k, scale, spec
+            )
         dense_q = q.reshape(
             spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
         )
