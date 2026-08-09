@@ -8,10 +8,10 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
-profiles, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. The exposed page-16 decode cache also uses the generic
-paged runtime when ALiBi is supplied.
+ALiBi calls, forward-only dense sliding windows, BERT-base encoder diagnostics,
+ALiBi on both shipped varlen profiles, and diagnostics on the shipped causal
+varlen profile use a generic Triton forward kernel. The exposed page-16 decode
+cache also uses the generic paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -128,6 +128,27 @@ def _is_sm90(device: torch.device) -> bool:
     return torch.cuda.get_device_capability(device) == (9, 0)
 
 
+def _validate_window_size(window_size: object) -> tuple[int, int]:
+    """Return a runtime-safe FlashAttention sliding-window pair."""
+    if not isinstance(window_size, (tuple, list)):
+        raise TypeError(
+            "window_size must be a tuple or list containing exactly two "
+            "Python integers"
+        )
+    if len(window_size) != 2:
+        raise ValueError("window_size must contain exactly two Python integers")
+    left, right = window_size
+    if type(left) is not int or type(right) is not int:
+        raise TypeError("window_size must contain exactly two Python integers")
+    if left < -1 or right < -1:
+        raise ValueError("window_size bounds must be -1 or non-negative")
+    if left > _INT32_MAX or right > _INT32_MAX:
+        raise ValueError(
+            f"window_size bounds must not exceed signed int32 max {_INT32_MAX}"
+        )
+    return left, right
+
+
 def _reject_unsupported(
     dropout_p: float,
     window_size: tuple[int, int],
@@ -138,15 +159,18 @@ def _reject_unsupported(
     allow_dropout: bool = False,
     allow_alibi: bool = False,
     allow_return_attn_probs: bool = False,
-) -> float:
+    allow_window: bool = False,
+) -> tuple[float, tuple[int, int]]:
     if isinstance(dropout_p, bool) or not isinstance(dropout_p, Real):
         raise TypeError("dropout_p must be a real number")
     probability = float(dropout_p)
     if not math.isfinite(probability) or not 0.0 <= probability < 1.0:
         raise ValueError("dropout_p must satisfy 0.0 <= dropout_p < 1.0")
+    window = _validate_window_size(window_size)
+    has_window = window != (-1, -1)
     if probability != 0.0 and not allow_dropout:
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
-    if tuple(window_size) != (-1, -1):
+    if has_window and not allow_window:
         raise NotImplementedError("sliding-window attention is not implemented")
     if softcap != 0.0:
         raise NotImplementedError("softcap is not implemented")
@@ -160,9 +184,21 @@ def _reject_unsupported(
         raise NotImplementedError(
             "return_attn_probs=True is not implemented with dropout"
         )
+    if has_window and probability != 0.0:
+        raise NotImplementedError(
+            "dropout combined with sliding-window attention is not implemented"
+        )
+    if has_window and alibi_slopes is not None:
+        raise NotImplementedError(
+            "sliding-window attention combined with ALiBi slopes is not implemented"
+        )
+    if has_window and return_attn_probs:
+        raise NotImplementedError(
+            "return_attn_probs=True is not implemented with sliding-window attention"
+        )
     if return_attn_probs and not allow_return_attn_probs:
         raise NotImplementedError("return_attn_probs is not implemented")
-    return probability
+    return probability, window
 
 
 def _supports_diagnostic_return(spec: AttnShape) -> bool:
@@ -454,6 +490,7 @@ def _generic_dense_forward(
     softmax_scale: float,
     spec: AttnShape,
     alibi_slopes: torch.Tensor | None,
+    window_size: tuple[int, int] = (-1, -1),
 ) -> torch.Tensor:
     """Adapt a validated dense batch to the generic packed Triton runtime."""
     total_q, total_k = _validate_generic_dense_layout(spec)
@@ -489,7 +526,7 @@ def _generic_dense_forward(
         dynamic_max_seqlen_k=None,
         softmax_scale=softmax_scale,
         causal=spec.causal,
-        window_size=(-1, -1),
+        window_size=window_size,
         softcap=0.0,
         alibi_slopes=alibi_slopes,
         q_descale=None,
@@ -731,6 +768,8 @@ def flash_attn_func(
             noncausal bf16 ``(8, 512, 512, 16, 16, 64)`` profile.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
+        window_size: ``(left, right)`` inclusive local-attention bounds. ``-1``
+            leaves that side unbounded. Non-global windows are forward-only.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
         return_attn_probs: for the shipped bf16 BERT-base encoder and three
@@ -749,9 +788,9 @@ def flash_attn_func(
         ``[batch, nheads_q, seqlen_q]`` and ``S_dmask`` is an empty
         input-dtype tensor, matching FlashAttention when dropout is zero.
 
-    Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
-    use a generic packed Triton forward kernel. The exact default-option,
-    default-scale, no-backward noncausal bf16
+    Unregistered fp16/bf16 shapes with ``head_dim <= 256``, all ALiBi calls,
+    and all forward-only non-global sliding windows use a generic packed Triton
+    kernel. The exact default-option, default-scale, no-backward noncausal bf16
     ``(2, 1024, 1024, 16, 16, 256)`` call uses direct PyTorch Flash SDPA on
     SM90 when eligible. The corresponding causal bf16
     ``(1, 4096, 4096, 32, 8, 128)``, ``(1, 8192, 8192, 28, 4, 128)``,
@@ -762,7 +801,7 @@ def flash_attn_func(
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
-    dropout = _reject_unsupported(
+    dropout, window = _reject_unsupported(
         dropout_p,
         window_size,
         softcap,
@@ -771,6 +810,7 @@ def flash_attn_func(
         allow_dropout=True,
         allow_alibi=True,
         allow_return_attn_probs=True,
+        allow_window=True,
     )
     spec = normalize_shape(shape, q.dtype, causal)
     if dropout != 0.0:
@@ -793,6 +833,11 @@ def flash_attn_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
     )
+    if window != (-1, -1) and needs_backward:
+        raise NotImplementedError(
+            "sliding-window backward is not implemented; sliding-window "
+            "attention is forward-only"
+        )
     if return_attn_probs:
         if needs_backward:
             raise NotImplementedError(
@@ -840,6 +885,16 @@ def flash_attn_func(
         if not has_kernel(spec):
             _validate_generic_dense_layout(spec)
         return dense_attention_sdpa(q, k, v, scale, spec)
+    if window != (-1, -1):
+        return _generic_dense_forward(
+            q,
+            k,
+            v,
+            scale,
+            spec,
+            None,
+            window_size=window,
+        )
     if (
         default_softmax_scale
         and not deterministic

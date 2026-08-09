@@ -1010,6 +1010,115 @@ def test_unregistered_dense_fallback_matches_fp32_sdpa(spec: AttnShape) -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    ("spec", "window_size", "softmax_scale"),
+    [
+        pytest.param(
+            AttnShape(2, 17, 17, 4, 4, 32, torch.bfloat16, False),
+            (3, 3),
+            None,
+            id="bf16-mha-noncausal-symmetric",
+        ),
+        pytest.param(
+            AttnShape(2, 19, 19, 8, 2, 64, torch.float16, True),
+            (5, 2),
+            0.37,
+            id="fp16-gqa-causal-asymmetric-custom-scale",
+        ),
+        pytest.param(
+            AttnShape(1, 23, 13, 4, 4, 32, torch.float16, True),
+            (-1, 2),
+            0.137,
+            id="fp16-cross-mha-causal-one-sided-custom-scale",
+        ),
+        pytest.param(
+            AttnShape(2, 11, 17, 8, 2, 64, torch.bfloat16, False),
+            (2, -1),
+            None,
+            id="bf16-cross-gqa-noncausal-one-sided",
+        ),
+    ],
+)
+def test_dense_sliding_window_matches_flash_attention_2(
+    spec: AttnShape,
+    window_size: tuple[int, int],
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    q, k, v = make_inputs(spec, seed=20260809)
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
+            window_size=window_size,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
+            window_size=window_size,
+        )
+
+    assert got.shape == expected.shape == q.shape
+    assert got.dtype == expected.dtype == spec.dtype
+    torch.testing.assert_close(
+        got.float(), expected.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+def test_dense_packed_entry_points_inherit_sliding_window_support() -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+
+    qkv_spec = AttnShape(2, 13, 13, 4, 4, 32, torch.bfloat16, False)
+    q, k, v = make_inputs(qkv_spec, seed=173205)
+    qkv = torch.stack((q, k, v), dim=2)
+    with torch.no_grad():
+        qkv_got = helion_attention.flash_attn_qkvpacked_func(
+            qkv,
+            softmax_scale=0.29,
+            window_size=(2, 4),
+            shape=qkv_spec,
+        )
+        qkv_expected = flash_attn.flash_attn_qkvpacked_func(
+            qkv,
+            softmax_scale=0.29,
+            window_size=(2, 4),
+        )
+    torch.testing.assert_close(
+        qkv_got.float(), qkv_expected.float(), atol=5e-2, rtol=2e-2
+    )
+
+    kv_spec = AttnShape(2, 9, 15, 8, 2, 64, torch.float16, True)
+    q, k, v = make_inputs(kv_spec, seed=223607)
+    kv = torch.stack((k, v), dim=2)
+    with torch.no_grad():
+        kv_got = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            causal=True,
+            window_size=(-1, 3),
+            shape=kv_spec,
+        )
+        kv_expected = flash_attn.flash_attn_kvpacked_func(
+            q,
+            kv,
+            causal=True,
+            window_size=(-1, 3),
+        )
+    torch.testing.assert_close(
+        kv_got.float(), kv_expected.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
 @pytest.mark.parametrize("nheads_kv", [4, 2], ids=["mha", "gqa"])
 @pytest.mark.parametrize(
@@ -1317,6 +1426,48 @@ def test_registered_dense_shape_does_not_use_generic_fallback(
     monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_fallback)
     out = helion_attention.flash_attn_func(q, k, v, causal=True, shape=spec)
     assert out.shape == q.shape
+
+
+@requires_cuda
+def test_dense_sliding_window_bypasses_registered_specialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entry = next(item for item in SHAPES if item["key"] == CHUNKED_PREFILL_KEY)
+    spec = spec_from_manifest_entry(entry)
+    q, k, v = make_inputs(spec, seed=271828)
+    sentinel = torch.empty_like(q)
+    dispatched: list[tuple[AttnShape, torch.Tensor | None, tuple[int, int]]] = []
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+        window_size: tuple[int, int] = (-1, -1),
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        dispatched.append((spec_arg, slopes_arg, window_size))
+        return sentinel
+
+    def reject_specialized(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("sliding-window call reached a generated specialization")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(helion_attention, "lookup", reject_specialized)
+
+    out = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=spec.causal,
+        window_size=(32, 0),
+        shape=spec,
+    )
+
+    assert out is sentinel
+    assert dispatched == [(spec, None, (32, 0))]
 
 
 @requires_cuda
@@ -1991,12 +2142,129 @@ def test_rejects_unimplemented_features() -> None:
     q = torch.randn(1, 7, 2, 32, device="cuda", dtype=torch.bfloat16)
     for kwargs in (
         {"dropout_p": 0.1},
-        {"window_size": (128, 0)},
         {"softcap": 30.0},
         {"return_attn_probs": True},
     ):
         with pytest.raises(NotImplementedError):
             helion_attention.flash_attn_func(q, q, q, shape=(1, 7, 2, 32), **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("window_size", "error"),
+    [
+        (None, TypeError),
+        (1, TypeError),
+        ((1,), ValueError),
+        ((1, 2, 3), ValueError),
+        ((True, 0), TypeError),
+        ((1.5, 0), TypeError),
+        ((-2, 0), ValueError),
+        ((2**31, 0), ValueError),
+    ],
+    ids=[
+        "none",
+        "scalar",
+        "short",
+        "long",
+        "bool-bound",
+        "float-bound",
+        "below-sentinel",
+        "int32-overflow",
+    ],
+)
+def test_dense_sliding_window_rejects_malformed_bounds(
+    window_size: object, error: type[Exception]
+) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    with pytest.raises(error, match="window_size"):
+        helion_attention.flash_attn_func(
+            q,
+            q,
+            q,
+            window_size=window_size,  # type: ignore[arg-type]
+            shape=(1, 1, 1, 1),
+        )
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("dropout_p", 0.25, "dropout combined with sliding-window"),
+        ("alibi_slopes", torch.ones(1), "sliding-window.*ALiBi"),
+        ("softcap", 1.0, "softcap"),
+        ("return_attn_probs", True, "return_attn_probs=True.*sliding-window"),
+    ],
+    ids=["dropout", "alibi", "softcap", "diagnostics"],
+)
+def test_dense_sliding_window_rejects_unsupported_combinations_before_dispatch(
+    option: str,
+    value: object,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported sliding-window call reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    kwargs = {
+        "window_size": (1, 0),
+        option: value,
+        "shape": (1, 1, 1, 1),
+    }
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_func(
+            q,
+            q,
+            q,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@requires_cuda
+def test_dense_sliding_window_rejects_backward_but_allows_no_grad(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = GENERIC_DENSE_SPECS[0]
+    q, k, v = make_inputs(spec, seed=314159)
+    q.requires_grad_()
+    sentinel = torch.empty_like(q)
+
+    def generic(*args: object, **kwargs: object) -> torch.Tensor:
+        return sentinel
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    with pytest.raises(NotImplementedError, match="sliding-window backward"):
+        helion_attention.flash_attn_func(
+            q, k, v, window_size=(3, 1), shape=spec
+        )
+
+    with torch.no_grad():
+        out = helion_attention.flash_attn_func(
+            q, k, v, window_size=(3, 1), shape=spec
+        )
+    assert out is sentinel
+
+
+def test_kvcache_rejects_sliding_window_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("sliding-window KV-cache call reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "flash_attn_varlen_func", reject_dispatch)
+    with pytest.raises(NotImplementedError, match="sliding-window"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            q,
+            q,
+            window_size=(1, 0),
+            shape=(1, 1, 1, 1),
+        )
 
 
 @pytest.mark.parametrize(

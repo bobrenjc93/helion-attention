@@ -76,16 +76,21 @@ be used because they are equivalent for bottom-right single-token decode.
 Dense calls do not need a checked-in specialization. Contiguous CUDA fp16 and
 bf16 MHA/GQA inputs with `head_dim <= 256` use the generic Triton forward when
 their exact shape is absent, including unequal query/key lengths and
-bottom-right causal masking. Grad-enabled calls without a generated backward
-use PyTorch SDPA autograd instead. Dense ALiBi forward calls accept fp32 slopes
-shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
-ALiBi backward is not implemented. The shipped noncausal bf16
+bottom-right causal masking. Forward-only dense calls also accept inclusive
+`window_size=(left, right)` bounds, with `-1` leaving either side unbounded;
+these calls always use the generic packed runtime and are inherited by the
+QKV-packed and KV-packed adapters. The default `(-1, -1)` window retains the
+normal generated and Hopper fast-path dispatch. Grad-enabled calls without a
+generated backward use PyTorch SDPA autograd instead. Dense ALiBi forward calls
+accept fp32 slopes shaped `[nheads]` or `[batch, nheads]` and always use the
+generic Triton path; ALiBi backward is not implemented. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
-Other dropout calls, local windows, softcap, dense diagnostic returns outside
-the subsets above, and deterministic dropout still fail explicitly as
-described below. Unregistered calls must also fit the generic kernel's signed
-32-bit Q/output and K/V element offsets.
+Other dropout calls, softcap, dense diagnostic returns outside the subsets
+above, and deterministic dropout still fail explicitly as described below.
+Local windows cannot be combined with autograd, dropout, ALiBi, softcap, or
+diagnostic returns. Unregistered calls must also fit the generic kernel's
+signed 32-bit Q/output and K/V element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -515,7 +520,9 @@ doing something else:
   fallback
 - dropout outside the exact encoder-training profile above, or combined with
   ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
-- sliding-window attention and softcap
+- sliding-window attention on varlen or KV-cache paths, with backward, or
+  combined with dropout, ALiBi, softcap, or diagnostic returns; softcap is not
+  implemented on the remaining paths either
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 decode profile above; paged ALiBi cannot be
