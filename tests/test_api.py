@@ -661,6 +661,67 @@ def test_cudnn_fast_path_falls_back_when_ineligible(
     assert generated_calls == 2
 
 
+@requires_two_cuda_devices
+def test_cudnn_fast_path_uses_tensor_device_for_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sm90_devices = [
+        index
+        for index in range(torch.cuda.device_count())
+        if torch.cuda.get_device_capability(index) == (9, 0)
+    ]
+    if not sm90_devices:
+        pytest.skip("the cuDNN fast path requires an SM90 device")
+    target_index = sm90_devices[0]
+    other_index = next(
+        index
+        for index in range(torch.cuda.device_count())
+        if index != target_index
+    )
+    target = torch.device("cuda", target_index)
+    spec = CUDNN_FAST_PATH
+    q, k, v = make_inputs(spec, device=target, seed=24601)
+
+    with torch.cuda.device(target):
+        preflight = helion_attention.dense_attention_cudnn_default_scale(
+            q, k, v
+        )
+    if preflight is None:
+        pytest.skip("cuDNN attention is unavailable for the fast-path shape")
+    torch.cuda.synchronize(target)
+    del preflight
+
+    real_can_use_cudnn = torch.backends.cuda.can_use_cudnn_attention
+    probe_devices: list[int] = []
+
+    def observing_can_use_cudnn(params: object) -> bool:
+        probe_devices.append(torch.cuda.current_device())
+        return real_can_use_cudnn(params)
+
+    def reject_generated(spec_arg: AttnShape):
+        raise AssertionError(
+            f"eligible non-current-device call fell back: {spec_arg.key}"
+        )
+
+    monkeypatch.setattr(
+        torch.backends.cuda,
+        "can_use_cudnn_attention",
+        observing_can_use_cudnn,
+    )
+    monkeypatch.setattr(helion_attention, "lookup", reject_generated)
+
+    with torch.cuda.device(other_index):
+        out = helion_attention.flash_attn_func(
+            q, k, v, causal=True, shape=spec
+        )
+        assert torch.cuda.current_device() == other_index
+    torch.cuda.synchronize(target)
+
+    assert probe_devices == [target_index]
+    assert out.device == target
+    assert out.is_contiguous()
+
+
 @requires_cuda
 def test_concurrent_cudnn_fast_path_preserves_sdpa_backend_state(
     monkeypatch: pytest.MonkeyPatch,
@@ -669,6 +730,11 @@ def test_concurrent_cudnn_fast_path_preserves_sdpa_backend_state(
         pytest.skip("the cuDNN fast path requires SM90")
     spec = CUDNN_FAST_PATH
     q, k, v = make_inputs(spec, seed=8675309)
+    preflight = helion_attention.dense_attention_cudnn_default_scale(q, k, v)
+    if preflight is None:
+        pytest.skip("cuDNN attention is unavailable for the fast-path shape")
+    torch.cuda.synchronize(q.device)
+    del preflight
 
     def reject_generated(spec_arg: AttnShape):
         raise AssertionError(

@@ -44,23 +44,27 @@ def dense_attention_cudnn_default_scale(
     ):
         return None
     try:
-        params = params_type(query, key, value, None, 0.0, True, False)
-        if not can_use_cudnn(params):
-            return None
-        cudnn_attention = (
-            torch.ops.aten._scaled_dot_product_cudnn_attention.default
-        )
-        with torch.autocast(device_type=q.device.type, enabled=False):
-            out = cudnn_attention(
-                query,
-                key,
-                value,
-                None,
-                False,
-                0.0,
-                True,
-                False,
-            )[0]
+        # PyTorch's eligibility probe consults the current CUDA device rather
+        # than deriving all device properties from the tensors. Preserve the
+        # caller's device while making both the probe and launch tensor-local.
+        with torch.cuda.device(q.device):
+            params = params_type(query, key, value, None, 0.0, True, False)
+            if not can_use_cudnn(params):
+                return None
+            cudnn_attention = (
+                torch.ops.aten._scaled_dot_product_cudnn_attention.default
+            )
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                out = cudnn_attention(
+                    query,
+                    key,
+                    value,
+                    None,
+                    False,
+                    0.0,
+                    True,
+                    False,
+                )[0]
     except torch.cuda.OutOfMemoryError:
         raise
     except (AttributeError, NotImplementedError, RuntimeError, TypeError):
