@@ -1213,6 +1213,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:50807fc87410847a6d961f133d0283c9db5e9bc7",
+      "commit": "50807fc87410847a6d961f133d0283c9db5e9bc7",
+      "recordedAt": "2026-08-09T03:32:11.093Z",
+      "label": "base 50807fc",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 82,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 96,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:54",
+      "recordedAt": "2026-08-09T03:32:11.093Z",
+      "label": "PR #54",
+      "kind": "leaf",
+      "prNumber": 54,
+      "title": "Enable ALiBi on shipped noncausal varlen attention",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 82,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 96,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

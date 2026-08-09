@@ -8,7 +8,7 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except one evidenced SM90 long-context MHA
 fast path that uses direct cuDNN SDPA; compatible unregistered dense shapes,
-dense ALiBi calls, and ALiBi on one shipped causal varlen profile use a generic
+dense ALiBi calls, and ALiBi on both shipped varlen profiles use a generic
 Triton forward kernel. Positive dropout on the shipped encoder-training profile
 and grad-enabled dense calls without a generated backward use PyTorch SDPA
 autograd. The explicit shape validates these paths and makes specialization
@@ -85,7 +85,12 @@ _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _CUDNN_SDPA_FAST_PATH_KEY = "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal"
-_VARLEN_ALIBI_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+_VARLEN_ALIBI_KEYS = frozenset(
+    {
+        "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
+        "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
+    }
+)
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
         (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
@@ -379,11 +384,13 @@ def _validate_alibi_slopes(
 
 
 def _check_varlen_alibi_spec(spec: AttnShape) -> None:
-    """Restrict generic varlen ALiBi dispatch to its validated profile."""
-    if f"varlen_{spec.key}" != _VARLEN_ALIBI_KEY:
+    """Restrict generic varlen ALiBi dispatch to its validated profiles."""
+    requested = f"varlen_{spec.key}"
+    if requested not in _VARLEN_ALIBI_KEYS:
+        supported = ", ".join(sorted(_VARLEN_ALIBI_KEYS))
         raise NotImplementedError(
             "varlen ALiBi slopes are implemented only for "
-            f"{_VARLEN_ALIBI_KEY}; got varlen_{spec.key}"
+            f"{supported}; got {requested}"
         )
 
 
@@ -708,8 +715,9 @@ def flash_attn_varlen_func(
     The packed token totals and individual sequence lengths may change between
     calls to the same specialization.  The batch size, maxima, head geometry,
     dtype, and causal mode must continue to match ``shape``. Forward-only
-    ALiBi is supported for the causal ``(8, 512, 512, 16, 16, 64)`` bf16
-    profile, with fp32 slopes shaped ``[16]`` or ``[8, 16]``.
+    ALiBi is supported for both causal modes of the
+    ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
+    ``[16]`` or ``[8, 16]``.
     """
     del deterministic  # This option affects backward only.
     _reject_unsupported(
