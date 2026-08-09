@@ -5,11 +5,38 @@ from __future__ import annotations
 from typing import TypeVar
 
 import torch
+from torch.nn.attention import SDPBackend
+from torch.nn.attention import sdpa_kernel
 from torch.nn.attention.bias import causal_lower_right
 
 from ._shape import AttnShape
 
 _Mask = TypeVar("_Mask")
+
+
+def dense_attention_cudnn_default_scale(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    """Run the exact default-scale causal MHA fast path through cuDNN SDPA."""
+    query = q.transpose(1, 2)
+    key = k.transpose(1, 2)
+    value = v.transpose(1, 2)
+
+    # Keep this override local: global backend settings belong to the caller,
+    # and all calls outside the one guarded public-API path retain their
+    # existing dispatch.
+    with torch.autocast(device_type=q.device.type, enabled=False), sdpa_kernel(
+        SDPBackend.CUDNN_ATTENTION
+    ):
+        out = torch.nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=True,
+        )
+    return out.transpose(1, 2).contiguous()
 
 
 def sdpa_causal_options(

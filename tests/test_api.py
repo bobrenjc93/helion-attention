@@ -35,6 +35,7 @@ LONG_DECODE = next(
 )
 BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
 ENCODER_TRAINING = spec_from_manifest_entry(BACKWARD_SHAPES[0])
+CUDNN_FAST_PATH_KEY = "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal"
 QWEN_PREFILL = AttnShape(
     batch=1,
     seqlen_q=2048,
@@ -44,6 +45,9 @@ QWEN_PREFILL = AttnShape(
     head_dim=128,
     dtype=torch.bfloat16,
     causal=True,
+)
+CUDNN_FAST_PATH = spec_from_manifest_entry(
+    next(entry for entry in SHAPES if entry["key"] == CUDNN_FAST_PATH_KEY)
 )
 PAGED_KVCACHE = AttnShape(
     batch=4,
@@ -327,6 +331,7 @@ def test_matches_fp32_sdpa(entry: dict[str, object]) -> None:
     q, k, v = make_inputs(spec)
     got = helion_attention.flash_attn_func(q, k, v, causal=spec.causal, shape=spec)
     expected = reference_attention(q, k, v, spec, 1.0 / math.sqrt(spec.head_dim))
+    assert got.is_contiguous()
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
 
 
@@ -445,6 +450,132 @@ def test_registered_shape_without_backward_dispatches_to_sdpa(
 
     assert out is sentinel
     assert dispatched == [spec]
+
+
+@requires_cuda
+def test_cudnn_fast_path_dispatch_is_narrow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = CUDNN_FAST_PATH
+
+    def empty(seqlen: int, nheads: int) -> torch.Tensor:
+        return torch.empty(
+            spec.batch,
+            seqlen,
+            nheads,
+            spec.head_dim,
+            device="cuda",
+            dtype=spec.dtype,
+        )
+
+    q = empty(spec.seqlen_q, spec.nheads_q)
+    k = empty(spec.seqlen_k, spec.nheads_kv)
+    v = empty(spec.seqlen_k, spec.nheads_kv)
+    sentinel = torch.empty((), device="cuda")
+    dispatched: list[str] = []
+
+    def cudnn(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg
+        dispatched.append("cudnn")
+        return sentinel
+
+    def lookup_stub(spec_arg: AttnShape):
+        del spec_arg
+
+        def generated(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            del q_arg, k_arg, v_arg, scale_arg
+            dispatched.append("generated")
+            return sentinel
+
+        return generated
+
+    def autograd_fallback(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg, spec_arg
+        dispatched.append("autograd")
+        return sentinel
+
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_cudnn_default_scale", cudnn
+    )
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_sdpa", autograd_fallback
+    )
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["cudnn"]
+
+    # Supplying even the numerical default explicitly retains generated-kernel
+    # dispatch; the fast path is specifically for an omitted/default scale.
+    dispatched.clear()
+    out = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0 / math.sqrt(spec.head_dim),
+        causal=True,
+        shape=spec,
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, deterministic=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: False)
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
+    other_spec = spec_from_manifest_entry(
+        next(entry for entry in SHAPES if entry["key"] == CHUNKED_PREFILL_KEY)
+    )
+    other_q, other_k, other_v = make_inputs(other_spec)
+    out = helion_attention.flash_attn_func(
+        other_q,
+        other_k,
+        other_v,
+        causal=other_spec.causal,
+        shape=other_spec,
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    q.requires_grad_()
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["autograd"]
 
 
 @requires_cuda
