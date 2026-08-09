@@ -1095,9 +1095,9 @@
       "note": "short-sequence encoder batch",
       "implementations": {
         "helion-attention": {
-          "us": 3505.7495419795696,
-          "tflops": 6.125604873608267,
-          "max_abs_error": 0.00380098819732666
+          "us": 648.1591380559481,
+          "tflops": 33.13204307264788,
+          "max_abs_error": 0.00401151180267334
         },
         "flash-attn": {
           "us": 553.9357213608479,
