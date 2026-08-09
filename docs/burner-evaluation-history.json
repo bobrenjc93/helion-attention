@@ -1333,6 +1333,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:0b78b081116d3bb6b5f276400ae3d0f26566c50a",
+      "commit": "0b78b081116d3bb6b5f276400ae3d0f26566c50a",
+      "recordedAt": "2026-08-09T05:01:39.154Z",
+      "label": "base 0b78b08",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 83,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:58",
+      "recordedAt": "2026-08-09T05:01:39.154Z",
+      "label": "PR #58",
+      "kind": "leaf",
+      "prNumber": 58,
+      "title": "Enable ALiBi on exposed paged decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 83,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

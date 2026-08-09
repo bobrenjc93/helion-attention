@@ -310,6 +310,36 @@ def reference_paged_single_token_lse(
     return torch.stack(lse)
 
 
+def reference_paged_single_token_alibi(
+    q: torch.Tensor,
+    logical_caches: list[tuple[torch.Tensor, torch.Tensor]],
+    spec: AttnShape,
+    scale: float,
+    alibi_slopes: torch.Tensor,
+) -> torch.Tensor:
+    """Compute ragged bottom-right ALiBi in fp32 per logical cache."""
+    outputs: list[torch.Tensor] = []
+    for batch, (query, (logical_k, logical_v)) in enumerate(
+        zip(q, logical_caches)
+    ):
+        slopes = alibi_slopes if alibi_slopes.ndim == 1 else alibi_slopes[batch]
+        key_positions = torch.arange(
+            logical_k.shape[0], device=q.device, dtype=torch.float32
+        )
+        distance = logical_k.shape[0] - 1 - key_positions
+        alibi_bias = -slopes.float()[:, None, None] * distance[None, None, :]
+        result = torch.nn.functional.scaled_dot_product_attention(
+            query.float().transpose(0, 1).unsqueeze(0),
+            logical_k.float().transpose(0, 1).unsqueeze(0),
+            logical_v.float().transpose(0, 1).unsqueeze(0),
+            attn_mask=alibi_bias.unsqueeze(0),
+            scale=scale,
+            enable_gqa=True,
+        )
+        outputs.append(result.squeeze(0).transpose(0, 1))
+    return torch.stack(outputs)
+
+
 def test_package_does_not_import_helion() -> None:
     assert "helion" not in sys.modules
 
@@ -1872,6 +1902,85 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
 
 
 @requires_cuda
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+def test_paged_kvcache_alibi_matches_fa2_and_fp32_for_ragged_permuted_pages(
+    causal: bool,
+    softmax_scale: float | None,
+    batched_slopes: bool,
+) -> None:
+    q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
+        make_paged_kvcache_inputs(seed=20260808)
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    head_slopes = torch.linspace(
+        0.01, 0.2, PAGED_KVCACHE.nheads_q, device=q.device, dtype=torch.float32
+    )
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(PAGED_KVCACHE.batch)]
+        )
+        if batched_slopes
+        else head_slopes
+    )
+    scale = (
+        1.0 / math.sqrt(PAGED_KVCACHE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    declared_shape = (
+        PAGED_KVCACHE if causal else (4, 1, 1024, 8, 2, 128)
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        alibi_slopes=slopes,
+        shape=declared_shape,
+    )
+    expected_fp32 = reference_paged_single_token_alibi(
+        q, logical_caches, PAGED_KVCACHE, scale, slopes
+    )
+
+    assert got.shape == q.shape
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+    # FA2 requires its paged cache blocks to be a multiple of 256, so compare
+    # the same logical cache after re-paging it to FA2's native minimum.
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    fa2_k, fa2_v, fa2_block_table = page_logical_caches(
+        PAGED_KVCACHE, logical_caches, page_size=256
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        fa2_k,
+        fa2_v,
+        cache_seqlens=cache_seqlens,
+        block_table=fa2_block_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        alibi_slopes=slopes,
+    )
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
@@ -2077,6 +2186,241 @@ def test_paged_kvcache_routes_through_core_varlen(
     assert kwargs["shape"] is spec
     assert got.shape == q.shape
     torch.testing.assert_close(got.flatten(0, 1), sentinel)
+
+
+@requires_cuda
+def test_paged_kvcache_alibi_uses_generic_paged_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs()
+    )
+    slopes = torch.linspace(
+        0.01,
+        0.2,
+        PAGED_KVCACHE.nheads_q,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    sentinel = torch.full_like(q.flatten(0, 1), 7.0)
+    seen: dict[str, object] = {}
+
+    def reject_generated(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("paged ALiBi call reached generated dispatch")
+
+    def fake_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_generated
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", fake_generic)
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=0.19,
+        causal=True,
+        alibi_slopes=slopes,
+        shape=PAGED_KVCACHE,
+    )
+
+    args = seen["args"]
+    kwargs = seen["kwargs"]
+    assert isinstance(args, tuple)
+    assert isinstance(kwargs, dict)
+    assert args[0].data_ptr() == q.data_ptr()
+    assert args[0].shape == q.flatten(0, 1).shape
+    assert args[1] is k_cache
+    assert args[2] is v_cache
+    assert args[5] is block_table
+    assert args[4].is_contiguous()
+    torch.testing.assert_close(args[4], cache_seqlens)
+    assert kwargs["softmax_scale"] == 0.19
+    assert kwargs["causal"] is True
+    assert kwargs["alibi_slopes"] is slopes
+    assert kwargs["return_softmax_lse"] is False
+    assert got.shape == q.shape
+    torch.testing.assert_close(got.flatten(0, 1), sentinel)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("lse", "return_softmax_lse.*ALiBi", id="lse"),
+        pytest.param("update", "read-only", id="update"),
+        pytest.param("rotary", "rotary embeddings", id="rotary"),
+        pytest.param("q-grad", "ALiBi backward", id="query-autograd"),
+        pytest.param("slope-grad", "ALiBi backward", id="slope-autograd"),
+    ],
+)
+def test_paged_kvcache_alibi_rejects_incompatible_modes_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs()
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    slopes = torch.ones(
+        PAGED_KVCACHE.nheads_q, device=q.device, dtype=torch.float32
+    )
+    kwargs: dict[str, object] = {
+        "cache_seqlens": cache_seqlens,
+        "block_table": block_table,
+        "causal": True,
+        "alibi_slopes": slopes,
+        "shape": PAGED_KVCACHE,
+    }
+    if case == "lse":
+        kwargs["return_softmax_lse"] = True
+    elif case == "update":
+        update_shape = (
+            PAGED_KVCACHE.batch,
+            1,
+            PAGED_KVCACHE.nheads_kv,
+            PAGED_KVCACHE.head_dim,
+        )
+        kwargs["k"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
+        kwargs["v"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
+    elif case == "rotary":
+        kwargs["rotary_cos"] = q
+        kwargs["rotary_sin"] = q
+    elif case == "q-grad":
+        q.requires_grad_()
+    else:
+        slopes.requires_grad_()
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported paged ALiBi call reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_dispatch
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q, k_cache, v_cache, **kwargs
+        )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+def test_paged_kvcache_alibi_rejects_other_profiles_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    spec = PAGED_CHUNKED_PREFILL
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs(spec=spec, lengths=[113, 271])
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported paged ALiBi profile reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_dispatch
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_dispatch)
+    with pytest.raises(NotImplementedError, match="ALiBi is implemented only"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            causal=True,
+            alibi_slopes=slopes,
+            shape=spec,
+        )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("not-tensor", "torch.Tensor", id="not-tensor"),
+        pytest.param("dtype", "dtype torch.float32", id="dtype"),
+        pytest.param("head-shape", "shape.*nheads_q", id="head-shape"),
+        pytest.param("batch-shape", "shape.*nheads_q", id="batch-shape"),
+        pytest.param("rank", "shape.*nheads_q", id="rank"),
+        pytest.param("cpu", "CUDA tensor", id="cpu"),
+        pytest.param(
+            "last-stride",
+            "contiguous.*last dimension",
+            id="last-dimension-stride",
+        ),
+    ],
+)
+def test_paged_kvcache_alibi_rejects_malformed_slopes_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs()
+    )
+    if case == "not-tensor":
+        slopes: object = [0.1] * PAGED_KVCACHE.nheads_q
+    elif case == "dtype":
+        slopes = torch.ones(
+            PAGED_KVCACHE.nheads_q, device=q.device, dtype=torch.float16
+        )
+    elif case == "head-shape":
+        slopes = torch.ones(PAGED_KVCACHE.nheads_q - 1, device=q.device)
+    elif case == "batch-shape":
+        slopes = torch.ones(
+            PAGED_KVCACHE.batch + 1, PAGED_KVCACHE.nheads_q, device=q.device
+        )
+    elif case == "rank":
+        slopes = torch.ones(
+            PAGED_KVCACHE.batch, 1, PAGED_KVCACHE.nheads_q, device=q.device
+        )
+    elif case == "cpu":
+        slopes = torch.ones(PAGED_KVCACHE.nheads_q)
+    else:
+        slopes = torch.ones(PAGED_KVCACHE.nheads_q, 2, device=q.device)[:, 0]
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("malformed paged ALiBi slopes reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_dispatch
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_dispatch)
+    with pytest.raises((TypeError, ValueError), match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            causal=True,
+            alibi_slopes=slopes,  # type: ignore[arg-type]
+            shape=PAGED_KVCACHE,
+        )
 
 
 @requires_cuda
