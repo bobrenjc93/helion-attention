@@ -8,11 +8,11 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
-profiles, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
-forward-only Gemma-2 profile. The exposed page-16 decode cache uses the generic
-paged runtime when ALiBi is supplied.
+ALiBi calls, BERT-base and unregistered noncausal dense diagnostics, ALiBi on
+both shipped varlen profiles, and diagnostics on the shipped causal varlen
+profile use a generic Triton forward kernel. That runtime also provides
+``softcap=50.0`` for one forward-only Gemma-2 profile. The exposed page-16
+decode cache uses the generic paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -197,12 +197,18 @@ def _supports_diagnostic_return(spec: AttnShape) -> bool:
         spec.head_dim,
         spec.dtype,
     )
+    registered = has_kernel(spec)
     # Causal and non-causal are equivalent for a bottom-right single-token
     # query, and the registry maps both modes to the same checked-in kernel.
-    return (
+    exact_diagnostic = registered and (
         spec.key == _BERT_DIAGNOSTIC_KEY
         or profile in _DIAGNOSTIC_DECODE_PROFILES
-    ) and has_kernel(spec)
+    )
+    # The diagnostic helper is an adapter around the same packed runtime as
+    # the ordinary generic dense forward. Keep checked-in non-diagnostic
+    # profiles on their exact gate, and do not broaden generic causal support.
+    generic_diagnostic = not registered and not spec.causal
+    return exact_diagnostic or generic_diagnostic
 
 
 def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
@@ -912,11 +918,12 @@ def flash_attn_func(
             ordinary dispatch; every other positive value remains unsupported.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
-        return_attn_probs: for the shipped bf16 BERT-base encoder and three
-            Llama GQA decode profiles, return FlashAttention's diagnostic
-            tuple. This is available only when no backward is needed and all
-            options other than ``softmax_scale`` (and the equivalent decode
-            ``causal`` mode) retain their defaults.
+        return_attn_probs: for compatible unregistered noncausal dense shapes,
+            the shipped bf16 BERT-base encoder, and three Llama GQA decode
+            profiles, return FlashAttention's diagnostic tuple. This is
+            available only when no backward is needed and all options other
+            than ``softmax_scale`` (and the equivalent decode ``causal`` mode)
+            retain their defaults.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -1012,11 +1019,13 @@ def flash_attn_func(
             )
         if not _supports_diagnostic_return(spec):
             raise NotImplementedError(
-                "return_attn_probs=True is implemented only for the shipped "
-                f"{_BERT_DIAGNOSTIC_KEY} BERT-base encoder and the three "
-                "shipped batch-1, single-token bf16 Llama GQA decode profiles"
+                "return_attn_probs=True is implemented only for unregistered "
+                "noncausal shapes supported by the generic dense fallback, "
+                f"the shipped {_BERT_DIAGNOSTIC_KEY} BERT-base encoder, and "
+                "the three shipped batch-1, single-token bf16 Llama GQA "
+                "decode profiles"
             )
-        if spec.key == _BERT_DIAGNOSTIC_KEY:
+        if spec.key == _BERT_DIAGNOSTIC_KEY or not has_kernel(spec):
             return _generic_dense_diagnostic_forward(q, k, v, scale, spec)
         out, softmax_lse = lookup(spec)(
             q, k, v, scale, return_softmax_lse=True

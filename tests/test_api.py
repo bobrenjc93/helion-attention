@@ -104,6 +104,14 @@ GENERIC_DENSE_SPECS = [
     AttnShape(1, 29, 17, 4, 4, 128, torch.float16, True),
     AttnShape(1, 13, 21, 8, 2, 256, torch.float16, True),
 ]
+GENERIC_DIAGNOSTIC_SPECS = [
+    AttnShape(2, 23, 23, 4, 4, 32, torch.bfloat16, False),
+    AttnShape(2, 23, 23, 4, 4, 32, torch.float16, False),
+    AttnShape(2, 19, 19, 8, 2, 64, torch.bfloat16, False),
+    AttnShape(2, 19, 19, 8, 2, 64, torch.float16, False),
+    AttnShape(1, 29, 17, 4, 4, 128, torch.bfloat16, False),
+    AttnShape(1, 29, 17, 4, 4, 128, torch.float16, False),
+]
 GEMMA2_SOFTCAP = AttnShape(
     1, 4096, 4096, 16, 8, 256, torch.bfloat16, True
 )
@@ -374,6 +382,41 @@ def reference_single_token_lse(
     scores = torch.matmul(grouped_q, grouped_k_t) * scale
     return torch.logsumexp(scores, dim=-1).reshape(
         spec.batch, spec.nheads_q, spec.seqlen_q
+    )
+
+
+def assert_dense_diagnostics_match_fa2(
+    got: object,
+    expected: object,
+    spec: AttnShape,
+    device: torch.device,
+) -> None:
+    assert isinstance(got, tuple) and len(got) == 3
+    assert isinstance(expected, tuple) and len(expected) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+
+    assert out.shape == expected_out.shape == (
+        spec.batch,
+        spec.seqlen_q,
+        spec.nheads_q,
+        spec.head_dim,
+    )
+    assert out.dtype == expected_out.dtype == spec.dtype
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.batch,
+        spec.nheads_q,
+        spec.seqlen_q,
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == spec.dtype
+    assert s_dmask.device == expected_s_dmask.device == device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
     )
 
 
@@ -1774,6 +1817,165 @@ def test_unequal_causal_mask_includes_bottom_right_boundary() -> None:
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "spec",
+    GENERIC_DIAGNOSTIC_SPECS,
+    ids=[spec.key for spec in GENERIC_DIAGNOSTIC_SPECS],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_generic_noncausal_return_attn_probs_matches_fa2(
+    spec: AttnShape,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    assert not helion_attention.is_shape_supported(
+        spec, dtype=spec.dtype, causal=False
+    )
+    q, k, v = make_inputs(spec, seed=20260809)
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            return_attn_probs=True,
+        )
+
+    assert_dense_diagnostics_match_fa2(got, expected, spec, q.device)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("entry_point", "spec"),
+    [
+        pytest.param("qkvpacked", GENERIC_DIAGNOSTIC_SPECS[0], id="qkv-bf16"),
+        pytest.param("qkvpacked", GENERIC_DIAGNOSTIC_SPECS[1], id="qkv-fp16"),
+        pytest.param("kvpacked", GENERIC_DIAGNOSTIC_SPECS[2], id="gqa-bf16"),
+        pytest.param("kvpacked", GENERIC_DIAGNOSTIC_SPECS[3], id="gqa-fp16"),
+        pytest.param("kvpacked", GENERIC_DIAGNOSTIC_SPECS[4], id="cross-bf16"),
+        pytest.param("kvpacked", GENERIC_DIAGNOSTIC_SPECS[5], id="cross-fp16"),
+    ],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_generic_noncausal_packed_adapters_inherit_diagnostic_return(
+    entry_point: str,
+    spec: AttnShape,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    q, k, v = make_inputs(spec, seed=20260809)
+
+    with torch.no_grad():
+        if entry_point == "qkvpacked":
+            qkv = torch.stack((q, k, v), dim=2)
+            got = helion_attention.flash_attn_qkvpacked_func(
+                qkv,
+                softmax_scale=softmax_scale,
+                return_attn_probs=True,
+                shape=spec,
+            )
+            expected = flash_attn.flash_attn_qkvpacked_func(
+                qkv,
+                softmax_scale=softmax_scale,
+                return_attn_probs=True,
+            )
+        else:
+            kv = torch.stack((k, v), dim=2)
+            got = helion_attention.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                return_attn_probs=True,
+                shape=spec,
+            )
+            expected = flash_attn.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                return_attn_probs=True,
+            )
+
+    assert_dense_diagnostics_match_fa2(got, expected, spec, q.device)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("entry_point", "spec"),
+    [
+        pytest.param("dense", GENERIC_DIAGNOSTIC_SPECS[0], id="dense"),
+        pytest.param("qkvpacked", GENERIC_DIAGNOSTIC_SPECS[0], id="qkv-packed"),
+        pytest.param("kvpacked", GENERIC_DIAGNOSTIC_SPECS[4], id="kv-packed"),
+    ],
+)
+def test_generic_noncausal_return_attn_probs_false_retains_output_dispatch(
+    entry_point: str,
+    spec: AttnShape,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q, k, v = make_inputs(spec, seed=1701)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[AttnShape, torch.Tensor | None, float]] = []
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+        *,
+        softcap: float = 0.0,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        calls.append((spec_arg, slopes_arg, softcap))
+        return sentinel
+
+    def reject_diagnostic(*args: object, **kwargs: object) -> object:
+        raise AssertionError("output-only call reached diagnostic dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_dense_diagnostic_forward",
+        reject_diagnostic,
+    )
+
+    if entry_point == "dense":
+        out = helion_attention.flash_attn_func(
+            q, k, v, return_attn_probs=False, shape=spec
+        )
+    elif entry_point == "qkvpacked":
+        out = helion_attention.flash_attn_qkvpacked_func(
+            torch.stack((q, k, v), dim=2),
+            return_attn_probs=False,
+            shape=spec,
+        )
+    else:
+        out = helion_attention.flash_attn_kvpacked_func(
+            q,
+            torch.stack((k, v), dim=2),
+            return_attn_probs=False,
+            shape=spec,
+        )
+
+    assert out is sentinel
+    assert calls == [(spec, None, 0.0)]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "entry_point",
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
@@ -1953,7 +2155,7 @@ def test_bert_return_attn_probs_rejects_out_of_scope_calls(
     elif case == "dropout":
         kwargs["dropout_p"] = 0.1
     else:
-        spec = AttnShape(1, 7, 7, 2, 2, 32, torch.bfloat16, False)
+        spec = ENCODER_TRAINING
         q, k, v = make_inputs(spec, seed=31415)
         kwargs["shape"] = spec
 
@@ -2227,10 +2429,21 @@ def test_split_decode_launches_on_tensor_device_when_it_is_not_current() -> None
 
 
 @requires_cuda
-def test_unregistered_dense_fallback_rejects_head_dim_above_256() -> None:
+@pytest.mark.parametrize(
+    "return_attn_probs", [False, True], ids=["output", "diagnostic"]
+)
+def test_unregistered_dense_fallback_rejects_head_dim_above_256(
+    return_attn_probs: bool,
+) -> None:
     q = torch.randn(1, 2, 1, 257, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(UnsupportedShapeError, match="head_dim <= 256"):
-        helion_attention.flash_attn_func(q, q, q, shape=(1, 2, 1, 257))
+        helion_attention.flash_attn_func(
+            q,
+            q,
+            q,
+            return_attn_probs=return_attn_probs,
+            shape=(1, 2, 1, 257),
+        )
 
 
 @requires_cuda
@@ -2247,7 +2460,7 @@ def test_rejects_unimplemented_features() -> None:
         {"dropout_p": 0.1},
         {"window_size": (128, 0)},
         {"softcap": 30.0},
-        {"return_attn_probs": True},
+        {"causal": True, "return_attn_probs": True},
     ):
         with pytest.raises(NotImplementedError):
             helion_attention.flash_attn_func(q, q, q, shape=(1, 7, 2, 32), **kwargs)
