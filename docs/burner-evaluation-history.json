@@ -1978,6 +1978,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:efbf9463e4e1222a3879d6d72fad029736e61591",
+      "commit": "efbf9463e4e1222a3879d6d72fad029736e61591",
+      "recordedAt": "2026-08-09T19:04:13.203Z",
+      "label": "base efbf946",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:95",
+      "recordedAt": "2026-08-09T19:04:13.203Z",
+      "label": "PR #95",
+      "kind": "leaf",
+      "prNumber": 95,
+      "title": "Allow empty slots in causal varlen self-attention backward",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 57,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
