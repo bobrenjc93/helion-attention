@@ -1006,12 +1006,16 @@ def _paged_kvcache_forward(
         )
         from ._paged_attention import paged_attention
 
+        # The generic kernel indexes per-request lengths as a flat array and
+        # therefore requires unit-stride storage. Preserve the public adapter's
+        # support for valid strided metadata by normalizing only this argument.
+        seqused_k = cache_seqlens.contiguous()
         result = paged_attention(
             packed_q,
             k_cache,
             v_cache,
             cu_seqlens_q,
-            cache_seqlens,
+            seqused_k,
             block_table,
             max_seqlen_q=spec.seqlen_q,
             max_seqlen_k=spec.seqlen_k,

@@ -1529,12 +1529,25 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
+@pytest.mark.parametrize(
+    "length_stride", [1, 2], ids=["contiguous-lengths", "stride-2-lengths"]
+)
 def test_paged_kvcache_returns_fp32_lse_for_ragged_permuted_pages(
     softmax_scale: float | None,
+    length_stride: int,
 ) -> None:
     q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
         make_paged_kvcache_inputs()
     )
+    if length_stride != 1:
+        length_storage = torch.empty(
+            PAGED_KVCACHE.batch * length_stride,
+            device=cache_seqlens.device,
+            dtype=cache_seqlens.dtype,
+        )
+        length_storage[::length_stride].copy_(cache_seqlens)
+        cache_seqlens = length_storage[::length_stride]
+    assert cache_seqlens.stride() == (length_stride,)
     original_k = k_cache.clone()
     original_v = v_cache.clone()
     scale = (
