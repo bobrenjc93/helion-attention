@@ -148,11 +148,14 @@ For dense caches, pass `return_softmax_lse=True` to receive
 `(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
 FlashAttention's KV-cache API.
 
-The exact bf16 profile `(4, 1, 1024, 8, 2, 128)` also accepts a read-only
-page-size-16 cache. `cache_seqlens` must be a CUDA int32 tensor shaped `[4]`;
-each row may select a different used length. Logical pages can map to physical
-cache pages in any order. The default `causal=False` works; for this
-single-token bottom-right decode it is equivalent to `causal=True`:
+Two exact bf16 profiles also accept a read-only page-size-16 cache through
+`flash_attn_with_kvcache`: chunked prefill `(2, 200, 320, 8, 2, 128)` with
+`causal=True`, and decode `(4, 1, 1024, 8, 2, 128)` with either causal mode.
+`cache_seqlens` must be a CUDA int32 tensor shaped `[batch]`; each row may
+select a different used length. Logical pages can map to physical cache pages
+in any order. Queries use dense BSHD layout and results are returned in that
+same layout. Chunked prefill uses bottom-right causal alignment. For decode,
+the default `causal=False` is equivalent to `causal=True`:
 
 ```python
 B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 16
@@ -175,9 +178,10 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-This narrow paged path routes through the checked-in paged-varlen kernel. It
-does not mutate the cache; paged updates, LSE, rotary, and autograd are rejected
-before dispatch.
+These narrow paged paths route through their checked-in paged-varlen kernels.
+They do not mutate the cache; paged updates, LSE, rotary, and autograd are
+rejected before dispatch. Non-causal chunked prefill and every other paged
+profile are also rejected before dispatch.
 
 The dense decode path also appends one paired K/V token when a scalar cache
 length points at the final slot declared by `shape`:
@@ -459,7 +463,7 @@ also raise `NotImplementedError` rather than silently doing something else:
   `(8, 512, 512, 16, 16, 64)` profile above, and for KV-cache calls
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense partial/ragged caches, paged profiles other than the exact read-only
-  page-size-16 profile above, paged LSE, and KV-cache rotary outside the
+  page-size-16 profiles above, paged LSE, and KV-cache rotary outside the
   full-head or D128 half-head interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward, default-option dense and
   KV-packed calls for the three Llama GQA decode profiles described above

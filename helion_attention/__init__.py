@@ -75,6 +75,9 @@ _CORE_PAGED_KVCACHE_SHAPE = (4, 1, 1024, 8, 2, 128, torch.bfloat16)
 _CORE_PAGED_VARLEN_SHAPES = frozenset(
     {_CORE_PAGED_CHUNKED_PREFILL_SHAPE, _CORE_PAGED_KVCACHE_SHAPE}
 )
+_CORE_PAGED_KVCACHE_SHAPES = frozenset(
+    {_CORE_PAGED_CHUNKED_PREFILL_SHAPE, _CORE_PAGED_KVCACHE_SHAPE}
+)
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
@@ -265,7 +268,7 @@ def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
 
 
 def _check_core_paged_kvcache_spec(spec: AttnShape, page_size: int) -> None:
-    """Require the one paged specialization exposed by the KV-cache API."""
+    """Require an exact read-only specialization exposed by the KV-cache API."""
     requested = (
         spec.batch,
         spec.seqlen_q,
@@ -276,13 +279,20 @@ def _check_core_paged_kvcache_spec(spec: AttnShape, page_size: int) -> None:
         spec.dtype,
     )
     if (
-        requested != _CORE_PAGED_KVCACHE_SHAPE
+        requested not in _CORE_PAGED_KVCACHE_SHAPES
+        or (
+            requested == _CORE_PAGED_CHUNKED_PREFILL_SHAPE
+            and not spec.causal
+        )
         or page_size != _CORE_PAGED_VARLEN_PAGE_SIZE
     ):
         raise UnsupportedShapeError(
-            "flash_attn_with_kvcache with block_table currently supports only:\n"
+            "flash_attn_with_kvcache with block_table currently supports only "
+            "these bf16 profiles with page_size=16:\n"
+            "    batch=2 seqlen_q=200 seqlen_k=320 nheads=8 (GQA 8:2) "
+            "head_dim=128 causal=True\n"
             "    batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
-            "head_dim=128 dtype=bf16 page_size=16\n"
+            "head_dim=128 causal=True or causal=False\n"
             f"got:\n    {spec.describe()}, page_size={page_size}"
         )
 
@@ -881,7 +891,7 @@ def _paged_kvcache_forward(
     return_softmax_lse: bool,
     shape: ShapeLike,
 ) -> torch.Tensor:
-    """Adapt the exact read-only paged decode profile to core varlen."""
+    """Adapt exact read-only dense-query paged profiles to core varlen."""
     if append_kv:
         raise NotImplementedError(
             "paged KV-cache updates are not implemented; paged caches are read-only"
@@ -908,7 +918,12 @@ def _paged_kvcache_forward(
     page_size = k_cache.shape[1]
     _check_core_paged_kvcache_spec(spec, page_size)
 
-    expected_q = (spec.batch, 1, spec.nheads_q, spec.head_dim)
+    expected_q = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.nheads_q,
+        spec.head_dim,
+    )
     if tuple(q.shape) != expected_q:
         raise ValueError(
             f"q has shape {tuple(q.shape)} but the declared paged KV-cache "
@@ -952,9 +967,13 @@ def _paged_kvcache_forward(
         if softmax_scale is None
         else float(softmax_scale)
     )
-    packed_q = q.squeeze(1)
+    packed_q = q.flatten(0, 1)
     cu_seqlens_q = torch.arange(
-        spec.batch + 1, device=q.device, dtype=torch.int32
+        0,
+        (spec.batch + 1) * spec.seqlen_q,
+        spec.seqlen_q,
+        device=q.device,
+        dtype=torch.int32,
     )
     cu_seqlens_k = torch.cat(
         (
@@ -975,7 +994,7 @@ def _paged_kvcache_forward(
         block_table=block_table,
         shape=spec,
     )
-    return packed_out.unsqueeze(1)
+    return packed_out.reshape(expected_q)
 
 
 def flash_attn_with_kvcache(
@@ -1001,19 +1020,20 @@ def flash_attn_with_kvcache(
     *,
     shape: ShapeLike,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Read or append one token to a FlashAttention-style KV cache.
+    """Read from, or append one token to, a FlashAttention-style KV cache.
 
     The general supported path is a dense, contiguous cache and exactly one
     query token. As with every entry point in this package, ``shape`` is
     required and describes ``q`` plus the cache:
     ``(batch, 1, cache_len, nheads_q, nheads_kv, head_dim)``.
 
-    One read-only paged specialization is also exposed: bf16
-    ``(4, 1, 1024, 8, 2, 128)`` with page-size-16 caches, an int32 CUDA
-    ``cache_seqlens`` tensor shaped ``[4]``, and ``block_table``. It routes
-    through :func:`flash_attn_varlen_func` and supports ragged logical caches.
-    Because this is single-token bottom-right decode, the default
-    ``causal=False`` and ``causal=True`` modes are equivalent and both work.
+    Two read-only paged specializations are also exposed with page-size-16
+    caches, an int32 CUDA ``cache_seqlens`` tensor shaped ``[batch]``, and
+    ``block_table``. Bf16 ``(2, 200, 320, 8, 2, 128)`` supports only
+    ``causal=True`` and uses bottom-right causal alignment for chunked prefill.
+    Bf16 ``(4, 1, 1024, 8, 2, 128)`` supports both causal modes, which are
+    equivalent for single-token bottom-right decode. Both route through
+    :func:`flash_attn_varlen_func` and support ragged logical caches.
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. A paired,
@@ -1029,7 +1049,8 @@ def flash_attn_with_kvcache(
     final-slot append: it may cover the full head or the first 64 dimensions of
     a 128-dimensional head, must use the default interleaved layout, and rotates
     both ``q`` and the appended ``k`` at ``cache_seqlens``. Read-only rotary
-    calls and other paged profiles fail explicitly.
+    calls and other paged profiles fail explicitly. Paged updates, rotary,
+    softmax LSE, and autograd are unsupported for both paged profiles.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
