@@ -3213,7 +3213,7 @@ def test_kvcache_appends_one_token_in_place_and_attends_to_it(
 )
 @pytest.mark.parametrize("return_softmax_lse", [False, True], ids=["out", "out-lse"])
 @pytest.mark.parametrize(
-    "rotary_dim", [64, 128], ids=["half-head", "full-head"]
+    "rotary_dim", range(16, 129, 16), ids=lambda rotary_dim: f"d{rotary_dim}"
 )
 def test_kvcache_interleaved_rotary_append_matches_fa2(
     entry: dict[str, object], return_softmax_lse: bool, rotary_dim: int
@@ -3416,13 +3416,22 @@ def test_kvcache_rejects_invalid_rotary_before_mutating_either_cache(
     reject(NotImplementedError, "non-interleaved", rotary_interleaved=False)
     reject(NotImplementedError, "one-token KV-cache append", k=None, v=None)
 
-    partial_cos = rotary_cos[:, :-1].contiguous()
-    partial_sin = rotary_sin[:, :-1].contiguous()
+    unaligned_cos = rotary_cos[:, :-1].contiguous()
+    unaligned_sin = rotary_sin[:, :-1].contiguous()
     reject(
         NotImplementedError,
-        "partial rotary dimensions",
-        rotary_cos=partial_cos,
-        rotary_sin=partial_sin,
+        "16-aligned prefix",
+        rotary_cos=unaligned_cos,
+        rotary_sin=unaligned_sin,
+    )
+    oversized_cos, oversized_sin = make_rotary_tables(
+        spec, rotary_dim=144, seed=14159
+    )
+    reject(
+        NotImplementedError,
+        "16-aligned prefix",
+        rotary_cos=oversized_cos,
+        rotary_sin=oversized_sin,
     )
     reject(
         ValueError,

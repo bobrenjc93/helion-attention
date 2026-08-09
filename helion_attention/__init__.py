@@ -217,15 +217,18 @@ def _validate_kvcache_rotary(
             f"{tuple(rotary_cos.shape)} and {tuple(rotary_sin.shape)}"
         )
     rotary_dim = rotary_cos.shape[1] * 2
-    supported_rotary_dims = {spec.head_dim}
     if spec.head_dim == 128:
-        supported_rotary_dims.add(64)
-    if rotary_dim not in supported_rotary_dims:
-        expected = " or ".join(str(dim) for dim in sorted(supported_rotary_dims))
+        if rotary_dim not in range(16, 129, 16):
+            raise NotImplementedError(
+                "partial rotary dimensions for head_dim=128 must form a "
+                "16-aligned prefix between 16 and 128; "
+                f"got rotary_dim={rotary_dim}"
+            )
+    elif rotary_dim != spec.head_dim:
         raise NotImplementedError(
-            "partial rotary dimensions are implemented only for rotary_dim=64 "
-            "with head_dim=128; "
-            f"rotary_dim must be {expected}, got {rotary_dim}"
+            "partial rotary dimensions are implemented only as 16-aligned "
+            "prefixes with head_dim=128; "
+            f"rotary_dim must be {spec.head_dim}, got {rotary_dim}"
         )
     if rotary_cos.shape[0] < spec.seqlen_k:
         raise ValueError(
@@ -1452,14 +1455,14 @@ def flash_attn_with_kvcache(
     append requires disjoint query, K-cache, and V-cache memory. Dense
     tensor-valued/partial lengths and multi-token updates fail explicitly. A
     paired ``rotary_cos``/``rotary_sin`` table may be supplied only for this
-    final-slot append: it may cover the full head or the first 64 dimensions of
-    a 128-dimensional head, must use the default interleaved layout, and rotates
-    both ``q`` and the appended ``k`` at ``cache_seqlens``. Read-only rotary
-    calls and other paged profiles fail explicitly. Paged updates, rotary, and
-    autograd are unsupported for both paged profiles. Paged ALiBi is unsupported
-    for chunked prefill, updates, LSE returns, other profiles, and other page
-    sizes. Paged softmax LSE is unsupported for chunked prefill, other profiles,
-    and other page sizes.
+    final-slot append: for a 128-dimensional head it may cover any 16-aligned
+    prefix from 16 through 128 dimensions, must use the default interleaved
+    layout, and rotates both ``q`` and the appended ``k`` at
+    ``cache_seqlens``. Read-only rotary calls and other paged profiles fail
+    explicitly. Paged updates, rotary, and autograd are unsupported for both
+    paged profiles. Paged ALiBi is unsupported for chunked prefill, updates,
+    LSE returns, other profiles, and other page sizes. Paged softmax LSE is
+    unsupported for chunked prefill, other profiles, and other page sizes.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")

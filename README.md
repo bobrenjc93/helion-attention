@@ -268,9 +268,9 @@ This same final-slot append accepts paired, contiguous `rotary_cos` and
 `rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
 `seqlen_ro >= S_CACHE` and the same CUDA dtype/device as `q`. The default
 interleaved layout rotates adjacent pairs in `q` and `new_k` at position
-`cache_seqlens`; the rotated key is what the cache stores. `rotary_dim` may be
-the full head dimension, or 64 for a D128 head; the latter preserves dimensions
-64 through 127 unchanged. Other partial rotary dimensions,
+`cache_seqlens`; the rotated key is what the cache stores. For a D128 head,
+`rotary_dim` may be any multiple of 16 from 16 through 128; dimensions after
+that prefix remain unchanged. Other partial rotary dimensions,
 `rotary_interleaved=False`, and rotary on a read-only call are rejected.
 
 `shape` accepts:
@@ -523,7 +523,7 @@ doing something else:
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense partial/ragged caches, paged profiles other than the exact read-only
   page-size-16 profiles above, paged LSE outside the exact decode profile
-  above, and KV-cache rotary outside the full-head or D128 half-head
+  above, and KV-cache rotary outside the full-head or 16-aligned D128-prefix
   interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
   KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
