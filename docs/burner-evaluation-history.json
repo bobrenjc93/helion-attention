@@ -1723,6 +1723,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:56eeb021e703f42fe36e9587c4e90e74646e7ecf",
+      "commit": "56eeb021e703f42fe36e9587c4e90e74646e7ecf",
+      "recordedAt": "2026-08-09T15:44:51.912Z",
+      "label": "base 56eeb02",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 89,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:86",
+      "recordedAt": "2026-08-09T15:44:51.912Z",
+      "label": "PR #86",
+      "kind": "leaf",
+      "prNumber": 86,
+      "title": "Backpropagate ragged causal varlen self-attention",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
