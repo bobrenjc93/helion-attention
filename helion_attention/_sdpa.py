@@ -12,6 +12,69 @@ from ._shape import AttnShape
 _Mask = TypeVar("_Mask")
 
 
+def dense_attention_cudnn_default_scale(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor | None:
+    """Run direct cuDNN SDPA, or return ``None`` when it is not usable."""
+    query = q.transpose(1, 2)
+    key = k.transpose(1, 2)
+    value = v.transpose(1, 2)
+
+    # sdpa_kernel mutates process-wide backend flags and races with concurrent
+    # callers. Ask PyTorch whether this exact call is supported, then invoke
+    # the cuDNN operator directly without changing backend-selection state.
+    params_type = getattr(torch.backends.cuda, "SDPAParams", None)
+    can_use_cudnn = getattr(
+        torch.backends.cuda, "can_use_cudnn_attention", None
+    )
+    cudnn_sdp_enabled = getattr(
+        torch.backends.cuda, "cudnn_sdp_enabled", None
+    )
+    if (
+        params_type is None
+        or can_use_cudnn is None
+        or cudnn_sdp_enabled is None
+        or not cudnn_sdp_enabled()
+        or not torch.backends.cudnn.enabled
+        or not torch.backends.cudnn.is_available()
+        or torch.backends.cudnn.deterministic
+        or torch.are_deterministic_algorithms_enabled()
+    ):
+        return None
+    try:
+        # PyTorch's eligibility probe consults the current CUDA device rather
+        # than deriving all device properties from the tensors. Preserve the
+        # caller's device while making both the probe and launch tensor-local.
+        with torch.cuda.device(q.device):
+            params = params_type(query, key, value, None, 0.0, True, False)
+            if not can_use_cudnn(params):
+                return None
+            cudnn_attention = (
+                torch.ops.aten._scaled_dot_product_cudnn_attention.default
+            )
+            with torch.autocast(device_type=q.device.type, enabled=False):
+                out = cudnn_attention(
+                    query,
+                    key,
+                    value,
+                    None,
+                    False,
+                    0.0,
+                    True,
+                    False,
+                )[0]
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except (AttributeError, NotImplementedError, RuntimeError, TypeError):
+        # Capability checks cannot cover missing operators in older builds or
+        # every cuDNN graph-construction/runtime rejection. The checked-in
+        # generated kernel remains the compatibility path for those cases.
+        return None
+    return out.transpose(1, 2).contiguous()
+
+
 def sdpa_causal_options(
     spec: AttnShape, causal_mask: _Mask | None
 ) -> tuple[_Mask | None, bool]:

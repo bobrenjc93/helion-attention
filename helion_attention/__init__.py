@@ -6,11 +6,12 @@ time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
-exact generated specialization; compatible unregistered dense shapes, dense
-ALiBi calls, and ALiBi on one shipped causal varlen profile use a generic
-Triton forward kernel. Positive dropout on the shipped encoder-training
-profile and grad-enabled dense calls without a generated backward use PyTorch
-SDPA autograd. The explicit shape validates these paths and makes specialization
+exact generated specialization, except one evidenced SM90 long-context MHA
+fast path that uses direct cuDNN SDPA; compatible unregistered dense shapes,
+dense ALiBi calls, and ALiBi on one shipped causal varlen profile use a generic
+Triton forward kernel. Positive dropout on the shipped encoder-training profile
+and grad-enabled dense calls without a generated backward use PyTorch SDPA
+autograd. The explicit shape validates these paths and makes specialization
 introspection independent of fallback coverage.
 """
 
@@ -34,6 +35,7 @@ from ._registry import lookup
 from ._registry import lookup_backward
 from ._registry import lookup_paged
 from ._registry import lookup_varlen
+from ._sdpa import dense_attention_cudnn_default_scale
 from ._sdpa import dense_attention_sdpa
 from ._shape import AttnShape
 from ._shape import ShapeLike
@@ -82,6 +84,7 @@ _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+_CUDNN_SDPA_FAST_PATH_KEY = "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal"
 _VARLEN_ALIBI_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
@@ -89,6 +92,11 @@ _DIAGNOSTIC_DECODE_PROFILES = frozenset(
         for cache_length in (1024, 4096, 16384)
     }
 )
+
+
+def _is_sm90(device: torch.device) -> bool:
+    """Whether ``device`` is exactly an SM90 CUDA GPU."""
+    return torch.cuda.get_device_capability(device) == (9, 0)
 
 
 def _reject_unsupported(
@@ -564,9 +572,11 @@ def flash_attn_func(
         when dropout is zero.
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
-    use a generic packed Triton forward kernel. Grad-enabled calls without
-    ALiBi or a generated backward, plus supported positive-dropout calls, use
-    PyTorch SDPA autograd.
+    use a generic packed Triton forward kernel. The exact default-option,
+    default-scale, no-backward causal bf16 ``(2, 8192, 8192, 16, 16, 128)``
+    call uses direct cuDNN SDPA on SM90 when eligible, falling back to its
+    generated kernel otherwise. Grad-enabled calls without ALiBi or a generated
+    backward, plus supported positive-dropout calls, use PyTorch SDPA autograd.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
@@ -594,7 +604,8 @@ def flash_attn_func(
     check_tensors(q, k, v, spec)
     if alibi_slopes is not None:
         _validate_alibi_slopes(alibi_slopes, q, spec)
-    if softmax_scale is None:
+    default_softmax_scale = softmax_scale is None
+    if default_softmax_scale:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
     needs_backward = torch.is_grad_enabled() and any(
@@ -644,6 +655,16 @@ def flash_attn_func(
         if not has_kernel(spec):
             _validate_generic_dense_layout(spec)
         return dense_attention_sdpa(q, k, v, scale, spec)
+    if (
+        default_softmax_scale
+        and not deterministic
+        and alibi_slopes is None
+        and spec.key == _CUDNN_SDPA_FAST_PATH_KEY
+        and _is_sm90(q.device)
+    ):
+        cudnn_out = dense_attention_cudnn_default_scale(q, k, v)
+        if cudnn_out is not None:
+            return cudnn_out
     if alibi_slopes is None and has_kernel(spec):
         return lookup(spec)(q, k, v, scale)
     return _generic_dense_forward(q, k, v, scale, spec, alibi_slopes)

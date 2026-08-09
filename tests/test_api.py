@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 import torch
@@ -35,6 +36,7 @@ LONG_DECODE = next(
 )
 BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
 ENCODER_TRAINING = spec_from_manifest_entry(BACKWARD_SHAPES[0])
+CUDNN_FAST_PATH_KEY = "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal"
 QWEN_PREFILL = AttnShape(
     batch=1,
     seqlen_q=2048,
@@ -44,6 +46,9 @@ QWEN_PREFILL = AttnShape(
     head_dim=128,
     dtype=torch.bfloat16,
     causal=True,
+)
+CUDNN_FAST_PATH = spec_from_manifest_entry(
+    next(entry for entry in SHAPES if entry["key"] == CUDNN_FAST_PATH_KEY)
 )
 PAGED_KVCACHE = AttnShape(
     batch=4,
@@ -327,6 +332,7 @@ def test_matches_fp32_sdpa(entry: dict[str, object]) -> None:
     q, k, v = make_inputs(spec)
     got = helion_attention.flash_attn_func(q, k, v, causal=spec.causal, shape=spec)
     expected = reference_attention(q, k, v, spec, 1.0 / math.sqrt(spec.head_dim))
+    assert got.is_contiguous()
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
 
 
@@ -445,6 +451,341 @@ def test_registered_shape_without_backward_dispatches_to_sdpa(
 
     assert out is sentinel
     assert dispatched == [spec]
+
+
+@requires_cuda
+def test_cudnn_fast_path_dispatch_is_narrow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = CUDNN_FAST_PATH
+
+    def empty(seqlen: int, nheads: int) -> torch.Tensor:
+        return torch.empty(
+            spec.batch,
+            seqlen,
+            nheads,
+            spec.head_dim,
+            device="cuda",
+            dtype=spec.dtype,
+        )
+
+    q = empty(spec.seqlen_q, spec.nheads_q)
+    k = empty(spec.seqlen_k, spec.nheads_kv)
+    v = empty(spec.seqlen_k, spec.nheads_kv)
+    sentinel = torch.empty((), device="cuda")
+    dispatched: list[str] = []
+
+    def cudnn(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg
+        dispatched.append("cudnn")
+        return sentinel
+
+    def lookup_stub(spec_arg: AttnShape):
+        del spec_arg
+
+        def generated(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            del q_arg, k_arg, v_arg, scale_arg
+            dispatched.append("generated")
+            return sentinel
+
+        return generated
+
+    def autograd_fallback(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg, spec_arg
+        dispatched.append("autograd")
+        return sentinel
+
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_cudnn_default_scale", cudnn
+    )
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_sdpa", autograd_fallback
+    )
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["cudnn"]
+
+    # Supplying even the numerical default explicitly retains generated-kernel
+    # dispatch; the fast path is specifically for an omitted/default scale.
+    dispatched.clear()
+    out = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0 / math.sqrt(spec.head_dim),
+        causal=True,
+        shape=spec,
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, deterministic=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: False)
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
+    monkeypatch.setattr(
+        helion_attention,
+        "dense_attention_cudnn_default_scale",
+        lambda q_arg, k_arg, v_arg: None,
+    )
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    other_spec = spec_from_manifest_entry(
+        next(entry for entry in SHAPES if entry["key"] == CHUNKED_PREFILL_KEY)
+    )
+    other_q, other_k, other_v = make_inputs(other_spec)
+    out = helion_attention.flash_attn_func(
+        other_q,
+        other_k,
+        other_v,
+        causal=other_spec.causal,
+        shape=other_spec,
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
+    q.requires_grad_()
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["autograd"]
+
+
+@requires_cuda
+def test_cudnn_fast_path_falls_back_when_ineligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = CUDNN_FAST_PATH
+
+    def empty(seqlen: int, nheads: int) -> torch.Tensor:
+        return torch.empty(
+            spec.batch,
+            seqlen,
+            nheads,
+            spec.head_dim,
+            device="cuda",
+            dtype=spec.dtype,
+        )
+
+    q = empty(spec.seqlen_q, spec.nheads_q)
+    k = empty(spec.seqlen_k, spec.nheads_kv)
+    v = empty(spec.seqlen_k, spec.nheads_kv)
+    sentinel = torch.empty((), device="cuda")
+    generated_calls = 0
+
+    def lookup_stub(spec_arg: AttnShape):
+        assert spec_arg == spec
+
+        def generated(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            nonlocal generated_calls
+            del q_arg, k_arg, v_arg
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            generated_calls += 1
+            return sentinel
+
+        return generated
+
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
+
+    deterministic_enabled = torch.are_deterministic_algorithms_enabled()
+    deterministic_warn_only = (
+        torch.is_deterministic_algorithms_warn_only_enabled()
+    )
+    try:
+        torch.use_deterministic_algorithms(True)
+        out = helion_attention.flash_attn_func(
+            q, k, v, causal=True, shape=spec
+        )
+    finally:
+        torch.use_deterministic_algorithms(
+            deterministic_enabled, warn_only=deterministic_warn_only
+        )
+    assert out is sentinel
+    assert generated_calls == 1
+
+    monkeypatch.setattr(
+        torch.backends.cuda,
+        "can_use_cudnn_attention",
+        lambda params: False,
+    )
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert generated_calls == 2
+
+
+@requires_two_cuda_devices
+def test_cudnn_fast_path_uses_tensor_device_for_eligibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sm90_devices = [
+        index
+        for index in range(torch.cuda.device_count())
+        if torch.cuda.get_device_capability(index) == (9, 0)
+    ]
+    if not sm90_devices:
+        pytest.skip("the cuDNN fast path requires an SM90 device")
+    target_index = sm90_devices[0]
+    other_index = next(
+        index
+        for index in range(torch.cuda.device_count())
+        if index != target_index
+    )
+    target = torch.device("cuda", target_index)
+    spec = CUDNN_FAST_PATH
+    q, k, v = make_inputs(spec, device=target, seed=24601)
+
+    with torch.cuda.device(target):
+        preflight = helion_attention.dense_attention_cudnn_default_scale(
+            q, k, v
+        )
+    if preflight is None:
+        pytest.skip("cuDNN attention is unavailable for the fast-path shape")
+    torch.cuda.synchronize(target)
+    del preflight
+
+    real_can_use_cudnn = torch.backends.cuda.can_use_cudnn_attention
+    probe_devices: list[int] = []
+
+    def observing_can_use_cudnn(params: object) -> bool:
+        probe_devices.append(torch.cuda.current_device())
+        return real_can_use_cudnn(params)
+
+    def reject_generated(spec_arg: AttnShape):
+        raise AssertionError(
+            f"eligible non-current-device call fell back: {spec_arg.key}"
+        )
+
+    monkeypatch.setattr(
+        torch.backends.cuda,
+        "can_use_cudnn_attention",
+        observing_can_use_cudnn,
+    )
+    monkeypatch.setattr(helion_attention, "lookup", reject_generated)
+
+    with torch.cuda.device(other_index):
+        out = helion_attention.flash_attn_func(
+            q, k, v, causal=True, shape=spec
+        )
+        assert torch.cuda.current_device() == other_index
+    torch.cuda.synchronize(target)
+
+    assert probe_devices == [target_index]
+    assert out.device == target
+    assert out.is_contiguous()
+
+
+@requires_cuda
+def test_concurrent_cudnn_fast_path_preserves_sdpa_backend_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("the cuDNN fast path requires SM90")
+    spec = CUDNN_FAST_PATH
+    q, k, v = make_inputs(spec, seed=8675309)
+    preflight = helion_attention.dense_attention_cudnn_default_scale(q, k, v)
+    if preflight is None:
+        pytest.skip("cuDNN attention is unavailable for the fast-path shape")
+    torch.cuda.synchronize(q.device)
+    del preflight
+
+    def reject_generated(spec_arg: AttnShape):
+        raise AssertionError(
+            f"eligible cuDNN call fell back to generated kernel: {spec_arg.key}"
+        )
+
+    monkeypatch.setattr(helion_attention, "lookup", reject_generated)
+    flags_before = (
+        torch.backends.cuda.flash_sdp_enabled(),
+        torch.backends.cuda.mem_efficient_sdp_enabled(),
+        torch.backends.cuda.math_sdp_enabled(),
+        torch.backends.cuda.cudnn_sdp_enabled(),
+    )
+
+    def run(barrier: Barrier) -> torch.Tensor:
+        barrier.wait()
+        return helion_attention.flash_attn_func(
+            q, k, v, causal=True, shape=spec
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for _ in range(30):
+                barrier = Barrier(2)
+                futures = [
+                    pool.submit(run, barrier), pool.submit(run, barrier)
+                ]
+                for future in futures:
+                    out = future.result()
+                    assert out.shape == q.shape
+                    assert out.is_contiguous()
+        torch.cuda.synchronize()
+
+        flags_after = (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+        )
+        assert flags_after == flags_before
+
+        float32_probe = torch.randn(1, 1, 2, 8, device="cuda")
+        probe_out = torch.nn.functional.scaled_dot_product_attention(
+            float32_probe, float32_probe, float32_probe
+        )
+        assert probe_out.shape == float32_probe.shape
+    finally:
+        torch.backends.cuda.enable_flash_sdp(flags_before[0])
+        torch.backends.cuda.enable_mem_efficient_sdp(flags_before[1])
+        torch.backends.cuda.enable_math_sdp(flags_before[2])
+        torch.backends.cuda.enable_cudnn_sdp(flags_before[3])
 
 
 @requires_cuda
