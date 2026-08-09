@@ -296,7 +296,10 @@ a custom `softmax_scale` and optional fp32 LSE. This path synchronizes once to
 check bounds recoverably, so it rejects CUDA graph capture and autograd.
 `cache_leftpad` is not supported with updates, cache remapping, rotary, paged
 caches, or any other profile. Omitting the length or passing the full length as
-a Python integer retains the checked-in split-KV generated kernel.
+a Python integer retains the checked-in split-KV generated kernel. Those full,
+read-only calls also accept `num_splits=16`, matching the generated kernel's
+fixed split count. Other explicit split counts, profiles, tensor spans, updates,
+rotary calls, and autograd are rejected before dispatch.
 
 Two exact bf16 profiles also accept a read-only paged cache through
 `flash_attn_with_kvcache`: page-size-16 chunked prefill

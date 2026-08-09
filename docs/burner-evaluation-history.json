@@ -2323,6 +2323,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:1956619588a21464fb91a3beb581f0dcedd13a71",
+      "commit": "1956619588a21464fb91a3beb581f0dcedd13a71",
+      "recordedAt": "2026-08-09T23:52:18.007Z",
+      "label": "base 1956619",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 54,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:108",
+      "recordedAt": "2026-08-09T23:52:18.007Z",
+      "label": "PR #108",
+      "kind": "leaf",
+      "prNumber": 108,
+      "title": "Honor the 16-way split selector on 16K decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 55,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
