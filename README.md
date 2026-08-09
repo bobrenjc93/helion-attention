@@ -246,6 +246,27 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
+The exact bf16 4K profile above also accepts forward-only fp32 ALiBi slopes
+shaped `[32]` or `[1, 32]`, with either decode-equivalent causal flag and the
+default or a custom `softmax_scale`:
+
+```python
+slopes = torch.linspace(0.01, 0.2, H_Q, device="cuda", dtype=torch.float32)
+out = helion_attention.flash_attn_with_kvcache(
+    q,
+    k_cache,
+    v_cache,
+    causal=True,
+    alibi_slopes=slopes,
+    shape=(B, 1, S_CACHE, H_Q, H_KV, D),
+)
+```
+
+ALiBi uses the generic packed Triton runtime and never mutates the cache;
+slope-free calls retain the checked-in generated specialization. This narrow
+mode does not support LSE, updates, partial lengths, cache remapping, left
+padding, rotary, windows, softcap, or autograd.
+
 One strict speculative-decoding slice handles two query tokens with a dense
 cache: causal bf16 `(1, 2, 1024, 32, 8, 128)`. It accepts either the default or
 a custom `softmax_scale` and uses the generic packed Triton runtime. The
@@ -257,10 +278,11 @@ other update positions or lengths, partial or GPT-NeoX rotary, cache remapping,
 autograd, noncausal mode, and every other multi-token KV-cache shape remain
 unsupported.
 
-For supported single-token dense caches, pass `return_softmax_lse=True` to receive
-`(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
-FlashAttention's KV-cache API. The exact paged decode profile below supports
-the same return for both the default and a custom `softmax_scale`.
+For supported slope-free single-token dense caches, pass
+`return_softmax_lse=True` to receive `(out, softmax_lse)`. The LSE is fp32 with
+shape `[batch, heads_q, 1]`, matching FlashAttention's KV-cache API. The exact
+paged decode profile below supports the same return for both the default and a
+custom `softmax_scale`.
 
 The causal bf16 dense profile `(1, 1, 16384, 32, 8, 128)` also accepts a
 contiguous CUDA int32 `cache_seqlens` tensor shaped `[1]`. Values from 1 through
@@ -636,9 +658,12 @@ also raise `NotImplementedError` rather than silently doing something else:
   exception permits its documented LSE return
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
-  the exact read-only page-size-16 profiles and page-size-256 decode above;
-  paged ALiBi cannot be combined with LSE, softcap, updates, rotary, or autograd
-  and is not supported with other page sizes
+  the exact read-only bf16 dense `(1, 1, 4096, 32, 8, 128)` decode profile,
+  page-size-16 profiles, and page-size-256 decode above; dense KV-cache ALiBi
+  cannot be combined with LSE, updates, partial lengths, remapping, left
+  padding, rotary, windows, softcap, or autograd; paged ALiBi cannot be combined
+  with LSE, softcap, updates, rotary, or autograd and is not supported with
+  other page sizes
 - KV-cache mutation beyond the dense paired one-token final-slot append and
   exact two-token final-two-slot append above;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
