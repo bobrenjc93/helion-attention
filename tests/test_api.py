@@ -66,6 +66,16 @@ PAGED_CHUNKED_PREFILL = AttnShape(
     causal=True,
 )
 CHUNKED_PREFILL_KEY = "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal"
+DENSE_ALIBI_BACKWARD = AttnShape(
+    batch=1,
+    seqlen_q=64,
+    seqlen_k=320,
+    nheads_q=8,
+    nheads_kv=2,
+    head_dim=128,
+    dtype=torch.bfloat16,
+    causal=True,
+)
 GENERIC_DENSE_SPECS = [
     AttnShape(2, 23, 23, 4, 4, 32, torch.bfloat16, False),
     AttnShape(2, 19, 31, 8, 2, 64, torch.bfloat16, True),
@@ -244,12 +254,27 @@ def reference_attention(
     v: torch.Tensor,
     spec: AttnShape,
     scale: float,
+    alibi_slopes: torch.Tensor | None = None,
 ) -> torch.Tensor:
     mask = None
+    row = torch.arange(spec.seqlen_q, device=q.device)[:, None]
+    col = torch.arange(spec.seqlen_k, device=q.device)[None, :]
     if spec.causal:
-        row = torch.arange(spec.seqlen_q, device=q.device)[:, None]
-        col = torch.arange(spec.seqlen_k, device=q.device)[None, :]
         mask = col <= row + spec.seqlen_k - spec.seqlen_q
+    if alibi_slopes is not None:
+        slopes = (
+            alibi_slopes.unsqueeze(0)
+            if alibi_slopes.ndim == 1
+            else alibi_slopes
+        )
+        distance = torch.abs(row + spec.seqlen_k - spec.seqlen_q - col)
+        bias = (
+            -slopes.float()[:, :, None, None]
+            * distance.float()[None, None]
+        )
+        if mask is not None:
+            bias = bias.masked_fill(~mask[None, None], float("-inf"))
+        mask = bias
     return torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2).float(),
         k.transpose(1, 2).float(),
@@ -529,6 +554,180 @@ def test_dense_alibi_bypasses_registered_specialization(
 
     out = helion_attention.flash_attn_func(
         q, k, v, causal=spec.causal, alibi_slopes=slopes, shape=spec
+    )
+
+    assert out is sentinel
+    assert dispatched == [(spec, slopes)]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "packed", [False, True], ids=["dense", "kvpacked"]
+)
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
+)
+def test_dense_alibi_backward_matches_fp32_and_fa2(
+    packed: bool,
+    batched_slopes: bool,
+    softmax_scale: float | None,
+) -> None:
+    spec = DENSE_ALIBI_BACKWARD
+    q_base, k_base, v_base = make_inputs(spec, seed=20260810)
+    grad_out = make_inputs(spec, seed=20260811)[0]
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q_base.device)
+    slopes = head_slopes.unsqueeze(0) if batched_slopes else head_slopes
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    q = q_base.detach().requires_grad_()
+    if packed:
+        kv = torch.stack((k_base, v_base), dim=2).detach().requires_grad_()
+        got = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            shape=spec,
+        )
+        actual_inputs = (q, kv)
+
+        q_ref = q_base.float().detach().requires_grad_()
+        kv_ref = (
+            torch.stack((k_base, v_base), dim=2)
+            .float()
+            .detach()
+            .requires_grad_()
+        )
+        k_ref, v_ref = (kv_ref[:, :, index] for index in range(2))
+        reference_inputs = (q_ref, kv_ref)
+    else:
+        k = k_base.detach().requires_grad_()
+        v = v_base.detach().requires_grad_()
+        got = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            shape=spec,
+        )
+        actual_inputs = (q, k, v)
+
+        q_ref = q_base.float().detach().requires_grad_()
+        k_ref = k_base.float().detach().requires_grad_()
+        v_ref = v_base.float().detach().requires_grad_()
+        reference_inputs = (q_ref, k_ref, v_ref)
+
+    got_grads = torch.autograd.grad(got, actual_inputs, grad_out)
+    expected = reference_attention(
+        q_ref,
+        k_ref,
+        v_ref,
+        spec,
+        scale,
+        alibi_slopes=slopes,
+    )
+    expected_grads = torch.autograd.grad(
+        expected, reference_inputs, grad_out.float()
+    )
+
+    assert got.shape == q_base.shape
+    assert got.dtype == spec.dtype
+    assert got.is_contiguous()
+    torch.testing.assert_close(got.float(), expected, atol=2e-2, rtol=1e-2)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=5e-2, rtol=2e-2
+        )
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+
+    q_fa2 = q_base.detach().requires_grad_()
+    if packed:
+        kv_fa2 = torch.stack((k_base, v_base), dim=2).detach().requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_kvpacked_func(
+            q_fa2,
+            kv_fa2,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+        )
+        fa2_inputs = (q_fa2, kv_fa2)
+    else:
+        k_fa2 = k_base.detach().requires_grad_()
+        v_fa2 = v_base.detach().requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_func(
+            q_fa2,
+            k_fa2,
+            v_fa2,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+        )
+        fa2_inputs = (q_fa2, k_fa2, v_fa2)
+    fa2_grads = torch.autograd.grad(expected_fa2, fa2_inputs, grad_out)
+
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=2e-2, rtol=1e-2
+    )
+    for actual, reference in zip(got_grads, fa2_grads):
+        torch.testing.assert_close(
+            actual.float(), reference.float(), atol=4e-2, rtol=2e-2
+        )
+
+
+@requires_cuda
+def test_dense_alibi_backward_dispatches_only_to_bounded_sdpa(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = DENSE_ALIBI_BACKWARD
+    q, k, v = make_inputs(spec, seed=112358)
+    q.requires_grad_()
+    slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    sentinel = torch.empty_like(q)
+    dispatched: list[tuple[AttnShape, torch.Tensor | None]] = []
+
+    def sdpa(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        dropout_arg: float = 0.0,
+        *,
+        alibi_slopes: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg, dropout_arg
+        dispatched.append((spec_arg, alibi_slopes))
+        return sentinel
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("ALiBi backward reached a forward dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", sdpa)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "attention_autograd", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+
+    out = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        alibi_slopes=slopes,
+        shape=spec,
     )
 
     assert out is sentinel
@@ -1405,6 +1604,42 @@ def test_dense_alibi_rejects_gradients_before_dispatch(
     with pytest.raises(NotImplementedError, match="ALiBi backward"):
         helion_attention.flash_attn_func(
             q, k, v, alibi_slopes=slopes, shape=spec
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("slopes", "slope gradients"),
+        ("deterministic", "deterministic=True"),
+    ],
+)
+def test_dense_alibi_backward_profile_rejects_unsupported_autograd_modes(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = DENSE_ALIBI_BACKWARD
+    q, k, v = make_inputs(spec, seed=271828)
+    q.requires_grad_()
+    slopes = torch.ones(spec.nheads_q, device=q.device)
+    deterministic = case == "deterministic"
+    if case == "slopes":
+        slopes.requires_grad_()
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported ALiBi autograd mode reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            alibi_slopes=slopes,
+            deterministic=deterministic,
+            shape=spec,
         )
 
 

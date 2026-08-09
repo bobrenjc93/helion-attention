@@ -6,12 +6,12 @@ time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
-exact generated specialization; compatible unregistered dense shapes, dense
-ALiBi calls, and ALiBi on one shipped causal varlen profile use a generic
-Triton forward kernel. Positive dropout on the shipped encoder-training
-profile and grad-enabled dense calls without a generated backward use PyTorch
-SDPA autograd. The explicit shape validates these paths and makes specialization
-introspection independent of fallback coverage.
+exact generated specialization; compatible unregistered dense shapes and ALiBi
+calls that do not need backward use a generic Triton forward kernel. Positive
+dropout on the shipped encoder-training profile, grad-enabled dense calls
+without a generated backward, and Q/K/V ALiBi backward on one bounded profile
+use PyTorch SDPA autograd. The explicit shape validates these paths and makes
+specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from ._registry import lookup
 from ._registry import lookup_backward
 from ._registry import lookup_paged
 from ._registry import lookup_varlen
+from ._sdpa import DENSE_ALIBI_BACKWARD_KEY
 from ._sdpa import dense_attention_sdpa
 from ._shape import AttnShape
 from ._shape import ShapeLike
@@ -546,7 +547,8 @@ def flash_attn_func(
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
-            ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
+            ``[batch, nheads_q]``. Q/K/V backward is supported for the causal
+            bf16 ``(1, 64, 320, 8, 2, 128)`` profile; slope gradients are not.
         return_attn_probs: for the three shipped bf16 Llama GQA decode
             profiles, return FlashAttention's diagnostic tuple. This is
             available only when no backward is needed and all options other
@@ -563,10 +565,11 @@ def flash_attn_func(
         ``S_dmask`` is an empty input-dtype tensor, matching FlashAttention
         when dropout is zero.
 
-    Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
-    use a generic packed Triton forward kernel. Grad-enabled calls without
-    ALiBi or a generated backward, plus supported positive-dropout calls, use
-    PyTorch SDPA autograd.
+    Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and ALiBi calls that
+    do not need backward use a generic packed Triton forward kernel.
+    Grad-enabled calls without a generated backward, supported positive-dropout
+    calls, and Q/K/V ALiBi backward on the exact profile above use PyTorch SDPA
+    autograd.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
@@ -623,12 +626,30 @@ def flash_attn_func(
             q, k, v, scale, return_softmax_lse=True
         )
         return out, softmax_lse, q.new_empty((0,))
-    if alibi_slopes is not None and torch.is_grad_enabled() and (
-        needs_backward or alibi_slopes.requires_grad
-    ):
-        raise NotImplementedError(
-            "ALiBi backward is not implemented; ALiBi calls are forward-only"
-        )
+    if alibi_slopes is not None and torch.is_grad_enabled():
+        if alibi_slopes.requires_grad:
+            raise NotImplementedError(
+                "ALiBi backward does not implement slope gradients"
+            )
+        if needs_backward:
+            if deterministic:
+                raise NotImplementedError(
+                    "deterministic=True is not supported by the ALiBi SDPA "
+                    "autograd fallback"
+                )
+            if spec.key != DENSE_ALIBI_BACKWARD_KEY:
+                raise NotImplementedError(
+                    "ALiBi backward is implemented only for "
+                    f"{DENSE_ALIBI_BACKWARD_KEY}; got {spec.key}"
+                )
+            return dense_attention_sdpa(
+                q,
+                k,
+                v,
+                scale,
+                spec,
+                alibi_slopes=alibi_slopes,
+            )
     if dropout != 0.0:
         return dense_attention_sdpa(q, k, v, scale, spec, dropout)
     if needs_backward:

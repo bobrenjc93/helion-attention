@@ -55,9 +55,11 @@ Dense calls do not need a checked-in specialization. Contiguous CUDA fp16 and
 bf16 MHA/GQA inputs with `head_dim <= 256` use the generic Triton forward when
 their exact shape is absent, including unequal query/key lengths and
 bottom-right causal masking. Grad-enabled calls without a generated backward
-use PyTorch SDPA autograd instead. Dense ALiBi forward calls accept fp32 slopes
-shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
-ALiBi backward is not implemented. The shipped noncausal bf16
+use PyTorch SDPA autograd instead. Dense ALiBi calls that do not need backward
+accept fp32 slopes shaped `[nheads]` or `[batch, nheads]` and use the generic
+Triton path. The causal bf16 `(1, 64, 320, 8, 2, 128)` profile additionally
+supports Q/K/V backward through bounded additive-bias SDPA; slope gradients and
+ALiBi backward on other profiles remain unsupported. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
 Other dropout calls, local windows, softcap, diagnostic returns outside the
@@ -454,7 +456,9 @@ autograd, including fp16/bf16 and bottom-right causal masking. Packed varlen and
 KV-cache calls remain forward-only. These unsupported FlashAttention features
 also raise `NotImplementedError` rather than silently doing something else:
 
-- backward for dense ALiBi, varlen, and KV-cache calls
+- dense ALiBi backward outside the causal bf16
+  `(1, 64, 320, 8, 2, 128)` Q/K/V subset above, ALiBi slope gradients, and
+  backward for packed varlen and KV-cache calls
 - `deterministic=True` when using the dense SDPA autograd fallback
 - dropout outside the exact encoder-training profile above, or combined with
   ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
