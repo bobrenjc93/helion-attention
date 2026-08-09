@@ -1123,6 +1123,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:ddd8d9aab6f800b920abc9ffd6d554305fa6ec6b",
+      "commit": "ddd8d9aab6f800b920abc9ffd6d554305fa6ec6b",
+      "recordedAt": "2026-08-09T00:59:24.427Z",
+      "label": "base ddd8d9a",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 81,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:49",
+      "recordedAt": "2026-08-09T00:59:24.427Z",
+      "label": "PR #49",
+      "kind": "leaf",
+      "prNumber": 49,
+      "title": "Expose paged chunked prefill through the KV-cache API",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 81,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
