@@ -2008,6 +2008,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:7746931cf4fd148d53b897e344ee5b1e7ee29db6",
+      "commit": "7746931cf4fd148d53b897e344ee5b1e7ee29db6",
+      "recordedAt": "2026-08-09T19:22:22.429Z",
+      "label": "base 7746931",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:96",
+      "recordedAt": "2026-08-09T19:22:22.429Z",
+      "label": "PR #96",
+      "kind": "leaf",
+      "prNumber": 96,
+      "title": "Add dropout to one shipped causal dense profile",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
