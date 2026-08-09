@@ -15,11 +15,13 @@ checked-in catalogue use those autotuned kernels. Other compatible dense calls
 use a generic packed Triton kernel for correctness and API coverage. Declaring
 the shape at the call site validates both paths and keeps acceleration explicit.
 
-One measured Hopper exception uses PyTorch's scoped cuDNN SDPA backend: the
-exact causal bf16 `(2, 8192, 8192, 16, 16, 128)` call routes there on SM90 when
-no backward is needed, `softmax_scale` is left at its default, and all other
-options retain their defaults. Explicit scales, autograd, non-SM90 devices,
-and every other call retain their normal generated-kernel or fallback dispatch.
+One measured Hopper exception invokes PyTorch's cuDNN SDPA operator directly:
+the exact causal bf16 `(2, 8192, 8192, 16, 16, 128)` call routes there on SM90
+when no backward is needed, `softmax_scale` is left at its default, and all
+other options retain their defaults. If PyTorch reports cuDNN attention
+unavailable for the current configuration, the call falls back to the
+checked-in kernel. Explicit scales, autograd, non-SM90 devices, and every other
+call retain their normal generated-kernel or fallback dispatch.
 
 ## Install
 
@@ -400,7 +402,7 @@ Paged rows use identical logical caches with each implementation's native page s
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True | 110 | 350 | 198 | 197 | 196 | 78 | **3.19x faster** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False | 130 | 303 | 199 | 195 | 195 | 132 | **2.33x faster** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=fp16 causal=False | 98 | 304 | 196 | 195 | 192 | 175 | **3.09x faster** |
-| batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True | 973 | 868 | 1627 | 1752 | 989 | 565 | **1.12x slower** |
+| batch=2 seqlen_q=8192 seqlen_k=8192 nheads=16 head_dim=128 dtype=bf16 causal=True | 975 | 868 | 1625 | 1753 | 994 | 564 | **1.12x slower** |
 | batch=4 seqlen_q=2048 seqlen_k=2048 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 400 | 355 | 405 | 432 | 239 | 301 | **1.13x slower** |
 | batch=4 seqlen_q=2048 seqlen_k=2048 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 412 | 374 | 455 | 488 | 276 | 333 | **1.10x slower** |
 | batch=4 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 1328 | 817 | 1412 | 1537 | 879 | 362 | **1.63x slower** |

@@ -5,8 +5,6 @@ from __future__ import annotations
 from typing import TypeVar
 
 import torch
-from torch.nn.attention import SDPBackend
-from torch.nn.attention import sdpa_kernel
 from torch.nn.attention.bias import causal_lower_right
 
 from ._shape import AttnShape
@@ -18,24 +16,58 @@ def dense_attention_cudnn_default_scale(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-) -> torch.Tensor:
-    """Run the exact default-scale causal MHA fast path through cuDNN SDPA."""
+) -> torch.Tensor | None:
+    """Run direct cuDNN SDPA, or return ``None`` when it is not usable."""
     query = q.transpose(1, 2)
     key = k.transpose(1, 2)
     value = v.transpose(1, 2)
 
-    # Keep this override local: global backend settings belong to the caller,
-    # and all calls outside the one guarded public-API path retain their
-    # existing dispatch.
-    with torch.autocast(device_type=q.device.type, enabled=False), sdpa_kernel(
-        SDPBackend.CUDNN_ATTENTION
+    # sdpa_kernel mutates process-wide backend flags and races with concurrent
+    # callers. Ask PyTorch whether this exact call is supported, then invoke
+    # the cuDNN operator directly without changing backend-selection state.
+    params_type = getattr(torch.backends.cuda, "SDPAParams", None)
+    can_use_cudnn = getattr(
+        torch.backends.cuda, "can_use_cudnn_attention", None
+    )
+    cudnn_sdp_enabled = getattr(
+        torch.backends.cuda, "cudnn_sdp_enabled", None
+    )
+    if (
+        params_type is None
+        or can_use_cudnn is None
+        or cudnn_sdp_enabled is None
+        or not cudnn_sdp_enabled()
+        or not torch.backends.cudnn.enabled
+        or not torch.backends.cudnn.is_available()
+        or torch.backends.cudnn.deterministic
+        or torch.are_deterministic_algorithms_enabled()
     ):
-        out = torch.nn.functional.scaled_dot_product_attention(
-            query,
-            key,
-            value,
-            is_causal=True,
+        return None
+    try:
+        params = params_type(query, key, value, None, 0.0, True, False)
+        if not can_use_cudnn(params):
+            return None
+        cudnn_attention = (
+            torch.ops.aten._scaled_dot_product_cudnn_attention.default
         )
+        with torch.autocast(device_type=q.device.type, enabled=False):
+            out = cudnn_attention(
+                query,
+                key,
+                value,
+                None,
+                False,
+                0.0,
+                True,
+                False,
+            )[0]
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except (AttributeError, NotImplementedError, RuntimeError, TypeError):
+        # Capability checks cannot cover missing operators in older builds or
+        # every cuDNN graph-construction/runtime rejection. The checked-in
+        # generated kernel remains the compatibility path for those cases.
+        return None
     return out.transpose(1, 2).contiguous()
 
 

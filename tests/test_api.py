@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 
 import pytest
 import torch
@@ -555,6 +556,18 @@ def test_cudnn_fast_path_dispatch_is_narrow(
 
     dispatched.clear()
     monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
+    monkeypatch.setattr(
+        helion_attention,
+        "dense_attention_cudnn_default_scale",
+        lambda q_arg, k_arg, v_arg: None,
+    )
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert dispatched == ["generated"]
+
+    dispatched.clear()
     other_spec = spec_from_manifest_entry(
         next(entry for entry in SHAPES if entry["key"] == CHUNKED_PREFILL_KEY)
     )
@@ -576,6 +589,137 @@ def test_cudnn_fast_path_dispatch_is_narrow(
     )
     assert out is sentinel
     assert dispatched == ["autograd"]
+
+
+@requires_cuda
+def test_cudnn_fast_path_falls_back_when_ineligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = CUDNN_FAST_PATH
+
+    def empty(seqlen: int, nheads: int) -> torch.Tensor:
+        return torch.empty(
+            spec.batch,
+            seqlen,
+            nheads,
+            spec.head_dim,
+            device="cuda",
+            dtype=spec.dtype,
+        )
+
+    q = empty(spec.seqlen_q, spec.nheads_q)
+    k = empty(spec.seqlen_k, spec.nheads_kv)
+    v = empty(spec.seqlen_k, spec.nheads_kv)
+    sentinel = torch.empty((), device="cuda")
+    generated_calls = 0
+
+    def lookup_stub(spec_arg: AttnShape):
+        assert spec_arg == spec
+
+        def generated(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            nonlocal generated_calls
+            del q_arg, k_arg, v_arg
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            generated_calls += 1
+            return sentinel
+
+        return generated
+
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
+
+    deterministic_enabled = torch.are_deterministic_algorithms_enabled()
+    deterministic_warn_only = (
+        torch.is_deterministic_algorithms_warn_only_enabled()
+    )
+    try:
+        torch.use_deterministic_algorithms(True)
+        out = helion_attention.flash_attn_func(
+            q, k, v, causal=True, shape=spec
+        )
+    finally:
+        torch.use_deterministic_algorithms(
+            deterministic_enabled, warn_only=deterministic_warn_only
+        )
+    assert out is sentinel
+    assert generated_calls == 1
+
+    monkeypatch.setattr(
+        torch.backends.cuda,
+        "can_use_cudnn_attention",
+        lambda params: False,
+    )
+    out = helion_attention.flash_attn_func(
+        q, k, v, causal=True, shape=spec
+    )
+    assert out is sentinel
+    assert generated_calls == 2
+
+
+@requires_cuda
+def test_concurrent_cudnn_fast_path_preserves_sdpa_backend_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("the cuDNN fast path requires SM90")
+    spec = CUDNN_FAST_PATH
+    q, k, v = make_inputs(spec, seed=8675309)
+
+    def reject_generated(spec_arg: AttnShape):
+        raise AssertionError(
+            f"eligible cuDNN call fell back to generated kernel: {spec_arg.key}"
+        )
+
+    monkeypatch.setattr(helion_attention, "lookup", reject_generated)
+    flags_before = (
+        torch.backends.cuda.flash_sdp_enabled(),
+        torch.backends.cuda.mem_efficient_sdp_enabled(),
+        torch.backends.cuda.math_sdp_enabled(),
+        torch.backends.cuda.cudnn_sdp_enabled(),
+    )
+
+    def run(barrier: Barrier) -> torch.Tensor:
+        barrier.wait()
+        return helion_attention.flash_attn_func(
+            q, k, v, causal=True, shape=spec
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            for _ in range(30):
+                barrier = Barrier(2)
+                futures = [
+                    pool.submit(run, barrier), pool.submit(run, barrier)
+                ]
+                for future in futures:
+                    out = future.result()
+                    assert out.shape == q.shape
+                    assert out.is_contiguous()
+        torch.cuda.synchronize()
+
+        flags_after = (
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            torch.backends.cuda.cudnn_sdp_enabled(),
+        )
+        assert flags_after == flags_before
+
+        float32_probe = torch.randn(1, 1, 2, 8, device="cuda")
+        probe_out = torch.nn.functional.scaled_dot_product_attention(
+            float32_probe, float32_probe, float32_probe
+        )
+        assert probe_out.shape == float32_probe.shape
+    finally:
+        torch.backends.cuda.enable_flash_sdp(flags_before[0])
+        torch.backends.cuda.enable_mem_efficient_sdp(flags_before[1])
+        torch.backends.cuda.enable_math_sdp(flags_before[2])
+        torch.backends.cuda.enable_cudnn_sdp(flags_before[3])
 
 
 @requires_cuda

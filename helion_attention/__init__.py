@@ -7,7 +7,7 @@ time they are checked in: importing this package pulls in ``torch`` and
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except one evidenced SM90 long-context MHA
-fast path that uses scoped cuDNN SDPA; compatible unregistered dense shapes,
+fast path that uses direct cuDNN SDPA; compatible unregistered dense shapes,
 dense ALiBi calls, and ALiBi on one shipped causal varlen profile use a generic
 Triton forward kernel. Positive dropout on the shipped encoder-training profile
 and grad-enabled dense calls without a generated backward use PyTorch SDPA
@@ -574,9 +574,9 @@ def flash_attn_func(
     Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
     use a generic packed Triton forward kernel. The exact default-option,
     default-scale, no-backward causal bf16 ``(2, 8192, 8192, 16, 16, 128)``
-    call uses scoped cuDNN SDPA on SM90. Grad-enabled calls without ALiBi or a
-    generated backward, plus supported positive-dropout calls, use PyTorch
-    SDPA autograd.
+    call uses direct cuDNN SDPA on SM90 when eligible, falling back to its
+    generated kernel otherwise. Grad-enabled calls without ALiBi or a generated
+    backward, plus supported positive-dropout calls, use PyTorch SDPA autograd.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
@@ -662,7 +662,9 @@ def flash_attn_func(
         and spec.key == _CUDNN_SDPA_FAST_PATH_KEY
         and _is_sm90(q.device)
     ):
-        return dense_attention_cudnn_default_scale(q, k, v)
+        cudnn_out = dense_attention_cudnn_default_scale(q, k, v)
+        if cudnn_out is not None:
+            return cudnn_out
     if alibi_slopes is None and has_kernel(spec):
         return lookup(spec)(q, k, v, scale)
     return _generic_dense_forward(q, k, v, scale, spec, alibi_slopes)
