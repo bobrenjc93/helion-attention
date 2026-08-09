@@ -1130,61 +1130,9 @@ def test_unregistered_varlen_gradients_fail_before_generic_dispatch(
 
 
 @requires_cuda
-@pytest.mark.parametrize(
-    "entry_point",
-    ["unpacked", "qkvpacked", "kvpacked"],
-    ids=["unpacked", "qkv-packed", "kv-packed"],
-)
-def test_unregistered_varlen_fallback_rejects_strided_inputs(
-    entry_point: str,
-) -> None:
-    if entry_point == "qkvpacked":
-        spec = GENERIC_VARLEN_SPECS[0]
-        q, k, v, cu_q, _, *_ = make_packed(spec, variant=2)
-        packed = torch.stack((q, k, v), dim=1)
-        storage = torch.empty(
-            (*packed.shape[:-1], packed.shape[-1] * 2),
-            device=packed.device,
-            dtype=packed.dtype,
-        )
-        strided = storage[..., ::2]
-        strided.copy_(packed)
-        assert not strided.is_contiguous()
-        with pytest.raises(ValueError, match="qkv must be contiguous"):
-            helion_attention.flash_attn_varlen_qkvpacked_func(
-                strided,
-                cu_q,
-                spec.seqlen_q,
-                causal=spec.causal,
-                shape=spec,
-            )
-        return
-
+def test_unregistered_varlen_fallback_rejects_strided_unpacked_input() -> None:
     spec = GENERIC_VARLEN_SPECS[-1]
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
-    if entry_point == "kvpacked":
-        packed = torch.stack((k, v), dim=1)
-        storage = torch.empty(
-            (*packed.shape[:-1], packed.shape[-1] * 2),
-            device=packed.device,
-            dtype=packed.dtype,
-        )
-        strided = storage[..., ::2]
-        strided.copy_(packed)
-        assert not strided.is_contiguous()
-        with pytest.raises(ValueError, match="kv must be contiguous"):
-            helion_attention.flash_attn_varlen_kvpacked_func(
-                q,
-                strided,
-                cu_q,
-                cu_k,
-                spec.seqlen_q,
-                spec.seqlen_k,
-                causal=spec.causal,
-                shape=spec,
-            )
-        return
-
     storage = torch.empty(
         (q.shape[0], q.shape[1], q.shape[2] * 2),
         device=q.device,
@@ -1205,6 +1153,112 @@ def test_unregistered_varlen_fallback_rejects_strided_inputs(
             causal=spec.causal,
             shape=spec,
         )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["qkvpacked", "kvpacked"], ids=["qkv-packed", "kv-packed"]
+)
+def test_unregistered_varlen_packed_adapters_accept_strided_containers(
+    entry_point: str,
+) -> None:
+    softmax_scale = 0.29
+    if entry_point == "qkvpacked":
+        spec = GENERIC_VARLEN_SPECS[0]
+        q, k, v, cu_q, _, *_ = make_packed(spec, variant=2, seed=141421)
+        packed = torch.stack((q, k, v), dim=1)
+        storage = torch.empty(
+            (packed.shape[0] * 2, *packed.shape[1:]),
+            device=packed.device,
+            dtype=packed.dtype,
+        )
+        strided = storage[::2]
+        strided.copy_(packed)
+        assert not strided.is_contiguous()
+        assert strided.stride(-1) == 1
+
+        got = helion_attention.flash_attn_varlen_qkvpacked_func(
+            strided,
+            cu_q,
+            spec.seqlen_q,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
+            shape=spec,
+        )
+        expected = helion_attention.flash_attn_varlen_qkvpacked_func(
+            packed,
+            cu_q,
+            spec.seqlen_q,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
+            shape=spec,
+        )
+        fa2_args = (strided, cu_q, spec.seqlen_q)
+    else:
+        spec = GENERIC_VARLEN_SPECS[-1]
+        q, k, v, cu_q, cu_k, *_ = make_packed(
+            spec, variant=0, seed=173205
+        )
+        packed = torch.stack((k, v), dim=1)
+        storage = torch.empty(
+            (packed.shape[0] * 2, *packed.shape[1:]),
+            device=packed.device,
+            dtype=packed.dtype,
+        )
+        strided = storage[::2]
+        strided.copy_(packed)
+        assert not strided.is_contiguous()
+        assert strided.stride(-1) == 1
+
+        got = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            strided,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
+            shape=spec,
+        )
+        expected = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            packed,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
+            shape=spec,
+        )
+        fa2_args = (
+            q,
+            strided,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+        )
+
+    torch.testing.assert_close(got, expected)
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    fa2_function = (
+        flash_attn.flash_attn_varlen_qkvpacked_func
+        if entry_point == "qkvpacked"
+        else flash_attn.flash_attn_varlen_kvpacked_func
+    )
+    expected_fa2 = fa2_function(
+        *fa2_args,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+    )
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
 
 
 @requires_cuda

@@ -1252,15 +1252,15 @@ def flash_attn_varlen_qkvpacked_func(
     *,
     shape: ShapeLike,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run varlen self-attention on ``[total, 3, nheads, head_dim]`` QKV."""
+    """Run varlen self-attention on ``[total, 3, nheads, head_dim]`` QKV.
+
+    The packed container may be strided; its Q/K/V slices are materialized in
+    the contiguous layout required by :func:`flash_attn_varlen_func`.
+    """
     if qkv.ndim != 4 or qkv.shape[1] != 3:
         raise ValueError(
             "qkv must have shape [total, 3, nheads, head_dim], "
             f"got {tuple(qkv.shape)}"
-        )
-    if not qkv.is_contiguous():
-        raise ValueError(
-            "qkv must be contiguous in [total, 3, nheads, head_dim] layout"
         )
     q, k, v = (qkv[:, index].contiguous() for index in range(3))
     return flash_attn_varlen_func(
@@ -1301,15 +1301,15 @@ def flash_attn_varlen_kvpacked_func(
     *,
     shape: ShapeLike,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run varlen attention with ``[total_k, 2, nheads_kv, head_dim]`` KV."""
+    """Run varlen attention with ``[total_k, 2, nheads_kv, head_dim]`` KV.
+
+    The packed container may be strided; its K/V slices are materialized in
+    the contiguous layout required by :func:`flash_attn_varlen_func`.
+    """
     if kv.ndim != 4 or kv.shape[1] != 2:
         raise ValueError(
             "kv must have shape [total_k, 2, nheads_kv, head_dim], "
             f"got {tuple(kv.shape)}"
-        )
-    if not kv.is_contiguous():
-        raise ValueError(
-            "kv must be contiguous in [total_k, 2, nheads_kv, head_dim] layout"
         )
     k, v = (kv[:, index].contiguous() for index in range(2))
     return flash_attn_varlen_func(

@@ -125,7 +125,9 @@ dropout, window, softcap, diagnostics, or paging is requested, and the packed
 offsets, padded indices, and flattened launch grid fit their signed 32-bit
 limits. Registered default calls retain their generated kernels, and the varlen
 QKV/KV-packed adapters inherit the fallback. Support queries continue to report
-specialization availability only.
+specialization availability only. Unpacked Q/K/V tensors must be contiguous;
+the packed adapters also accept strided outer containers because they
+materialize contiguous component slices before dispatch.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
 `return_attn_probs=True` for forward-only calls with otherwise default options
