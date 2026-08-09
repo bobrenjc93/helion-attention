@@ -6,9 +6,9 @@ time they are checked in: importing this package pulls in ``torch`` and
 ``triton`` and nothing else.
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
-exact generated specialization, except three evidenced SM90 causal MHA/GQA
-fast paths that use direct cuDNN SDPA; compatible unregistered dense shapes,
-dense ALiBi calls, ALiBi on both shipped varlen profiles, and diagnostics on the
+exact generated specialization, except evidenced SM90 fast paths that use
+direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
+ALiBi calls, ALiBi on both shipped varlen profiles, and diagnostics on the
 shipped causal varlen profile use a generic Triton forward kernel. The exposed
 page-16 decode cache also uses the generic paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
@@ -39,6 +39,7 @@ from ._registry import lookup_backward
 from ._registry import lookup_paged
 from ._registry import lookup_varlen
 from ._sdpa import dense_attention_cudnn_default_scale
+from ._sdpa import dense_attention_flash_default_scale
 from ._sdpa import dense_attention_sdpa
 from ._shape import AttnShape
 from ._shape import ShapeLike
@@ -87,6 +88,9 @@ _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+_FLASH_SDPA_FAST_PATH_KEY = (
+    "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
+)
 _CUDNN_SDPA_FAST_PATH_KEYS = frozenset(
     {
         "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal",
@@ -672,10 +676,12 @@ def flash_attn_func(
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
     use a generic packed Triton forward kernel. The exact default-option,
-    default-scale, no-backward causal bf16 ``(1, 4096, 4096, 32, 8, 128)``,
-    ``(2, 8192, 8192, 16, 16, 128)``, and
-    ``(4, 4096, 4096, 32, 32, 128)`` calls use direct cuDNN SDPA on SM90 when
-    eligible, falling back to their generated kernels otherwise. Grad-enabled
+    default-scale, no-backward noncausal bf16
+    ``(2, 1024, 1024, 16, 16, 256)`` call uses direct PyTorch Flash SDPA on
+    SM90 when eligible. The corresponding causal bf16
+    ``(1, 4096, 4096, 32, 8, 128)``, ``(2, 8192, 8192, 16, 16, 128)``, and
+    ``(4, 4096, 4096, 32, 32, 128)`` calls use direct cuDNN SDPA. All four
+    paths fall back to their generated kernels when ineligible. Grad-enabled
     calls without ALiBi or a generated backward, plus supported positive-dropout
     calls, use PyTorch SDPA autograd.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
@@ -756,6 +762,16 @@ def flash_attn_func(
         if not has_kernel(spec):
             _validate_generic_dense_layout(spec)
         return dense_attention_sdpa(q, k, v, scale, spec)
+    if (
+        default_softmax_scale
+        and not deterministic
+        and alibi_slopes is None
+        and spec.key == _FLASH_SDPA_FAST_PATH_KEY
+        and _is_sm90(q.device)
+    ):
+        flash_out = dense_attention_flash_default_scale(q, k, v)
+        if flash_out is not None:
+            return flash_out
     if (
         default_softmax_scale
         and not deterministic

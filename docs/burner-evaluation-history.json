@@ -1423,6 +1423,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:43b04851b6847955c055b32373cbb8795456bbc5",
+      "commit": "43b04851b6847955c055b32373cbb8795456bbc5",
+      "recordedAt": "2026-08-09T06:22:47.228Z",
+      "label": "base 43b0485",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 84,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:61",
+      "recordedAt": "2026-08-09T06:22:47.228Z",
+      "label": "PR #61",
+      "kind": "leaf",
+      "prNumber": 61,
+      "title": "Fast-path the D256 encoder with PyTorch Flash SDPA",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 85,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
