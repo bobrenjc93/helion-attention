@@ -1430,13 +1430,19 @@ def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
 
 
 @requires_cuda
-def test_gemma2_softcap_zero_retains_generic_dispatch(
+@pytest.mark.parametrize(
+    "softcap",
+    [0.0, GEMMA2_SOFTCAP_VALUE],
+    ids=["zero", "output-only-softcap"],
+)
+def test_gemma2_softcap_output_dispatch_is_unchanged(
+    softcap: float,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = GEMMA2_SOFTCAP
     q, k, v = make_inputs(spec, seed=173205)
     sentinel = torch.empty_like(q)
-    calls: list[tuple[AttnShape, torch.Tensor | None]] = []
+    calls: list[tuple[AttnShape, torch.Tensor | None, float]] = []
 
     def generic(
         q_arg: torch.Tensor,
@@ -1445,9 +1451,11 @@ def test_gemma2_softcap_zero_retains_generic_dispatch(
         scale_arg: float,
         spec_arg: AttnShape,
         slopes_arg: torch.Tensor | None,
+        *,
+        softcap: float = 0.0,
     ) -> torch.Tensor:
         del q_arg, k_arg, v_arg, scale_arg
-        calls.append((spec_arg, slopes_arg))
+        calls.append((spec_arg, slopes_arg, softcap))
         return sentinel
 
     def reject_specialized(*args: object, **kwargs: object) -> torch.Tensor:
@@ -1458,11 +1466,83 @@ def test_gemma2_softcap_zero_retains_generic_dispatch(
 
     with torch.no_grad():
         out = helion_attention.flash_attn_func(
-            q, k, v, causal=True, softcap=0.0, shape=spec
+            q, k, v, causal=True, softcap=softcap, shape=spec
         )
 
     assert out is sentinel
-    assert calls == [(spec, None)]
+    assert calls == [(spec, None, softcap)]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_gemma2_softcap_return_attn_probs_matches_fa2(
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = GEMMA2_SOFTCAP
+    q, k, v = make_inputs(spec, seed=20260809)
+
+    with torch.no_grad():
+        if entry_point == "dense":
+            got = helion_attention.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=True,
+                softcap=GEMMA2_SOFTCAP_VALUE,
+                return_attn_probs=True,
+                shape=spec,
+            )
+            expected = flash_attn.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=True,
+                softcap=GEMMA2_SOFTCAP_VALUE,
+                return_attn_probs=True,
+            )
+        else:
+            kv = torch.stack((k, v), dim=2)
+            got = helion_attention.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                softcap=GEMMA2_SOFTCAP_VALUE,
+                return_attn_probs=True,
+                shape=spec,
+            )
+            expected = flash_attn.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                softcap=GEMMA2_SOFTCAP_VALUE,
+                return_attn_probs=True,
+            )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (1, 16, 4096)
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(out, expected_out, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
 
 
 @requires_cuda
@@ -1477,7 +1557,6 @@ def test_gemma2_softcap_zero_retains_generic_dispatch(
         ("window", "sliding-window"),
         ("dropout", "softcap combined with dropout"),
         ("alibi", "softcap combined with ALiBi"),
-        ("diagnostic", "return_attn_probs=True.*softcap"),
     ],
 )
 def test_gemma2_softcap_rejects_out_of_scope_calls_before_dispatch(
@@ -1510,9 +1589,6 @@ def test_gemma2_softcap_rejects_out_of_scope_calls_before_dispatch(
         kwargs["alibi_slopes"] = torch.ones(
             spec.nheads_q, device=q.device, dtype=torch.float32
         )
-    elif case == "diagnostic":
-        kwargs["return_attn_probs"] = True
-
     def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
         raise AssertionError("out-of-scope Gemma-2 softcap call reached dispatch")
 
