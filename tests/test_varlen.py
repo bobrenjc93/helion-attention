@@ -521,9 +521,12 @@ def test_varlen_packed_entry_points_match_unpacked(
     "name",
     ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
 )
-def test_varlen_packed_entry_points_reject_gradients(name: str) -> None:
-    entry = next(item for item in VARLEN_SHAPES if not item["causal"])
-    spec = spec_from_manifest_entry(entry)
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+def test_ragged_varlen_packed_entry_points_reject_gradients(
+    name: str, spec: AttnShape
+) -> None:
     variant = 2 if name == "flash_attn_varlen_qkvpacked_func" else 0
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=variant)
 
@@ -535,7 +538,11 @@ def test_varlen_packed_entry_points_reject_gradients(name: str) -> None:
                 q.device,
             )
             helion_attention.flash_attn_varlen_qkvpacked_func(
-                qkv, cu_q, spec.seqlen_q, shape=spec
+                qkv,
+                cu_q,
+                spec.seqlen_q,
+                causal=spec.causal,
+                shape=spec,
             )
         else:
             kv = torch.stack((k, v), dim=1).requires_grad_()
@@ -546,6 +553,7 @@ def test_varlen_packed_entry_points_reject_gradients(name: str) -> None:
                 cu_k,
                 spec.seqlen_q,
                 spec.seqlen_k,
+                causal=spec.causal,
                 shape=spec,
             )
 
@@ -554,11 +562,13 @@ def test_varlen_packed_entry_points_reject_gradients(name: str) -> None:
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_full_noncausal_varlen_backward_matches_fp32_and_fa2(
-    softmax_scale: float | None,
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+def test_full_varlen_backward_matches_fp32_and_fa2(
+    softmax_scale: float | None, spec: AttnShape
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
-    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
         spec, variant=2, seed=20260808
     )
@@ -582,6 +592,7 @@ def test_full_noncausal_varlen_backward_matches_fp32_and_fa2(
         spec.seqlen_q,
         spec.seqlen_k,
         softmax_scale=softmax_scale,
+        causal=spec.causal,
         shape=spec,
     )
     got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
@@ -591,6 +602,7 @@ def test_full_noncausal_varlen_backward_matches_fp32_and_fa2(
         if softmax_scale is None
         else softmax_scale
     )
+    fp32_gradient_atol = 8e-2 if spec.causal else 5e-2
     q_ref = q.float().detach().requires_grad_()
     k_ref = k.float().detach().requires_grad_()
     v_ref = v.float().detach().requires_grad_()
@@ -600,7 +612,7 @@ def test_full_noncausal_varlen_backward_matches_fp32_and_fa2(
         v_ref,
         lengths_q,
         lengths_k,
-        causal=False,
+        causal=spec.causal,
         scale=scale,
     )
     expected_grads = torch.autograd.grad(
@@ -619,6 +631,7 @@ def test_full_noncausal_varlen_backward_matches_fp32_and_fa2(
         spec.seqlen_q,
         spec.seqlen_k,
         softmax_scale=softmax_scale,
+        causal=spec.causal,
     )
     expected_fa2_grads = torch.autograd.grad(
         expected_fa2, (q_fa2, k_fa2, v_fa2), grad_out
@@ -635,10 +648,10 @@ def test_full_noncausal_varlen_backward_matches_fp32_and_fa2(
         got_grads, expected_grads, expected_fa2_grads
     ):
         torch.testing.assert_close(
-            actual.float(), reference, atol=5e-2, rtol=2e-2
+            actual.float(), reference, atol=fp32_gradient_atol, rtol=2e-2
         )
         torch.testing.assert_close(
-            actual.float(), reference_fa2.float(), atol=5e-2, rtol=2e-2
+            actual.float(), reference_fa2.float(), atol=2e-2, rtol=2e-2
         )
 
 
@@ -648,10 +661,16 @@ def test_full_noncausal_varlen_backward_matches_fp32_and_fa2(
     ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
     ids=["qkv-packed", "kv-packed"],
 )
-def test_full_noncausal_varlen_packed_adapters_propagate_gradients(
-    name: str,
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+def test_full_varlen_packed_adapters_match_fp32_and_fa2(
+    name: str, softmax_scale: float | None, spec: AttnShape
 ) -> None:
-    spec = VARLEN_ALIBI_NONCAUSAL
+    flash_attn = pytest.importorskip("flash_attn")
     q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
         spec, variant=2, seed=161803
     )
@@ -662,14 +681,26 @@ def test_full_noncausal_varlen_packed_adapters_propagate_gradients(
         dtype=q.dtype,
         generator=generator,
     )
-    scale = 1.0 / math.sqrt(spec.head_dim)
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    fp32_gradient_atol = (
+        8e-2 if spec.causal or softmax_scale is not None else 5e-2
+    )
 
     if name == "flash_attn_varlen_qkvpacked_func":
         qkv = torch.stack((q, k, v), dim=1).requires_grad_()
         got = helion_attention.flash_attn_varlen_qkvpacked_func(
-            qkv, cu_q, spec.seqlen_q, shape=spec
+            qkv,
+            cu_q,
+            spec.seqlen_q,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
+            shape=spec,
         )
-        (got_grad,) = torch.autograd.grad(got, (qkv,), grad_out)
+        got_inputs = (qkv,)
 
         qkv_ref = qkv.float().detach().requires_grad_()
         q_ref, k_ref, v_ref = (qkv_ref[:, index] for index in range(3))
@@ -679,15 +710,20 @@ def test_full_noncausal_varlen_packed_adapters_propagate_gradients(
             v_ref,
             lengths_q,
             lengths_k,
-            causal=False,
+            causal=spec.causal,
             scale=scale,
         )
-        (expected_grad,) = torch.autograd.grad(
-            expected, (qkv_ref,), grad_out.float()
+        reference_inputs = (qkv_ref,)
+
+        qkv_fa2 = qkv.detach().requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_varlen_qkvpacked_func(
+            qkv_fa2,
+            cu_q,
+            spec.seqlen_q,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
         )
-        torch.testing.assert_close(
-            got_grad.float(), expected_grad, atol=5e-2, rtol=2e-2
-        )
+        fa2_inputs = (qkv_fa2,)
     else:
         q.requires_grad_()
         kv = torch.stack((k, v), dim=1).requires_grad_()
@@ -698,9 +734,11 @@ def test_full_noncausal_varlen_packed_adapters_propagate_gradients(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
             shape=spec,
         )
-        got_grads = torch.autograd.grad(got, (q, kv), grad_out)
+        got_inputs = (q, kv)
 
         q_ref = q.float().detach().requires_grad_()
         kv_ref = kv.float().detach().requires_grad_()
@@ -711,18 +749,45 @@ def test_full_noncausal_varlen_packed_adapters_propagate_gradients(
             v_ref,
             lengths_q,
             lengths_k,
-            causal=False,
+            causal=spec.causal,
             scale=scale,
         )
-        expected_grads = torch.autograd.grad(
-            expected, (q_ref, kv_ref), grad_out.float()
-        )
-        for actual, reference in zip(got_grads, expected_grads):
-            torch.testing.assert_close(
-                actual.float(), reference, atol=5e-2, rtol=2e-2
-            )
+        reference_inputs = (q_ref, kv_ref)
 
+        q_fa2 = q.detach().requires_grad_()
+        kv_fa2 = kv.detach().requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_varlen_kvpacked_func(
+            q_fa2,
+            kv_fa2,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=spec.causal,
+        )
+        fa2_inputs = (q_fa2, kv_fa2)
+
+    got_grads = torch.autograd.grad(got, got_inputs, grad_out)
+    expected_grads = torch.autograd.grad(
+        expected, reference_inputs, grad_out.float()
+    )
+    expected_fa2_grads = torch.autograd.grad(
+        expected_fa2, fa2_inputs, grad_out
+    )
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+    for actual, reference, reference_fa2 in zip(
+        got_grads, expected_grads, expected_fa2_grads
+    ):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=fp32_gradient_atol, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            actual.float(), reference_fa2.float(), atol=2e-2, rtol=2e-2
+        )
 
 
 @requires_cuda
@@ -735,10 +800,12 @@ def test_full_noncausal_varlen_packed_adapters_propagate_gradients(
     ],
     ids=["unpacked", "qkv-packed", "kv-packed"],
 )
-def test_full_noncausal_varlen_no_grad_retains_generated_dispatch(
-    name: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+def test_full_varlen_no_grad_retains_generated_dispatch(
+    name: str, spec: AttnShape, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
     sentinel = torch.empty_like(q)
     calls: list[tuple[object, ...]] = []
@@ -762,12 +829,17 @@ def test_full_noncausal_varlen_no_grad_retains_generated_dispatch(
                 cu_k,
                 spec.seqlen_q,
                 spec.seqlen_k,
+                causal=spec.causal,
                 shape=spec,
             )
         elif name == "flash_attn_varlen_qkvpacked_func":
             qkv = torch.stack((q, k, v), dim=1).requires_grad_()
             out = helion_attention.flash_attn_varlen_qkvpacked_func(
-                qkv, cu_q, spec.seqlen_q, shape=spec
+                qkv,
+                cu_q,
+                spec.seqlen_q,
+                causal=spec.causal,
+                shape=spec,
             )
         else:
             kv = torch.stack((k, v), dim=1).requires_grad_()
@@ -778,6 +850,7 @@ def test_full_noncausal_varlen_no_grad_retains_generated_dispatch(
                 cu_k,
                 spec.seqlen_q,
                 spec.seqlen_k,
+                causal=spec.causal,
                 shape=spec,
             )
 
@@ -787,27 +860,19 @@ def test_full_noncausal_varlen_no_grad_retains_generated_dispatch(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    ("case", "message"),
-    [
-        ("causal", "implemented only"),
-        ("deterministic", "deterministic=True"),
-    ],
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
 )
-def test_full_varlen_backward_rejects_out_of_scope_calls(
-    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+def test_full_varlen_backward_rejects_deterministic(
+    spec: AttnShape, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = VARLEN_ALIBI_CAUSAL if case == "causal" else VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
     q.requires_grad_()
-    kwargs: dict[str, object] = {"causal": spec.causal, "shape": spec}
-    if case == "deterministic":
-        kwargs["deterministic"] = True
 
     def reject_sdpa(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
         raise AssertionError("unsupported varlen backward reached dense SDPA")
 
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
-    with pytest.raises(NotImplementedError, match=message):
+    with pytest.raises(NotImplementedError, match="deterministic=True"):
         helion_attention.flash_attn_varlen_func(
             q,
             k,
@@ -816,7 +881,9 @@ def test_full_varlen_backward_rejects_out_of_scope_calls(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            **kwargs,
+            causal=spec.causal,
+            deterministic=True,
+            shape=spec,
         )
 
 
@@ -1364,10 +1431,12 @@ def test_varlen_alibi_rejects_other_profiles(spec: AttnShape) -> None:
 
 @requires_cuda
 @pytest.mark.parametrize("gradient_source", ["q", "slopes"])
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
 def test_varlen_alibi_rejects_gradients_before_dispatch(
-    gradient_source: str, monkeypatch: pytest.MonkeyPatch
+    gradient_source: str, spec: AttnShape, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     slopes = torch.ones(spec.nheads_q, device=q.device)
     if gradient_source == "q":
@@ -1540,8 +1609,12 @@ def test_varlen_supports_cuda_graph_capture() -> None:
 
 
 @requires_cuda
-def test_full_noncausal_varlen_grad_enabled_supports_cuda_graph_capture() -> None:
-    spec = VARLEN_ALIBI_NONCAUSAL
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+def test_full_varlen_grad_enabled_supports_cuda_graph_capture(
+    spec: AttnShape,
+) -> None:
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
     q.requires_grad_()
     k.requires_grad_()
@@ -1556,6 +1629,7 @@ def test_full_noncausal_varlen_grad_enabled_supports_cuda_graph_capture() -> Non
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
+            causal=spec.causal,
             shape=spec,
         )
 

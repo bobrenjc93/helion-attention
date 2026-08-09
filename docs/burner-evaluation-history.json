@@ -1393,6 +1393,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:c8887598ec448bebf06ee2c8759e3cf6d4e856ca",
+      "commit": "c8887598ec448bebf06ee2c8759e3cf6d4e856ca",
+      "recordedAt": "2026-08-09T05:52:26.495Z",
+      "label": "base c888759",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 85,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:60",
+      "recordedAt": "2026-08-09T05:52:26.495Z",
+      "label": "PR #60",
+      "kind": "leaf",
+      "prNumber": 60,
+      "title": "Backpropagate the full-length causal varlen profile",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 85,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
