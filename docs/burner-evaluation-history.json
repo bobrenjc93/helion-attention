@@ -1363,6 +1363,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:c47d95065720bdca8f1752a42c0a59857aa8d64d",
+      "commit": "c47d95065720bdca8f1752a42c0a59857aa8d64d",
+      "recordedAt": "2026-08-09T05:30:21.400Z",
+      "label": "base c47d950",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 83,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:59",
+      "recordedAt": "2026-08-09T05:30:21.400Z",
+      "label": "PR #59",
+      "kind": "leaf",
+      "prNumber": 59,
+      "title": "Fast-path B1 4K Llama GQA with direct cuDNN",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 85,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
