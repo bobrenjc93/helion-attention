@@ -178,17 +178,20 @@ Zero-dropout backward is supported for both the causal and noncausal bf16
 sequences have length 512 (so their valid cumulative offsets are
 `[0, 512, ..., 4096]`). The causal profile additionally supports independent
 query and key cumulative offsets describing eight nonempty sequences apiece,
-each of length at most 512. Full-length inputs are viewed as one dense batch;
-ragged causal inputs use one bounded PyTorch SDPA call per sequence. Both paths
-provide forward and Q/K/V gradients for the default or a custom
-`softmax_scale`. The QKV-packed adapter inherits self-attention support, while
-the KV-packed adapter also supports independent query/key offsets. Full-length
-training remains CUDA-graph capturable. Ragged training reads the cumulative
-offsets on the host for validation and therefore rejects graph capture. Calls
-that do not require gradients continue to use the generated varlen kernel,
-including ragged and full-length calls. Ragged noncausal batches, empty
-sequences, deterministic mode, paged caches, ALiBi, diagnostic returns, and
-positive dropout remain explicitly unsupported for varlen backward.
+each of length at most 512. Causal self-attention also accepts identical query
+and key offsets containing both empty and nonempty slots. Full-length inputs
+are viewed as one dense batch; ragged causal inputs use one bounded PyTorch
+SDPA call per nonempty sequence. Both paths provide forward and Q/K/V gradients
+for the default or a custom `softmax_scale`. The QKV-packed adapter inherits
+self-attention support; the KV-packed adapter accepts the same self-attention
+cases and also supports independent nonempty query/key offsets. Full-length
+training remains CUDA-graph capturable.
+Ragged training reads the cumulative offsets on the host for validation and
+therefore rejects graph capture. Calls that do not require gradients continue
+to use the generated varlen kernel, including ragged and full-length calls.
+Ragged noncausal batches, all-empty batches, empty cross-attention,
+deterministic mode, paged caches, ALiBi, diagnostic returns, and positive
+dropout remain explicitly unsupported for varlen backward.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
 profiles when `block_table` is supplied. Both use bf16 page-size-16 caches in
@@ -585,7 +588,8 @@ These unsupported FlashAttention features also raise `NotImplementedError`
 rather than silently doing something else:
 
 - backward for dense or varlen ALiBi, ragged noncausal varlen batches,
-  empty-sequence or graph-captured ragged batches, and KV-cache calls
+  all-empty or empty cross-attention batches, graph-captured ragged batches,
+  and KV-cache calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback
 - dropout outside the exact encoder-training and BERT-base profiles above, or
   combined with ALiBi, diagnostic returns, local windows, softcap, or
