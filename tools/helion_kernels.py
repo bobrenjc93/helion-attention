@@ -367,7 +367,7 @@ def decode_attention_bshd_split_kv_combine(
 def decode_attention_bshd_split_kv(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
 ) -> torch.Tensor:
-    """Single-query decode with eight KV-sequence programs per GQA head group.
+    """Single-query decode with sixteen KV-sequence programs per GQA head group.
 
     Long-cache decode otherwise exposes only ``batch * nheads_q`` programs.
     Each split computes an online-softmax numerator and statistics for its KV
@@ -375,7 +375,7 @@ def decode_attention_bshd_split_kv(
     A single bottom-right-aligned query can see the entire cache, so causal and
     non-causal decode have the same unmasked computation here.
     """
-    num_splits = 8
+    num_splits = 16
     partial_acc = torch.empty(
         (q.size(0), q.size(2), num_splits, 1, q.size(3)),
         dtype=torch.float32,

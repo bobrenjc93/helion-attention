@@ -51,7 +51,7 @@ PERSISTENT_CAUSAL_KEYS = {
     "b4_sq8192_sk8192_hq28_hkv4_d128_bf16_causal",
 }
 SPLIT_KV_DECODE_16K_KEY = "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
-SPLIT_KV_DECODE_SPLITS = 8
+SPLIT_KV_DECODE_SPLITS = 16
 AUTOTUNE_ACCEPTANCE_REPEAT = 100
 MIN_CANDIDATE_SPEEDUP = 0.02
 
@@ -402,22 +402,44 @@ def add_split_decode_lse_support(code: str) -> str:
 
 
 _SPLIT_KV_DECODE_ENTRY_POINT = f'''
+import threading as _threading
+
 from .._launcher import launcher_context as _launcher_context
+
+# Keep scratch alive between decode steps. Workspaces are stream-local, and
+# the lock keeps each partial/combine launch pair adjacent on a shared stream.
+_SPLIT_KV_WORKSPACES = {{}}
+
+def _split_kv_workspace(q: torch.Tensor, num_splits: int):
+    key = (
+        q.device.index,
+        torch.cuda.current_stream(q.device).cuda_stream,
+    )
+    workspace = _SPLIT_KV_WORKSPACES.get(key)
+    if workspace is None:
+        candidate = (
+            torch.empty(
+                (q.size(0), q.size(2), num_splits, 1, q.size(3)),
+                dtype=torch.float32,
+                device=q.device,
+            ),
+            torch.empty(
+                (q.size(0), q.size(2), 2, num_splits, 1),
+                dtype=torch.float32,
+                device=q.device,
+            ),
+            _threading.Lock(),
+        )
+        workspace = _SPLIT_KV_WORKSPACES.setdefault(key, candidate)
+    return workspace
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):
     num_splits = {SPLIT_KV_DECODE_SPLITS}
-    partial_acc = torch.empty(
-        (q.size(0), q.size(2), num_splits, 1, q.size(3)),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    partial_stats = torch.empty(
-        (q.size(0), q.size(2), 2, num_splits, 1),
-        dtype=torch.float32,
-        device=q.device,
+    partial_acc, partial_stats, workspace_lock = _split_kv_workspace(
+        q, num_splits
     )
     out = torch.empty_like(q)
-    with _launcher_context(q.device, _launcher) as launch:
+    with workspace_lock, _launcher_context(q.device, _launcher) as launch:
         _attention_split_kv_partials(
             q, k, v, partial_acc, partial_stats, sm_scale, _launcher=launch
         )

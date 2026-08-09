@@ -777,6 +777,8 @@ def test_strip_helion_removes_varlen_constexpr_annotations() -> None:
 
 
 def test_split_kv_modules_are_composed_without_constexpr_collisions() -> None:
+    assert generate.SPLIT_KV_DECODE_SPLITS == 16
+
     partial = (
         "from __future__ import annotations\n"
         "_BLOCK_SIZE = 128\n"
@@ -797,6 +799,8 @@ def test_split_kv_modules_are_composed_without_constexpr_collisions() -> None:
     assert f"num_splits = {generate.SPLIT_KV_DECODE_SPLITS}" in (
         generate._SPLIT_KV_DECODE_ENTRY_POINT
     )
+    assert "torch.cuda.current_stream" in generate._SPLIT_KV_DECODE_ENTRY_POINT
+    assert "with workspace_lock" in generate._SPLIT_KV_DECODE_ENTRY_POINT
 
 
 def test_direct_decode_generation_exposes_online_softmax_lse() -> None:
