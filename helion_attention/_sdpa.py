@@ -20,10 +20,10 @@ try:
 except AttributeError:  # pragma: no cover - depends on the PyTorch build
     _FLASH_ATTENTION_FORWARD = None
 
-# Eligibility is invariant for this one validated shape on a given device and
-# PyTorch build. Cache successful probes only; backend enablement and global
+# Eligibility is invariant for each validated head dimension on a given device
+# and PyTorch build. Cache successful probes only; backend enablement and global
 # determinism remain live per-call checks below.
-_FLASH_CAPABLE_DEVICES: set[tuple[int | None, object, object]] = set()
+_FLASH_CAPABLE_PROFILES: set[tuple[int | None, int, object, object]] = set()
 
 
 def dense_attention_flash_default_scale(
@@ -52,8 +52,13 @@ def dense_attention_flash_default_scale(
     ):
         return None
     try:
-        capability_key = (q.device.index, params_type, can_use_flash)
-        if capability_key not in _FLASH_CAPABLE_DEVICES:
+        capability_key = (
+            q.device.index,
+            q.shape[-1],
+            params_type,
+            can_use_flash,
+        )
+        if capability_key not in _FLASH_CAPABLE_PROFILES:
             query = q.transpose(1, 2)
             key = k.transpose(1, 2)
             value = v.transpose(1, 2)
@@ -66,7 +71,7 @@ def dense_attention_flash_default_scale(
                 )
                 if not can_use_flash(params):
                     return None
-            _FLASH_CAPABLE_DEVICES.add(capability_key)
+            _FLASH_CAPABLE_PROFILES.add(capability_key)
 
         flash_attention = _FLASH_ATTENTION_FORWARD
         if torch.is_autocast_enabled(q.device.type):
