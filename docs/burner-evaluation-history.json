@@ -1933,6 +1933,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:93",
+      "recordedAt": "2026-08-09T18:23:31.402Z",
+      "label": "PR #93",
+      "kind": "leaf",
+      "prNumber": 93,
+      "title": "Enable symmetric windows for noncausal varlen self-attention",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
