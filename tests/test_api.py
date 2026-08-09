@@ -384,10 +384,12 @@ def reference_single_token_prefix_attention(
     length: int,
     spec: AttnShape,
     scale: float,
+    *,
+    leftpad: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return fp32 SDPA output and LSE for one dense cache prefix."""
-    prefix_k = k[:, :length]
-    prefix_v = v[:, :length]
+    """Return fp32 SDPA output and LSE for one dense cache span."""
+    prefix_k = k[:, leftpad:length]
+    prefix_v = v[:, leftpad:length]
     output = torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2).float(),
         prefix_k.transpose(1, 2).float(),
@@ -3174,6 +3176,16 @@ def test_paged_kvcache_chunked_prefill_rejects_unsupported_modes_before_dispatch
         helion_attention.flash_attn_with_kvcache(
             q.detach().requires_grad_(), k_cache, v_cache, **base
         )
+    with pytest.raises(NotImplementedError, match="cache_leftpad.*dense"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_leftpad=torch.zeros(
+                spec.batch, device=q.device, dtype=torch.int32
+            ),
+            **base,
+        )
     with pytest.raises(UnsupportedShapeError, match="causal=True"):
         helion_attention.flash_attn_with_kvcache(
             q,
@@ -3323,6 +3335,95 @@ def test_kvcache_16k_tensor_length_prefix_matches_fp32(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    ("leftpad", "length"),
+    [(0, 1), (1, 1025), (8192, 16384)],
+    ids=["zero-start", "split-edge", "max-end"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["out", "out-lse"],
+)
+def test_kvcache_16k_tensor_length_leftpad_matches_fa2_and_fp32(
+    leftpad: int,
+    length: int,
+    softmax_scale: float | None,
+    return_softmax_lse: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=173205)
+    cache_seqlens = torch.tensor(
+        [length], device=q.device, dtype=torch.int32
+    )
+    cache_leftpad = torch.tensor(
+        [leftpad], device=q.device, dtype=torch.int32
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        cache_leftpad=cache_leftpad,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        return_softmax_lse=return_softmax_lse,
+        shape=spec,
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        cache_leftpad=cache_leftpad,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        return_softmax_lse=return_softmax_lse,
+    )
+    expected_out, expected_lse = reference_single_token_prefix_attention(
+        q,
+        k_cache,
+        v_cache,
+        length,
+        spec,
+        scale,
+        leftpad=leftpad,
+    )
+
+    if return_softmax_lse:
+        assert isinstance(got, tuple)
+        assert isinstance(expected_fa2, tuple)
+        out, lse = got
+        fa2_out, fa2_lse = expected_fa2
+        assert lse.shape == (spec.batch, spec.nheads_q, spec.seqlen_q)
+        assert lse.dtype == torch.float32
+        torch.testing.assert_close(lse, fa2_lse, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+    else:
+        assert isinstance(got, torch.Tensor)
+        assert isinstance(expected_fa2, torch.Tensor)
+        out = got
+        fa2_out = expected_fa2
+
+    assert out.shape == q.shape
+    assert out.dtype == q.dtype
+    torch.testing.assert_close(out, fa2_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
 def test_kvcache_16k_tensor_length_output_only_returns_tensor() -> None:
     spec = spec_from_manifest_entry(LONG_DECODE)
     q, k_cache, v_cache = make_inputs(spec, seed=271828)
@@ -3407,12 +3508,130 @@ def test_kvcache_16k_tensor_length_validates_metadata_and_bounds() -> None:
 
 
 @requires_cuda
-def test_kvcache_16k_tensor_length_rejects_autograd() -> None:
+def test_kvcache_16k_tensor_length_leftpad_validates_metadata_and_bounds() -> None:
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=223607)
+    cache_seqlens = torch.tensor(
+        [1025], device=q.device, dtype=torch.int32
+    )
+    invalid_leftpads: list[tuple[torch.Tensor, str]] = [
+        (
+            torch.tensor([[1]], device=q.device, dtype=torch.int32),
+            "cache_leftpad must have shape",
+        ),
+        (
+            torch.tensor([1], device=q.device, dtype=torch.int64),
+            "cache_leftpad must have dtype torch.int32",
+        ),
+        (
+            torch.tensor([1], dtype=torch.int32),
+            "cache_leftpad must be a CUDA tensor",
+        ),
+    ]
+    if torch.cuda.device_count() > 1:
+        invalid_leftpads.append(
+            (
+                torch.tensor([1], device="cuda:1", dtype=torch.int32),
+                "cache_leftpad must be on the same CUDA device",
+            )
+        )
+
+    for cache_leftpad, match in invalid_leftpads:
+        with pytest.raises(ValueError, match=match):
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                cache_seqlens=cache_seqlens,
+                cache_leftpad=cache_leftpad,
+                causal=spec.causal,
+                shape=spec,
+            )
+
+    for leftpad, length in [(-1, 1), (1, 1), (2, 1), (0, 16385)]:
+        with pytest.raises(
+            ValueError,
+            match="0 <= cache_leftpad < cache_seqlens <= 16384",
+        ):
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                cache_seqlens=torch.tensor(
+                    [length], device=q.device, dtype=torch.int32
+                ),
+                cache_leftpad=torch.tensor(
+                    [leftpad], device=q.device, dtype=torch.int32
+                ),
+                causal=spec.causal,
+                shape=spec,
+            )
+
+    # Bounds errors are recoverable host exceptions, not device assertions.
+    torch.testing.assert_close(q + 1, q.add(1))
+    torch.cuda.synchronize(q.device)
+
+
+@requires_cuda
+def test_kvcache_16k_tensor_length_leftpad_rejects_other_cache_modes() -> None:
+    spec = spec_from_manifest_entry(LONG_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=244949)
+    cache_seqlens = torch.tensor(
+        [spec.seqlen_k // 2], device=q.device, dtype=torch.int32
+    )
+    cache_leftpad = torch.tensor([23], device=q.device, dtype=torch.int32)
+    base: dict[str, object] = {
+        "cache_seqlens": cache_seqlens,
+        "cache_leftpad": cache_leftpad,
+        "causal": spec.causal,
+        "shape": spec,
+    }
+
+    with pytest.raises(NotImplementedError, match="cache_batch_idx"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_batch_idx=torch.zeros(1, device=q.device, dtype=torch.int32),
+            **base,
+        )
+    with pytest.raises(NotImplementedError, match="rotary embeddings"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            rotary_cos=q,
+            rotary_sin=q,
+            **base,
+        )
+    with pytest.raises(
+        NotImplementedError,
+        match="cache_leftpad requires tensor-valued cache_seqlens",
+    ):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            cache_seqlens=spec.seqlen_k,
+            cache_leftpad=cache_leftpad,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize("use_leftpad", [False, True], ids=["prefix", "leftpad"])
+def test_kvcache_16k_tensor_length_rejects_autograd(use_leftpad: bool) -> None:
     spec = spec_from_manifest_entry(LONG_DECODE)
     q, k_cache, v_cache = make_inputs(spec, seed=141421)
     q.requires_grad_()
     cache_seqlens = torch.tensor(
         [spec.seqlen_k // 2], device=q.device, dtype=torch.int32
+    )
+    cache_leftpad = (
+        torch.tensor([17], device=q.device, dtype=torch.int32)
+        if use_leftpad
+        else None
     )
 
     with pytest.raises(NotImplementedError, match="do not support autograd"):
@@ -3421,6 +3640,7 @@ def test_kvcache_16k_tensor_length_rejects_autograd() -> None:
             k_cache,
             v_cache,
             cache_seqlens=cache_seqlens,
+            cache_leftpad=cache_leftpad,
             causal=spec.causal,
             shape=spec,
         )
@@ -3773,6 +3993,11 @@ def test_kvcache_rejects_invalid_updates_before_mutating_either_cache(
         cache_seqlens=torch.tensor(
             [spec.seqlen_k - 1], device=q.device, dtype=torch.int32
         ),
+    )
+    reject(
+        NotImplementedError,
+        "cache_leftpad.*read-only",
+        cache_leftpad=torch.tensor([1], device=q.device, dtype=torch.int32),
     )
     reject(ValueError, "must be a Python int", cache_seqlens=None)
     reject(NotImplementedError, "final cache slot", cache_seqlens=spec.seqlen_k - 2)
@@ -4253,11 +4478,19 @@ def test_kvcache_full_length_supports_cuda_graph_capture(
 
 
 @requires_cuda
-def test_kvcache_16k_tensor_length_rejects_cuda_graph_capture() -> None:
+@pytest.mark.parametrize("use_leftpad", [False, True], ids=["prefix", "leftpad"])
+def test_kvcache_16k_tensor_length_rejects_cuda_graph_capture(
+    use_leftpad: bool,
+) -> None:
     spec = spec_from_manifest_entry(LONG_DECODE)
     q, k_cache, v_cache = make_inputs(spec)
     cache_seqlens = torch.tensor(
         [spec.seqlen_k // 2], device=q.device, dtype=torch.int32
+    )
+    cache_leftpad = (
+        torch.tensor([19], device=q.device, dtype=torch.int32)
+        if use_leftpad
+        else None
     )
 
     graph = torch.cuda.CUDAGraph()
@@ -4270,6 +4503,7 @@ def test_kvcache_16k_tensor_length_rejects_cuda_graph_capture() -> None:
                 k_cache,
                 v_cache,
                 cache_seqlens=cache_seqlens,
+                cache_leftpad=cache_leftpad,
                 causal=spec.causal,
                 shape=spec,
             )
@@ -4460,6 +4694,7 @@ def test_split_kv_decode_external_stream_workspace_cache_is_bounded() -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize("use_leftpad", [False, True], ids=["length", "leftpad"])
 @pytest.mark.parametrize(
     "entry",
     [entry for entry in DECODE_SHAPES if entry is not LONG_DECODE],
@@ -4471,6 +4706,7 @@ def test_split_kv_decode_external_stream_workspace_cache_is_bounded() -> None:
 )
 def test_other_kvcache_profiles_reject_tensor_lengths_without_poisoning_cuda(
     entry: dict[str, object],
+    use_leftpad: bool,
 ) -> None:
     spec = spec_from_manifest_entry(entry)
     q, k_cache, v_cache = make_inputs(spec)
@@ -4480,6 +4716,11 @@ def test_other_kvcache_profiles_reject_tensor_lengths_without_poisoning_cuda(
         dtype=torch.int32,
         device=q.device,
     )
+    cache_leftpad = (
+        torch.zeros((spec.batch,), dtype=torch.int32, device=q.device)
+        if use_leftpad
+        else None
+    )
 
     with pytest.raises(NotImplementedError, match="implemented only"):
         helion_attention.flash_attn_with_kvcache(
@@ -4487,6 +4728,7 @@ def test_other_kvcache_profiles_reject_tensor_lengths_without_poisoning_cuda(
             k_cache,
             v_cache,
             cache_seqlens=invalid_lengths,
+            cache_leftpad=cache_leftpad,
             causal=spec.causal,
             shape=spec,
         )

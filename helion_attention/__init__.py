@@ -564,46 +564,87 @@ def _generic_dense_forward(
     )
 
 
-def _validate_dense_kvcache_tensor_length(
-    cache_seqlens: torch.Tensor,
+def _validate_dense_kvcache_index_tensor(
+    tensor: torch.Tensor,
+    name: str,
     *,
     device: torch.device,
     spec: AttnShape,
 ) -> None:
-    """Validate the one supported device-resident dense-cache length."""
+    """Validate metadata shared by dense-cache end and left-pad tensors."""
     expected_shape = (spec.batch,)
-    if tuple(cache_seqlens.shape) != expected_shape:
+    if tuple(tensor.shape) != expected_shape:
         raise ValueError(
-            f"cache_seqlens must have shape {expected_shape}, got "
-            f"{tuple(cache_seqlens.shape)}"
+            f"{name} must have shape {expected_shape}, got "
+            f"{tuple(tensor.shape)}"
         )
-    if cache_seqlens.dtype != torch.int32:
-        raise ValueError("cache_seqlens must have dtype torch.int32")
-    if not cache_seqlens.is_cuda:
+    if tensor.dtype != torch.int32:
+        raise ValueError(f"{name} must have dtype torch.int32")
+    if not tensor.is_cuda:
         raise ValueError(
-            "cache_seqlens must be a CUDA tensor, got device "
-            f"{cache_seqlens.device}"
+            f"{name} must be a CUDA tensor, got device {tensor.device}"
         )
-    if cache_seqlens.device != device:
+    if tensor.device != device:
         raise ValueError(
-            "cache_seqlens must be on the same CUDA device as q, k_cache, "
-            "and v_cache"
+            f"{name} must be on the same CUDA device as q, k_cache, and "
+            "v_cache"
         )
-    if cache_seqlens.layout != torch.strided:
-        raise ValueError("cache_seqlens must use torch.strided layout")
-    if not cache_seqlens.is_contiguous():
-        raise ValueError("cache_seqlens must be contiguous")
+    if tensor.layout != torch.strided:
+        raise ValueError(f"{name} must use torch.strided layout")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+
+
+def _validate_dense_kvcache_tensor_span(
+    cache_seqlens: torch.Tensor,
+    cache_leftpad: torch.Tensor | None,
+    *,
+    device: torch.device,
+    spec: AttnShape,
+) -> None:
+    """Validate the one supported device-resident dense-cache span."""
+    _validate_dense_kvcache_index_tensor(
+        cache_seqlens,
+        "cache_seqlens",
+        device=device,
+        spec=spec,
+    )
+    if cache_leftpad is not None:
+        _validate_dense_kvcache_index_tensor(
+            cache_leftpad,
+            "cache_leftpad",
+            device=device,
+            spec=spec,
+        )
 
     # Recoverable bounds validation requires one deliberate device-to-host
-    # synchronization. Reject capture before .item() so graph construction is
-    # ended cleanly instead of failing inside an implicit synchronization.
+    # synchronization. Reject capture before reading either tensor so graph
+    # construction ends cleanly instead of failing inside an implicit sync.
     with torch.cuda.device(device):
         if torch.cuda.is_current_stream_capturing():
             raise NotImplementedError(
                 "tensor-valued cache_seqlens are not supported during CUDA "
                 "graph capture"
             )
-        length = int(cache_seqlens.detach().item())
+        if cache_leftpad is None:
+            length = int(cache_seqlens.detach().item())
+        else:
+            leftpad, length = (
+                int(value)
+                for value in torch.cat(
+                    (cache_leftpad.detach(), cache_seqlens.detach())
+                ).tolist()
+            )
+
+    if cache_leftpad is not None:
+        if not 0 <= leftpad < length <= spec.seqlen_k:
+            raise ValueError(
+                "cache_leftpad and cache_seqlens values must satisfy "
+                f"0 <= cache_leftpad < cache_seqlens <= {spec.seqlen_k}, "
+                f"got cache_leftpad={leftpad} and cache_seqlens={length}"
+            )
+        return
+
     if length < 1 or length > spec.seqlen_k:
         raise ValueError(
             "cache_seqlens values must be in the inclusive range "
@@ -616,14 +657,15 @@ def _tensor_length_dense_kvcache_forward(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     cache_seqlens: torch.Tensor,
+    cache_leftpad: torch.Tensor | None,
     softmax_scale: float,
     spec: AttnShape,
     *,
     return_softmax_lse: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Read a device-selected prefix with one generic Triton attention launch."""
+    """Read a device-selected cache span with one generic attention launch."""
     # Batch one makes the dense cache row identical to packed token storage.
-    # Express its used prefix as cumulative offsets so the generic packed
+    # Express its selected span as cumulative offsets so the generic packed
     # runtime can stay in one attention kernel without invoking torch.einsum
     # (and its per-stream cuBLAS workspace).
     from ._paged_attention import packed_attention
@@ -635,7 +677,12 @@ def _tensor_length_dense_kvcache_forward(
         spec.batch + 1, device=q.device, dtype=torch.int32
     )
     cu_seqlens_k = torch.cat(
-        (cache_seqlens.new_zeros(1), cache_seqlens)
+        (
+            cache_seqlens.new_zeros(1)
+            if cache_leftpad is None
+            else cache_leftpad,
+            cache_seqlens,
+        )
     )
     result = packed_attention(
         packed_q,
@@ -1644,10 +1691,13 @@ def flash_attn_with_kvcache(
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
     bf16 ``(1, 1, 16384, 32, 8, 128)`` profile additionally accepts a contiguous
-    CUDA int32 tensor shaped ``[1]`` selecting a prefix of length 1 through
-    16384. This tensor-length path synchronizes once for recoverable bounds
-    validation and rejects CUDA graph capture and autograd. A paired, one-token
-    ``k`` and ``v`` update is supported when a Python integer
+    CUDA int32 ``cache_seqlens`` tensor shaped ``[1]`` selecting the end of a
+    prefix. A matching ``cache_leftpad`` tensor selects the half-open cache span
+    ``[cache_leftpad, cache_seqlens)`` when
+    ``0 <= cache_leftpad < cache_seqlens <= 16384``. This tensor-span path
+    synchronizes once for recoverable bounds validation and rejects CUDA graph
+    capture and autograd. A paired, one-token ``k`` and ``v`` update is
+    supported when a Python integer
     ``cache_seqlens`` is exactly one less than the declared length; the update
     is copied into the final cache slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
@@ -1657,8 +1707,8 @@ def flash_attn_with_kvcache(
     specialization. ALiBi cannot be combined with that LSE return. Cache tensors
     created in inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
-    lengths on updates and other dense profiles, scalar partial lengths, and
-    multi-token updates fail explicitly. A
+    lengths and left padding on updates and other dense profiles, scalar partial
+    lengths, and multi-token updates fail explicitly. A
     paired ``rotary_cos``/``rotary_sin`` table may be supplied only for this
     final-slot append: the default interleaved layout may cover the full head or
     the first 64 dimensions of a 128-dimensional head, while the non-interleaved
@@ -1683,8 +1733,11 @@ def flash_attn_with_kvcache(
     apply_rotary = rotary_cos is not None
     if cache_batch_idx is not None:
         raise NotImplementedError("cache_batch_idx is not implemented")
-    if cache_leftpad is not None:
-        raise NotImplementedError("cache_leftpad is not implemented")
+    tensor_cache_leftpad = (
+        cache_leftpad if isinstance(cache_leftpad, torch.Tensor) else None
+    )
+    if cache_leftpad is not None and tensor_cache_leftpad is None:
+        raise TypeError("cache_leftpad must be a torch.Tensor or None")
     if num_splits != 0:
         raise NotImplementedError(
             "explicit num_splits is not implemented; pass num_splits=0"
@@ -1700,6 +1753,11 @@ def flash_attn_with_kvcache(
         False,
         allow_alibi=block_table is not None,
     )
+    if tensor_cache_leftpad is not None and block_table is not None:
+        raise NotImplementedError(
+            "cache_leftpad is implemented only for the read-only dense "
+            f"{_TENSOR_LENGTH_DENSE_KVCACHE_KEY} tensor-length profile"
+        )
     if block_table is not None:
         return _paged_kvcache_forward(
             q,
@@ -1724,6 +1782,20 @@ def flash_attn_with_kvcache(
     tensor_cache_seqlens = (
         cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
     )
+    if tensor_cache_leftpad is not None:
+        if append_kv:
+            raise NotImplementedError(
+                "cache_leftpad is supported only for read-only KV-cache calls"
+            )
+        if tensor_cache_seqlens is None:
+            raise NotImplementedError(
+                "cache_leftpad requires tensor-valued cache_seqlens"
+            )
+        if spec.key != _TENSOR_LENGTH_DENSE_KVCACHE_KEY:
+            raise NotImplementedError(
+                "cache_leftpad is implemented only for the read-only dense "
+                f"{_TENSOR_LENGTH_DENSE_KVCACHE_KEY} tensor-length profile"
+            )
     if tensor_cache_seqlens is not None and append_kv:
         raise NotImplementedError(
             "tensor-valued cache_seqlens are supported only for read-only KV "
@@ -1838,8 +1910,9 @@ def flash_attn_with_kvcache(
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
     if tensor_cache_seqlens is not None:
-        _validate_dense_kvcache_tensor_length(
+        _validate_dense_kvcache_tensor_span(
             tensor_cache_seqlens,
+            tensor_cache_leftpad,
             device=q.device,
             spec=spec,
         )
@@ -1854,6 +1927,7 @@ def flash_attn_with_kvcache(
             k_cache,
             v_cache,
             tensor_cache_seqlens,
+            tensor_cache_leftpad,
             scale,
             spec,
             return_softmax_lse=return_softmax_lse,
