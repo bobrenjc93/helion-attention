@@ -51,10 +51,12 @@ CAUSAL_DROPOUT = spec_from_manifest_entry(
 FLASH_FAST_PATH_KEY = "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
 CUDNN_GQA_FAST_PATH_KEY = "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal"
 CUDNN_QWEN_FAST_PATH_KEY = "b1_sq8192_sk8192_hq28_hkv4_d128_bf16_causal"
+CUDNN_B4_QWEN_FAST_PATH_KEY = "b4_sq2048_sk2048_hq28_hkv4_d128_bf16_causal"
 CUDNN_FAST_PATH_KEYS = (
     CUDNN_GQA_FAST_PATH_KEY,
     CUDNN_QWEN_FAST_PATH_KEY,
     "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
+    CUDNN_B4_QWEN_FAST_PATH_KEY,
     "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
 )
 QWEN_PREFILL = AttnShape(
@@ -564,6 +566,7 @@ def test_matches_fp32_sdpa(
     if spec.key in {
         CUDNN_GQA_FAST_PATH_KEY,
         CUDNN_QWEN_FAST_PATH_KEY,
+        CUDNN_B4_QWEN_FAST_PATH_KEY,
         FLASH_FAST_PATH_KEY,
     }:
         with torch.autocast(device_type="cuda", dtype=torch.float16):

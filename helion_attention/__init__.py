@@ -121,6 +121,7 @@ _CUDNN_SDPA_FAST_PATH_KEYS = frozenset(
         "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal",
         "b1_sq8192_sk8192_hq28_hkv4_d128_bf16_causal",
         "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
+        "b4_sq2048_sk2048_hq28_hkv4_d128_bf16_causal",
         "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
     }
 )
@@ -1336,10 +1337,11 @@ def flash_attn_func(
     ``(2, 1024, 1024, 16, 16, 256)`` call uses direct PyTorch Flash SDPA on
     SM90 when eligible. The corresponding causal bf16
     ``(1, 4096, 4096, 32, 8, 128)``, ``(1, 8192, 8192, 28, 4, 128)``,
-    ``(2, 8192, 8192, 16, 16, 128)``, and ``(4, 4096, 4096, 32, 32, 128)``
-    calls use direct cuDNN SDPA. All five paths fall back to their generated
-    kernels when ineligible. Grad-enabled calls without ALiBi or a generated
-    backward, plus supported positive-dropout calls, use PyTorch SDPA autograd.
+    ``(2, 8192, 8192, 16, 16, 128)``, ``(4, 2048, 2048, 28, 4, 128)``, and
+    ``(4, 4096, 4096, 32, 32, 128)`` calls use direct cuDNN SDPA. All six
+    paths fall back to their generated kernels when ineligible. Grad-enabled
+    calls without ALiBi or a generated backward, plus supported positive-dropout
+    calls, use PyTorch SDPA autograd.
     Deterministic zero-dropout training on the exact BERT-base profile uses
     PyTorch's direct math SDPA operator for repeatable output and gradients.
     Zero-dropout training on the shipped encoder profile retains generated
