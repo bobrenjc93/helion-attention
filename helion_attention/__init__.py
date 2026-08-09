@@ -23,8 +23,10 @@ back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, both
 full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. The explicit shape validates these paths and makes specialization
-introspection independent of fallback coverage.
+autograd. Deterministic zero-dropout BERT-base training uses the direct math
+operator without changing process-wide SDPA backend state. The explicit shape
+validates these paths and makes specialization introspection independent of
+fallback coverage.
 """
 
 from __future__ import annotations
@@ -51,6 +53,7 @@ from ._registry import lookup_paged
 from ._registry import lookup_varlen
 from ._sdpa import dense_attention_cudnn_default_scale
 from ._sdpa import dense_attention_flash_default_scale
+from ._sdpa import dense_attention_math_sdpa
 from ._sdpa import dense_attention_sdpa
 from ._shape import AttnShape
 from ._shape import ShapeLike
@@ -1284,6 +1287,8 @@ def flash_attn_func(
     calls use direct cuDNN SDPA. All five paths fall back to their generated
     kernels when ineligible. Grad-enabled calls without ALiBi or a generated
     backward, plus supported positive-dropout calls, use PyTorch SDPA autograd.
+    Deterministic zero-dropout training on the exact BERT-base profile uses
+    PyTorch's direct math SDPA operator for repeatable output and gradients.
     Zero-dropout training on the shipped encoder profile retains generated
     forward values. Its omitted/default-scale SM90 path uses raw BSHD PyTorch
     Flash gradients, falling back to the generated backward when Flash is
@@ -1391,6 +1396,8 @@ def flash_attn_func(
                 return attention_with_flash_gradients(q, k, v, scale, spec)
             return attention_autograd(q, k, v, scale, spec)
         if deterministic:
+            if spec.key == _BERT_DIAGNOSTIC_KEY:
+                return dense_attention_math_sdpa(q, k, v, scale, spec)
             raise NotImplementedError(
                 "deterministic=True is not supported by the PyTorch SDPA "
                 "autograd fallback"

@@ -73,7 +73,9 @@ use the generic packed runtime; ordinary calls retain the generated
 specialization. The same three entry points accept `0 < dropout_p < 1` through
 PyTorch SDPA, with either the default or a custom `softmax_scale`. Causal mode,
 ALiBi, deterministic dropout, dropout diagnostics, and other dense profiles
-remain outside this BERT-base subset.
+remain outside this BERT-base subset. For zero-dropout training, the same
+entry points accept `deterministic=True` with either scale and call PyTorch's
+repeatable math operator directly, without changing global SDPA backend flags.
 
 The three checked-in batch-1 Llama GQA decode profiles (one query token and a
 1K, 4K, or 16K KV sequence) support `return_attn_probs=True` through both
@@ -88,9 +90,11 @@ Dense calls do not need a checked-in specialization. Contiguous CUDA fp16 and
 bf16 MHA/GQA inputs with `head_dim <= 256` use the generic Triton forward when
 their exact shape is absent, including unequal query/key lengths and
 bottom-right causal masking. Grad-enabled calls without a generated backward
-use PyTorch SDPA autograd instead. Dense ALiBi forward calls accept fp32 slopes
-shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
-ALiBi backward is not implemented. The shipped noncausal bf16
+use PyTorch SDPA autograd instead; the exact BERT-base profile above uses its
+direct math operator when deterministic backward is requested. Dense ALiBi
+forward calls accept fp32 slopes shaped `[nheads]` or `[batch, nheads]` and
+always use the generic Triton path; ALiBi backward is not implemented. The
+shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile retains generated forward
 values during zero-dropout training. On SM90, calls that omit `softmax_scale`
 use raw PyTorch BSHD Flash gradients, falling back to the generated backward
@@ -585,7 +589,9 @@ The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape keeps
 its generated forward during zero-dropout training. Omitted-scale SM90 calls
 use raw PyTorch BSHD Flash gradients with a generated-backward fallback;
 custom-scale, non-SM90, and deterministic calls retain the checked-in generated
-backward. It, the non-causal bf16 BERT-base profile, and causal bf16
+backward. The BERT-base profile uses the direct math SDPA operator for
+deterministic zero-dropout training. The encoder-training profile, BERT-base
+profile, and causal bf16
 `(2, 1024, 1024, 32, 32, 64)` use PyTorch SDPA when `0 < dropout_p < 1`.
 Default-option dense MHA, GQA, and cross-attention calls without a generated
 backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
@@ -598,7 +604,8 @@ else:
 - backward for dense or varlen ALiBi, ragged noncausal varlen batches,
   all-empty or empty cross-attention batches, graph-captured ragged batches,
   and KV-cache calls
-- `deterministic=True` when using the dense or varlen SDPA autograd fallback
+- `deterministic=True` when using the dense or varlen SDPA autograd fallback,
+  except for zero-dropout training on the exact bf16 BERT-base profile
 - dropout outside the exact encoder-training, BERT-base, and causal GPT-2
   profiles above, or combined with ALiBi, diagnostic returns, local windows,
   softcap, or deterministic mode
