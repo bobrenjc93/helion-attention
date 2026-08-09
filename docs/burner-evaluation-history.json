@@ -2203,6 +2203,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:325eed1c18982db14a9af35fa6c0371f91ce5e74",
+      "commit": "325eed1c18982db14a9af35fa6c0371f91ce5e74",
+      "recordedAt": "2026-08-09T22:17:18.196Z",
+      "label": "base 325eed1",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:103",
+      "recordedAt": "2026-08-09T22:17:18.196Z",
+      "label": "PR #103",
+      "kind": "leaf",
+      "prNumber": 103,
+      "title": "Enable ALiBi on page-256 paged decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

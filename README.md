@@ -283,18 +283,20 @@ select a different used length. Logical pages can map to physical cache pages
 in any order. Queries use dense BSHD layout and results are returned in that
 same layout. Chunked prefill uses bottom-right causal alignment. For decode,
 the default `causal=False` is equivalent to `causal=True`. The page-size-16
-profiles also accept forward-only fp32 ALiBi slopes shaped `[8]` or
-`[batch, 8]` (`[2, 8]` for chunked prefill and `[4, 8]` for decode):
+profiles and page-size-256 decode also accept forward-only fp32 ALiBi slopes
+shaped `[8]` or `[batch, 8]` (`[2, 8]` for chunked prefill and `[4, 8]` for
+decode):
 
 ```python
-B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 16
+B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 256
+NUM_BLOCKS = B * (MAX_CACHE // PAGE_SIZE)
 q = torch.randn(B, 1, H_Q, D, device="cuda", dtype=torch.bfloat16)
-k_cache = torch.randn(256, PAGE_SIZE, H_KV, D, device="cuda", dtype=torch.bfloat16)
+k_cache = torch.randn(NUM_BLOCKS, PAGE_SIZE, H_KV, D, device="cuda", dtype=torch.bfloat16)
 v_cache = torch.randn_like(k_cache)
 cache_seqlens = torch.tensor([37, 128, 1024, 5], device="cuda", dtype=torch.int32)
 alibi_slopes = torch.linspace(0.01, 0.2, H_Q, device="cuda", dtype=torch.float32)
 block_table = torch.randperm(
-    k_cache.shape[0], device="cuda", dtype=torch.int32
+    NUM_BLOCKS, device="cuda", dtype=torch.int32
 ).view(B, MAX_CACHE // PAGE_SIZE)
 
 out = helion_attention.flash_attn_with_kvcache(
@@ -310,16 +312,16 @@ out = helion_attention.flash_attn_with_kvcache(
 ```
 
 Slope-free output-only page-size-16 calls route through their checked-in
-paged-varlen kernels. Page-size-256 decode calls and page-size-16 ALiBi calls
-use the generic single-launch paged runtime, as does requesting LSE without
-ALiBi; the latter returns fp32 `[4, 8, 1]` LSE alongside the
+paged-varlen kernels. Page-size-256 decode calls and all paged ALiBi calls use
+the generic single-launch paged runtime, as does requesting LSE without ALiBi;
+the latter returns fp32 `[4, 8, 1]` LSE alongside the
 `[4, 1, 8, 128]` output for either decode page size. Neither path mutates the
 cache. Read-only page-size-256 decode additionally accepts exactly
 `softcap=50.0`, with the default or a custom scale and with or without the LSE
 return. `softcap=0` preserves the existing dispatch, including the generated
 path for page-size-16 output-only calls. Other caps, page sizes, and profiles,
-plus page-size-256 ALiBi, ALiBi with LSE, paged updates, rotary, windows, and
-autograd are rejected before dispatch. LSE on chunked prefill, non-causal
+plus ALiBi with LSE or softcap, paged updates, rotary, windows, and autograd are
+rejected before dispatch. LSE on chunked prefill, non-causal
 chunked prefill, every other paged profile, and every page size other than 16
 or 256 are also rejected before dispatch.
 
@@ -634,8 +636,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   exception permits its documented LSE return
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
-  the exact read-only page-size-16 profiles above; paged ALiBi cannot be combined
-  with LSE, updates, rotary, or autograd and is not supported with page size 256
+  the exact read-only page-size-16 profiles and page-size-256 decode above;
+  paged ALiBi cannot be combined with LSE, softcap, updates, rotary, or autograd
+  and is not supported with other page sizes
 - KV-cache mutation beyond the dense paired one-token final-slot append and
   exact two-token final-two-slot append above;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
