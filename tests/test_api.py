@@ -92,6 +92,7 @@ PAGED_KVCACHE = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+PAGED_KVCACHE_SOFTCAP_VALUE = 50.0
 PAGED_CHUNKED_PREFILL = AttnShape(
     batch=2,
     seqlen_q=200,
@@ -432,6 +433,35 @@ def reference_paged_single_token_lse(
         scores = torch.matmul(grouped_q, grouped_k_t) * scale
         lse.append(torch.logsumexp(scores, dim=-1).reshape(spec.nheads_q, 1))
     return torch.stack(lse)
+
+
+def reference_paged_single_token_softcap(
+    q: torch.Tensor,
+    logical_caches: list[tuple[torch.Tensor, torch.Tensor]],
+    spec: AttnShape,
+    scale: float,
+    softcap: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute ragged softcapped GQA output and LSE in fp32."""
+    group = spec.nheads_q // spec.nheads_kv
+    outputs: list[torch.Tensor] = []
+    lse: list[torch.Tensor] = []
+    for query, (logical_k, logical_v) in zip(q, logical_caches):
+        grouped_q = query[0].reshape(
+            spec.nheads_kv, group, spec.head_dim
+        ).float()
+        grouped_k_t = logical_k.float().permute(1, 2, 0)
+        scores = torch.matmul(grouped_q, grouped_k_t) * scale
+        scores = softcap * torch.tanh(scores / softcap)
+        probabilities = torch.softmax(scores, dim=-1)
+        grouped_v = logical_v.float().permute(1, 0, 2)
+        outputs.append(
+            torch.matmul(probabilities, grouped_v).reshape(
+                spec.seqlen_q, spec.nheads_q, spec.head_dim
+            )
+        )
+        lse.append(torch.logsumexp(scores, dim=-1).reshape(spec.nheads_q, 1))
+    return torch.stack(outputs), torch.stack(lse)
 
 
 def reference_paged_alibi(
@@ -3436,6 +3466,9 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "softcap", [0.0, PAGED_KVCACHE_SOFTCAP_VALUE], ids=["no-cap", "softcap-50"]
+)
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
@@ -3444,6 +3477,7 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
     "return_softmax_lse", [False, True], ids=["output-only", "with-lse"]
 )
 def test_page256_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages(
+    softcap: float,
     causal: bool,
     softmax_scale: float | None,
     return_softmax_lse: bool,
@@ -3467,6 +3501,7 @@ def test_page256_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages(
         block_table=block_table,
         softmax_scale=softmax_scale,
         causal=causal,
+        softcap=softcap,
         return_softmax_lse=return_softmax_lse,
         shape=(4, 1, 1024, 8, 2, 128),
     )
@@ -3478,23 +3513,28 @@ def test_page256_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages(
         out = result
         lse = None
 
-    expected_out = torch.stack(
-        [
-            torch.nn.functional.scaled_dot_product_attention(
-                query.float().transpose(0, 1).unsqueeze(0),
-                logical_k.float().transpose(0, 1).unsqueeze(0),
-                logical_v.float().transpose(0, 1).unsqueeze(0),
-                scale=scale,
-                enable_gqa=True,
-            )
-            .squeeze(0)
-            .transpose(0, 1)
-            for query, (logical_k, logical_v) in zip(q, logical_caches)
-        ]
-    )
-    expected_lse = reference_paged_single_token_lse(
-        q, logical_caches, PAGED_KVCACHE, scale
-    )
+    if softcap == 0.0:
+        expected_out = torch.stack(
+            [
+                torch.nn.functional.scaled_dot_product_attention(
+                    query.float().transpose(0, 1).unsqueeze(0),
+                    logical_k.float().transpose(0, 1).unsqueeze(0),
+                    logical_v.float().transpose(0, 1).unsqueeze(0),
+                    scale=scale,
+                    enable_gqa=True,
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+                for query, (logical_k, logical_v) in zip(q, logical_caches)
+            ]
+        )
+        expected_lse = reference_paged_single_token_lse(
+            q, logical_caches, PAGED_KVCACHE, scale
+        )
+    else:
+        expected_out, expected_lse = reference_paged_single_token_softcap(
+            q, logical_caches, PAGED_KVCACHE, scale, softcap
+        )
 
     assert out.shape == q.shape
     torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
@@ -3517,6 +3557,7 @@ def test_page256_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages(
         block_table=block_table,
         softmax_scale=softmax_scale,
         causal=causal,
+        softcap=softcap,
         return_softmax_lse=return_softmax_lse,
     )
     if return_softmax_lse:
@@ -3874,6 +3915,7 @@ def test_paged_kvcache_routes_through_core_varlen(
         block_table=block_table,
         softmax_scale=0.19,
         causal=True,
+        softcap=0.0,
         shape=spec,
     )
 
@@ -3905,9 +3947,11 @@ def test_paged_kvcache_routes_through_core_varlen(
 
 @requires_cuda
 @pytest.mark.parametrize("return_softmax_lse", [False, True])
+@pytest.mark.parametrize("softcap", [0.0, PAGED_KVCACHE_SOFTCAP_VALUE])
 def test_page256_paged_kvcache_uses_generic_runtime(
     monkeypatch: pytest.MonkeyPatch,
     return_softmax_lse: bool,
+    softcap: float,
 ) -> None:
     import helion_attention._paged_attention as generic_attention
 
@@ -3946,6 +3990,7 @@ def test_page256_paged_kvcache_uses_generic_runtime(
         block_table=block_table,
         softmax_scale=0.19,
         causal=True,
+        softcap=softcap,
         return_softmax_lse=return_softmax_lse,
         shape=PAGED_KVCACHE,
     )
@@ -3959,6 +4004,7 @@ def test_page256_paged_kvcache_uses_generic_runtime(
     assert args[2] is v_cache
     assert args[5] is block_table
     assert kwargs["softmax_scale"] == 0.19
+    assert kwargs["softcap"] == softcap
     assert kwargs["alibi_slopes"] is None
     assert kwargs["return_softmax_lse"] is return_softmax_lse
     if return_softmax_lse:
@@ -3972,6 +4018,123 @@ def test_page256_paged_kvcache_uses_generic_runtime(
         assert isinstance(result, torch.Tensor)
         out = result
     torch.testing.assert_close(out.flatten(0, 1), packed_out)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        pytest.param(
+            "other-cap",
+            NotImplementedError,
+            "only as softcap=50.0",
+            id="other-cap",
+        ),
+        pytest.param(
+            "page16",
+            NotImplementedError,
+            "page-size-256",
+            id="page-16",
+        ),
+        pytest.param(
+            "page32",
+            UnsupportedShapeError,
+            "supports only",
+            id="other-page-size",
+        ),
+        pytest.param(
+            "other-profile",
+            UnsupportedShapeError,
+            "supports only",
+            id="other-profile",
+        ),
+        pytest.param(
+            "update", NotImplementedError, "read-only", id="update"
+        ),
+        pytest.param(
+            "window", NotImplementedError, "sliding-window", id="window"
+        ),
+        pytest.param(
+            "alibi",
+            NotImplementedError,
+            "softcap combined with ALiBi",
+            id="alibi",
+        ),
+        pytest.param(
+            "autograd", NotImplementedError, "autograd", id="autograd"
+        ),
+    ],
+)
+def test_page256_paged_kvcache_softcap_rejects_out_of_scope_calls(
+    case: str,
+    error: type[Exception],
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
+        make_paged_kvcache_inputs(page_size=256)
+    )
+    kwargs: dict[str, object] = {
+        "cache_seqlens": cache_seqlens,
+        "block_table": block_table,
+        "causal": True,
+        "softcap": PAGED_KVCACHE_SOFTCAP_VALUE,
+        "shape": PAGED_KVCACHE,
+    }
+    if case == "other-cap":
+        kwargs["softcap"] = 49.0
+    elif case == "page16":
+        q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+            make_paged_kvcache_inputs(page_size=16)
+        )
+        kwargs["cache_seqlens"] = cache_seqlens
+        kwargs["block_table"] = block_table
+    elif case == "page32":
+        k_cache, v_cache, block_table = page_logical_caches(
+            PAGED_KVCACHE, logical_caches, page_size=32
+        )
+        kwargs["block_table"] = block_table
+    elif case == "other-profile":
+        kwargs["shape"] = AttnShape(
+            4, 1, 512, 8, 2, 128, torch.bfloat16, True
+        )
+    elif case == "update":
+        update_shape = (
+            PAGED_KVCACHE.batch,
+            1,
+            PAGED_KVCACHE.nheads_kv,
+            PAGED_KVCACHE.head_dim,
+        )
+        kwargs["k"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
+        kwargs["v"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            PAGED_KVCACHE.nheads_q, device=q.device, dtype=torch.float32
+        )
+    else:
+        q.requires_grad_()
+
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope paged softcap call reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_dispatch
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_dispatch)
+    with pytest.raises(error, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q, k_cache, v_cache, **kwargs
+        )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
 
 
 @requires_cuda

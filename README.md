@@ -55,8 +55,8 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
 
-Score capping is limited to two forward-only inference profiles. The dense
-causal-bf16 Gemma-2 profile
+Score capping is limited to the forward-only inference profiles described
+below. The dense causal-bf16 Gemma-2 profile
 `(1, 4096, 4096, 16, 8, 256)` accepts exactly `softcap=50.0` through
 `flash_attn_func` and `flash_attn_kvpacked_func`, with either the default or a
 custom `softmax_scale`. It uses the generic packed Triton runtime and applies
@@ -100,9 +100,9 @@ the shipped causal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2 profile accept
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs,
 with either the default or a custom scale. Zero-dropout calls that do not need
 backward retain each generated specialization. Other dropout calls, local
-windows, softcap outside the exact dense and varlen subsets described here,
-dense diagnostic returns outside the subsets above, and deterministic dropout
-still fail explicitly as described below.
+windows, softcap outside the exact dense, varlen, and paged subsets described
+here, dense diagnostic returns outside the subsets above, and deterministic
+dropout still fail explicitly as described below.
 Unregistered calls must also fit the generic kernel's signed 32-bit Q/output
 and K/V element offsets.
 
@@ -303,10 +303,14 @@ paged-varlen kernels. Page-size-256 decode calls and page-size-16 ALiBi calls
 use the generic single-launch paged runtime, as does requesting LSE without
 ALiBi; the latter returns fp32 `[4, 8, 1]` LSE alongside the
 `[4, 1, 8, 128]` output for either decode page size. Neither path mutates the
-cache. Page-size-256 ALiBi, ALiBi with LSE, paged updates, rotary, and autograd
-are rejected before dispatch. LSE on chunked prefill, non-causal chunked
-prefill, every other paged profile, and every page size other than 16 or 256
-are also rejected before dispatch.
+cache. Read-only page-size-256 decode additionally accepts exactly
+`softcap=50.0`, with the default or a custom scale and with or without the LSE
+return. `softcap=0` preserves the existing dispatch, including the generated
+path for page-size-16 output-only calls. Other caps, page sizes, and profiles,
+plus page-size-256 ALiBi, ALiBi with LSE, paged updates, rotary, windows, and
+autograd are rejected before dispatch. LSE on chunked prefill, non-causal
+chunked prefill, every other paged profile, and every page size other than 16
+or 256 are also rejected before dispatch.
 
 The single-token dense decode paths append one paired K/V token when a scalar
 cache length points at the final slot declared by `shape`:
@@ -601,10 +605,13 @@ else:
 - sliding-window attention outside finite symmetric inference on the
   noncausal bf16 varlen self-attention profile above, including all windowed
   backward and KV-cache calls
-- softcap except for no-backward causal bf16 calls with exactly `softcap=50.0`
-  on dense/KV-packed `(1, 4096, 4096, 16, 8, 256)` or unpacked/QKV/KV-packed
-  varlen `(8, 512, 512, 16, 16, 64)`; the supported softcap cannot be combined
-  with dropout, ALiBi, local windows, diagnostic returns, or paged caches
+- softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
+  causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
+  unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, or read-only
+  page-size-256 KV-cache decode `(4, 1, 1024, 8, 2, 128)` with either
+  decode-equivalent causal flag; the supported softcap cannot be combined with
+  dropout, ALiBi, local windows, or autograd, and only the paged exception
+  permits its documented LSE return
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 profiles above; paged ALiBi cannot be combined
