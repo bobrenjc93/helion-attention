@@ -2038,6 +2038,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:9c546a766f1f974bcc4be23720c51cd7f59ac5b0",
+      "commit": "9c546a766f1f974bcc4be23720c51cd7f59ac5b0",
+      "recordedAt": "2026-08-09T19:43:48.260Z",
+      "label": "base 9c546a7",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:97",
+      "recordedAt": "2026-08-09T19:43:48.260Z",
+      "label": "PR #97",
+      "kind": "leaf",
+      "prNumber": 97,
+      "title": "Enable softcap 50 on page-256 paged decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
