@@ -132,6 +132,17 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
+The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
+symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for
+forward-only self-attention. Dynamic ragged lengths with identical query/key
+cumulative offsets and either the default or a custom `softmax_scale` are
+supported. Windowed calls use the generic packed Triton runtime; the global
+`(-1, -1)` default retains the checked-in generated specialization. The varlen
+QKV-packed adapter inherits this support. Asymmetric windows, cross-attention
+offsets, other profiles, backward, paged caches, ALiBi, diagnostic returns,
+softcap, dropout, and deterministic mode remain unsupported in combination
+with a varlen window.
+
 This shipped causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts
 exactly `softcap=50.0` for calls that do not require backward. Dynamic ragged
 query/key lengths and the default or a custom `softmax_scale` are supported by
@@ -576,7 +587,9 @@ forward-only. These unsupported FlashAttention features also raise
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback
 - dropout outside the exact encoder-training profile above, or combined with
   ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
-- sliding-window attention
+- sliding-window attention outside finite symmetric inference on the
+  noncausal bf16 varlen self-attention profile above, including all windowed
+  backward and KV-cache calls
 - softcap except for no-backward causal bf16 calls with exactly `softcap=50.0`
   on dense/KV-packed `(1, 4096, 4096, 16, 8, 256)` or unpacked/QKV/KV-packed
   varlen `(8, 512, 512, 16, 16, 64)`; the supported softcap cannot be combined
