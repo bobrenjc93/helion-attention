@@ -10,10 +10,10 @@ exact generated specialization, except one evidenced SM90 long-context MHA
 fast path that uses direct cuDNN SDPA; compatible unregistered dense shapes,
 dense ALiBi calls, ALiBi on both shipped varlen profiles, and diagnostics on the
 shipped causal varlen profile use a generic Triton forward kernel. Positive
-dropout on the shipped encoder-training profile and grad-enabled dense calls
-without a generated backward use PyTorch SDPA autograd. The explicit shape
-validates these paths and makes specialization introspection independent of
-fallback coverage.
+dropout on the shipped encoder-training profile, grad-enabled dense calls
+without a generated backward, and the full-length noncausal varlen encoder
+profile use PyTorch SDPA autograd. The explicit shape validates these paths and
+makes specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -93,6 +93,9 @@ _VARLEN_ALIBI_KEYS = frozenset(
     }
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+_VARLEN_SDPA_BACKWARD_KEY = (
+    "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+)
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
         (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
@@ -401,6 +404,38 @@ def _supports_varlen_diagnostic_return(spec: AttnShape) -> bool:
     return (
         f"varlen_{spec.key}" == _VARLEN_DIAGNOSTIC_KEY
         and has_varlen_kernel(spec)
+    )
+
+
+def _has_canonical_full_varlen_layout(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    spec: AttnShape,
+) -> bool:
+    """Whether packed inputs are exactly the dense batch in THD layout."""
+    if (
+        q.shape[0] != spec.batch * spec.seqlen_q
+        or k.shape[0] != spec.batch * spec.seqlen_k
+    ):
+        return False
+    canonical_q = torch.arange(
+        0,
+        (spec.batch + 1) * spec.seqlen_q,
+        spec.seqlen_q,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    canonical_k = torch.arange(
+        0,
+        (spec.batch + 1) * spec.seqlen_k,
+        spec.seqlen_k,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    return torch.equal(cu_seqlens_q, canonical_q) and torch.equal(
+        cu_seqlens_k, canonical_k
     )
 
 
@@ -784,6 +819,13 @@ def flash_attn_varlen_func(
     ``(out, softmax_lse, S_dmask)`` with fp32 LSE shaped ``[nheads_q, total_q]``
     and an empty bf16 ``S_dmask``, matching FlashAttention 2 when dropout is
     zero.
+
+    The noncausal version supports zero-dropout backward when all eight query
+    and key sequences have length 512. That exact full-length layout is
+    reshaped to dense BSHD and uses PyTorch SDPA autograd. Ragged, causal,
+    deterministic, paged, ALiBi, and diagnostic varlen backward remain
+    unsupported. Calls that do not need backward retain the generated packed
+    kernel, including full-length calls.
     """
     _reject_unsupported(
         dropout_p,
@@ -864,8 +906,15 @@ def flash_attn_varlen_func(
     check_varlen_tensors(q, k, v, cu_seqlens_q, cu_seqlens_k, spec)
     if alibi_slopes is not None:
         _validate_alibi_slopes(alibi_slopes, q, spec)
-    grad_tensors = (q, k, v, alibi_slopes) if alibi_slopes is not None else (q, k, v)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in grad_tensors):
+    grad_tensors = (
+        (q, k, v, alibi_slopes)
+        if alibi_slopes is not None
+        else (q, k, v)
+    )
+    needs_backward = torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in grad_tensors
+    )
+    if needs_backward:
         if return_attn_probs:
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented for grad-enabled "
@@ -876,10 +925,40 @@ def flash_attn_varlen_func(
                 "ALiBi backward is not implemented; varlen ALiBi calls are "
                 "forward-only"
             )
-        raise NotImplementedError(
-            "flash_attn_varlen_func is currently forward-only; no packed-sequence "
-            "backward kernel is checked in"
+        if f"varlen_{spec.key}" != _VARLEN_SDPA_BACKWARD_KEY:
+            raise NotImplementedError(
+                "varlen backward is implemented only for "
+                f"{_VARLEN_SDPA_BACKWARD_KEY} with eight full-length "
+                "sequences"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "deterministic=True is not supported by the varlen PyTorch "
+                "SDPA autograd fallback"
+            )
+        if not _has_canonical_full_varlen_layout(
+            q, k, cu_seqlens_q, cu_seqlens_k, spec
+        ):
+            raise NotImplementedError(
+                "varlen backward requires all eight query and key sequences "
+                "to have the canonical length 512; partial or ragged batches "
+                "remain forward-only"
+            )
+        if softmax_scale is None:
+            softmax_scale = 1.0 / math.sqrt(spec.head_dim)
+        dense_q = q.reshape(
+            spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
         )
+        dense_k = k.reshape(
+            spec.batch, spec.seqlen_k, spec.nheads_kv, spec.head_dim
+        )
+        dense_v = v.reshape(
+            spec.batch, spec.seqlen_k, spec.nheads_kv, spec.head_dim
+        )
+        dense_out = dense_attention_sdpa(
+            dense_q, dense_k, dense_v, float(softmax_scale), spec
+        )
+        return dense_out.reshape(q.shape)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
