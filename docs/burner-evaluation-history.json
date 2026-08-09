@@ -1468,6 +1468,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:97b85da70bed0208cd4b0ab93c63025eeae5289a",
+      "commit": "97b85da70bed0208cd4b0ab93c63025eeae5289a",
+      "recordedAt": "2026-08-09T07:01:06.658Z",
+      "label": "base 97b85da",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 86,
+        "eval_1afd133e": 57,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:63",
+      "recordedAt": "2026-08-09T07:01:06.658Z",
+      "label": "PR #63",
+      "kind": "leaf",
+      "prNumber": 63,
+      "title": "Fast-path default-scale B1 8K Qwen with cuDNN",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 88,
+        "eval_1afd133e": 57,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
