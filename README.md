@@ -55,6 +55,14 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
 
+One forward-only Gemma-2 profile supports score capping: causal bf16
+`(1, 4096, 4096, 16, 8, 256)` accepts exactly `softcap=50.0` through
+`flash_attn_func` and `flash_attn_kvpacked_func`, with either the default or a
+custom `softmax_scale`. It uses the generic packed Triton runtime and applies
+`50 * tanh(scores / 50)` before softmax. `softcap=0` retains the usual generic
+dispatch for this unregistered shape. Other caps, shapes, option combinations,
+and calls that need gradients remain unsupported.
+
 The checked-in noncausal bf16 BERT-base encoder profile
 `(16, 512, 512, 12, 12, 64)` supports `return_attn_probs=True` through the
 dense, QKV-packed, and KV-packed entry points. A forward-only, dropout-free
@@ -82,10 +90,10 @@ shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
 ALiBi backward is not implemented. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
-Other dropout calls, local windows, softcap, dense diagnostic returns outside
-the subsets above, and deterministic dropout still fail explicitly as
-described below. Unregistered calls must also fit the generic kernel's signed
-32-bit Q/output and K/V element offsets.
+Other dropout calls, local windows, softcap outside the exact Gemma-2 subset
+above, dense diagnostic returns outside the subsets above, and deterministic
+dropout still fail explicitly as described below. Unregistered calls must also
+fit the generic kernel's signed 32-bit Q/output and K/V element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -525,7 +533,10 @@ doing something else:
   fallback
 - dropout outside the exact encoder-training profile above, or combined with
   ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
-- sliding-window attention and softcap
+- sliding-window attention
+- softcap except for no-backward dense/KV-packed causal bf16
+  `(1, 4096, 4096, 16, 8, 256)` calls with exactly `softcap=50.0`; the supported
+  softcap cannot be combined with dropout, ALiBi, or diagnostic returns
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 decode profile above; paged ALiBi cannot be

@@ -10,7 +10,8 @@ exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
 profiles, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. The exposed page-16 decode cache also uses the generic
+Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
+forward-only Gemma-2 profile. The exposed page-16 decode cache uses the generic
 paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
@@ -90,6 +91,8 @@ _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
+_GEMMA2_SOFTCAP_KEY = "b1_sq4096_sk4096_hq16_hkv8_d256_bf16_causal"
+_GEMMA2_SOFTCAP = 50.0
 _FLASH_SDPA_FAST_PATH_KEY = (
     "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
 )
@@ -141,6 +144,7 @@ def _reject_unsupported(
     allow_dropout: bool = False,
     allow_alibi: bool = False,
     allow_return_attn_probs: bool = False,
+    allowed_softcap: float | None = None,
 ) -> float:
     if isinstance(dropout_p, bool) or not isinstance(dropout_p, Real):
         raise TypeError("dropout_p must be a real number")
@@ -151,8 +155,12 @@ def _reject_unsupported(
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
     if tuple(window_size) != (-1, -1):
         raise NotImplementedError("sliding-window attention is not implemented")
-    if softcap != 0.0:
-        raise NotImplementedError("softcap is not implemented")
+    has_softcap = softcap != 0.0
+    if has_softcap and softcap != allowed_softcap:
+        raise NotImplementedError(
+            "softcap is implemented only as softcap=50.0 for the supported "
+            "dense Gemma-2 profile"
+        )
     if alibi_slopes is not None and not allow_alibi:
         raise NotImplementedError("ALiBi slopes are not implemented")
     if probability != 0.0 and alibi_slopes is not None:
@@ -162,6 +170,16 @@ def _reject_unsupported(
     if probability != 0.0 and return_attn_probs:
         raise NotImplementedError(
             "return_attn_probs=True is not implemented with dropout"
+        )
+    if has_softcap and probability != 0.0:
+        raise NotImplementedError("softcap combined with dropout is not implemented")
+    if has_softcap and alibi_slopes is not None:
+        raise NotImplementedError(
+            "softcap combined with ALiBi slopes is not implemented"
+        )
+    if has_softcap and return_attn_probs:
+        raise NotImplementedError(
+            "return_attn_probs=True is not implemented with softcap"
         )
     if return_attn_probs and not allow_return_attn_probs:
         raise NotImplementedError("return_attn_probs is not implemented")
@@ -486,6 +504,8 @@ def _generic_dense_forward(
     softmax_scale: float,
     spec: AttnShape,
     alibi_slopes: torch.Tensor | None,
+    *,
+    softcap: float = 0.0,
 ) -> torch.Tensor:
     """Adapt a validated dense batch to the generic packed Triton runtime."""
     total_q, total_k = _validate_generic_dense_layout(spec)
@@ -522,7 +542,7 @@ def _generic_dense_forward(
         softmax_scale=softmax_scale,
         causal=spec.causal,
         window_size=(-1, -1),
-        softcap=0.0,
+        softcap=softcap,
         alibi_slopes=alibi_slopes,
         q_descale=None,
         k_descale=None,
@@ -887,6 +907,9 @@ def flash_attn_func(
             noncausal bf16 ``(8, 512, 512, 16, 16, 64)`` profile.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
+        softcap: exactly ``50.0`` is supported for forward-only causal bf16
+            ``(1, 4096, 4096, 16, 8, 256)`` Gemma-2 attention. Zero retains
+            ordinary dispatch; every other positive value remains unsupported.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
         return_attn_probs: for the shipped bf16 BERT-base encoder and three
@@ -905,8 +928,9 @@ def flash_attn_func(
         ``[batch, nheads_q, seqlen_q]`` and ``S_dmask`` is an empty
         input-dtype tensor, matching FlashAttention when dropout is zero.
 
-    Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
-    use a generic packed Triton forward kernel. The exact default-option,
+    Unregistered fp16/bf16 shapes with ``head_dim <= 256``, all ALiBi calls, and
+    the supported Gemma-2 softcap call use a generic packed Triton forward
+    kernel. The exact default-option,
     default-scale, no-backward noncausal bf16
     ``(2, 1024, 1024, 16, 16, 256)`` call uses direct PyTorch Flash SDPA on
     SM90 when eligible. The corresponding causal bf16
@@ -927,8 +951,16 @@ def flash_attn_func(
         allow_dropout=True,
         allow_alibi=True,
         allow_return_attn_probs=True,
+        allowed_softcap=_GEMMA2_SOFTCAP,
     )
     spec = normalize_shape(shape, q.dtype, causal)
+    has_softcap = softcap != 0.0
+    if has_softcap and spec.key != _GEMMA2_SOFTCAP_KEY:
+        raise NotImplementedError(
+            "softcap=50.0 is implemented only for the no-backward bf16 causal "
+            "Gemma-2 profile (1, 4096, 4096, 16, 8, 256); "
+            f"got {spec.describe()}"
+        )
     if dropout != 0.0:
         if spec.key != _DROPOUT_SDPA_KEY:
             raise NotImplementedError(
@@ -949,6 +981,21 @@ def flash_attn_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
     )
+    if has_softcap:
+        if needs_backward:
+            raise NotImplementedError(
+                "softcap backward is not implemented; the Gemma-2 softcap "
+                "profile is forward-only"
+            )
+        return _generic_dense_forward(
+            q,
+            k,
+            v,
+            scale,
+            spec,
+            None,
+            softcap=_GEMMA2_SOFTCAP,
+        )
     if return_attn_probs:
         if needs_backward:
             raise NotImplementedError(
