@@ -120,8 +120,9 @@ ALiBi. Pass fp32 CUDA slopes shaped `[16]` or `[8, 16]` through `alibi_slopes`;
 both the unpacked API and the varlen QKV/KV-packed adapters accept them, with
 either the default or a custom `softmax_scale`. ALiBi calls use the generic
 packed Triton runtime, while `alibi_slopes=None` retains the checked-in generated
-specialization. Other varlen profiles and paged calls still reject ALiBi
-explicitly.
+specialization. Other varlen profiles and paged calls made directly through the
+core varlen API still reject ALiBi explicitly; the narrow KV-cache decode path
+described below is the only paged exception.
 
 Zero-dropout backward is supported for the noncausal bf16
 `(8, 512, 512, 16, 16, 64)` varlen profile only when all eight query and key
@@ -188,7 +189,8 @@ Two exact bf16 profiles also accept a read-only page-size-16 cache through
 select a different used length. Logical pages can map to physical cache pages
 in any order. Queries use dense BSHD layout and results are returned in that
 same layout. Chunked prefill uses bottom-right causal alignment. For decode,
-the default `causal=False` is equivalent to `causal=True`:
+the default `causal=False` is equivalent to `causal=True`. That decode profile
+also accepts forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]`:
 
 ```python
 B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 16
@@ -196,6 +198,7 @@ q = torch.randn(B, 1, H_Q, D, device="cuda", dtype=torch.bfloat16)
 k_cache = torch.randn(256, PAGE_SIZE, H_KV, D, device="cuda", dtype=torch.bfloat16)
 v_cache = torch.randn_like(k_cache)
 cache_seqlens = torch.tensor([37, 128, 1024, 5], device="cuda", dtype=torch.int32)
+alibi_slopes = torch.linspace(0.01, 0.2, H_Q, device="cuda", dtype=torch.float32)
 block_table = torch.randperm(
     k_cache.shape[0], device="cuda", dtype=torch.int32
 ).view(B, MAX_CACHE // PAGE_SIZE)
@@ -207,17 +210,19 @@ out = helion_attention.flash_attn_with_kvcache(
     cache_seqlens=cache_seqlens,
     block_table=block_table,
     softmax_scale=0.37,
+    alibi_slopes=alibi_slopes,
     shape=(B, 1, MAX_CACHE, H_Q, H_KV, D),
 )
 ```
 
-Output-only calls on these narrow paged paths route through their checked-in
-paged-varlen kernels. Requesting LSE on the decode profile uses the generic
-single-launch paged runtime and returns fp32 `[4, 8, 1]` LSE alongside the
-`[4, 1, 8, 128]` output. Neither path mutates the cache. Paged updates, rotary,
-and autograd are rejected before dispatch. LSE on chunked prefill, non-causal
-chunked prefill, every other paged profile, and every other page size are also
-rejected before dispatch.
+Slope-free output-only calls on these narrow paged paths route through their
+checked-in paged-varlen kernels. ALiBi decode calls use the generic single-launch
+paged runtime, as does requesting LSE without ALiBi; the latter returns fp32
+`[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. Neither path mutates the
+cache. ALiBi with LSE, paged updates, rotary, and autograd are rejected before
+dispatch. ALiBi on chunked prefill, LSE on chunked prefill, non-causal chunked
+prefill, every other paged profile, and every other page size are also rejected
+before dispatch.
 
 The dense decode path also appends one paired K/V token when a scalar cache
 length points at the final slot declared by `shape`:
@@ -500,7 +505,9 @@ doing something else:
   ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
 - sliding-window attention and softcap
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
-  `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls
+  `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
+  the exact read-only page-size-16 decode profile above; paged ALiBi cannot be
+  combined with LSE, updates, rotary, or autograd
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense partial/ragged caches, paged profiles other than the exact read-only
   page-size-16 profiles above, paged LSE outside the exact decode profile
