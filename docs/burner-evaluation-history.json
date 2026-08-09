@@ -2173,6 +2173,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:b9f208b41229fc0b656f8f7d8d1fbeb158b0b207",
+      "commit": "b9f208b41229fc0b656f8f7d8d1fbeb158b0b207",
+      "recordedAt": "2026-08-09T21:56:00.164Z",
+      "label": "base b9f208b",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 91,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:102",
+      "recordedAt": "2026-08-09T21:56:00.164Z",
+      "label": "PR #102",
+      "kind": "leaf",
+      "prNumber": 102,
+      "title": "Backpropagate the shipped symmetric varlen window",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 91,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
