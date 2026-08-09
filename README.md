@@ -63,14 +63,28 @@ custom `softmax_scale`. It uses the generic packed Triton runtime and applies
 dispatch for this unregistered shape. Other caps, shapes, option combinations,
 and calls that need gradients remain unsupported.
 
+Every unregistered causal fp16/bf16 dense shape inside the generic Triton
+envelope supports `return_attn_probs=True` for forward-only MHA, GQA, and
+cross-attention. This includes the dense entry point and the QKV-packed or
+KV-packed adapters where their layouts apply, with either the default or a
+custom `softmax_scale`. Calls return `(out, softmax_lse, S_dmask)`, where LSE
+is fp32 with shape `[batch, heads_q, seqlen_q]` and `S_dmask` is an empty tensor
+with the input dtype. When a longer query creates fully masked bottom-right
+causal rows, those rows have zero output and `+inf` LSE, matching FA2.
+Diagnostic calls use the generic packed runtime; `return_attn_probs=False`
+retains ordinary output-only dispatch. Generic noncausal shapes and checked-in
+profiles other than the explicit diagnostic profiles below remain unsupported
+for diagnostic returns.
+
 The checked-in noncausal bf16 BERT-base encoder profile
 `(16, 512, 512, 12, 12, 64)` supports `return_attn_probs=True` through the
 dense, QKV-packed, and KV-packed entry points. A forward-only, dropout-free
 call returns `(out, softmax_lse, S_dmask)` with fp32 LSE shaped
 `[16, 12, 512]` and an empty bf16 `S_dmask`, matching FA2. Diagnostic calls
 use the generic packed runtime; ordinary calls retain the generated
-specialization. Causal mode, ALiBi, and other dense profiles remain outside
-this encoder diagnostic subset.
+specialization. The same geometry in causal mode is unregistered and follows
+the generic causal support above; ALiBi and other registered dense profiles
+remain outside this encoder diagnostic subset.
 
 The three checked-in batch-1 Llama GQA decode profiles (one query token and a
 1K, 4K, or 16K KV sequence) support `return_attn_probs=True` through both
@@ -91,9 +105,10 @@ ALiBi backward is not implemented. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
 Other dropout calls, local windows, softcap outside the exact Gemma-2 subset
-above, dense diagnostic returns outside the subsets above, and deterministic
-dropout still fail explicitly as described below. Unregistered calls must also
-fit the generic kernel's signed 32-bit Q/output and K/V element offsets.
+above, noncausal generic or non-diagnostic registered dense diagnostic returns,
+and deterministic dropout still fail explicitly as described below.
+Unregistered calls must also fit the generic kernel's signed 32-bit Q/output
+and K/V element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -547,9 +562,11 @@ doing something else:
   profiles above, paged LSE outside the exact decode profile above, and
   KV-cache rotary outside the full-head interleaved/NeoX or D128 half-head
   interleaved final-slot append
-- `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
-  KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
-  profiles, and the causal bf16 varlen profile described above
+- `return_attn_probs=True` for noncausal or out-of-envelope unregistered dense
+  shapes, registered dense shapes outside the BERT-base and three Llama GQA
+  decode profiles, or varlen shapes outside the causal bf16 profile described
+  above; diagnostic returns also reject backward, dropout, ALiBi, local-window,
+  softcap, and deterministic combinations
 
 ## How the kernels are made
 
