@@ -1528,6 +1528,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:3084d9f0395b6c0a418917b8b14a76224b678a6e",
+      "commit": "3084d9f0395b6c0a418917b8b14a76224b678a6e",
+      "recordedAt": "2026-08-09T11:17:57.221Z",
+      "label": "base 3084d9f",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 88,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:73",
+      "recordedAt": "2026-08-09T11:17:57.221Z",
+      "label": "PR #73",
+      "kind": "leaf",
+      "prNumber": 73,
+      "title": "Read a tensor-length prefix from the 16K dense cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 88,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
