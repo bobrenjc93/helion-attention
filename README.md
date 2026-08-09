@@ -146,7 +146,8 @@ out = helion_attention.flash_attn_with_kvcache(
 
 For dense caches, pass `return_softmax_lse=True` to receive
 `(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
-FlashAttention's KV-cache API.
+FlashAttention's KV-cache API. The exact paged decode profile below supports
+the same return for both the default and a custom `softmax_scale`.
 
 Two exact bf16 profiles also accept a read-only page-size-16 cache through
 `flash_attn_with_kvcache`: chunked prefill `(2, 200, 320, 8, 2, 128)` with
@@ -178,10 +179,13 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-These narrow paged paths route through their checked-in paged-varlen kernels.
-They do not mutate the cache; paged updates, LSE, rotary, and autograd are
-rejected before dispatch. Non-causal chunked prefill and every other paged
-profile are also rejected before dispatch.
+Output-only calls on these narrow paged paths route through their checked-in
+paged-varlen kernels. Requesting LSE on the decode profile uses the generic
+single-launch paged runtime and returns fp32 `[4, 8, 1]` LSE alongside the
+`[4, 1, 8, 128]` output. Neither path mutates the cache. Paged updates, rotary,
+and autograd are rejected before dispatch. LSE on chunked prefill, non-causal
+chunked prefill, every other paged profile, and every other page size are also
+rejected before dispatch.
 
 The dense decode path also appends one paired K/V token when a scalar cache
 length points at the final slot declared by `shape`:
@@ -463,8 +467,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   `(8, 512, 512, 16, 16, 64)` profile above, and for KV-cache calls
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense partial/ragged caches, paged profiles other than the exact read-only
-  page-size-16 profiles above, paged LSE, and KV-cache rotary outside the
-  full-head or D128 half-head interleaved final-slot append
+  page-size-16 profiles above, paged LSE outside the exact decode profile
+  above, and KV-cache rotary outside the full-head or D128 half-head
+  interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward, default-option dense and
   KV-packed calls for the three Llama GQA decode profiles described above
 

@@ -279,6 +279,25 @@ def reference_single_token_lse(
     )
 
 
+def reference_paged_single_token_lse(
+    q: torch.Tensor,
+    logical_caches: list[tuple[torch.Tensor, torch.Tensor]],
+    spec: AttnShape,
+    scale: float,
+) -> torch.Tensor:
+    """Compute ragged GQA LSE without materializing padded cache rows."""
+    group = spec.nheads_q // spec.nheads_kv
+    lse: list[torch.Tensor] = []
+    for query, (logical_k, _) in zip(q, logical_caches):
+        grouped_q = query[0].reshape(
+            spec.nheads_kv, group, spec.head_dim
+        ).float()
+        grouped_k_t = logical_k.float().permute(1, 2, 0)
+        scores = torch.matmul(grouped_q, grouped_k_t) * scale
+        lse.append(torch.logsumexp(scores, dim=-1).reshape(spec.nheads_q, 1))
+    return torch.stack(lse)
+
+
 def test_package_does_not_import_helion() -> None:
     assert "helion" not in sys.modules
 
@@ -1507,6 +1526,64 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_paged_kvcache_returns_fp32_lse_for_ragged_permuted_pages(
+    softmax_scale: float | None,
+) -> None:
+    q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
+        make_paged_kvcache_inputs()
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    scale = (
+        1.0 / math.sqrt(PAGED_KVCACHE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        return_softmax_lse=True,
+        shape=(4, 1, 1024, 8, 2, 128),
+    )
+    assert isinstance(result, tuple)
+    out, lse = result
+    expected_out = torch.stack(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                query.float().transpose(0, 1).unsqueeze(0),
+                logical_k.float().transpose(0, 1).unsqueeze(0),
+                logical_v.float().transpose(0, 1).unsqueeze(0),
+                scale=scale,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+            for query, (logical_k, logical_v) in zip(q, logical_caches)
+        ]
+    )
+    expected_lse = reference_paged_single_token_lse(
+        q, logical_caches, PAGED_KVCACHE, scale
+    )
+
+    assert out.shape == (4, 1, 8, 128)
+    assert lse.shape == (4, 8, 1)
+    assert lse.dtype == torch.float32
+    assert lse.device == q.device
+    torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=2e-3, rtol=1e-3)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
 def test_paged_kvcache_chunked_prefill_matches_fp32_and_fa2() -> None:
     spec = PAGED_CHUNKED_PREFILL
     q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
@@ -1676,19 +1753,30 @@ def test_paged_kvcache_rejects_unsupported_modes_before_varlen_dispatch(
     update_v = torch.zeros_like(update_k)
     with pytest.raises(NotImplementedError, match="read-only"):
         helion_attention.flash_attn_with_kvcache(
-            q, k_cache, v_cache, k=update_k, v=update_v, **base
-        )
-    with pytest.raises(NotImplementedError, match="return_softmax_lse"):
-        helion_attention.flash_attn_with_kvcache(
-            q, k_cache, v_cache, return_softmax_lse=True, **base
+            q,
+            k_cache,
+            v_cache,
+            k=update_k,
+            v=update_v,
+            return_softmax_lse=True,
+            **base,
         )
     with pytest.raises(NotImplementedError, match="rotary embeddings"):
         helion_attention.flash_attn_with_kvcache(
-            q, k_cache, v_cache, rotary_cos=q, **base
+            q,
+            k_cache,
+            v_cache,
+            rotary_cos=q,
+            return_softmax_lse=True,
+            **base,
         )
     with pytest.raises(NotImplementedError, match="autograd"):
         helion_attention.flash_attn_with_kvcache(
-            q.detach().requires_grad_(), k_cache, v_cache, **base
+            q.detach().requires_grad_(),
+            k_cache,
+            v_cache,
+            return_softmax_lse=True,
+            **base,
         )
 
     other_profile = AttnShape(
@@ -1699,6 +1787,7 @@ def test_paged_kvcache_rejects_unsupported_modes_before_varlen_dispatch(
             q,
             k_cache,
             v_cache,
+            return_softmax_lse=True,
             **{**base, "shape": other_profile},
         )
     page_32_k = torch.empty(
@@ -1707,7 +1796,11 @@ def test_paged_kvcache_rejects_unsupported_modes_before_varlen_dispatch(
     page_32_v = torch.empty_like(page_32_k)
     with pytest.raises(UnsupportedShapeError, match="page_size=16"):
         helion_attention.flash_attn_with_kvcache(
-            q, page_32_k, page_32_v, **base
+            q,
+            page_32_k,
+            page_32_v,
+            return_softmax_lse=True,
+            **base,
         )
 
     assert torch.equal(k_cache, original_k)
