@@ -23,10 +23,11 @@ back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, both
 full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. Deterministic zero-dropout BERT-base training uses the direct math
-operator without changing process-wide SDPA backend state. The explicit shape
-validates these paths and makes specialization introspection independent of
-fallback coverage.
+autograd. Full-length symmetric-window training on the shipped noncausal
+varlen profile uses the same bounded SDPA bridge. Deterministic zero-dropout
+BERT-base training uses the direct math operator without changing process-wide
+SDPA backend state. The explicit shape validates these paths and makes
+specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -1527,12 +1528,14 @@ def flash_attn_varlen_func(
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
     ``[16]`` or ``[8, 16]``.
 
-    The noncausal version also supports forward-only local self-attention with
+    The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
-    Query and key cumulative offsets must be identical. These calls use the
-    generic packed Triton runtime and accept the default or a custom
-    ``softmax_scale``. The global ``(-1, -1)`` default continues to use the
-    generated specialization.
+    Query and key cumulative offsets must be identical. Forward-only calls use
+    the generic packed Triton runtime. Zero-dropout backward is additionally
+    supported when all eight sequences have length 512, by reshaping them to a
+    dense windowed PyTorch SDPA call. Both paths accept the default or a custom
+    ``softmax_scale``. The global ``(-1, -1)`` default retains its existing
+    dispatch.
 
     The causal version of that profile accepts exactly ``softcap=50.0`` for
     calls that do not need backward, with either the default or a custom
@@ -1555,8 +1558,8 @@ def flash_attn_varlen_func(
     query/key offsets containing a mix of empty and nonempty slots. Full-length
     inputs are reshaped to one dense BSHD call; ragged inputs use one bounded
     PyTorch SDPA call per nonempty sequence. All-empty batches, empty
-    cross-attention, ragged noncausal, graph-captured ragged, deterministic,
-    paged, ALiBi, and diagnostic and windowed varlen backward remain
+    cross-attention, ragged noncausal (including windowed calls), graph-captured
+    ragged, deterministic, paged, ALiBi, and diagnostic varlen backward remain
     unsupported. Calls that do not need backward retain the generated packed
     kernel, including ragged and full-length calls with the global window.
     """
@@ -1703,11 +1706,6 @@ def flash_attn_varlen_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in grad_tensors
     )
-    if has_symmetric_window and needs_backward:
-        raise NotImplementedError(
-            "varlen sliding-window backward is not implemented; finite "
-            "symmetric windows are inference-only"
-        )
     if has_symmetric_window:
         _validate_varlen_self_attention_offsets(
             q, k, cu_seqlens_q, cu_seqlens_k
@@ -1741,6 +1739,12 @@ def flash_attn_varlen_func(
                 "SDPA autograd fallback"
             )
         full_length = _has_full_varlen_token_totals(q, k, spec)
+        if has_symmetric_window and not full_length:
+            raise NotImplementedError(
+                "varlen sliding-window backward is implemented only when all "
+                "eight self-attention sequences have length 512; ragged "
+                "windowed calls remain forward-only"
+            )
         if (
             not full_length
             and f"varlen_{spec.key}" != _RAGGED_VARLEN_SDPA_BACKWARD_KEY
@@ -1769,9 +1773,22 @@ def flash_attn_varlen_func(
         dense_v = v.reshape(
             spec.batch, spec.seqlen_k, spec.nheads_kv, spec.head_dim
         )
-        dense_out = dense_attention_sdpa(
-            dense_q, dense_k, dense_v, scale, spec
-        )
+        if has_symmetric_window:
+            dense_out = dense_attention_sdpa(
+                dense_q,
+                dense_k,
+                dense_v,
+                scale,
+                spec,
+                symmetric_window_radius=window[0],
+            )
+        else:
+            # Preserve the existing global backward call and its dispatch
+            # signature exactly; the optional radius belongs only to the new
+            # finite-window bridge.
+            dense_out = dense_attention_sdpa(
+                dense_q, dense_k, dense_v, scale, spec
+            )
         return dense_out.reshape(q.shape)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
