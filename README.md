@@ -195,6 +195,14 @@ For dense caches, pass `return_softmax_lse=True` to receive
 FlashAttention's KV-cache API. The exact paged decode profile below supports
 the same return for both the default and a custom `softmax_scale`.
 
+The causal bf16 dense profile `(1, 1, 16384, 32, 8, 128)` also accepts a
+contiguous CUDA int32 `cache_seqlens` tensor shaped `[1]`. Values from 1 through
+16384 select that prefix of the cache for a read-only call, with the default or
+a custom `softmax_scale` and optional LSE. This path synchronizes once to check
+bounds recoverably, so it rejects CUDA graph capture and autograd. Omitting the
+length or passing the full length as a Python integer retains the checked-in
+split-KV generated kernel.
+
 Two exact bf16 profiles also accept a read-only page-size-16 cache through
 `flash_attn_with_kvcache`: chunked prefill `(2, 200, 320, 8, 2, 128)` with
 `causal=True`, and decode `(4, 1, 1024, 8, 2, 128)` with either causal mode.
@@ -257,12 +265,13 @@ out = helion_attention.flash_attn_with_kvcache(
 
 The append mutates both dense caches in place and attends over the updated full
 cache. Dense read-only calls may omit `cache_seqlens` or pass the full cache
-length. Dense update lengths must be Python integers and satisfy
-`cache_seqlens + 1 == S_CACHE`; unpaired or multi-token updates and dense
-tensor-valued, partial, or ragged lengths are rejected explicitly. Caches
-created inside `torch.inference_mode()` must be updated while that mode remains
-enabled. For an append, `q`, `k_cache`, and `v_cache` must occupy disjoint
-memory; update `k`/`v` aliases are staged safely.
+length; the exact 16K profile above additionally accepts its documented tensor
+prefix. Dense update lengths must be Python integers and satisfy
+`cache_seqlens + 1 == S_CACHE`; unpaired or multi-token updates, scalar partial
+lengths, and tensor lengths on every other dense profile are rejected
+explicitly. Caches created inside `torch.inference_mode()` must be updated while
+that mode remains enabled. For an append, `q`, `k_cache`, and `v_cache` must
+occupy disjoint memory; update `k`/`v` aliases are staged safely.
 
 This same final-slot append accepts paired, contiguous `rotary_cos` and
 `rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
@@ -521,10 +530,11 @@ doing something else:
   the exact read-only page-size-16 decode profile above; paged ALiBi cannot be
   combined with LSE, updates, rotary, or autograd
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
-  dense partial/ragged caches, paged profiles other than the exact read-only
-  page-size-16 profiles above, paged LSE outside the exact decode profile
-  above, and KV-cache rotary outside the full-head or D128 half-head
-  interleaved final-slot append
+  dense tensor lengths outside the exact read-only 16K profile above, scalar
+  partial caches, paged profiles other than the exact read-only page-size-16
+  profiles above, paged LSE outside the exact decode profile above, and
+  KV-cache rotary outside the full-head or D128 half-head interleaved final-slot
+  append
 - `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
   KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
   profiles, and the causal bf16 varlen profile described above
