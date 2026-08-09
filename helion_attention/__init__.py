@@ -1052,11 +1052,16 @@ def flash_attn_varlen_func(
                 "SDPA autograd fallback"
             )
         if not _has_full_varlen_token_totals(q, k, spec):
-            operation = "dropout" if dropout != 0.0 else "backward"
+            if dropout != 0.0:
+                raise NotImplementedError(
+                    "varlen dropout requires all eight query and key sequences "
+                    "to have the canonical length 512; partial or ragged "
+                    "batches do not support dropout"
+                )
             raise NotImplementedError(
-                f"varlen {operation} requires all eight query and key sequences "
+                "varlen backward requires all eight query and key sequences "
                 "to have the canonical length 512; partial or ragged batches "
-                "are unsupported for this path"
+                "remain forward-only"
             )
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(spec.head_dim)
