@@ -1303,6 +1303,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6798b8826ede8b2b1d4aa7774b85a8de26c2a3d3",
+      "commit": "6798b8826ede8b2b1d4aa7774b85a8de26c2a3d3",
+      "recordedAt": "2026-08-09T04:40:28.572Z",
+      "label": "base 6798b88",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 83,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:57",
+      "recordedAt": "2026-08-09T04:40:28.572Z",
+      "label": "PR #57",
+      "kind": "leaf",
+      "prNumber": 57,
+      "title": "Fast-path B4 4K causal MHA with cuDNN",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 83,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

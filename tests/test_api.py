@@ -36,7 +36,10 @@ LONG_DECODE = next(
 )
 BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
 ENCODER_TRAINING = spec_from_manifest_entry(BACKWARD_SHAPES[0])
-CUDNN_FAST_PATH_KEY = "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal"
+CUDNN_FAST_PATH_KEYS = (
+    "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
+    "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
+)
 QWEN_PREFILL = AttnShape(
     batch=1,
     seqlen_q=2048,
@@ -47,9 +50,13 @@ QWEN_PREFILL = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
-CUDNN_FAST_PATH = spec_from_manifest_entry(
-    next(entry for entry in SHAPES if entry["key"] == CUDNN_FAST_PATH_KEY)
-)
+CUDNN_FAST_PATHS = [
+    spec_from_manifest_entry(
+        next(entry for entry in SHAPES if entry["key"] == key)
+    )
+    for key in CUDNN_FAST_PATH_KEYS
+]
+CUDNN_FAST_PATH = CUDNN_FAST_PATHS[0]
 PAGED_KVCACHE = AttnShape(
     batch=4,
     seqlen_q=1,
@@ -454,11 +461,10 @@ def test_registered_shape_without_backward_dispatches_to_sdpa(
 
 
 @requires_cuda
+@pytest.mark.parametrize("spec", CUDNN_FAST_PATHS, ids=CUDNN_FAST_PATH_KEYS)
 def test_cudnn_fast_path_dispatch_is_narrow(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, spec: AttnShape
 ) -> None:
-    spec = CUDNN_FAST_PATH
-
     def empty(seqlen: int, nheads: int) -> torch.Tensor:
         return torch.empty(
             spec.batch,
@@ -592,11 +598,10 @@ def test_cudnn_fast_path_dispatch_is_narrow(
 
 
 @requires_cuda
+@pytest.mark.parametrize("spec", CUDNN_FAST_PATHS, ids=CUDNN_FAST_PATH_KEYS)
 def test_cudnn_fast_path_falls_back_when_ineligible(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, spec: AttnShape
 ) -> None:
-    spec = CUDNN_FAST_PATH
-
     def empty(seqlen: int, nheads: int) -> torch.Tensor:
         return torch.empty(
             spec.batch,
