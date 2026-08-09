@@ -1753,6 +1753,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6d85dea080e52cdff9eb64ff056bc12c6fb25b8d",
+      "commit": "6d85dea080e52cdff9eb64ff056bc12c6fb25b8d",
+      "recordedAt": "2026-08-09T16:07:41.002Z",
+      "label": "base 6d85dea",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:87",
+      "recordedAt": "2026-08-09T16:07:41.002Z",
+      "label": "PR #87",
+      "kind": "leaf",
+      "prNumber": 87,
+      "title": "Read exactly two tokens from the 1K dense KV cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
