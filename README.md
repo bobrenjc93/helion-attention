@@ -12,8 +12,9 @@ argument**. Helion only beats FlashAttention when a kernel is specialized to one
 exact problem size — block sizes, warp counts, pipelining stages, indexing mode
 and the tensor strides are all baked into the generated Triton. Shapes in the
 checked-in catalogue use those autotuned kernels. Other compatible dense calls
-use a generic packed Triton kernel for correctness and API coverage. Declaring
-the shape at the call site validates both paths and keeps acceleration explicit.
+and unregistered causal varlen diagnostics use a generic packed Triton kernel
+for correctness and API coverage. Declaring the shape at the call site validates
+both paths and keeps acceleration explicit.
 
 One measured Hopper encoder profile invokes PyTorch's Flash SDPA operator
 directly: the exact noncausal bf16 `(2, 1024, 1024, 16, 16, 256)` MHA call.
@@ -126,10 +127,21 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
-The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
-`return_attn_probs=True` for forward-only calls with otherwise default options
-apart from `causal=True` and an optional custom `softmax_scale`. It returns
-`(out, softmax_lse, S_dmask)`, where LSE is fp32 with shape
+Every unregistered causal fp16/bf16 varlen shape inside the generic nonpaged
+runtime envelope supports `return_attn_probs=True` for forward-only MHA, GQA,
+and cross-attention. This includes dynamically ragged query and key lengths,
+the unpacked API, both varlen packed adapters where their layouts apply, and
+either the default or a custom `softmax_scale`. The result is `(out,
+softmax_lse, S_dmask)`, with fp32 LSE shaped `[heads_q, total_q]` and an empty
+input-dtype `S_dmask`. Fully masked causal rows have zero output and `+inf` LSE,
+matching FA2. Generic noncausal shapes, calls that need gradients, and shapes
+outside the fallback's head-dimension and signed-32-bit launch limits remain
+unsupported. Setting `return_attn_probs=False` retains ordinary dispatch.
+
+The registered causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile also
+supports `return_attn_probs=True` for forward-only calls with otherwise default
+options apart from `causal=True` and an optional custom `softmax_scale`. It
+returns `(out, softmax_lse, S_dmask)`, where LSE is fp32 with shape
 `[heads_q, total_q]` and `S_dmask` is an empty bf16 tensor. Fully masked causal
 rows have zero output and `+inf` LSE, matching FA2. The generated specialization
 remains the path when the option is false; diagnostic calls use the generic
@@ -547,9 +559,11 @@ doing something else:
   profiles above, paged LSE outside the exact decode profile above, and
   KV-cache rotary outside the full-head interleaved/NeoX or D128 half-head
   interleaved final-slot append
-- `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
-  KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
-  profiles, and the causal bf16 varlen profile described above
+- `return_attn_probs=True` for noncausal or out-of-envelope unregistered varlen
+  shapes, registered varlen shapes outside the causal bf16 profile above, or
+  dense shapes outside the no-backward BERT-base and three Llama GQA decode
+  profiles; diagnostics also reject backward, dropout, ALiBi, local-window,
+  softcap, deterministic, and paged combinations
 
 ## How the kernels are made
 

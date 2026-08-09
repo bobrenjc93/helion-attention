@@ -9,10 +9,10 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
-profiles, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
-forward-only Gemma-2 profile. The exposed page-16 decode cache uses the generic
-paged runtime when ALiBi is supplied.
+profiles, and diagnostics on shipped or compatible unregistered causal varlen
+shapes use a generic Triton forward kernel. That runtime also provides
+``softcap=50.0`` for one forward-only Gemma-2 profile. The exposed page-16
+decode cache uses the generic paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -88,6 +88,7 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
 )
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
+_GENERIC_VARLEN_MAX_HEAD_DIM = _GENERIC_DENSE_MAX_HEAD_DIM
 _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
@@ -431,6 +432,93 @@ def _validate_generic_dense_layout(spec: AttnShape) -> tuple[int, int]:
     return total_q, total_k
 
 
+def _validate_generic_varlen_layout(
+    q: torch.Tensor, k: torch.Tensor, spec: AttnShape
+) -> None:
+    """Validate the generic packed kernel's varlen launch envelope."""
+    if spec.head_dim > _GENERIC_VARLEN_MAX_HEAD_DIM:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback supports head_dim <= "
+            f"{_GENERIC_VARLEN_MAX_HEAD_DIM}. To request a specialization, "
+            "file an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    # Import the launch tiles lazily with the runtime so validation and the
+    # Triton launch cannot drift to different index or grid limits.
+    from ._paged_attention import _PACKED_KEY_BLOCK_SIZE
+    from ._paged_attention import _PACKED_QUERY_BLOCK_SIZE
+
+    query_blocks = (
+        spec.seqlen_q + _PACKED_QUERY_BLOCK_SIZE - 1
+    ) // _PACKED_QUERY_BLOCK_SIZE
+    max_padded_query_index = query_blocks * _PACKED_QUERY_BLOCK_SIZE - 1
+    if max_padded_query_index > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback uses signed int32 query indices, but "
+            f"the padded maximum is {max_padded_query_index} "
+            f"(limit {_INT32_MAX}) with query block size "
+            f"{_PACKED_QUERY_BLOCK_SIZE}. To request a specialization, file "
+            "an issue at https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    key_blocks = (
+        spec.seqlen_k + _PACKED_KEY_BLOCK_SIZE - 1
+    ) // _PACKED_KEY_BLOCK_SIZE
+    key_loop_endpoint = key_blocks * _PACKED_KEY_BLOCK_SIZE
+    if key_loop_endpoint > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback uses a signed int32 key-loop "
+            f"induction variable, but its rounded-up endpoint is "
+            f"{key_loop_endpoint} "
+            f"(limit {_INT32_MAX}) with key block size "
+            f"{_PACKED_KEY_BLOCK_SIZE}. To request a specialization, file "
+            "an issue at https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    grid_size = query_blocks * spec.batch * spec.nheads_q
+    if grid_size > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback's flattened CUDA launch grid requires "
+            f"{grid_size} blocks (limit {_INT32_MAX}) with query block size "
+            f"{_PACKED_QUERY_BLOCK_SIZE}. To request a specialization, file "
+            "an issue at https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    total_q = q.shape[0]
+    total_k = k.shape[0]
+    if max(total_q, total_k) > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback requires packed token offsets to fit "
+            "in int32. To request a specialization, file an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    layout_numels = (("Q/output", q.numel()), ("K/V", k.numel()))
+    for layout, numel in layout_numels:
+        max_element_offset = numel - 1
+        if max_element_offset > _INT32_MAX:
+            raise UnsupportedShapeError(
+                "no checked-in varlen specialization exists for:\n"
+                f"    {spec.describe()}\n"
+                "the generic varlen fallback uses signed int32 element "
+                f"offsets, but {layout} requires maximum offset "
+                f"{max_element_offset} (limit {_INT32_MAX}). To request a "
+                "specialization, file an issue at "
+                "https://github.com/bobrenjc93/helion-attention/issues"
+            )
+
+
 def _validate_alibi_slopes(
     alibi_slopes: torch.Tensor,
     q: torch.Tensor,
@@ -472,11 +560,16 @@ def _check_varlen_alibi_spec(spec: AttnShape) -> None:
 
 
 def _supports_varlen_diagnostic_return(spec: AttnShape) -> bool:
-    """Whether ``spec`` is the one LSE-capable core varlen profile."""
-    return (
-        f"varlen_{spec.key}" == _VARLEN_DIAGNOSTIC_KEY
-        and has_varlen_kernel(spec)
+    """Whether ``spec`` has a validated core varlen diagnostic path."""
+    registered = has_varlen_kernel(spec)
+    exact_diagnostic = (
+        registered and f"varlen_{spec.key}" == _VARLEN_DIAGNOSTIC_KEY
     )
+    # The diagnostic helper uses the same shape-general packed runtime as the
+    # generic nonpaged fallback. Preserve the exact gate for registered shapes
+    # and do not broaden generic noncausal diagnostics.
+    generic_diagnostic = not registered and spec.causal
+    return exact_diagnostic or generic_diagnostic
 
 
 def _has_full_varlen_token_totals(
@@ -815,6 +908,8 @@ def _generic_varlen_diagnostic_forward(
     spec: AttnShape,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return FA2-compatible diagnostics from the generic packed runtime."""
+    _validate_generic_varlen_layout(q, k, spec)
+
     # The generated specialization remains the default fast path, but it does
     # not materialize LSE. The generic packed kernel stores LSE directly in
     # FlashAttention's [heads, total_q] layout without unpacking ragged rows.
@@ -1110,12 +1205,12 @@ def flash_attn_varlen_func(
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
     ``[16]`` or ``[8, 16]``.
 
-    The causal version of that profile also supports
-    ``return_attn_probs=True`` when no backward is needed, ``causal=True``, and
-    all options other than ``softmax_scale`` retain their defaults. It returns
-    ``(out, softmax_lse, S_dmask)`` with fp32 LSE shaped ``[nheads_q, total_q]``
-    and an empty bf16 ``S_dmask``, matching FlashAttention 2 when dropout is
-    zero.
+    Compatible unregistered causal fp16/bf16 shapes and the causal version of
+    that profile support ``return_attn_probs=True`` when no backward is needed
+    and all options other than ``softmax_scale`` retain their defaults. They
+    return ``(out, softmax_lse, S_dmask)`` with fp32 LSE shaped
+    ``[nheads_q, total_q]`` and an empty input-dtype ``S_dmask``, matching
+    FlashAttention 2 when dropout is zero.
 
     Both causal modes support zero-dropout backward when all eight query and
     key sequences have length 512. That exact full-length layout is reshaped
@@ -1159,8 +1254,9 @@ def flash_attn_varlen_func(
             )
         if not _supports_varlen_diagnostic_return(spec):
             raise NotImplementedError(
-                "return_attn_probs=True is implemented only for "
-                f"{_VARLEN_DIAGNOSTIC_KEY}"
+                "return_attn_probs=True is implemented only for unregistered "
+                "causal shapes supported by the generic nonpaged varlen "
+                f"fallback and the shipped {_VARLEN_DIAGNOSTIC_KEY} profile"
             )
 
     if alibi_slopes is not None:
