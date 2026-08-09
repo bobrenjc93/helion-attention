@@ -3519,6 +3519,83 @@ def test_two_token_dense_kvcache_append_matches_fa2(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.37],
+    ids=["default-scale", "custom-scale"],
+)
+def test_two_token_dense_kvcache_rotary_append_matches_fa2(
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = TWO_TOKEN_KVCACHE
+    q, initial_k, initial_v = make_inputs(spec, seed=20260811)
+    new_k = initial_k[:, :2].clone()
+    new_v = initial_v[:, :2].clone()
+    rotary_cos, rotary_sin = make_rotary_tables(spec, seed=20260812)
+    position = spec.seqlen_k - 2
+
+    q_helion = q.clone()
+    k_helion = initial_k.clone()
+    v_helion = initial_v.clone()
+    got = helion_attention.flash_attn_with_kvcache(
+        q_helion,
+        k_helion,
+        v_helion,
+        k=new_k,
+        v=new_v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=position,
+        softmax_scale=softmax_scale,
+        causal=True,
+        shape=spec,
+    )
+
+    q_fa2 = q.clone()
+    k_fa2 = initial_k.clone()
+    v_fa2 = initial_v.clone()
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q_fa2,
+        k_fa2,
+        v_fa2,
+        k=new_k,
+        v=new_v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=position,
+        softmax_scale=softmax_scale,
+        causal=True,
+    )
+
+    expected_appended_k = torch.cat(
+        tuple(
+            reference_interleaved_rotary(
+                new_k[:, token_index : token_index + 1],
+                rotary_cos,
+                rotary_sin,
+                position + token_index,
+            )
+            for token_index in range(spec.seqlen_q)
+        ),
+        dim=1,
+    )
+    assert isinstance(got, torch.Tensor)
+    assert isinstance(expected_fa2, torch.Tensor)
+    assert torch.equal(q_helion, q)
+    assert torch.equal(q_fa2, q)
+    assert torch.equal(new_k, initial_k[:, :2])
+    assert torch.equal(k_helion, k_fa2)
+    assert torch.equal(k_helion[:, :-2], initial_k[:, :-2])
+    assert torch.equal(k_helion[:, -2:], expected_appended_k)
+    assert torch.equal(v_helion, v_fa2)
+    assert torch.equal(v_helion[:, :-2], initial_v[:, :-2])
+    assert torch.equal(v_helion[:, -2:], new_v)
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    assert (got.float() - expected_fa2.float()).abs().mean().item() < 1e-3
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "entry",
     DECODE_SHAPES,
     ids=[str(entry["key"]) for entry in DECODE_SHAPES],
@@ -3573,7 +3650,6 @@ def test_single_token_kvcache_retains_generated_dispatch(
         ("non-final-update", "final two cache slots"),
         ("partial-scalar", "partial or ragged"),
         ("tensor-length", "tensor-valued cache_seqlens"),
-        ("rotary-update", "rotary embeddings"),
         ("remapping", "cache_batch_idx"),
         ("autograd-update", "does not support autograd"),
         ("noncausal", "multi-token dense queries only"),
@@ -3611,15 +3687,6 @@ def test_two_token_dense_kvcache_rejects_out_of_scope_calls_before_dispatch(
     elif case == "tensor-length":
         kwargs["cache_seqlens"] = torch.tensor(
             [spec.seqlen_k], device=q.device, dtype=torch.int32
-        )
-    elif case == "rotary-update":
-        rotary_cos, rotary_sin = make_rotary_tables(spec)
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=spec.seqlen_k - 2,
-            rotary_cos=rotary_cos,
-            rotary_sin=rotary_sin,
         )
     elif case == "remapping":
         kwargs["cache_batch_idx"] = torch.zeros(
@@ -3681,6 +3748,107 @@ def test_two_token_dense_kvcache_rejects_out_of_scope_calls_before_dispatch(
         )
     assert torch.equal(k_cache, original_k)
     assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+def test_two_token_dense_kvcache_rejects_invalid_rotary_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = TWO_TOKEN_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec, seed=20260813)
+    original_q = q.clone()
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    new_k = k_cache[:, :2].clone()
+    new_v = v_cache[:, :2].clone()
+    rotary_cos, rotary_sin = make_rotary_tables(spec, seed=20260814)
+    base_kwargs: dict[str, object] = {
+        "k": new_k,
+        "v": new_v,
+        "rotary_cos": rotary_cos,
+        "rotary_sin": rotary_sin,
+        "cache_seqlens": spec.seqlen_k - 2,
+    }
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("invalid two-token rotary call reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_forward", reject_dispatch
+    )
+
+    def reject(
+        error: type[Exception],
+        match: str,
+        *,
+        q_arg: torch.Tensor = q,
+        shape_arg: AttnShape | tuple[int, ...] = spec,
+        **overrides: object,
+    ) -> None:
+        kwargs = {**base_kwargs, **overrides}
+        with pytest.raises(error, match=match):
+            helion_attention.flash_attn_with_kvcache(
+                q_arg,
+                k_cache,
+                v_cache,
+                causal=True,
+                shape=shape_arg,
+                **kwargs,
+            )
+        assert torch.equal(q, original_q)
+        assert torch.equal(k_cache, original_k)
+        assert torch.equal(v_cache, original_v)
+
+    partial_cos, partial_sin = make_rotary_tables(
+        spec, rotary_dim=64, seed=20260815
+    )
+    reject(
+        NotImplementedError,
+        "full-head interleaved",
+        rotary_cos=partial_cos,
+        rotary_sin=partial_sin,
+    )
+    reject(
+        NotImplementedError,
+        "full-head interleaved",
+        rotary_interleaved=False,
+    )
+    reject(NotImplementedError, "return_softmax_lse", return_softmax_lse=True)
+    reject(
+        NotImplementedError,
+        "final two cache slots",
+        cache_seqlens=spec.seqlen_k - 3,
+    )
+    reject(
+        NotImplementedError,
+        "does not support autograd",
+        q_arg=q.detach().requires_grad_(),
+    )
+    reject(
+        NotImplementedError,
+        "does not support autograd",
+        rotary_cos=rotary_cos.detach().requires_grad_(),
+    )
+
+    other_q = torch.cat((q, q[:, :1]), dim=1)
+    other_k = torch.cat((new_k, new_k[:, :1]), dim=1)
+    other_v = torch.cat((new_v, new_v[:, :1]), dim=1)
+    reject(
+        NotImplementedError,
+        "multi-token dense queries only",
+        q_arg=other_q,
+        shape_arg=(
+            spec.batch,
+            spec.seqlen_q + 1,
+            spec.seqlen_k,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+        ),
+        k=other_k,
+        v=other_v,
+        cache_seqlens=spec.seqlen_k - 3,
+    )
 
 
 @requires_cuda
