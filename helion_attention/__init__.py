@@ -127,6 +127,9 @@ _RAGGED_VARLEN_SDPA_BACKWARD_KEY = (
 _TENSOR_LENGTH_DENSE_KVCACHE_KEY = (
     "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
 )
+_TWO_TOKEN_DENSE_KVCACHE_KEY = (
+    "b1_sq2_sk1024_hq32_hkv8_d128_bf16_causal"
+)
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
         (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
@@ -1791,7 +1794,12 @@ def flash_attn_with_kvcache(
     The general supported path is a dense, contiguous cache and exactly one
     query token. As with every entry point in this package, ``shape`` is
     required and describes ``q`` plus the cache:
-    ``(batch, 1, cache_len, nheads_q, nheads_kv, head_dim)``.
+    ``(batch, query_len, cache_len, nheads_q, nheads_kv, head_dim)``. One
+    additional speculative-decoding slice accepts exactly two query tokens:
+    causal bf16 ``(1, 2, 1024, 32, 8, 128)`` with a full, read-only dense
+    cache. It uses the generic packed runtime and supports the default or a
+    custom softmax scale, but not LSE, updates, partial lengths, rotary,
+    remapping, autograd, or noncausal attention.
 
     Two read-only paged specializations are also exposed with page-size-16
     caches, an int32 CUDA ``cache_seqlens`` tensor shaped ``[batch]``, and
@@ -1889,11 +1897,24 @@ def flash_attn_with_kvcache(
         )
 
     spec = normalize_shape(shape, q.dtype, causal)
-    if not spec.is_decode:
+    is_two_token_dense_read = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
+    if not spec.is_decode and not is_two_token_dense_read:
         raise NotImplementedError(
-            "flash_attn_with_kvcache currently supports only seqlen_q=1 "
-            "with a non-empty cache"
+            "flash_attn_with_kvcache supports multi-token dense queries only "
+            "for causal bf16 (1, 2, 1024, 32, 8, 128); all other dense "
+            "profiles require seqlen_q=1 with a non-empty cache"
         )
+    if is_two_token_dense_read:
+        if append_kv:
+            raise NotImplementedError(
+                "the two-token dense KV-cache profile is read-only; cache "
+                "updates are not implemented"
+            )
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "return_softmax_lse is not implemented for the two-token "
+                "dense KV-cache profile"
+            )
     tensor_cache_seqlens = (
         cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
     )
@@ -2046,6 +2067,22 @@ def flash_attn_with_kvcache(
             scale,
             spec,
             return_softmax_lse=return_softmax_lse,
+        )
+
+    if is_two_token_dense_read:
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError(
+                "the two-token dense KV-cache profile does not support autograd"
+            )
+        return _generic_dense_forward(
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            spec,
+            None,
         )
 
     # Preserve the scalar full-cache/update dispatch: those calls still resolve

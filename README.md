@@ -207,7 +207,14 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-For dense caches, pass `return_softmax_lse=True` to receive
+One strict speculative-decoding slice reads two query tokens from a full dense
+cache: causal bf16 `(1, 2, 1024, 32, 8, 128)`. It accepts either the default or
+a custom `softmax_scale` and uses the generic packed Triton runtime. This path
+is read-only and output-only: LSE, cache updates, partial or tensor-valued
+lengths, rotary, cache remapping, autograd, noncausal mode, and every other
+multi-token KV-cache shape remain unsupported.
+
+For supported single-token dense caches, pass `return_softmax_lse=True` to receive
 `(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
 FlashAttention's KV-cache API. The exact paged decode profile below supports
 the same return for both the default and a custom `softmax_scale`.
