@@ -1093,6 +1093,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:8596d731180b4ce04b85245c37cf771aa223aab8",
+      "commit": "8596d731180b4ce04b85245c37cf771aa223aab8",
+      "recordedAt": "2026-08-09T00:39:28.718Z",
+      "label": "base 8596d73",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 80,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:48",
+      "recordedAt": "2026-08-09T00:39:28.718Z",
+      "label": "PR #48",
+      "kind": "leaf",
+      "prNumber": 48,
+      "title": "Use the fixed persistent source for B1 8K Llama GQA",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 81,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
