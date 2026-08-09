@@ -16,7 +16,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from benchmarks.timing import timing_methodology  # noqa: E402
+from benchmarks.timing import report_timing_methodology  # noqa: E402
 
 README = REPO_ROOT / "README.md"
 MANIFEST = REPO_ROOT / "helion_attention" / "kernels" / "manifest.json"
@@ -157,7 +157,7 @@ def benchmark_table() -> str:
     if report.get("flash_attn_3"):
         flash_versions.append(f"FA3 {report['flash_attn_3']}")
     version_suffix = f", {', '.join(flash_versions)}" if flash_versions else ""
-    methodology = timing_methodology()
+    methodology = report_timing_methodology(report)
     lines = [
         f"Measured on {report['device']} (torch {report['torch']}, "
         f"triton {report['triton']}{version_suffix}). "

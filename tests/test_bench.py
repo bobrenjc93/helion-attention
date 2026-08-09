@@ -12,6 +12,8 @@ import torch
 
 from benchmarks.inventory import benchmark_entries
 from benchmarks.inventory import benchmark_key
+from benchmarks.render import render_markdown
+from benchmarks.timing import timing_metadata
 from helion_attention._sdpa import sdpa_causal_options
 from helion_attention._shape import AttnShape
 
@@ -61,7 +63,7 @@ def test_decode_omits_all_true_causal_mask_for_fused_sdpa() -> None:
     assert not is_causal
 
 
-def test_markdown_reports_fa3_and_fastest_baseline_plainly(
+def test_readme_markdown_reports_fa3_baseline_and_legacy_timing_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     report = {
@@ -113,25 +115,65 @@ def test_markdown_reports_fa3_and_fastest_baseline_plainly(
     assert "fastest measured implementation on 1 of 2 workloads" in table
 
 
-def test_standalone_markdown_reports_timing_defaults(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Importing the executable sets a default GPU mask; keep that side effect
-    # scoped to this test while exercising its renderer directly.
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4,5,6,7")
-    from benchmarks import bench
+def test_timing_metadata_records_nondefault_rounds() -> None:
+    assert timing_metadata(1) == {
+        "rounds": 1,
+        "warmup_ms": 50,
+        "measurement_ms": 200,
+    }
 
-    table = bench.render_markdown(
+
+def test_standalone_markdown_reports_recorded_timing() -> None:
+    table = render_markdown(
         {
             "device": "test GPU",
             "torch": "test torch",
             "triton": "test triton",
+            "timing": {
+                "rounds": 1,
+                "warmup_ms": 75,
+                "measurement_ms": 300,
+            },
             "results": [],
         }
     )
 
-    assert "median of three interleaved rounds" in table
-    assert "50 ms warmup and 200 ms measurement" in table
+    assert "median of one interleaved round" in table
+    assert "75 ms warmup and 300 ms measurement" in table
+    assert "three interleaved rounds" not in table
+
+
+def test_readme_renderer_reports_recorded_timing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = {
+        "device": "test GPU",
+        "torch": "test torch",
+        "triton": "test triton",
+        "timing": {
+            "rounds": 1,
+            "warmup_ms": 75,
+            "measurement_ms": 300,
+        },
+        "results": [],
+    }
+
+    class BenchmarkReport:
+        @staticmethod
+        def exists() -> bool:
+            return True
+
+        @staticmethod
+        def read_text() -> str:
+            return json.dumps(report)
+
+    monkeypatch.setattr(update_readme, "BENCHMARKS", BenchmarkReport())
+
+    table = update_readme.benchmark_table()
+
+    assert "median of one interleaved round" in table
+    assert "75 ms warmup and 300 ms measurement" in table
+    assert "three interleaved rounds" not in table
 
 
 def test_readme_regeneration_preserves_benchmark_rows(
@@ -213,6 +255,7 @@ def test_discovery_and_report_cover_every_checked_in_kernel() -> None:
     report = json.loads((REPO_ROOT / "docs" / "benchmarks.json").read_text())
     report_by_key = {row["key"]: row for row in report["results"]}
 
+    assert report["timing"] == timing_metadata()
     assert discovered_keys == expected
     assert set(discovered_keys) == artifact_keys
     assert [row["key"] for row in report["results"]] == expected

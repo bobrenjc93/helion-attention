@@ -40,10 +40,12 @@ import helion_attention.vllm_flash_attn as vllm_flash_attn  # noqa: E402
 from benchmarks.inventory import BenchmarkKind  # noqa: E402
 from benchmarks.inventory import benchmark_entries  # noqa: E402
 from benchmarks.inventory import benchmark_key  # noqa: E402
+from benchmarks.render import FLASH_ATTN_PAGE_SIZE  # noqa: E402
+from benchmarks.render import render_markdown  # noqa: E402
 from benchmarks.timing import DEFAULT_ROUNDS  # noqa: E402
 from benchmarks.timing import MEASUREMENT_MS  # noqa: E402
 from benchmarks.timing import WARMUP_MS  # noqa: E402
-from benchmarks.timing import timing_methodology  # noqa: E402
+from benchmarks.timing import timing_metadata  # noqa: E402
 from helion_attention._registry import spec_from_manifest_entry  # noqa: E402
 from helion_attention._sdpa import sdpa_causal_options  # noqa: E402
 from helion_attention._shape import AttnShape  # noqa: E402
@@ -88,14 +90,6 @@ from torch.nn.attention import sdpa_kernel  # noqa: E402
 
 BenchmarkOutput = torch.Tensor | tuple[torch.Tensor, ...]
 Candidate = Callable[[], BenchmarkOutput]
-FLASH_ATTN_PAGE_SIZE = 256
-IMPLEMENTATION_NAMES = [
-    "helion-attention",
-    "flash-attn-3",
-    "flash-attn",
-    "sdpa-flash",
-    "sdpa-cudnn",
-]
 
 
 def installed_version(distribution: str) -> str | None:
@@ -603,6 +597,7 @@ def main() -> int:
         "flash_attn": installed_version("flash-attn"),
         "flash_attn_3": installed_version("flash-attn-3"),
         "python": platform.python_version(),
+        "timing": timing_metadata(args.rounds),
         "results": [],
     }
     for entry, kind in entries:
@@ -665,75 +660,12 @@ def main() -> int:
     if args.json:
         json.dump(report, sys.stdout, indent=2)
         sys.stdout.write("\n")
-    table = render_markdown(report, rounds=args.rounds)
+    table = render_markdown(report)
     if not args.json:
         sys.stdout.write(table)
     if args.markdown:
         args.markdown.write_text(table)
     return 0
-
-
-def render_markdown(
-    report: dict[str, object], rounds: int = DEFAULT_ROUNDS
-) -> str:
-    names = IMPLEMENTATION_NAMES
-    flash_versions = []
-    if report.get("flash_attn"):
-        flash_versions.append(f"FA2 {report['flash_attn']}")
-    if report.get("flash_attn_3"):
-        flash_versions.append(f"FA3 {report['flash_attn_3']}")
-    version_suffix = f", {', '.join(flash_versions)}" if flash_versions else ""
-    lines = [
-        f"Measured on {report['device']}, torch {report['torch']}, "
-        f"triton {report['triton']}{version_suffix}. "
-        f"{timing_methodology(rounds)}",
-        "",
-    ]
-    kinds = {row.get("kind") for row in report["results"]}  # type: ignore[index]
-    notes = []
-    if "paged" in kinds:
-        notes.append(
-            "Paged rows use identical logical caches with native page sizes "
-            f"(Helion and FA3: 16; FA2: {FLASH_ATTN_PAGE_SIZE}); FA2 paged "
-            "decode uses flash_attn_with_kvcache and chunked prefill uses "
-            "flash_attn_varlen_func; FA3 uses flash_attn_with_kvcache."
-        )
-    if "backward" in kinds:
-        notes.append(
-            "Backward rows time dQ/dK/dV only, excluding forward setup; "
-            "TFLOP/s uses a 2.5x-forward operation estimate."
-        )
-    if notes:
-        lines.extend([" ".join(notes), ""])
-    lines.extend(
-        [
-            "| shape | "
-            + " | ".join(f"{n} (µs)" for n in names)
-            + " | helion vs flash-attn-3 |",
-            "| --- | " + " | ".join("---:" for _ in names) + " | ---: |",
-        ]
-    )
-    for row in report["results"]:  # type: ignore[index]
-        impls = row["implementations"]
-        cells = []
-        for name in names:
-            entry = impls.get(name)
-            cells.append("n/a" if entry is None else f"{entry['us']:.0f}")
-        helion = impls.get("helion-attention")
-        flash_3 = impls.get("flash-attn-3")
-        if helion is not None and flash_3 is not None:
-            speedup = flash_3["us"] / helion["us"]
-            comparison = (
-                f"{speedup:.2f}x faster"
-                if speedup >= 1
-                else f"{1 / speedup:.2f}x slower"
-            )
-        else:
-            comparison = "n/a"
-        lines.append(
-            f"| {row['description']} | " + " | ".join(cells) + f" | {comparison} |"
-        )
-    return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":
