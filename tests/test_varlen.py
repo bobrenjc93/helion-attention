@@ -551,12 +551,8 @@ def test_varlen_packed_entry_points_match_unpacked(
 
 
 @requires_cuda
-@pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
-)
-def test_ragged_varlen_kvpacked_rejects_cross_attention_gradients(
-    spec: AttnShape,
-) -> None:
+def test_ragged_varlen_kvpacked_rejects_cross_attention_gradients() -> None:
+    spec = VARLEN_ALIBI_CAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     kv = torch.stack((k, v), dim=1).requires_grad_()
 
@@ -1196,15 +1192,20 @@ def test_full_varlen_backward_rejects_deterministic(
 @pytest.mark.parametrize(
     ("case", "message"),
     [
+        ("noncausal", "causal.*profile"),
         ("cross-attention", "identical.*cross-attention"),
         ("empty", "nonempty"),
         ("deterministic", "deterministic=True"),
     ],
 )
-def test_ragged_causal_varlen_backward_rejects_out_of_scope_calls(
+def test_ragged_varlen_backward_rejects_out_of_scope_calls(
     case: str, message: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = VARLEN_ALIBI_CAUSAL
+    spec = (
+        VARLEN_ALIBI_NONCAUSAL
+        if case == "noncausal"
+        else VARLEN_ALIBI_CAUSAL
+    )
     if case == "cross-attention":
         q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     else:
@@ -1229,7 +1230,7 @@ def test_ragged_causal_varlen_backward_rejects_out_of_scope_calls(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=True,
+            causal=spec.causal,
             deterministic=case == "deterministic",
             shape=spec,
         )

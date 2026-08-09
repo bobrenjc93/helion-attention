@@ -16,10 +16,10 @@ the generic paged runtime when ALiBi is supplied.
 Default-scale SM90 training on the shipped encoder profile keeps its generated
 forward values and uses raw PyTorch BSHD Flash gradients, falling back to its
 generated backward when Flash is unavailable. Positive dropout on that profile,
-grad-enabled dense calls without a generated backward, and both full-length and
-ragged self-attention varlen profiles use PyTorch SDPA autograd. The explicit
-shape validates these paths and makes specialization introspection independent
-of fallback coverage.
+grad-enabled dense calls without a generated backward, both full-length varlen
+profiles, and ragged causal self-attention use PyTorch SDPA autograd. The
+explicit shape validates these paths and makes specialization introspection
+independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -121,11 +121,8 @@ _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
 )
-_RAGGED_VARLEN_SDPA_BACKWARD_KEYS = frozenset(
-    {
-        "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
-        "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
-    }
+_RAGGED_VARLEN_SDPA_BACKWARD_KEY = (
+    "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 )
 _TENSOR_LENGTH_DENSE_KVCACHE_KEY = (
     "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
@@ -1269,14 +1266,15 @@ def flash_attn_varlen_func(
     and an empty bf16 ``S_dmask``, matching FlashAttention 2 when dropout is
     zero.
 
-    Both causal modes support zero-dropout backward for eight nonempty
-    self-attention sequences of length at most 512 when query and key
-    cumulative offsets are identical. Full-length inputs are reshaped to one
-    dense BSHD call; ragged inputs use eight bounded PyTorch SDPA calls.
-    Cross-attention offsets, graph-captured ragged calls, deterministic mode,
-    paged caches, ALiBi, and diagnostic varlen backward remain unsupported.
-    Calls that do not need backward retain the generated packed kernel,
-    including ragged and full-length calls.
+    Both causal modes support zero-dropout backward when all eight query and
+    key sequences have length 512. The causal profile additionally supports
+    eight nonempty self-attention sequences of length at most 512 when query
+    and key cumulative offsets are identical. Full-length inputs are reshaped
+    to one dense BSHD call; ragged inputs use eight bounded PyTorch SDPA calls.
+    Ragged noncausal and cross-attention offsets, graph-captured ragged calls,
+    deterministic mode, paged caches, ALiBi, and diagnostic varlen backward
+    remain unsupported. Calls that do not need backward retain the generated
+    packed kernel, including ragged and full-length calls.
     """
     _reject_unsupported(
         dropout_p,
@@ -1391,12 +1389,12 @@ def flash_attn_varlen_func(
         full_length = _has_full_varlen_token_totals(q, k, spec)
         if (
             not full_length
-            and f"varlen_{spec.key}" not in _RAGGED_VARLEN_SDPA_BACKWARD_KEYS
+            and f"varlen_{spec.key}" != _RAGGED_VARLEN_SDPA_BACKWARD_KEY
         ):
             raise NotImplementedError(
-                "ragged varlen backward is implemented only for the shipped "
-                "causal and noncausal bf16 (8, 512, 512, 16, 16, 64) "
-                "self-attention profiles"
+                "ragged varlen backward is implemented only for the causal "
+                "bf16 (8, 512, 512, 16, 16, 64) self-attention profile; "
+                "ragged noncausal calls remain forward-only"
             )
         if softmax_scale is None:
             softmax_scale = 1.0 / math.sqrt(spec.head_dim)
