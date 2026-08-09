@@ -9,12 +9,13 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
-profiles, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
-forward-only Gemma-2 profile and the shipped causal varlen profile. Both
-exposed page-16 paged KV-cache profiles use the generic paged runtime when
-ALiBi is supplied. The decode profile also accepts page-256 caches through
-that generic runtime, without expanding the core paged-varlen API.
+profiles, symmetric windows on the shipped noncausal varlen profile, and
+diagnostics on the shipped causal varlen profile use a generic Triton forward
+kernel. That runtime also provides ``softcap=50.0`` for one forward-only
+Gemma-2 profile and the shipped causal varlen profile. Both exposed page-16
+paged KV-cache profiles use the generic paged runtime when ALiBi is supplied.
+The decode profile also accepts page-256 caches through that generic runtime,
+without expanding the core paged-varlen API.
 Default-scale SM90 training on the shipped encoder profile keeps its generated
 forward values and uses raw PyTorch BSHD Flash gradients, falling back to its
 generated backward when Flash is unavailable. Positive dropout on that profile,
@@ -118,6 +119,9 @@ _VARLEN_ALIBI_KEYS = frozenset(
     }
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+_VARLEN_SYMMETRIC_WINDOW_KEY = (
+    "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+)
 _VARLEN_SOFTCAP_KEY = _VARLEN_DIAGNOSTIC_KEY
 _VARLEN_SOFTCAP = 50.0
 _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
@@ -487,6 +491,61 @@ def _check_varlen_alibi_spec(spec: AttnShape) -> None:
         raise NotImplementedError(
             "varlen ALiBi slopes are implemented only for "
             f"{supported}; got {requested}"
+        )
+
+
+def _validate_varlen_window_size(window_size: object) -> tuple[int, int]:
+    """Return a runtime-safe FlashAttention window pair for varlen dispatch."""
+    if not isinstance(window_size, (tuple, list)):
+        raise TypeError(
+            "window_size must be a tuple or list containing exactly two "
+            "Python integers"
+        )
+    if len(window_size) != 2:
+        raise ValueError("window_size must contain exactly two Python integers")
+    left, right = window_size
+    if type(left) is not int or type(right) is not int:
+        raise TypeError("window_size must contain exactly two Python integers")
+    if left < -1 or right < -1:
+        raise ValueError("window_size bounds must be -1 or non-negative")
+    if left > _INT32_MAX or right > _INT32_MAX:
+        raise ValueError(
+            f"window_size bounds must not exceed signed int32 max {_INT32_MAX}"
+        )
+    return left, right
+
+
+def _validate_varlen_self_attention_offsets(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+) -> None:
+    """Require query and key metadata to describe the same ragged sequences."""
+    if q.shape[0] != k.shape[0]:
+        raise NotImplementedError(
+            "varlen symmetric-window attention requires identical "
+            "cu_seqlens_q and cu_seqlens_k for self-attention"
+        )
+
+    # The common self-attention and QKV-packed forms pass one tensor twice. In
+    # that case equality is structural and no host synchronization is needed,
+    # so dynamic offsets remain CUDA-graph capturable. Accept equal independent
+    # metadata too, after one deliberate comparison outside graph capture.
+    if cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr():
+        return
+    with torch.cuda.device(q.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "varlen symmetric-window attention requires shared query/key "
+                "offset storage during CUDA graph capture"
+            )
+        offsets_q = tuple(cu_seqlens_q.tolist())
+        offsets_k = tuple(cu_seqlens_k.tolist())
+    if offsets_q != offsets_k:
+        raise NotImplementedError(
+            "varlen symmetric-window attention requires identical "
+            "cu_seqlens_q and cu_seqlens_k for self-attention"
         )
 
 
@@ -974,6 +1033,52 @@ def _generic_varlen_alibi_forward(
     return packed_out
 
 
+def _generic_varlen_symmetric_window_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+    window_size: tuple[int, int],
+) -> torch.Tensor:
+    """Run a validated noncausal symmetric window through generic Triton."""
+    from ._paged_attention import packed_attention
+
+    packed_out = packed_attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=False,
+        window_size=window_size,
+        softcap=0.0,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
+    return packed_out
+
+
 def _generic_varlen_softcap_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1338,6 +1443,13 @@ def flash_attn_varlen_func(
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
     ``[16]`` or ``[8, 16]``.
 
+    The noncausal version also supports forward-only local self-attention with
+    ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
+    Query and key cumulative offsets must be identical. These calls use the
+    generic packed Triton runtime and accept the default or a custom
+    ``softmax_scale``. The global ``(-1, -1)`` default continues to use the
+    generated specialization.
+
     The causal version of that profile accepts exactly ``softcap=50.0`` for
     calls that do not need backward, with either the default or a custom
     ``softmax_scale``. Softcapped calls use the generic packed Triton runtime;
@@ -1358,13 +1470,17 @@ def flash_attn_varlen_func(
     sequences of length at most 512. Full-length inputs are reshaped to one
     dense BSHD call; ragged inputs use eight bounded PyTorch SDPA calls. Ragged
     noncausal, graph-captured ragged, deterministic, paged, ALiBi, and
-    diagnostic varlen backward remain unsupported. Calls that do not need
-    backward retain the generated packed kernel, including ragged and
-    full-length calls.
+    diagnostic and windowed varlen backward remain unsupported. Calls that do
+    not need backward retain the generated packed kernel, including ragged and
+    full-length calls with the global window.
     """
+    window = _validate_varlen_window_size(window_size)
+    # Non-default varlen windows have their narrow support checks below. Keep
+    # the shared validator responsible for all other feature flags without
+    # widening dense or KV-cache window support.
     _reject_unsupported(
         dropout_p,
-        window_size,
+        (-1, -1),
         softcap,
         alibi_slopes,
         return_attn_probs,
@@ -1393,6 +1509,46 @@ def flash_attn_varlen_func(
             f"declared by shape ({spec.seqlen_q}, {spec.seqlen_k}); got "
             f"({max_seqlen_q}, {max_seqlen_k})"
         )
+
+    has_symmetric_window = window != (-1, -1)
+    if has_symmetric_window:
+        if window[0] < 0 or window[0] != window[1]:
+            raise NotImplementedError(
+                "varlen sliding-window attention is implemented only for "
+                "finite window_size=(radius, radius) with radius >= 0"
+            )
+        requested = f"varlen_{spec.key}"
+        if requested != _VARLEN_SYMMETRIC_WINDOW_KEY:
+            raise NotImplementedError(
+                "varlen sliding-window attention with symmetric bounds is "
+                "implemented only for "
+                f"{_VARLEN_SYMMETRIC_WINDOW_KEY}; got {requested}"
+            )
+        if block_table is not None:
+            raise NotImplementedError(
+                "varlen sliding-window attention is not implemented with "
+                "block_table"
+            )
+        if softcap != 0.0:
+            raise NotImplementedError(
+                "varlen sliding-window attention is not implemented with "
+                "softcap"
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "varlen sliding-window attention is not implemented with "
+                "ALiBi slopes, including symmetric windows"
+            )
+        if return_attn_probs:
+            raise NotImplementedError(
+                "return_attn_probs=True is not implemented with varlen "
+                "symmetric-window attention"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "deterministic=True is not supported with varlen "
+                "symmetric-window attention"
+            )
 
     if return_attn_probs:
         if block_table is not None:
@@ -1461,6 +1617,15 @@ def flash_attn_varlen_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in grad_tensors
     )
+    if has_symmetric_window and needs_backward:
+        raise NotImplementedError(
+            "varlen sliding-window backward is not implemented; finite "
+            "symmetric windows are inference-only"
+        )
+    if has_symmetric_window:
+        _validate_varlen_self_attention_offsets(
+            q, k, cu_seqlens_q, cu_seqlens_k
+        )
     if needs_backward:
         if has_softcap:
             raise NotImplementedError(
@@ -1525,6 +1690,17 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    if has_symmetric_window:
+        return _generic_varlen_symmetric_window_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            scale,
+            spec,
+            window,
+        )
     if has_softcap:
         return _generic_varlen_softcap_forward(
             q,
