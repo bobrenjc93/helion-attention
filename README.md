@@ -205,11 +205,15 @@ the same return for both the default and a custom `softmax_scale`.
 
 The causal bf16 dense profile `(1, 1, 16384, 32, 8, 128)` also accepts a
 contiguous CUDA int32 `cache_seqlens` tensor shaped `[1]`. Values from 1 through
-16384 select that prefix of the cache for a read-only call, with the default or
-a custom `softmax_scale` and optional LSE. This path synchronizes once to check
-bounds recoverably, so it rejects CUDA graph capture and autograd. Omitting the
-length or passing the full length as a Python integer retains the checked-in
-split-KV generated kernel.
+16384 select that prefix of the cache for a read-only call. An optional
+contiguous CUDA int32 `cache_leftpad` tensor shaped `[1]` changes the selected
+span to `[cache_leftpad, cache_seqlens)`, with
+`0 <= cache_leftpad < cache_seqlens <= 16384`. Both forms support the default or
+a custom `softmax_scale` and optional fp32 LSE. This path synchronizes once to
+check bounds recoverably, so it rejects CUDA graph capture and autograd.
+`cache_leftpad` is not supported with updates, cache remapping, rotary, paged
+caches, or any other profile. Omitting the length or passing the full length as
+a Python integer retains the checked-in split-KV generated kernel.
 
 Two exact bf16 profiles also accept a read-only page-size-16 cache through
 `flash_attn_with_kvcache`: chunked prefill `(2, 200, 320, 8, 2, 128)` with
@@ -274,9 +278,9 @@ out = helion_attention.flash_attn_with_kvcache(
 The append mutates both dense caches in place and attends over the updated full
 cache. Dense read-only calls may omit `cache_seqlens` or pass the full cache
 length; the exact 16K profile above additionally accepts its documented tensor
-prefix. Dense update lengths must be Python integers and satisfy
-`cache_seqlens + 1 == S_CACHE`; unpaired or multi-token updates, scalar partial
-lengths, and tensor lengths on every other dense profile are rejected
+prefix or left-padded span. Dense update lengths must be Python integers and
+satisfy `cache_seqlens + 1 == S_CACHE`; unpaired or multi-token updates, scalar
+partial lengths, and tensor lengths on every other dense profile are rejected
 explicitly. Caches created inside `torch.inference_mode()` must be updated while
 that mode remains enabled. For an append, `q`, `k_cache`, and `v_cache` must
 occupy disjoint memory; update `k`/`v` aliases are staged safely.
@@ -543,9 +547,10 @@ doing something else:
   combined with LSE, updates, rotary, or autograd
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
-  partial caches, paged profiles other than the exact read-only page-size-16
-  profiles above, paged LSE outside the exact decode profile above, and
-  KV-cache rotary outside the full-head interleaved/NeoX or D128 half-head
+  partial caches, `cache_leftpad` outside that profile or combined with updates,
+  remapping, rotary, or autograd, paged profiles other than the exact read-only
+  page-size-16 profiles above, paged LSE outside the exact decode profile above,
+  and KV-cache rotary outside the full-head interleaved/NeoX or D128 half-head
   interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
   KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
