@@ -222,17 +222,52 @@ def dense_attention_sdpa(
     softmax_scale: float,
     spec: AttnShape,
     dropout_p: float = 0.0,
+    *,
+    symmetric_window_radius: int | None = None,
 ) -> torch.Tensor:
-    """Run a validated dense call through PyTorch's native SDPA autograd."""
+    """Run a validated dense call through PyTorch's native SDPA autograd.
+
+    ``symmetric_window_radius`` is reserved for the bounded equal-length,
+    noncausal varlen bridge validated by the public dispatcher.
+    """
     query = q.transpose(1, 2)
     key = k.transpose(1, 2)
     value = v.transpose(1, 2)
     enable_gqa = spec.nheads_q != spec.nheads_kv
 
+    window_mask = None
+    if symmetric_window_radius is not None:
+        if spec.causal or spec.seqlen_q != spec.seqlen_k:
+            raise ValueError(
+                "symmetric-window SDPA requires equal-length noncausal "
+                "self-attention"
+            )
+        if symmetric_window_radius < 0:
+            raise ValueError("symmetric_window_radius must be non-negative")
+        positions = torch.arange(spec.seqlen_q, device=q.device)
+        window_mask = (
+            positions[:, None] - positions[None, :]
+        ).abs() <= symmetric_window_radius
+
     # FlashAttention returns the input dtype even under cross-dtype autocast.
     # SDPA is autocast-eligible, so keep its native fp16/bf16 contract explicit.
     with torch.autocast(device_type=q.device.type, enabled=False):
-        if spec.causal and spec.seqlen_q > spec.seqlen_k:
+        if window_mask is not None:
+            if dropout_p != 0.0:
+                raise ValueError(
+                    "symmetric-window SDPA requires dropout_p=0.0"
+                )
+            out = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=window_mask,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=softmax_scale,
+                enable_gqa=enable_gqa,
+            )
+        elif spec.causal and spec.seqlen_q > spec.seqlen_k:
             # Bottom-right alignment leaves the first Sq-Sk query rows fully
             # masked. PyTorch's lower-right bias warns that those rows may be
             # NaN on some backends. The remaining Sk rows are exactly ordinary
