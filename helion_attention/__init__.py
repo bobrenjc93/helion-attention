@@ -9,9 +9,9 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
-profiles, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. The exposed page-16 decode cache also uses the generic
-paged runtime when ALiBi is supplied.
+profiles, finite left windows and diagnostics on the shipped causal varlen
+profile use a generic Triton forward kernel. The exposed page-16 decode cache
+also uses the generic paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -108,6 +108,9 @@ _VARLEN_ALIBI_KEYS = frozenset(
     }
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+_VARLEN_LEFT_WINDOW_KEY = (
+    "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+)
 _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
     {
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
@@ -421,6 +424,27 @@ def _check_varlen_alibi_spec(spec: AttnShape) -> None:
         )
 
 
+def _validate_varlen_window_size(window_size: object) -> tuple[int, int]:
+    """Return a runtime-safe FlashAttention window pair for varlen dispatch."""
+    if not isinstance(window_size, (tuple, list)):
+        raise TypeError(
+            "window_size must be a tuple or list containing exactly two "
+            "Python integers"
+        )
+    if len(window_size) != 2:
+        raise ValueError("window_size must contain exactly two Python integers")
+    left, right = window_size
+    if type(left) is not int or type(right) is not int:
+        raise TypeError("window_size must contain exactly two Python integers")
+    if left < -1 or right < -1:
+        raise ValueError("window_size bounds must be -1 or non-negative")
+    if left > _INT32_MAX or right > _INT32_MAX:
+        raise ValueError(
+            f"window_size bounds must not exceed signed int32 max {_INT32_MAX}"
+        )
+    return left, right
+
+
 def _supports_varlen_diagnostic_return(spec: AttnShape) -> bool:
     """Whether ``spec`` is the one LSE-capable core varlen profile."""
     return (
@@ -611,6 +635,52 @@ def _generic_varlen_alibi_forward(
         window_size=(-1, -1),
         softcap=0.0,
         alibi_slopes=alibi_slopes,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
+    return packed_out
+
+
+def _generic_varlen_window_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+    window_size: tuple[int, int],
+) -> torch.Tensor:
+    """Run a validated causal left window through the generic packed runtime."""
+    from ._paged_attention import packed_attention
+
+    packed_out = packed_attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=window_size,
+        softcap=0.0,
+        alibi_slopes=None,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -907,6 +977,12 @@ def flash_attn_varlen_func(
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
     ``[16]`` or ``[8, 16]``.
 
+    The causal version also supports forward-only local attention with
+    ``window_size=(left, 0)`` and a finite non-negative ``left`` bound. These
+    calls use the generic packed Triton runtime and accept the default or a
+    custom ``softmax_scale``. The global ``(-1, -1)`` default continues to use
+    the generated specialization.
+
     The causal version of that profile also supports
     ``return_attn_probs=True`` when no backward is needed, ``causal=True``, and
     all options other than ``softmax_scale`` retain their defaults. It returns
@@ -916,14 +992,18 @@ def flash_attn_varlen_func(
 
     Both causal modes support zero-dropout backward when all eight query and
     key sequences have length 512. That exact full-length layout is reshaped
-    to dense BSHD and uses PyTorch SDPA autograd. Ragged, deterministic, paged,
-    ALiBi, and diagnostic varlen backward remain unsupported. Calls that do
-    not need backward retain the generated packed kernel, including
-    full-length calls.
+    to dense BSHD and uses PyTorch SDPA autograd. Ragged, windowed,
+    deterministic, paged, ALiBi, and diagnostic varlen backward remain
+    unsupported. Calls that do not need backward retain the generated packed
+    kernel, including full-length calls.
     """
+    window = _validate_varlen_window_size(window_size)
+    # Non-default varlen windows have their narrow support checks below. Keep
+    # the shared validator responsible for the remaining feature flags without
+    # widening dense or KV-cache window support in this branch.
     _reject_unsupported(
         dropout_p,
-        window_size,
+        (-1, -1),
         softcap,
         alibi_slopes,
         return_attn_probs,
@@ -940,6 +1020,40 @@ def flash_attn_varlen_func(
             f"declared by shape ({spec.seqlen_q}, {spec.seqlen_k}); got "
             f"({max_seqlen_q}, {max_seqlen_k})"
         )
+
+    has_left_window = window != (-1, -1)
+    if has_left_window:
+        if window[0] < 0 or window[1] != 0:
+            raise NotImplementedError(
+                "varlen sliding-window attention is implemented only for "
+                "finite window_size=(left, 0) with left >= 0"
+            )
+        requested = f"varlen_{spec.key}"
+        if requested != _VARLEN_LEFT_WINDOW_KEY:
+            raise NotImplementedError(
+                "varlen sliding-window attention is implemented only for "
+                f"{_VARLEN_LEFT_WINDOW_KEY}; got {requested}"
+            )
+        if block_table is not None:
+            raise NotImplementedError(
+                "varlen sliding-window attention is not implemented with "
+                "block_table"
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "varlen sliding-window attention is not implemented with "
+                "ALiBi slopes"
+            )
+        if return_attn_probs:
+            raise NotImplementedError(
+                "return_attn_probs=True is not implemented with varlen "
+                "sliding-window attention"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "deterministic=True is not supported with varlen "
+                "sliding-window attention"
+            )
 
     if return_attn_probs:
         if block_table is not None:
@@ -1008,6 +1122,11 @@ def flash_attn_varlen_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in grad_tensors
     )
+    if has_left_window and needs_backward:
+        raise NotImplementedError(
+            "varlen sliding-window backward is not implemented; finite left "
+            "windows are inference-only"
+        )
     if needs_backward:
         if return_attn_probs:
             raise NotImplementedError(
@@ -1055,6 +1174,17 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    if has_left_window:
+        return _generic_varlen_window_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            scale,
+            spec,
+            window,
+        )
     if return_attn_probs:
         return _generic_varlen_diagnostic_forward(
             q,

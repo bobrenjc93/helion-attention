@@ -118,6 +118,16 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
+The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
+left-only windows as `window_size=(left, 0)`, where `left >= 0`, for
+forward-only inference. Dynamic ragged lengths and either the default or a
+custom `softmax_scale` are supported. Windowed calls use the generic packed
+Triton runtime; the global `(-1, -1)` default retains the checked-in generated
+specialization. The varlen QKV/KV-packed adapters inherit this support. Other
+window forms and profiles, backward, paged caches, ALiBi, diagnostic returns,
+softcap, dropout, and deterministic mode remain unsupported in combination
+with a varlen window.
+
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
 `return_attn_probs=True` for forward-only calls with otherwise default options
 apart from `causal=True` and an optional custom `softmax_scale`. It returns
@@ -515,7 +525,9 @@ doing something else:
   fallback
 - dropout outside the exact encoder-training profile above, or combined with
   ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
-- sliding-window attention and softcap
+- sliding-window attention outside finite `(left, 0)` inference on the causal
+  bf16 varlen profile above, including all windowed backward and KV-cache
+  calls; softcap is not implemented
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 decode profile above; paged ALiBi cannot be
