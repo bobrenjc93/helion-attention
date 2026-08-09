@@ -36,6 +36,7 @@ VARLEN_ALIBI_NONCAUSAL = AttnShape(
     causal=False,
 )
 VARLEN_ALIBI_PROFILES = (VARLEN_ALIBI_CAUSAL, VARLEN_ALIBI_NONCAUSAL)
+VARLEN_DIAGNOSTIC = VARLEN_ALIBI_CAUSAL
 PAGED_DECODE = AttnShape(
     batch=4,
     seqlen_q=1,
@@ -573,6 +574,244 @@ def test_varlen_matches_fp32_sdpa_with_dynamic_token_totals(
         q, k, v, lengths_q, lengths_k, causal=spec.causal, scale=scale
     )
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_causal_varlen_return_attn_probs_matches_fa2_for_ragged_masked_rows(
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = VARLEN_DIAGNOSTIC
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=0, seed=20260808
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            return_attn_probs=True,
+        )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.nheads_q,
+        q.shape[0],
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+
+    finite_lse = torch.isfinite(expected_lse)
+    assert torch.equal(torch.isfinite(softmax_lse), finite_lse)
+    torch.testing.assert_close(
+        softmax_lse[finite_lse],
+        expected_lse[finite_lse],
+        atol=2e-3,
+        rtol=1e-5,
+    )
+    assert torch.equal(softmax_lse[~finite_lse], expected_lse[~finite_lse])
+
+    fully_masked = lengths_q[0] - lengths_k[0]
+    assert fully_masked > 0
+    assert torch.isposinf(softmax_lse[:, :fully_masked]).all()
+    torch.testing.assert_close(
+        out[:fully_masked], torch.zeros_like(out[:fully_masked])
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("entry_point", ["qkvpacked", "kvpacked"])
+def test_causal_varlen_packed_entry_points_inherit_diagnostic_return(
+    entry_point: str,
+) -> None:
+    spec = VARLEN_DIAGNOSTIC
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=1, seed=271828)
+    if entry_point == "qkvpacked":
+        # QKV packing requires self-attention metadata. Preserve the ragged
+        # query lengths while giving K and V distinct values.
+        k = q.roll(1, dims=0).contiguous()
+        v = q.roll(2, dims=0).contiguous()
+        cu_k = cu_q
+
+    with torch.no_grad():
+        expected = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=0.37,
+            causal=True,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        if entry_point == "qkvpacked":
+            got = helion_attention.flash_attn_varlen_qkvpacked_func(
+                torch.stack((q, k, v), dim=1),
+                cu_q,
+                spec.seqlen_q,
+                softmax_scale=0.37,
+                causal=True,
+                return_attn_probs=True,
+                shape=spec,
+            )
+        else:
+            got = helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=1),
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=0.37,
+                causal=True,
+                return_attn_probs=True,
+                shape=spec,
+            )
+
+    assert isinstance(got, tuple) and isinstance(expected, tuple)
+    for actual_tensor, expected_tensor in zip(got, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+
+
+@requires_cuda
+def test_causal_varlen_return_attn_probs_false_retains_generated_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_DIAGNOSTIC
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[object, ...]] = []
+
+    def generated(*args: object) -> torch.Tensor:
+        calls.append(args)
+        return sentinel
+
+    def reject_diagnostic(*args: object, **kwargs: object) -> object:
+        raise AssertionError("ordinary varlen call reached diagnostic dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup_varlen", lambda _spec: generated)
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", reject_diagnostic
+    )
+    out = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=True,
+        return_attn_probs=False,
+        shape=spec,
+    )
+
+    assert out is sentinel
+    assert len(calls) == 1
+    assert len(calls[0]) == 9
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("noncausal", "causal"),
+        ("paged", "block_table"),
+        ("grad", "grad-enabled"),
+        ("alibi", "ALiBi"),
+        ("deterministic", "deterministic=False"),
+        ("dropout", "dropout"),
+        ("window", "sliding-window"),
+        ("softcap", "softcap"),
+        ("other-shape", "causal"),
+    ],
+)
+def test_causal_varlen_return_attn_probs_rejects_out_of_scope_calls(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = VARLEN_DIAGNOSTIC
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "return_attn_probs": True,
+        "shape": spec,
+    }
+    if case == "noncausal":
+        spec = VARLEN_ALIBI_NONCAUSAL
+        kwargs.update(causal=False, shape=spec)
+    elif case == "paged":
+        kwargs["block_table"] = torch.zeros(1, device=q.device)
+    elif case == "grad":
+        q.requires_grad_()
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    elif case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 1.0
+    else:
+        spec = AttnShape(8, 256, 256, 16, 16, 64, torch.bfloat16, True)
+        kwargs["shape"] = spec
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
+        raise AssertionError("out-of-scope diagnostic call reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            **kwargs,
+        )
 
 
 @requires_cuda

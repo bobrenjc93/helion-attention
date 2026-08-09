@@ -8,11 +8,12 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except one evidenced SM90 long-context MHA
 fast path that uses direct cuDNN SDPA; compatible unregistered dense shapes,
-dense ALiBi calls, and ALiBi on both shipped varlen profiles use a generic
-Triton forward kernel. Positive dropout on the shipped encoder-training profile
-and grad-enabled dense calls without a generated backward use PyTorch SDPA
-autograd. The explicit shape validates these paths and makes specialization
-introspection independent of fallback coverage.
+dense ALiBi calls, ALiBi on both shipped varlen profiles, and diagnostics on the
+shipped causal varlen profile use a generic Triton forward kernel. Positive
+dropout on the shipped encoder-training profile and grad-enabled dense calls
+without a generated backward use PyTorch SDPA autograd. The explicit shape
+validates these paths and makes specialization introspection independent of
+fallback coverage.
 """
 
 from __future__ import annotations
@@ -91,6 +92,7 @@ _VARLEN_ALIBI_KEYS = frozenset(
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
 )
+_VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
         (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
@@ -394,6 +396,14 @@ def _check_varlen_alibi_spec(spec: AttnShape) -> None:
         )
 
 
+def _supports_varlen_diagnostic_return(spec: AttnShape) -> bool:
+    """Whether ``spec`` is the one LSE-capable core varlen profile."""
+    return (
+        f"varlen_{spec.key}" == _VARLEN_DIAGNOSTIC_KEY
+        and has_varlen_kernel(spec)
+    )
+
+
 def _generic_dense_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -505,6 +515,55 @@ def _generic_varlen_alibi_forward(
     if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
         raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
     return packed_out
+
+
+def _generic_varlen_diagnostic_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return FA2-compatible diagnostics from the generic packed runtime."""
+    # The generated specialization remains the default fast path, but it does
+    # not materialize LSE. The generic packed kernel stores LSE directly in
+    # FlashAttention's [heads, total_q] layout without unpacking ragged rows.
+    from ._paged_attention import packed_attention
+
+    packed_result = packed_attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=True,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_result, tuple):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention did not return softmax LSE")
+    out, softmax_lse = packed_result
+    return out, softmax_lse, q.new_empty((0,))
 
 
 def is_shape_supported(
@@ -696,7 +755,7 @@ def flash_attn_varlen_func(
     block_table: torch.Tensor | None = None,
     *,
     shape: ShapeLike,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Drop-in replacement for ``flash_attn.flash_attn_varlen_func``.
 
     ``q`` is ``[total_q, nheads_q, head_dim]``. Without ``block_table``,
@@ -718,8 +777,14 @@ def flash_attn_varlen_func(
     ALiBi is supported for both causal modes of the
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
     ``[16]`` or ``[8, 16]``.
+
+    The causal version of that profile also supports
+    ``return_attn_probs=True`` when no backward is needed, ``causal=True``, and
+    all options other than ``softmax_scale`` retain their defaults. It returns
+    ``(out, softmax_lse, S_dmask)`` with fp32 LSE shaped ``[nheads_q, total_q]``
+    and an empty bf16 ``S_dmask``, matching FlashAttention 2 when dropout is
+    zero.
     """
-    del deterministic  # This option affects backward only.
     _reject_unsupported(
         dropout_p,
         window_size,
@@ -727,6 +792,7 @@ def flash_attn_varlen_func(
         alibi_slopes,
         return_attn_probs,
         allow_alibi=block_table is None,
+        allow_return_attn_probs=True,
     )
     if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
@@ -738,6 +804,25 @@ def flash_attn_varlen_func(
             f"declared by shape ({spec.seqlen_q}, {spec.seqlen_k}); got "
             f"({max_seqlen_q}, {max_seqlen_k})"
         )
+
+    if return_attn_probs:
+        if block_table is not None:
+            raise NotImplementedError(
+                "return_attn_probs=True is not implemented with block_table"
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "return_attn_probs=True is not implemented with ALiBi slopes"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "return_attn_probs=True requires deterministic=False"
+            )
+        if not _supports_varlen_diagnostic_return(spec):
+            raise NotImplementedError(
+                "return_attn_probs=True is implemented only for "
+                f"{_VARLEN_DIAGNOSTIC_KEY}"
+            )
 
     if alibi_slopes is not None:
         _check_varlen_alibi_spec(spec)
@@ -779,11 +864,13 @@ def flash_attn_varlen_func(
     check_varlen_tensors(q, k, v, cu_seqlens_q, cu_seqlens_k, spec)
     if alibi_slopes is not None:
         _validate_alibi_slopes(alibi_slopes, q, spec)
-    else:
-        # Keep slope-free calls on the generated specialization.
-        kernel = lookup_varlen(spec)
     grad_tensors = (q, k, v, alibi_slopes) if alibi_slopes is not None else (q, k, v)
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in grad_tensors):
+        if return_attn_probs:
+            raise NotImplementedError(
+                "return_attn_probs=True is not implemented for grad-enabled "
+                "calls"
+            )
         if alibi_slopes is not None:
             raise NotImplementedError(
                 "ALiBi backward is not implemented; varlen ALiBi calls are "
@@ -796,6 +883,16 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    if return_attn_probs:
+        return _generic_varlen_diagnostic_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            scale,
+            spec,
+        )
     if alibi_slopes is not None:
         return _generic_varlen_alibi_forward(
             q,
@@ -807,6 +904,8 @@ def flash_attn_varlen_func(
             spec,
             alibi_slopes,
         )
+    # Keep ordinary slope-free calls on the generated specialization.
+    kernel = lookup_varlen(spec)
     return kernel(
         q,
         k,
@@ -834,7 +933,7 @@ def flash_attn_varlen_qkvpacked_func(
     return_attn_probs: bool = False,
     *,
     shape: ShapeLike,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run varlen self-attention on ``[total, 3, nheads, head_dim]`` QKV."""
     if qkv.ndim != 4 or qkv.shape[1] != 3:
         raise ValueError(
@@ -879,7 +978,7 @@ def flash_attn_varlen_kvpacked_func(
     return_attn_probs: bool = False,
     *,
     shape: ShapeLike,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run varlen attention with ``[total_k, 2, nheads_kv, head_dim]`` KV."""
     if kv.ndim != 4 or kv.shape[1] != 2:
         raise ValueError(

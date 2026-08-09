@@ -68,8 +68,8 @@ shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
 ALiBi backward is not implemented. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
-Other dropout calls, local windows, softcap, diagnostic returns outside the
-decode subset above, and deterministic dropout still fail explicitly as
+Other dropout calls, local windows, softcap, dense diagnostic returns outside
+the decode subset above, and deterministic dropout still fail explicitly as
 described below. Unregistered calls must also fit the generic kernel's signed
 32-bit Q/output and K/V element offsets.
 
@@ -103,6 +103,16 @@ out = helion_attention.flash_attn_varlen_func(
 `cu_seqlens_q` and `cu_seqlens_k` remain on the GPU and may describe different
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
+
+The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
+`return_attn_probs=True` for forward-only calls with otherwise default options
+apart from `causal=True` and an optional custom `softmax_scale`. It returns
+`(out, softmax_lse, S_dmask)`, where LSE is fp32 with shape
+`[heads_q, total_q]` and `S_dmask` is an empty bf16 tensor. Fully masked causal
+rows have zero output and `+inf` LSE, matching FA2. The generated specialization
+remains the path when the option is false; diagnostic calls use the generic
+packed runtime that produces LSE directly. The varlen QKV/KV-packed adapters
+inherit this support.
 
 Both the causal and noncausal bf16 profiles at these maxima support forward-only
 ALiBi. Pass fp32 CUDA slopes shaped `[16]` or `[8, 16]` through `alibi_slopes`;
@@ -479,8 +489,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   page-size-16 profiles above, paged LSE outside the exact decode profile
   above, and KV-cache rotary outside the full-head or D128 half-head
   interleaved final-slot append
-- `return_attn_probs=True` outside the no-backward, default-option dense and
-  KV-packed calls for the three Llama GQA decode profiles described above
+- `return_attn_probs=True` outside the no-backward dense/KV-packed calls for the
+  three Llama GQA decode profiles and the causal bf16 varlen profile described
+  above
 
 ## How the kernels are made
 
