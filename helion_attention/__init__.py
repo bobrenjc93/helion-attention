@@ -11,8 +11,9 @@ direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
 profiles, and diagnostics on the shipped causal varlen profile use a generic
 Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
-forward-only Gemma-2 profile. Both exposed page-16 paged KV-cache profiles use
-the generic paged runtime when ALiBi is supplied.
+forward-only Gemma-2 profile and the shipped causal varlen profile. Both
+exposed page-16 paged KV-cache profiles use the generic paged runtime when
+ALiBi is supplied.
 Default-scale SM90 training on the shipped encoder profile keeps its generated
 forward values and uses raw PyTorch BSHD Flash gradients, falling back to its
 generated backward when Flash is unavailable. Positive dropout on that profile,
@@ -115,6 +116,8 @@ _VARLEN_ALIBI_KEYS = frozenset(
     }
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+_VARLEN_SOFTCAP_KEY = _VARLEN_DIAGNOSTIC_KEY
+_VARLEN_SOFTCAP = 50.0
 _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
     {
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
@@ -169,7 +172,7 @@ def _reject_unsupported(
     if has_softcap and softcap != allowed_softcap:
         raise NotImplementedError(
             "softcap is implemented only as softcap=50.0 for the supported "
-            "dense Gemma-2 profile"
+            "inference profiles"
         )
     if alibi_slopes is not None and not allow_alibi:
         raise NotImplementedError("ALiBi slopes are not implemented")
@@ -945,6 +948,53 @@ def _generic_varlen_alibi_forward(
     return packed_out
 
 
+def _generic_varlen_softcap_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Run the validated varlen softcap profile through generic Triton."""
+    # Keep the Triton dependency lazy for callers that only inspect the
+    # specialization manifest.
+    from ._paged_attention import packed_attention
+
+    packed_out = packed_attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=(-1, -1),
+        softcap=_VARLEN_SOFTCAP,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
+    return packed_out
+
+
 def _generic_varlen_diagnostic_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1262,6 +1312,13 @@ def flash_attn_varlen_func(
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
     ``[16]`` or ``[8, 16]``.
 
+    The causal version of that profile accepts exactly ``softcap=50.0`` for
+    calls that do not need backward, with either the default or a custom
+    ``softmax_scale``. Softcapped calls use the generic packed Triton runtime;
+    ``softcap=0`` retains the generated specialization. Other caps and
+    profiles, paged caches, gradients, dropout, ALiBi, local windows, and
+    diagnostic returns remain unsupported with softcap.
+
     The causal version of that profile also supports
     ``return_attn_probs=True`` when no backward is needed, ``causal=True``, and
     all options other than ``softmax_scale`` retain their defaults. It returns
@@ -1287,11 +1344,23 @@ def flash_attn_varlen_func(
         return_attn_probs,
         allow_alibi=block_table is None,
         allow_return_attn_probs=True,
+        allowed_softcap=_VARLEN_SOFTCAP,
     )
     if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
 
     spec = normalize_shape(shape, q.dtype, causal)
+    has_softcap = softcap != 0.0
+    if has_softcap and block_table is not None:
+        raise NotImplementedError(
+            "varlen softcap is not implemented with paged block_table caches"
+        )
+    if has_softcap and f"varlen_{spec.key}" != _VARLEN_SOFTCAP_KEY:
+        raise NotImplementedError(
+            "softcap=50.0 is implemented only for the no-backward causal "
+            "varlen bf16 profile (8, 512, 512, 16, 16, 64); "
+            f"got {spec.describe()}"
+        )
     if max_seqlen_q != spec.seqlen_q or max_seqlen_k != spec.seqlen_k:
         raise ValueError(
             "max_seqlen_q/max_seqlen_k must match the maximum sequence lengths "
@@ -1367,6 +1436,11 @@ def flash_attn_varlen_func(
         tensor.requires_grad for tensor in grad_tensors
     )
     if needs_backward:
+        if has_softcap:
+            raise NotImplementedError(
+                "softcap backward is not implemented; the causal varlen "
+                "softcap profile is forward-only"
+            )
         if return_attn_probs:
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented for grad-enabled "
@@ -1423,6 +1497,16 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    if has_softcap:
+        return _generic_varlen_softcap_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            scale,
+            spec,
+        )
     if return_attn_probs:
         return _generic_varlen_diagnostic_forward(
             q,
