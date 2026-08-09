@@ -120,6 +120,16 @@ def _varlen_attention_kernel(
         window_right = tl.where(
             window_right >= real_max_seqlen_k, -1, window_right
         )
+        # FA2 treats a global endpoint as a key-length-sized bound when the
+        # other endpoint makes the mask local.  Keeping a global right side as
+        # a negative sentinel would incorrectly expose keys to bottom-right
+        # aligned query rows that precede position zero when seqlen_q >
+        # seqlen_k.  The left sentinel can remain unbounded because key
+        # positions are non-negative.
+        local_window = (window_left >= 0) | (window_right >= 0)
+        window_right = tl.where(
+            local_window & (window_right < 0), real_max_seqlen_k, window_right
+        )
     else:
         window_left = tl.where(
             window_left >= real_max_seqlen_k - 1, -1, window_left
@@ -173,7 +183,16 @@ def _varlen_attention_kernel(
         if HAS_Q_DESCALE:
             qv_values *= q_scale
 
-    aligned_query = offs_m + total_seqlen_k - seqlen_q
+    # Position bounds can exceed signed int32 even though every tensor offset
+    # itself fits.  Promote before forming the bottom-right alignment and local
+    # endpoints so large accepted windows cannot wrap the mask arithmetic.
+    aligned_query = (
+        offs_m.to(tl.int64)
+        + total_seqlen_k.to(tl.int64)
+        - seqlen_q.to(tl.int64)
+    )
+    window_left_i64 = window_left.to(tl.int64)
+    window_right_i64 = window_right.to(tl.int64)
     if HAS_SINK:
         sink = tl.load(sinks + batch * stride_sink_b + head_q * stride_sink_h)
         running_max = tl.full([BLOCK_M], sink, tl.float32)
@@ -186,7 +205,9 @@ def _varlen_attention_kernel(
     for key_start in tl.range(0, seqlen_k, BLOCK_N):
         offs_n = key_start + tl.arange(0, BLOCK_N)
         valid_n = offs_n < seqlen_k
-        global_key_positions = offs_n * CP_WORLD_SIZE + CP_RANK
+        global_key_positions = (
+            offs_n.to(tl.int64) * CP_WORLD_SIZE + CP_RANK
+        )
         valid_storage = valid_n & (global_key_positions < total_seqlen_k)
         if PAGED:
             logical_blocks = offs_n // PAGE_SIZE
@@ -275,11 +296,13 @@ def _varlen_attention_kernel(
         )
         if CAUSAL:
             score_mask &= global_key_positions[None, :] <= aligned_query[:, None]
-        score_mask &= (window_left < 0) | (
-            global_key_positions[None, :] >= aligned_query[:, None] - window_left
+        score_mask &= (window_left_i64 < 0) | (
+            global_key_positions[None, :]
+            >= aligned_query[:, None] - window_left_i64
         )
-        score_mask &= (window_right < 0) | (
-            global_key_positions[None, :] <= aligned_query[:, None] + window_right
+        score_mask &= (window_right_i64 < 0) | (
+            global_key_positions[None, :]
+            <= aligned_query[:, None] + window_right_i64
         )
         if HAS_ALIBI:
             slope = tl.load(

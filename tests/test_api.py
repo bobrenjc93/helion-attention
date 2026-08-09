@@ -1074,6 +1074,100 @@ def test_dense_sliding_window_matches_flash_attention_2(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "window_size",
+    [(1, -1), (1, 3), (1, 128)],
+    ids=["sentinel", "key-length", "large"],
+)
+def test_dense_noncausal_q_longer_than_k_preserves_fa2_local_alignment(
+    window_size: tuple[int, int],
+) -> None:
+    spec = AttnShape(1, 8, 3, 1, 1, 16, torch.float16, False)
+    q = torch.zeros(
+        spec.batch,
+        spec.seqlen_q,
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    k = torch.zeros(
+        spec.batch,
+        spec.seqlen_k,
+        spec.nheads_kv,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    values = torch.arange(1, spec.seqlen_k + 1, device=q.device, dtype=q.dtype)
+    v = values.view(1, spec.seqlen_k, 1, 1).expand_as(k).contiguous()
+
+    with torch.no_grad():
+        out = helion_attention.flash_attn_func(
+            q, k, v, window_size=window_size, shape=spec
+        )
+
+    expected = torch.tensor(
+        [0.0, 0.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.5],
+        device=q.device,
+        dtype=q.dtype,
+    )
+    torch.testing.assert_close(out[0, :, 0, 0], expected, atol=0.0, rtol=0.0)
+
+
+@requires_cuda
+def test_packed_window_endpoint_arithmetic_does_not_overflow_int32() -> None:
+    from helion_attention._paged_attention import packed_attention
+
+    # Reproduce the dense Sq=1, Sk=1_073_741_825 endpoint arithmetic without
+    # allocating multi-gigabyte K/V tensors. One context-parallel shard stores
+    # the final logical key while device metadata retains the original global
+    # positions, so aligned_query + window_right is exactly 2**31.
+    total_seqlen_k = 1_073_741_825
+    window_size = (0, total_seqlen_k - 1)
+    assert helion_attention._validate_window_size(window_size) == window_size
+    q = torch.zeros(1, 1, 16, device="cuda", dtype=torch.float16)
+    k = torch.zeros_like(q)
+    v = torch.full_like(q, 7.0)
+    cu_seqlens = torch.tensor([0, 1], device=q.device, dtype=torch.int32)
+    total_lengths = torch.tensor(
+        [total_seqlen_k], device=q.device, dtype=torch.int32
+    )
+
+    with torch.no_grad():
+        out = packed_attention(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_k=total_seqlen_k,
+            dynamic_max_seqlen_q=None,
+            dynamic_max_seqlen_k=None,
+            softmax_scale=1.0,
+            causal=False,
+            window_size=window_size,
+            softcap=0.0,
+            alibi_slopes=None,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            s_aux=None,
+            q_v=None,
+            cp_world_size=total_seqlen_k,
+            cp_rank=total_seqlen_k - 1,
+            cp_tot_seqused_k=total_lengths,
+            out=None,
+            return_softmax_lse=False,
+            shift_fa2_lse=False,
+            fa_version=2,
+        )
+
+    torch.testing.assert_close(out, v, atol=0.0, rtol=0.0)
+
+
+@requires_cuda
 def test_dense_packed_entry_points_inherit_sliding_window_support() -> None:
     flash_attn = pytest.importorskip("flash_attn")
 
