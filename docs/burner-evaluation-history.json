@@ -1873,6 +1873,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:35b6444903bed171baa158ae4ed9c01ca7fb1bc7",
+      "commit": "35b6444903bed171baa158ae4ed9c01ca7fb1bc7",
+      "recordedAt": "2026-08-09T17:36:28.773Z",
+      "label": "base 35b6444",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 89,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:91",
+      "recordedAt": "2026-08-09T17:36:28.773Z",
+      "label": "PR #91",
+      "kind": "leaf",
+      "prNumber": 91,
+      "title": "Make benchmark inventory tests collision-resistant",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
