@@ -1648,6 +1648,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6366733994bb25b7497e18299946e9efa97ce6bf",
+      "commit": "6366733994bb25b7497e18299946e9efa97ce6bf",
+      "recordedAt": "2026-08-09T14:12:42.798Z",
+      "label": "base 6366733",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 87,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:83",
+      "recordedAt": "2026-08-09T14:12:42.798Z",
+      "label": "PR #83",
+      "kind": "leaf",
+      "prNumber": 83,
+      "title": "Enable ALiBi on paged chunked prefill",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 87,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
