@@ -3,7 +3,7 @@
 Helion only beats FlashAttention when the kernel is specialized to one exact
 problem size, so ``shape`` is a required argument of the public API instead of
 something inferred from the tensors. The same declaration validates calls that
-use the generic dense fallback when no specialization is checked in.
+use a generic dense or varlen fallback when no specialization is checked in.
 """
 
 from __future__ import annotations

@@ -6,6 +6,9 @@ import torch
 import triton
 import triton.language as tl
 
+_PACKED_QUERY_BLOCK_SIZE = 16
+_PACKED_KEY_BLOCK_SIZE = 64
+
 
 @triton.jit
 def _varlen_attention_kernel(
@@ -494,8 +497,8 @@ def _attention(
 
     block_d = max(16, triton.next_power_of_2(head_dim))
     block_dv = max(16, triton.next_power_of_2(value_dim))
-    block_m = 16
-    block_n = 64
+    block_m = _PACKED_QUERY_BLOCK_SIZE
+    block_n = _PACKED_KEY_BLOCK_SIZE
     query_blocks = triton.cdiv(max_seqlen_q, block_m)
     grid = (query_blocks * batch * nheads_q,)
     with torch.cuda.device(q.device):

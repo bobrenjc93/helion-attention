@@ -37,6 +37,12 @@ VARLEN_ALIBI_NONCAUSAL = AttnShape(
 )
 VARLEN_ALIBI_PROFILES = (VARLEN_ALIBI_CAUSAL, VARLEN_ALIBI_NONCAUSAL)
 VARLEN_DIAGNOSTIC = VARLEN_ALIBI_CAUSAL
+GENERIC_VARLEN_SPECS = (
+    AttnShape(3, 19, 19, 4, 4, 32, torch.bfloat16, False),
+    AttnShape(3, 23, 29, 8, 2, 64, torch.bfloat16, True),
+    AttnShape(2, 17, 11, 4, 4, 128, torch.float16, True),
+    AttnShape(2, 13, 21, 8, 2, 256, torch.float16, False),
+)
 PAGED_DECODE = AttnShape(
     batch=4,
     seqlen_q=1,
@@ -817,8 +823,14 @@ def test_full_varlen_no_grad_retains_generated_dispatch(
     def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
         raise AssertionError("no-grad varlen call reached dense SDPA")
 
+    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("registered varlen call reached generic fallback")
+
     monkeypatch.setattr(helion_attention, "lookup_varlen", lambda _spec: generated)
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_generic
+    )
     with torch.no_grad():
         if name == "flash_attn_varlen_func":
             out = helion_attention.flash_attn_varlen_func(
@@ -915,6 +927,412 @@ def test_varlen_matches_fp32_sdpa_with_dynamic_token_totals(
         q, k, v, lengths_q, lengths_k, causal=spec.causal, scale=scale
     )
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "spec", GENERIC_VARLEN_SPECS, ids=[spec.key for spec in GENERIC_VARLEN_SPECS]
+)
+@pytest.mark.parametrize(
+    ("softmax_scale", "variant"),
+    [(None, 0), (0.37, 1)],
+    ids=["default-scale", "custom-scale"],
+)
+def test_unregistered_varlen_fallback_matches_fp32_and_fa2(
+    spec: AttnShape, softmax_scale: float | None, variant: int
+) -> None:
+    assert not helion_attention.is_varlen_shape_supported(
+        spec, dtype=spec.dtype, causal=spec.causal
+    )
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=variant, seed=20260809
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    got = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        shape=spec,
+    )
+    expected_fp32 = reference_packed(
+        q,
+        k,
+        v,
+        lengths_q,
+        lengths_k,
+        causal=spec.causal,
+        scale=scale,
+    )
+
+    assert got.shape == q.shape
+    assert got.dtype == spec.dtype
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    expected_fa2 = flash_attn.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+    )
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["qkvpacked", "kvpacked"], ids=["qkv-packed", "kv-packed"]
+)
+def test_unregistered_varlen_packed_adapters_inherit_fallback(
+    entry_point: str,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    if entry_point == "qkvpacked":
+        spec = GENERIC_VARLEN_SPECS[0]
+        q, k, v, cu_q, _, *_ = make_packed(spec, variant=2, seed=314159)
+        qkv = torch.stack((q, k, v), dim=1)
+        got = helion_attention.flash_attn_varlen_qkvpacked_func(
+            qkv,
+            cu_q,
+            spec.seqlen_q,
+            softmax_scale=0.29,
+            causal=spec.causal,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_varlen_qkvpacked_func(
+            qkv,
+            cu_q,
+            spec.seqlen_q,
+            softmax_scale=0.29,
+            causal=spec.causal,
+        )
+    else:
+        spec = GENERIC_VARLEN_SPECS[-1]
+        q, k, v, cu_q, cu_k, *_ = make_packed(
+            spec, variant=0, seed=271828
+        )
+        kv = torch.stack((k, v), dim=1)
+        got = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=0.29,
+            causal=spec.causal,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=0.29,
+            causal=spec.causal,
+        )
+
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    torch.testing.assert_close(
+        got.float(), expected.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+def test_unregistered_varlen_no_grad_reaches_generic_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = GENERIC_VARLEN_SPECS[1]
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    sentinel = torch.empty_like(q)
+    seen: list[AttnShape] = []
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        cu_q_arg: torch.Tensor,
+        cu_k_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, cu_q_arg, cu_k_arg, scale_arg
+        seen.append(spec_arg)
+        return sentinel
+
+    monkeypatch.setattr(helion_attention, "_generic_varlen_forward", generic)
+    with torch.no_grad():
+        out = helion_attention.flash_attn_varlen_func(
+            q.requires_grad_(),
+            k.requires_grad_(),
+            v.requires_grad_(),
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+    assert out is sentinel
+    assert seen == [spec]
+
+
+@requires_cuda
+def test_unregistered_varlen_gradients_fail_before_generic_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = GENERIC_VARLEN_SPECS[0]
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    q.requires_grad_()
+
+    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("gradient-bearing call reached generic fallback")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_generic
+    )
+    with pytest.raises(NotImplementedError, match="varlen backward"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["unpacked", "qkvpacked", "kvpacked"],
+    ids=["unpacked", "qkv-packed", "kv-packed"],
+)
+def test_unregistered_varlen_fallback_rejects_strided_inputs(
+    entry_point: str,
+) -> None:
+    if entry_point == "qkvpacked":
+        spec = GENERIC_VARLEN_SPECS[0]
+        q, k, v, cu_q, _, *_ = make_packed(spec, variant=2)
+        packed = torch.stack((q, k, v), dim=1)
+        storage = torch.empty(
+            (*packed.shape[:-1], packed.shape[-1] * 2),
+            device=packed.device,
+            dtype=packed.dtype,
+        )
+        strided = storage[..., ::2]
+        strided.copy_(packed)
+        assert not strided.is_contiguous()
+        with pytest.raises(ValueError, match="qkv must be contiguous"):
+            helion_attention.flash_attn_varlen_qkvpacked_func(
+                strided,
+                cu_q,
+                spec.seqlen_q,
+                causal=spec.causal,
+                shape=spec,
+            )
+        return
+
+    spec = GENERIC_VARLEN_SPECS[-1]
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    if entry_point == "kvpacked":
+        packed = torch.stack((k, v), dim=1)
+        storage = torch.empty(
+            (*packed.shape[:-1], packed.shape[-1] * 2),
+            device=packed.device,
+            dtype=packed.dtype,
+        )
+        strided = storage[..., ::2]
+        strided.copy_(packed)
+        assert not strided.is_contiguous()
+        with pytest.raises(ValueError, match="kv must be contiguous"):
+            helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                strided,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=spec.causal,
+                shape=spec,
+            )
+        return
+
+    storage = torch.empty(
+        (q.shape[0], q.shape[1], q.shape[2] * 2),
+        device=q.device,
+        dtype=q.dtype,
+    )
+    strided_q = storage[..., ::2]
+    strided_q.copy_(q)
+    assert not strided_q.is_contiguous()
+    with pytest.raises(ValueError, match="q must be contiguous"):
+        helion_attention.flash_attn_varlen_func(
+            strided_q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("dropout_p", 0.1, "dropout"),
+        ("window_size", (2, 1), "sliding-window"),
+        ("softcap", 1.0, "softcap"),
+        ("alibi_slopes", "slopes", "implemented only"),
+        ("return_attn_probs", True, "implemented only"),
+    ],
+)
+def test_unregistered_varlen_optional_features_fail_before_generic_dispatch(
+    option: str,
+    value: object,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = GENERIC_VARLEN_SPECS[0]
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    if value == "slopes":
+        value = torch.ones(spec.nheads_q, device=q.device)
+
+    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported feature reached generic fallback")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_generic
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=spec.causal,
+            shape=spec,
+            **{option: value},
+        )
+
+
+@requires_cuda
+def test_unregistered_varlen_fallback_rejects_head_dim_above_256() -> None:
+    spec = AttnShape(1, 2, 3, 1, 1, 257, torch.bfloat16, False)
+    q = torch.zeros(2, 1, 257, device="cuda", dtype=spec.dtype)
+    k = torch.zeros(3, 1, 257, device="cuda", dtype=spec.dtype)
+    v = torch.zeros_like(k)
+    cu_q = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor([0, 3], device="cuda", dtype=torch.int32)
+
+    with pytest.raises(helion_attention.UnsupportedShapeError, match="head_dim <= 256"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            shape=spec,
+        )
+
+
+def test_generic_varlen_layout_accepts_maximum_flattened_grid() -> None:
+    limit = 2**31 - 1
+    spec = AttnShape(limit, 16, 1, 1, 1, 1, torch.bfloat16, False)
+    q = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+    k = torch.empty((1, 1, 1), device="meta", dtype=spec.dtype)
+
+    assert helion_attention._validate_generic_varlen_layout(q, k, spec) is None
+
+
+@pytest.mark.parametrize(
+    ("spec", "message"),
+    [
+        pytest.param(
+            AttnShape(2**30, 17, 1, 1, 1, 1, torch.bfloat16, False),
+            r"CUDA launch grid requires 2147483648 blocks .*limit 2147483647",
+            id="flattened-grid",
+        ),
+        pytest.param(
+            AttnShape(1, 2**31 + 1, 1, 1, 1, 1, torch.bfloat16, False),
+            r"signed int32 query indices.*padded maximum is 2147483663",
+            id="query-index",
+        ),
+        pytest.param(
+            AttnShape(1, 1, 2**31 + 1, 1, 1, 1, torch.bfloat16, False),
+            r"signed int32 key indices.*padded maximum is 2147483711",
+            id="key-index",
+        ),
+    ],
+)
+def test_generic_varlen_layout_rejects_oversized_launch_geometry(
+    spec: AttnShape, message: str
+) -> None:
+    q = torch.empty((1, spec.nheads_q, spec.head_dim), device="meta")
+    k = torch.empty((1, spec.nheads_kv, spec.head_dim), device="meta")
+
+    with pytest.raises(helion_attention.UnsupportedShapeError, match=message):
+        helion_attention._validate_generic_varlen_layout(q, k, spec)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "k_shape", "layout"),
+    [
+        ((8_388_609, 1, 256), (1, 1, 256), "Q/output"),
+        ((1, 1, 256), (8_388_609, 1, 256), "K/V"),
+    ],
+    ids=["query-output", "key-value"],
+)
+def test_generic_varlen_layout_rejects_int32_element_offset_overflow(
+    q_shape: tuple[int, int, int],
+    k_shape: tuple[int, int, int],
+    layout: str,
+) -> None:
+    spec = AttnShape(1, 1, 1, 1, 1, 256, torch.bfloat16, False)
+    q = torch.empty(q_shape, device="meta", dtype=spec.dtype)
+    k = torch.empty(k_shape, device="meta", dtype=spec.dtype)
+
+    with pytest.raises(
+        helion_attention.UnsupportedShapeError,
+        match=rf"{layout} requires maximum offset .*limit 2147483647",
+    ):
+        helion_attention._validate_generic_varlen_layout(q, k, spec)
 
 
 @requires_cuda

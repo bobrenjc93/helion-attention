@@ -7,11 +7,11 @@ time they are checked in: importing this package pulls in ``torch`` and
 
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
-direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
-profiles, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. The exposed page-16 decode cache also uses the generic
-paged runtime when ALiBi is supplied.
+direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense and varlen
+shapes, dense ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped
+varlen profiles, and diagnostics on the shipped causal varlen profile use a
+generic Triton forward kernel. The exposed page-16 decode cache also uses the
+generic paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -87,6 +87,7 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
 )
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
+_GENERIC_VARLEN_MAX_HEAD_DIM = _GENERIC_DENSE_MAX_HEAD_DIM
 _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
@@ -381,6 +382,92 @@ def _validate_generic_dense_layout(spec: AttnShape) -> tuple[int, int]:
     return total_q, total_k
 
 
+def _validate_generic_varlen_layout(
+    q: torch.Tensor, k: torch.Tensor, spec: AttnShape
+) -> None:
+    """Validate the generic packed kernel's varlen launch envelope."""
+    if spec.head_dim > _GENERIC_VARLEN_MAX_HEAD_DIM:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback supports head_dim <= "
+            f"{_GENERIC_VARLEN_MAX_HEAD_DIM}. To request a specialization, "
+            "file an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    # Import the launch tiles lazily with the runtime so validation and the
+    # Triton launch cannot drift to different index or grid limits.
+    from ._paged_attention import _PACKED_KEY_BLOCK_SIZE
+    from ._paged_attention import _PACKED_QUERY_BLOCK_SIZE
+
+    query_blocks = (
+        spec.seqlen_q + _PACKED_QUERY_BLOCK_SIZE - 1
+    ) // _PACKED_QUERY_BLOCK_SIZE
+    max_padded_query_index = query_blocks * _PACKED_QUERY_BLOCK_SIZE - 1
+    if max_padded_query_index > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback uses signed int32 query indices, but "
+            f"the padded maximum is {max_padded_query_index} "
+            f"(limit {_INT32_MAX}) with query block size "
+            f"{_PACKED_QUERY_BLOCK_SIZE}. To request a specialization, file "
+            "an issue at https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    key_blocks = (
+        spec.seqlen_k + _PACKED_KEY_BLOCK_SIZE - 1
+    ) // _PACKED_KEY_BLOCK_SIZE
+    max_padded_key_index = key_blocks * _PACKED_KEY_BLOCK_SIZE - 1
+    if max_padded_key_index > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback uses signed int32 key indices, but "
+            f"the padded maximum is {max_padded_key_index} "
+            f"(limit {_INT32_MAX}) with key block size "
+            f"{_PACKED_KEY_BLOCK_SIZE}. To request a specialization, file "
+            "an issue at https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    grid_size = query_blocks * spec.batch * spec.nheads_q
+    if grid_size > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback's flattened CUDA launch grid requires "
+            f"{grid_size} blocks (limit {_INT32_MAX}) with query block size "
+            f"{_PACKED_QUERY_BLOCK_SIZE}. To request a specialization, file "
+            "an issue at https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    total_q = q.shape[0]
+    total_k = k.shape[0]
+    if max(total_q, total_k) > _INT32_MAX:
+        raise UnsupportedShapeError(
+            "no checked-in varlen specialization exists for:\n"
+            f"    {spec.describe()}\n"
+            "the generic varlen fallback requires packed token offsets to fit "
+            "in int32. To request a specialization, file an issue at "
+            "https://github.com/bobrenjc93/helion-attention/issues"
+        )
+
+    layout_numels = (("Q/output", q.numel()), ("K/V", k.numel()))
+    for layout, numel in layout_numels:
+        max_element_offset = numel - 1
+        if max_element_offset > _INT32_MAX:
+            raise UnsupportedShapeError(
+                "no checked-in varlen specialization exists for:\n"
+                f"    {spec.describe()}\n"
+                "the generic varlen fallback uses signed int32 element "
+                f"offsets, but {layout} requires maximum offset "
+                f"{max_element_offset} (limit {_INT32_MAX}). To request a "
+                "specialization, file an issue at "
+                "https://github.com/bobrenjc93/helion-attention/issues"
+            )
+
+
 def _validate_alibi_slopes(
     alibi_slopes: torch.Tensor,
     q: torch.Tensor,
@@ -581,7 +668,7 @@ def _generic_dense_diagnostic_forward(
     return out, softmax_lse, q.new_empty((0,))
 
 
-def _generic_varlen_alibi_forward(
+def _generic_varlen_runtime_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -589,9 +676,9 @@ def _generic_varlen_alibi_forward(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
-    alibi_slopes: torch.Tensor,
+    alibi_slopes: torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run validated packed ALiBi inputs through the generic Triton runtime."""
+    """Run validated packed inputs through the generic Triton runtime."""
     # Keep the Triton dependency lazy for callers that only inspect the
     # specialization manifest.
     from ._paged_attention import packed_attention
@@ -627,6 +714,52 @@ def _generic_varlen_alibi_forward(
     if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
         raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
     return packed_out
+
+
+def _generic_varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Run an unregistered, validated packed-varlen shape generically."""
+    _validate_generic_varlen_layout(q, k, spec)
+    return _generic_varlen_runtime_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        softmax_scale,
+        spec,
+        None,
+    )
+
+
+def _generic_varlen_alibi_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+    alibi_slopes: torch.Tensor,
+) -> torch.Tensor:
+    """Run validated packed ALiBi inputs through the generic Triton runtime."""
+    return _generic_varlen_runtime_forward(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        softmax_scale,
+        spec,
+        alibi_slopes,
+    )
 
 
 def _generic_varlen_diagnostic_forward(
@@ -919,7 +1052,10 @@ def flash_attn_varlen_func(
     to dense BSHD and uses PyTorch SDPA autograd. Ragged, deterministic, paged,
     ALiBi, and diagnostic varlen backward remain unsupported. Calls that do
     not need backward retain the generated packed kernel, including
-    full-length calls.
+    full-length calls. Compatible unregistered, contiguous fp16/bf16 shapes
+    with ``head_dim <= 256`` use the generic packed Triton forward when no
+    backward or optional feature is requested. Specialization introspection
+    continues to report only checked-in generated kernels.
     """
     _reject_unsupported(
         dropout_p,
@@ -1076,18 +1212,28 @@ def flash_attn_varlen_func(
             spec,
             alibi_slopes,
         )
-    # Keep ordinary slope-free calls on the generated specialization.
-    kernel = lookup_varlen(spec)
-    return kernel(
+    # Keep registered ordinary calls on their generated specialization; only
+    # the final missing-registry case enters the generic packed runtime.
+    if has_varlen_kernel(spec):
+        return lookup_varlen(spec)(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            scale,
+            causal,
+        )
+    return _generic_varlen_forward(
         q,
         k,
         v,
         cu_seqlens_q,
         cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
         scale,
-        causal,
+        spec,
     )
 
 
@@ -1111,6 +1257,10 @@ def flash_attn_varlen_qkvpacked_func(
         raise ValueError(
             "qkv must have shape [total, 3, nheads, head_dim], "
             f"got {tuple(qkv.shape)}"
+        )
+    if not qkv.is_contiguous():
+        raise ValueError(
+            "qkv must be contiguous in [total, 3, nheads, head_dim] layout"
         )
     q, k, v = (qkv[:, index].contiguous() for index in range(3))
     return flash_attn_varlen_func(
@@ -1156,6 +1306,10 @@ def flash_attn_varlen_kvpacked_func(
         raise ValueError(
             "kv must have shape [total_k, 2, nheads_kv, head_dim], "
             f"got {tuple(kv.shape)}"
+        )
+    if not kv.is_contiguous():
+        raise ValueError(
+            "kv must be contiguous in [total_k, 2, nheads_kv, head_dim] layout"
         )
     k, v = (kv[:, index].contiguous() for index in range(2))
     return flash_attn_varlen_func(

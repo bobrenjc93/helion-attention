@@ -11,9 +11,10 @@ The one API difference from FlashAttention is that **`shape` is a required
 argument**. Helion only beats FlashAttention when a kernel is specialized to one
 exact problem size — block sizes, warp counts, pipelining stages, indexing mode
 and the tensor strides are all baked into the generated Triton. Shapes in the
-checked-in catalogue use those autotuned kernels. Other compatible dense calls
-use a generic packed Triton kernel for correctness and API coverage. Declaring
-the shape at the call site validates both paths and keeps acceleration explicit.
+checked-in catalogue use those autotuned kernels. Other compatible dense and
+packed-varlen calls use a generic packed Triton kernel for correctness and API
+coverage. Declaring the shape at the call site validates both paths and keeps
+acceleration explicit.
 
 One measured Hopper encoder profile invokes PyTorch's Flash SDPA operator
 directly: the exact noncausal bf16 `(2, 1024, 1024, 16, 16, 256)` MHA call.
@@ -117,6 +118,14 @@ out = helion_attention.flash_attn_varlen_func(
 `cu_seqlens_q` and `cu_seqlens_k` remain on the GPU and may describe different
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
+
+Contiguous CUDA fp16 and bf16 calls without a checked-in varlen specialization
+use the generic packed forward when `head_dim <= 256`, no backward, ALiBi,
+dropout, window, softcap, diagnostics, or paging is requested, and the packed
+offsets, padded indices, and flattened launch grid fit their signed 32-bit
+limits. Registered default calls retain their generated kernels, and the varlen
+QKV/KV-packed adapters inherit the fallback. Support queries continue to report
+specialization availability only.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
 `return_attn_probs=True` for forward-only calls with otherwise default options
@@ -298,10 +307,11 @@ helion_attention.available_paged_shapes()
 ```
 
 These introspection functions intentionally describe only checked-in generated
-kernels; they do not report generic fallback coverage. An unlisted compatible
-dense shape remains callable but is not specialization-accelerated. Dense shapes
-outside the fallback envelope and unlisted varlen/paged shapes raise
-`UnsupportedShapeError`. **To accelerate an unlisted shape, please
+kernels; they do not report generic fallback coverage. Unlisted compatible
+dense and non-paged varlen shapes remain callable but are not
+specialization-accelerated. Shapes outside the fallback envelope and unlisted
+core paged shapes raise `UnsupportedShapeError`. **To accelerate an unlisted
+shape, please
 [file an issue](https://github.com/bobrenjc93/helion-attention/issues)** — adding
 a specialization is an autotuning run, not a runtime code change.
 
