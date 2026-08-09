@@ -114,6 +114,9 @@ _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
 )
+_TENSOR_LENGTH_DENSE_KVCACHE_KEY = (
+    "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
+)
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
         (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
@@ -510,6 +513,130 @@ def _generic_dense_forward(
     return packed_out.view(
         spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
     )
+
+
+def _validate_dense_kvcache_tensor_length(
+    cache_seqlens: torch.Tensor,
+    *,
+    device: torch.device,
+    spec: AttnShape,
+) -> None:
+    """Validate the one supported device-resident dense-cache length."""
+    expected_shape = (spec.batch,)
+    if tuple(cache_seqlens.shape) != expected_shape:
+        raise ValueError(
+            f"cache_seqlens must have shape {expected_shape}, got "
+            f"{tuple(cache_seqlens.shape)}"
+        )
+    if cache_seqlens.dtype != torch.int32:
+        raise ValueError("cache_seqlens must have dtype torch.int32")
+    if not cache_seqlens.is_cuda:
+        raise ValueError(
+            "cache_seqlens must be a CUDA tensor, got device "
+            f"{cache_seqlens.device}"
+        )
+    if cache_seqlens.device != device:
+        raise ValueError(
+            "cache_seqlens must be on the same CUDA device as q, k_cache, "
+            "and v_cache"
+        )
+    if cache_seqlens.layout != torch.strided:
+        raise ValueError("cache_seqlens must use torch.strided layout")
+    if not cache_seqlens.is_contiguous():
+        raise ValueError("cache_seqlens must be contiguous")
+
+    # Recoverable bounds validation requires one deliberate device-to-host
+    # synchronization. Reject capture before .item() so graph construction is
+    # ended cleanly instead of failing inside an implicit synchronization.
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "tensor-valued cache_seqlens are not supported during CUDA "
+                "graph capture"
+            )
+        length = int(cache_seqlens.detach().item())
+    if length < 1 or length > spec.seqlen_k:
+        raise ValueError(
+            "cache_seqlens values must be in the inclusive range "
+            f"[1, {spec.seqlen_k}], got {length}"
+        )
+
+
+def _tensor_length_dense_kvcache_forward(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+    *,
+    return_softmax_lse: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Read a device-selected prefix with one generic Triton attention launch."""
+    # Batch one makes the dense cache row identical to packed token storage.
+    # Express its used prefix as cumulative offsets so the generic packed
+    # runtime can stay in one attention kernel without invoking torch.einsum
+    # (and its per-stream cuBLAS workspace).
+    from ._paged_attention import packed_attention
+
+    packed_q = q.view(spec.batch, spec.nheads_q, spec.head_dim)
+    packed_k = k_cache.view(spec.seqlen_k, spec.nheads_kv, spec.head_dim)
+    packed_v = v_cache.view(spec.seqlen_k, spec.nheads_kv, spec.head_dim)
+    cu_seqlens_q = torch.arange(
+        spec.batch + 1, device=q.device, dtype=torch.int32
+    )
+    cu_seqlens_k = torch.cat(
+        (cache_seqlens.new_zeros(1), cache_seqlens)
+    )
+    result = packed_attention(
+        packed_q,
+        packed_k,
+        packed_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=spec.causal,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=return_softmax_lse,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+
+    output_shape = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.nheads_q,
+        spec.head_dim,
+    )
+    if not return_softmax_lse:
+        if not isinstance(result, torch.Tensor):  # pragma: no cover - contract guard
+            raise RuntimeError(
+                "tensor-length KV-cache attention unexpectedly returned LSE"
+            )
+        return result.reshape(output_shape)
+
+    if not isinstance(result, tuple):  # pragma: no cover - contract guard
+        raise RuntimeError(
+            "tensor-length KV-cache attention did not return requested LSE"
+        )
+    output, packed_lse = result
+    softmax_lse = packed_lse.transpose(0, 1).contiguous().unsqueeze(-1)
+    return output.reshape(output_shape), softmax_lse
 
 
 def _generic_dense_diagnostic_forward(
@@ -1439,18 +1566,23 @@ def flash_attn_with_kvcache(
     runtime.
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
-    integer equal to the declared cache length for a read-only call. A paired,
-    one-token ``k`` and ``v`` update is supported when the Python integer
-    ``cache_seqlens`` is exactly one less than that length; the update is copied
-    into the final cache slot before attention runs. On this dense path,
+    integer equal to the declared cache length for a read-only call. The causal
+    bf16 ``(1, 1, 16384, 32, 8, 128)`` profile additionally accepts a contiguous
+    CUDA int32 tensor shaped ``[1]`` selecting a prefix of length 1 through
+    16384. This tensor-length path synchronizes once for recoverable bounds
+    validation and rejects CUDA graph capture and autograd. A paired, one-token
+    ``k`` and ``v`` update is supported when a Python integer
+    ``cache_seqlens`` is exactly one less than the declared length; the update
+    is copied into the final cache slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
     decode profile supports the same return through the generic single-launch
     paged runtime; slope-free output-only calls retain the generated
     specialization. ALiBi cannot be combined with that LSE return. Cache tensors
     created in inference mode must also be updated in inference mode, and an
-    append requires disjoint query, K-cache, and V-cache memory. Dense
-    tensor-valued/partial lengths and multi-token updates fail explicitly. A
+    append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
+    lengths on updates and other dense profiles, scalar partial lengths, and
+    multi-token updates fail explicitly. A
     paired ``rotary_cos``/``rotary_sin`` table may be supplied only for this
     final-slot append: it may cover the full head or the first 64 dimensions of
     a 128-dimensional head, must use the default interleaved layout, and rotates
@@ -1517,16 +1649,28 @@ def flash_attn_with_kvcache(
             "flash_attn_with_kvcache currently supports only seqlen_q=1 "
             "with a non-empty cache"
         )
-    if isinstance(cache_seqlens, torch.Tensor):
-        # Reading a CUDA tensor on the host would synchronize and break graph
-        # capture, while a device assertion would poison the CUDA context for
-        # an ordinary input error. Reject this unsupported dynamic/ragged form
-        # recoverably before launching any CUDA work.
+    tensor_cache_seqlens = (
+        cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
+    )
+    if tensor_cache_seqlens is not None and append_kv:
         raise NotImplementedError(
-            "tensor-valued cache_seqlens are not implemented; pass a Python int"
+            "tensor-valued cache_seqlens are supported only for read-only KV "
+            "cache calls; updates require a Python int"
         )
     if cache_seqlens is not None and type(cache_seqlens) is not int:
-        raise TypeError("cache_seqlens must be a Python int, a torch.Tensor, or None")
+        if tensor_cache_seqlens is None:
+            raise TypeError(
+                "cache_seqlens must be a Python int, a torch.Tensor, or None"
+            )
+
+    if (
+        tensor_cache_seqlens is not None
+        and spec.key != _TENSOR_LENGTH_DENSE_KVCACHE_KEY
+    ):
+        raise NotImplementedError(
+            "tensor-valued cache_seqlens are implemented only for read-only "
+            f"{_TENSOR_LENGTH_DENSE_KVCACHE_KEY}"
+        )
 
     if append_kv:
         if cache_seqlens is None:
@@ -1544,10 +1688,13 @@ def flash_attn_with_kvcache(
                 "implemented; cache_seqlens + 1 must equal the cache length "
                 "declared by shape"
             )
-    elif cache_seqlens is not None and cache_seqlens != spec.seqlen_k:
+    elif tensor_cache_seqlens is None and (
+        cache_seqlens is not None and cache_seqlens != spec.seqlen_k
+    ):
         raise NotImplementedError(
-            "partial or ragged KV caches are not implemented for read-only "
-            "calls; cache_seqlens must equal the cache length declared by shape"
+            "partial or ragged scalar KV caches are not implemented for "
+            "read-only calls; cache_seqlens must equal the cache length "
+            "declared by shape"
         )
 
     # Dispatch directly after the KV-cache-specific checks. Routing back
@@ -1611,8 +1758,32 @@ def flash_attn_with_kvcache(
             _validate_kvcache_rotary(rotary_cos, rotary_sin, q, spec)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
-    kernel = lookup(spec)
     scale = float(softmax_scale)
+    if tensor_cache_seqlens is not None:
+        _validate_dense_kvcache_tensor_length(
+            tensor_cache_seqlens,
+            device=q.device,
+            spec=spec,
+        )
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError(
+                "tensor-valued cache_seqlens do not support autograd"
+            )
+        return _tensor_length_dense_kvcache_forward(
+            q,
+            k_cache,
+            v_cache,
+            tensor_cache_seqlens,
+            scale,
+            spec,
+            return_softmax_lse=return_softmax_lse,
+        )
+
+    # Preserve the scalar full-cache/update dispatch: those calls still resolve
+    # and launch the same checked-in specialization as before.
+    kernel = lookup(spec)
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad
         for tensor in (q, k_cache, v_cache, k, v, rotary_cos, rotary_sin)
