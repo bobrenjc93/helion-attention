@@ -173,6 +173,7 @@ def _reject_unsupported(
     allow_dropout: bool = False,
     allow_alibi: bool = False,
     allow_return_attn_probs: bool = False,
+    allow_softcap_return_attn_probs: bool = False,
     allowed_softcap: float | None = None,
 ) -> float:
     if isinstance(dropout_p, bool) or not isinstance(dropout_p, Real):
@@ -206,7 +207,11 @@ def _reject_unsupported(
         raise NotImplementedError(
             "softcap combined with ALiBi slopes is not implemented"
         )
-    if has_softcap and return_attn_probs:
+    if (
+        has_softcap
+        and return_attn_probs
+        and not allow_softcap_return_attn_probs
+    ):
         raise NotImplementedError(
             "return_attn_probs=True is not implemented with softcap"
         )
@@ -947,6 +952,8 @@ def _generic_dense_diagnostic_forward(
     v: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
+    *,
+    softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return FA2-compatible dense diagnostics from the packed runtime."""
     total_q, total_k = _validate_generic_dense_layout(spec)
@@ -979,9 +986,9 @@ def _generic_dense_diagnostic_forward(
         dynamic_max_seqlen_q=None,
         dynamic_max_seqlen_k=None,
         softmax_scale=softmax_scale,
-        causal=False,
+        causal=spec.causal,
         window_size=(-1, -1),
-        softcap=0.0,
+        softcap=softcap,
         alibi_slopes=None,
         q_descale=None,
         k_descale=None,
@@ -1260,11 +1267,12 @@ def flash_attn_func(
             ordinary dispatch; every other positive value remains unsupported.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
-        return_attn_probs: for the shipped bf16 BERT-base encoder and three
-            Llama GQA decode profiles, return FlashAttention's diagnostic
-            tuple. This is available only when no backward is needed and all
-            options other than ``softmax_scale`` (and the equivalent decode
-            ``causal`` mode) retain their defaults.
+        return_attn_probs: for the shipped bf16 BERT-base encoder, three Llama
+            GQA decode profiles, and the ``softcap=50.0`` Gemma-2 profile,
+            return FlashAttention's diagnostic tuple. This is available only
+            when no backward is needed and all options other than
+            ``softmax_scale`` (plus the documented causal/softcap settings)
+            retain their defaults.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -1306,6 +1314,7 @@ def flash_attn_func(
         allow_dropout=True,
         allow_alibi=True,
         allow_return_attn_probs=True,
+        allow_softcap_return_attn_probs=True,
         allowed_softcap=_GEMMA2_SOFTCAP,
     )
     spec = normalize_shape(shape, q.dtype, causal)
@@ -1341,6 +1350,19 @@ def flash_attn_func(
             raise NotImplementedError(
                 "softcap backward is not implemented; the Gemma-2 softcap "
                 "profile is forward-only"
+            )
+        if return_attn_probs:
+            if deterministic:
+                raise NotImplementedError(
+                    "return_attn_probs=True requires deterministic=False"
+                )
+            return _generic_dense_diagnostic_forward(
+                q,
+                k,
+                v,
+                scale,
+                spec,
+                softcap=_GEMMA2_SOFTCAP,
             )
         return _generic_dense_forward(
             q,

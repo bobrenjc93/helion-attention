@@ -60,9 +60,13 @@ below. The dense causal-bf16 Gemma-2 profile
 `(1, 4096, 4096, 16, 8, 256)` accepts exactly `softcap=50.0` through
 `flash_attn_func` and `flash_attn_kvpacked_func`, with either the default or a
 custom `softmax_scale`. It uses the generic packed Triton runtime and applies
-`50 * tanh(scores / 50)` before softmax. `softcap=0` retains the usual generic
-dispatch for this unregistered shape. Other caps, shapes, option combinations,
-and calls that need gradients remain unsupported.
+`50 * tanh(scores / 50)` before softmax. These calls also accept
+`return_attn_probs=True` and return `(out, softmax_lse, S_dmask)`, with fp32
+LSE shaped `[1, 16, 4096]` and an empty bf16 `S_dmask`, through both entry
+points. `softcap=0` retains the usual generic dispatch for this unregistered
+shape. Other caps and profiles remain unsupported; softcap cannot be combined
+with dropout, ALiBi, local windows, or autograd, and its diagnostic return
+requires `deterministic=False`.
 
 The checked-in noncausal bf16 BERT-base encoder profile
 `(16, 512, 512, 12, 12, 64)` supports `return_attn_probs=True` through the
@@ -617,8 +621,9 @@ else:
   unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, or read-only
   page-size-256 KV-cache decode `(4, 1, 1024, 8, 2, 128)` with either
   decode-equivalent causal flag; the supported softcap cannot be combined with
-  dropout, ALiBi, local windows, or autograd, and only the paged exception
-  permits its documented LSE return
+  dropout, ALiBi, local windows, or autograd; the dense/KV-packed Gemma-2
+  exception permits its diagnostic tuple described above, while the paged
+  exception permits its documented LSE return
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 profiles above; paged ALiBi cannot be combined
@@ -633,7 +638,8 @@ else:
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
   KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
-  profiles, and the causal bf16 varlen profile described above
+  profiles, dense/KV-packed calls for the causal bf16 Gemma-2 profile with
+  `softcap=50.0`, and the causal bf16 varlen profile described above
 
 ## How the kernels are made
 
