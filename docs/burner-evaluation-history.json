@@ -1813,6 +1813,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:d7f3110ac1573c44d996eee005cbe6feecd1fb71",
+      "commit": "d7f3110ac1573c44d996eee005cbe6feecd1fb71",
+      "recordedAt": "2026-08-09T16:53:56.648Z",
+      "label": "base d7f3110",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:89",
+      "recordedAt": "2026-08-09T16:53:56.648Z",
+      "label": "PR #89",
+      "kind": "leaf",
+      "prNumber": 89,
+      "title": "Backpropagate ragged causal varlen cross-attention",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
