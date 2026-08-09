@@ -1588,6 +1588,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:f9491e7c226d91a0041c702aa1b844637d0e8aca",
+      "commit": "f9491e7c226d91a0041c702aa1b844637d0e8aca",
+      "recordedAt": "2026-08-09T11:58:47.632Z",
+      "label": "base f9491e7",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 87,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:75",
+      "recordedAt": "2026-08-09T11:58:47.632Z",
+      "label": "PR #75",
+      "kind": "leaf",
+      "prNumber": 75,
+      "title": "Enable Gemma-2 softcap on one inference profile",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 87,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
