@@ -1678,6 +1678,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:84",
+      "recordedAt": "2026-08-09T14:39:46.862Z",
+      "label": "PR #84",
+      "kind": "leaf",
+      "prNumber": 84,
+      "title": "Publish benchmark timing defaults in README prose",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 87,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
