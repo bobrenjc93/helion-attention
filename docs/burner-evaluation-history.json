@@ -1273,6 +1273,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:8720c026583d4a924eab7ae0d5efb964696a762b",
+      "commit": "8720c026583d4a924eab7ae0d5efb964696a762b",
+      "recordedAt": "2026-08-09T04:21:37.330Z",
+      "label": "base 8720c02",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 82,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:56",
+      "recordedAt": "2026-08-09T04:21:37.330Z",
+      "label": "PR #56",
+      "kind": "leaf",
+      "prNumber": 56,
+      "title": "Backpropagate full-length noncausal varlen batches",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 82,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
