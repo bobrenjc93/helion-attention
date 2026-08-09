@@ -2263,6 +2263,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6c209dc94442e900b5cdca91766ed10aed77d98b",
+      "commit": "6c209dc94442e900b5cdca91766ed10aed77d98b",
+      "recordedAt": "2026-08-09T23:12:27.735Z",
+      "label": "base 6c209dc",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 91,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:106",
+      "recordedAt": "2026-08-09T23:12:27.735Z",
+      "label": "PR #106",
+      "kind": "leaf",
+      "prNumber": 106,
+      "title": "Read four tokens from the 1K dense KV cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 91,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
