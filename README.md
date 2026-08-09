@@ -68,6 +68,12 @@ shape. Other caps and profiles remain unsupported; softcap cannot be combined
 with dropout, ALiBi, local windows, or autograd, and its diagnostic return
 requires `deterministic=False`.
 
+The dense KV-cache API exposes the matching bf16 Gemma-2 decode profile
+`(1, 1, 4096, 16, 8, 256)` as a separate, read-only bounded-generic path. It
+accepts `softcap=50.0` or `0.0`, either decode-equivalent causal flag, and the
+default or a custom scale. It does not accept cache metadata, updates, rotary,
+ALiBi, windows, LSE, or autograd.
+
 The checked-in noncausal bf16 BERT-base encoder profile
 `(16, 512, 512, 12, 12, 64)` supports `return_attn_probs=True` through the
 dense, QKV-packed, and KV-packed entry points. A forward-only, dropout-free
@@ -246,6 +252,15 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
+One narrow read-only Gemma-2 decode slice uses a dense bf16 cache:
+`(1, 1, 4096, 16, 8, 256)`. Exactly `softcap=50.0` applies
+`50 * tanh(scores / 50)` before softmax; `softcap=0.0` uses the same bounded
+generic packed Triton path without capping. Both values accept either causal
+flag and the default or a custom `softmax_scale`, and neither mutates cache
+storage. Other caps and shapes are unsupported. This slice requires the full
+cache with no `cache_seqlens`, `cache_leftpad`, or remapping metadata and
+rejects updates, rotary, ALiBi, windows, LSE, and autograd.
+
 One strict speculative-decoding slice handles two query tokens with a dense
 cache: causal bf16 `(1, 2, 1024, 32, 8, 128)`. It accepts either the default or
 a custom `softmax_scale` and uses the generic packed Triton runtime. The
@@ -257,10 +272,11 @@ other update positions or lengths, partial or GPT-NeoX rotary, cache remapping,
 autograd, noncausal mode, and every other multi-token KV-cache shape remain
 unsupported.
 
-For supported single-token dense caches, pass `return_softmax_lse=True` to receive
-`(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
-FlashAttention's KV-cache API. The exact paged decode profile below supports
-the same return for both the default and a custom `softmax_scale`.
+For supported single-token dense caches other than the output-only Gemma-2
+slice above, pass `return_softmax_lse=True` to receive `(out, softmax_lse)`.
+The LSE is fp32 with shape `[batch, heads_q, 1]`, matching FlashAttention's
+KV-cache API. The exact paged decode profile below supports the same return for
+both the default and a custom `softmax_scale`.
 
 The causal bf16 dense profile `(1, 1, 16384, 32, 8, 128)` also accepts a
 contiguous CUDA int32 `cache_seqlens` tensor shaped `[1]`. Values from 1 through
@@ -325,8 +341,8 @@ rejected before dispatch. LSE on chunked prefill, non-causal
 chunked prefill, every other paged profile, and every page size other than 16
 or 256 are also rejected before dispatch.
 
-The single-token dense decode paths append one paired K/V token when a scalar
-cache length points at the final slot declared by `shape`:
+The other single-token dense decode paths append one paired K/V token when a
+scalar cache length points at the final slot declared by `shape`:
 
 ```python
 new_k = torch.randn(B, 1, H_KV, D, device="cuda", dtype=torch.bfloat16)
@@ -346,9 +362,10 @@ out = helion_attention.flash_attn_with_kvcache(
 The append mutates both dense caches in place and attends over the updated full
 cache. The exact two-token profile above similarly accepts paired K/V tensors
 shaped `[1, 2, 8, 128]` when the Python integer `cache_seqlens` is 1022, and
-mutates only the final two slots. Dense read-only calls may omit
-`cache_seqlens` or pass the full cache length; the exact 16K profile above
-additionally accepts its documented tensor prefix or left-padded span.
+mutates only the final two slots. Other dense read-only calls may omit
+`cache_seqlens` or pass the full cache length; the Gemma-2 slice requires it to
+be omitted, while the exact 16K profile above additionally accepts its
+documented tensor prefix or left-padded span.
 Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`; the
 two-token update must satisfy `cache_seqlens + 2 == 1024`. Other multi-token
 updates, scalar partial lengths, and tensor lengths on every other dense
@@ -628,12 +645,14 @@ also raise `NotImplementedError` rather than silently doing something else:
   and all KV-cache window calls
 - softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
   causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
-  unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, or read-only
-  page-size-256 KV-cache decode `(4, 1, 1024, 8, 2, 128)` with either
-  decode-equivalent causal flag; the supported softcap cannot be combined with
+  unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, read-only dense
+  KV-cache decode `(1, 1, 4096, 16, 8, 256)`, or read-only page-size-256
+  KV-cache decode `(4, 1, 1024, 8, 2, 128)`; both decode profiles accept either
+  equivalent causal flag. The supported softcap cannot be combined with
   dropout, ALiBi, local windows, or autograd; the dense/KV-packed Gemma-2
-  exception permits its diagnostic tuple described above, while the paged
-  exception permits its documented LSE return
+  attention exception permits its diagnostic tuple, the paged exception
+  permits its documented LSE return, and the dense-cache exception permits
+  neither LSE nor cache metadata
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 profiles and page-size-256 decode above;

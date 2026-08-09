@@ -126,6 +126,9 @@ GEMMA2_SOFTCAP = AttnShape(
     1, 4096, 4096, 16, 8, 256, torch.bfloat16, True
 )
 GEMMA2_SOFTCAP_VALUE = 50.0
+GEMMA2_DENSE_KVCACHE = AttnShape(
+    1, 1, 4096, 16, 8, 256, torch.bfloat16, True
+)
 
 
 def make_inputs(
@@ -3337,6 +3340,217 @@ def test_kvcache_shape_argument_is_required() -> None:
     q = torch.zeros(1, 1, 1, 1)
     with pytest.raises(TypeError):
         helion_attention.flash_attn_with_kvcache(q, q, q)  # type: ignore[call-arg]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softcap", [0.0, GEMMA2_SOFTCAP_VALUE], ids=["no-cap", "softcap-50"]
+)
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_gemma2_dense_kvcache_matches_fa2_and_fp32_without_mutation(
+    softcap: float,
+    causal: bool,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = AttnShape(
+        1, 1, 4096, 16, 8, 256, torch.bfloat16, causal
+    )
+    q, k_cache, v_cache = make_inputs(spec, seed=20260809)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    shape = (1, 1, 4096, 16, 8, 256)
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap,
+            shape=shape,
+        )
+        expected_fa2 = flash_attn.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap,
+        )
+        expected_fp32 = (
+            reference_attention(q, k_cache, v_cache, spec, scale)
+            if softcap == 0.0
+            else reference_softcap_attention(
+                q, k_cache, v_cache, spec, scale, softcap
+            )
+        )
+
+    assert isinstance(got, torch.Tensor)
+    assert isinstance(expected_fa2, torch.Tensor)
+    assert got.shape == q.shape
+    assert got.dtype == torch.bfloat16
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softcap", [0.0, GEMMA2_SOFTCAP_VALUE], ids=["no-cap", "softcap-50"]
+)
+def test_gemma2_dense_kvcache_uses_bounded_generic_runtime(
+    softcap: float,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = GEMMA2_DENSE_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec, seed=173205)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[AttnShape, torch.Tensor | None, float]] = []
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+        *,
+        softcap: float = 0.0,
+    ) -> torch.Tensor:
+        assert q_arg is q
+        assert k_arg is k_cache
+        assert v_arg is v_cache
+        assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+        calls.append((spec_arg, slopes_arg, softcap))
+        return sentinel
+
+    def reject_generated(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("Gemma-2 dense-cache decode reached generated lookup")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(helion_attention, "lookup", reject_generated)
+    with torch.no_grad():
+        out = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            causal=True,
+            softcap=softcap,
+            shape=spec,
+        )
+
+    assert out is sentinel
+    assert calls == [(spec, None, softcap)]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("other-cap", "only as softcap=50.0", id="other-cap"),
+        pytest.param("lse", "return_softmax_lse", id="lse"),
+        pytest.param("update", "read-only", id="update"),
+        pytest.param("cache-seqlens", "cache_seqlens", id="cache-seqlens"),
+        pytest.param("cache-leftpad", "cache_leftpad", id="cache-leftpad"),
+        pytest.param("remapping", "cache_batch_idx", id="remapping"),
+        pytest.param("rotary", "rotary embeddings", id="rotary"),
+        pytest.param("alibi", "ALiBi", id="alibi"),
+        pytest.param("window", "sliding-window", id="window"),
+        pytest.param("autograd", "does not support autograd", id="autograd"),
+        pytest.param("other-shape", "only for.*Gemma-2", id="other-shape"),
+        pytest.param("fp16", "only for.*Gemma-2", id="fp16"),
+    ],
+)
+def test_gemma2_dense_kvcache_rejects_out_of_scope_calls_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = GEMMA2_DENSE_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec, seed=223607)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "softcap": GEMMA2_SOFTCAP_VALUE,
+        "shape": spec,
+    }
+
+    if case == "other-cap":
+        kwargs["softcap"] = 49.0
+    elif case == "lse":
+        kwargs["return_softmax_lse"] = True
+    elif case == "update":
+        kwargs.update(
+            k=k_cache[:, :1].clone(),
+            v=v_cache[:, :1].clone(),
+            cache_seqlens=spec.seqlen_k - 1,
+        )
+    elif case == "cache-seqlens":
+        kwargs["cache_seqlens"] = spec.seqlen_k
+    elif case == "cache-leftpad":
+        kwargs["cache_seqlens"] = torch.tensor(
+            [spec.seqlen_k], device=q.device, dtype=torch.int32
+        )
+        kwargs["cache_leftpad"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
+        )
+    elif case == "remapping":
+        kwargs["cache_batch_idx"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
+        )
+    elif case == "rotary":
+        rotary_cos, rotary_sin = make_rotary_tables(spec)
+        kwargs["rotary_cos"] = rotary_cos
+        kwargs["rotary_sin"] = rotary_sin
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "autograd":
+        q.requires_grad_()
+    elif case == "other-shape":
+        other = AttnShape(1, 1, 2048, 16, 8, 256, torch.bfloat16, True)
+        q, k_cache, v_cache = make_inputs(other, seed=223607)
+        original_k = k_cache.clone()
+        original_v = v_cache.clone()
+        kwargs["shape"] = other
+    elif case == "fp16":
+        other = AttnShape(1, 1, 4096, 16, 8, 256, torch.float16, True)
+        q, k_cache, v_cache = make_inputs(other, seed=223607)
+        original_k = k_cache.clone()
+        original_v = v_cache.clone()
+        kwargs["shape"] = other
+    else:  # pragma: no cover - parametrization guard
+        raise AssertionError(f"unknown case {case}")
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope dense-cache softcap reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q, k_cache, v_cache, **kwargs
+        )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
 
 
 @requires_cuda

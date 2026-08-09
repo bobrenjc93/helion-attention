@@ -12,10 +12,11 @@ ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
 profiles, symmetric windows on the shipped noncausal varlen profile, and
 diagnostics on the shipped causal varlen profile use a generic Triton forward
 kernel. That runtime also provides ``softcap=50.0`` for one forward-only
-Gemma-2 profile, the shipped causal varlen profile, and read-only page-256
-paged decode. Both exposed page-16 paged KV-cache profiles and page-256 decode
-use the generic paged runtime when ALiBi is supplied, without expanding the
-core paged-varlen API.
+Gemma-2 attention profile, its read-only dense-cache decode profile, the
+shipped causal varlen profile, and read-only page-256 paged decode. Both
+exposed page-16 paged KV-cache profiles and page-256 decode use the generic
+paged runtime when ALiBi is supplied, without expanding the core paged-varlen
+API.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -111,6 +112,15 @@ _DROPOUT_SDPA_KEYS = frozenset(
 )
 _GEMMA2_SOFTCAP_KEY = "b1_sq4096_sk4096_hq16_hkv8_d256_bf16_causal"
 _GEMMA2_SOFTCAP = 50.0
+_GEMMA2_DENSE_KVCACHE_PROFILE = (
+    1,
+    1,
+    4096,
+    16,
+    8,
+    256,
+    torch.bfloat16,
+)
 _FLASH_SDPA_FAST_PATH_KEY = (
     "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
 )
@@ -2237,18 +2247,25 @@ def flash_attn_with_kvcache(
     shaped ``[8]`` or ``[batch, 8]`` through the generic paged runtime
     (``[2, 8]`` for chunked prefill and ``[4, 8]`` for decode).
 
-    For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
-    integer equal to the declared cache length for a read-only call. The causal
-    bf16 ``(1, 1, 16384, 32, 8, 128)`` profile additionally accepts a contiguous
-    CUDA int32 ``cache_seqlens`` tensor shaped ``[1]`` selecting the end of a
-    prefix. A matching ``cache_leftpad`` tensor selects the half-open cache span
-    ``[cache_leftpad, cache_seqlens)`` when
+    The read-only bf16 Gemma-2 dense-cache profile
+    ``(1, 1, 4096, 16, 8, 256)`` accepts exactly ``softcap=50.0`` or the disabled
+    value ``0.0``, the default or a custom scale, and either decode-equivalent
+    causal flag through the bounded generic packed runtime. It requires the full
+    cache and is output-only: cache metadata, updates, rotary, ALiBi, windows,
+    LSE, and autograd are unsupported.
+
+    For other dense caches, ``cache_seqlens`` may be omitted or supplied as a
+    Python integer equal to the declared cache length for a read-only call. The
+    causal bf16 ``(1, 1, 16384, 32, 8, 128)`` profile additionally accepts a
+    contiguous CUDA int32 ``cache_seqlens`` tensor shaped ``[1]`` selecting the
+    end of a prefix. A matching ``cache_leftpad`` tensor selects the half-open
+    cache span ``[cache_leftpad, cache_seqlens)`` when
     ``0 <= cache_leftpad < cache_seqlens <= 16384``. This tensor-span path
     synchronizes once for recoverable bounds validation and rejects CUDA graph
     capture and autograd. For the single-token dense paths, a paired ``k`` and
     ``v`` update is supported when a Python integer ``cache_seqlens`` is exactly
     one less than the declared length; the update is copied into the final cache
-    slot before attention runs. On this dense path,
+    slot before attention runs. On these other dense paths,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
     decode profile supports the same return for page sizes 16 and 256 through
@@ -2256,10 +2273,11 @@ def flash_attn_with_kvcache(
     calls retain the generated specialization. ALiBi cannot be combined with
     that LSE return. Cache tensors created in inference mode must also be updated
     in inference mode, and an
-    append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
-    lengths and left padding on updates and other dense profiles, scalar partial
-    lengths, and multi-token updates outside the exact two-token profile fail
-    explicitly. A paired ``rotary_cos``/``rotary_sin`` table may be supplied
+    append requires disjoint query, K-cache, and V-cache memory. The Gemma-2
+    dense-cache profile is read-only and accepts no cache-length metadata.
+    Tensor-valued lengths and left padding on updates and other dense profiles,
+    scalar partial lengths, and multi-token updates outside the exact two-token
+    profile fail explicitly. A paired ``rotary_cos``/``rotary_sin`` table may be supplied
     for the one-token final-slot append: the default interleaved layout may
     cover the full head or the first 64 dimensions of a 128-dimensional head,
     while the non-interleaved GPT-NeoX layout requires full-head rotation. Both
@@ -2310,7 +2328,7 @@ def flash_attn_with_kvcache(
         allowed_softcap=(
             _PAGE256_PAGED_KVCACHE_SOFTCAP
             if block_table is not None
-            else None
+            else _GEMMA2_SOFTCAP
         ),
     )
     if tensor_cache_leftpad is not None and block_table is not None:
@@ -2335,6 +2353,39 @@ def flash_attn_with_kvcache(
         )
 
     spec = normalize_shape(shape, q.dtype, causal)
+    dense_kvcache_profile = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    ) == _GEMMA2_DENSE_KVCACHE_PROFILE
+    if softcap != 0.0 and not dense_kvcache_profile:
+        raise NotImplementedError(
+            "softcap=50.0 for dense KV caches is implemented only for the "
+            "read-only bf16 Gemma-2 decode profile "
+            "(1, 1, 4096, 16, 8, 256) with either causal flag; "
+            f"got {spec.describe()}"
+        )
+    if dense_kvcache_profile:
+        if append_kv:
+            raise NotImplementedError(
+                "the Gemma-2 dense KV-cache decode profile is read-only; "
+                "K/V updates are not implemented"
+            )
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "return_softmax_lse is not implemented for the Gemma-2 "
+                "dense KV-cache decode profile"
+            )
+        if cache_seqlens is not None or tensor_cache_leftpad is not None:
+            raise NotImplementedError(
+                "the Gemma-2 dense KV-cache decode profile requires the full "
+                "cache and does not support cache_seqlens or cache_leftpad "
+                "metadata"
+            )
     is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
     if not spec.is_decode and not is_two_token_dense_profile:
         raise NotImplementedError(
@@ -2497,6 +2548,23 @@ def flash_attn_with_kvcache(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    if dense_kvcache_profile:
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError(
+                "the Gemma-2 dense KV-cache decode profile does not support "
+                "autograd"
+            )
+        return _generic_dense_forward(
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            spec,
+            None,
+            softcap=softcap,
+        )
     if tensor_cache_seqlens is not None:
         _validate_dense_kvcache_tensor_span(
             tensor_cache_seqlens,
