@@ -228,7 +228,7 @@ def _normalize_fa_window(
     max_seqlen_q: int,
     max_seqlen_k: int,
 ) -> tuple[int, int]:
-    """Apply the selected FlashAttention version's global-window sentinels."""
+    """Apply global sentinels and FA2's effective local-mask endpoints."""
     left, right = window_size
     if fa_version == 2:
         left_limit = right_limit = max_seqlen_k
@@ -237,10 +237,18 @@ def _normalize_fa_window(
         # axis, rather than FA2's key-length threshold for both endpoints.
         left_limit = max_seqlen_k - 1
         right_limit = max_seqlen_q - 1
-    return (
+    normalized = (
         -1 if left >= left_limit else left,
         -1 if right >= right_limit else right,
     )
+    if fa_version == 2 and normalized != (-1, -1) and normalized[1] < 0:
+        # FA2 keeps the right side finite once either side makes the mask
+        # local. This matters for bottom-right aligned rows before position
+        # zero when seqlen_q exceeds seqlen_k. CUDA performs the equivalent
+        # materialization in the packed kernel; expose it here as well so the
+        # PyTorch fallback consumes the same effective mask.
+        normalized = (normalized[0], max_seqlen_k)
+    return normalized
 
 
 def _normalize_maximum(

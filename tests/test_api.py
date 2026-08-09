@@ -1116,6 +1116,65 @@ def test_dense_noncausal_q_longer_than_k_preserves_fa2_local_alignment(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "window_size",
+    [(-1, 3), (3, -1), (3, 3)],
+    ids=["global-right", "global-left", "global-both"],
+)
+def test_dense_effective_global_windows_preserve_alibi_and_backward(
+    window_size: tuple[int, int],
+) -> None:
+    spec = AttnShape(1, 5, 3, 2, 2, 16, torch.bfloat16, False)
+    q, k, v = make_inputs(spec, seed=161803)
+    slopes = torch.tensor([0.1, 0.2], device=q.device, dtype=torch.float32)
+
+    with torch.no_grad():
+        alibi_out = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=0.37,
+            window_size=window_size,
+            alibi_slopes=slopes,
+            shape=spec,
+        )
+        expected_alibi_out = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=0.37,
+            alibi_slopes=slopes,
+            shape=spec,
+        )
+    torch.testing.assert_close(alibi_out, expected_alibi_out)
+
+    actual_inputs = tuple(tensor.detach().requires_grad_() for tensor in (q, k, v))
+    expected_inputs = tuple(
+        tensor.detach().clone().requires_grad_() for tensor in (q, k, v)
+    )
+    grad_out = make_inputs(spec, seed=141421)[0]
+    out = helion_attention.flash_attn_func(
+        *actual_inputs,
+        softmax_scale=0.37,
+        window_size=window_size,
+        shape=spec,
+    )
+    expected_out = helion_attention.flash_attn_func(
+        *expected_inputs,
+        softmax_scale=0.37,
+        shape=spec,
+    )
+    grads = torch.autograd.grad(out, actual_inputs, grad_out)
+    expected_grads = torch.autograd.grad(
+        expected_out, expected_inputs, grad_out
+    )
+
+    torch.testing.assert_close(out, expected_out)
+    for grad, expected_grad in zip(grads, expected_grads):
+        torch.testing.assert_close(grad, expected_grad)
+
+
+@requires_cuda
 def test_packed_window_endpoint_arithmetic_does_not_overflow_int32() -> None:
     from helion_attention._paged_attention import packed_attention
 

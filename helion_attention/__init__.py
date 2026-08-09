@@ -149,6 +149,17 @@ def _validate_window_size(window_size: object) -> tuple[int, int]:
     return left, right
 
 
+def _canonicalize_fa2_window(
+    window_size: tuple[int, int], seqlen_k: int
+) -> tuple[int, int]:
+    """Replace FA2 bounds spanning the full key sequence with its sentinel."""
+    left, right = window_size
+    return (
+        -1 if left >= seqlen_k else left,
+        -1 if right >= seqlen_k else right,
+    )
+
+
 def _reject_unsupported(
     dropout_p: float,
     window_size: tuple[int, int],
@@ -801,9 +812,14 @@ def flash_attn_func(
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
+    validated_window = _validate_window_size(window_size)
+    spec = normalize_shape(shape, q.dtype, causal)
+    canonical_window = _canonicalize_fa2_window(
+        validated_window, spec.seqlen_k
+    )
     dropout, window = _reject_unsupported(
         dropout_p,
-        window_size,
+        canonical_window,
         softcap,
         alibi_slopes,
         return_attn_probs,
@@ -812,7 +828,6 @@ def flash_attn_func(
         allow_return_attn_probs=True,
         allow_window=True,
     )
-    spec = normalize_shape(shape, q.dtype, causal)
     if dropout != 0.0:
         if spec.key != _DROPOUT_SDPA_KEY:
             raise NotImplementedError(

@@ -1146,6 +1146,42 @@ def test_finite_window_normalization_matches_fa_version_cuda(
 
 
 @requires_cuda
+def test_fa2_one_sided_window_matches_cpu_and_cuda_for_q_longer_than_k() -> None:
+    def run(device: str) -> torch.Tensor:
+        q = torch.zeros(8, 1, 16, device=device, dtype=torch.float16)
+        k = torch.zeros(3, 1, 16, device=device, dtype=torch.float16)
+        values = torch.arange(1, 4, device=device, dtype=torch.float16)
+        v = values[:, None, None].expand_as(k).contiguous()
+        return compat.flash_attn_varlen_func(
+            q=q,
+            k=k,
+            v=v,
+            max_seqlen_q=8,
+            cu_seqlens_q=torch.tensor(
+                [0, 8], device=device, dtype=torch.int32
+            ),
+            max_seqlen_k=3,
+            cu_seqlens_k=torch.tensor(
+                [0, 3], device=device, dtype=torch.int32
+            ),
+            causal=False,
+            window_size=(1, -1),
+            fa_version=2,
+        )
+
+    expected = torch.tensor(
+        [0.0, 0.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.5],
+        dtype=torch.float16,
+    )
+    cpu_out = run("cpu")
+    cuda_out = run("cuda").cpu()
+
+    torch.testing.assert_close(cpu_out[:, 0, 0], expected, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(cuda_out[:, 0, 0], expected, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(cuda_out, cpu_out, atol=0.0, rtol=0.0)
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     "window", [(-1, -1), (5, 0)], ids=["unbounded", "effective-global"]
 )
