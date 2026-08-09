@@ -407,35 +407,21 @@ def _supports_varlen_diagnostic_return(spec: AttnShape) -> bool:
     )
 
 
-def _has_canonical_full_varlen_layout(
+def _has_full_varlen_token_totals(
     q: torch.Tensor,
     k: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,
-    cu_seqlens_k: torch.Tensor,
     spec: AttnShape,
 ) -> bool:
-    """Whether packed inputs are exactly the dense batch in THD layout."""
-    if (
-        q.shape[0] != spec.batch * spec.seqlen_q
-        or k.shape[0] != spec.batch * spec.seqlen_k
-    ):
-        return False
-    canonical_q = torch.arange(
-        0,
-        (spec.batch + 1) * spec.seqlen_q,
-        spec.seqlen_q,
-        dtype=torch.int32,
-        device=q.device,
-    )
-    canonical_k = torch.arange(
-        0,
-        (spec.batch + 1) * spec.seqlen_k,
-        spec.seqlen_k,
-        dtype=torch.int32,
-        device=q.device,
-    )
-    return torch.equal(cu_seqlens_q, canonical_q) and torch.equal(
-        cu_seqlens_k, canonical_k
+    """Whether valid packed inputs contain the full declared dense batch.
+
+    Varlen callers are responsible for valid cumulative offsets and lengths no
+    larger than the declared maxima. Under that contract, these full totals
+    imply that every sequence has its canonical maximum length. Keeping this
+    decision shape-only also makes the SDPA autograd path CUDA-graph capturable.
+    """
+    return (
+        q.shape[0] == spec.batch * spec.seqlen_q
+        and k.shape[0] == spec.batch * spec.seqlen_k
     )
 
 
@@ -936,9 +922,7 @@ def flash_attn_varlen_func(
                 "deterministic=True is not supported by the varlen PyTorch "
                 "SDPA autograd fallback"
             )
-        if not _has_canonical_full_varlen_layout(
-            q, k, cu_seqlens_q, cu_seqlens_k, spec
-        ):
+        if not _has_full_varlen_token_totals(q, k, spec):
             raise NotImplementedError(
                 "varlen backward requires all eight query and key sequences "
                 "to have the canonical length 512; partial or ragged batches "

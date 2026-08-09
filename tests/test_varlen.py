@@ -791,7 +791,6 @@ def test_full_noncausal_varlen_no_grad_retains_generated_dispatch(
     [
         ("causal", "implemented only"),
         ("deterministic", "deterministic=True"),
-        ("noncanonical-offsets", "canonical length 512"),
     ],
 )
 def test_full_varlen_backward_rejects_out_of_scope_calls(
@@ -803,9 +802,6 @@ def test_full_varlen_backward_rejects_out_of_scope_calls(
     kwargs: dict[str, object] = {"causal": spec.causal, "shape": spec}
     if case == "deterministic":
         kwargs["deterministic"] = True
-    elif case == "noncanonical-offsets":
-        cu_q = cu_q.clone()
-        cu_q[1] -= 1
 
     def reject_sdpa(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
         raise AssertionError("unsupported varlen backward reached dense SDPA")
@@ -1540,6 +1536,38 @@ def test_varlen_supports_cuda_graph_capture() -> None:
         captured = run()
     graph.replay()
     torch.cuda.synchronize(q.device)
+    torch.testing.assert_close(captured, expected)
+
+
+@requires_cuda
+def test_full_noncausal_varlen_grad_enabled_supports_cuda_graph_capture() -> None:
+    spec = VARLEN_ALIBI_NONCAUSAL
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+
+    def run() -> torch.Tensor:
+        return helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            shape=spec,
+        )
+
+    expected = run().detach()
+    torch.cuda.synchronize(q.device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = run()
+    graph.replay()
+    torch.cuda.synchronize(q.device)
+
+    assert captured.grad_fn is not None
     torch.testing.assert_close(captured, expected)
 
 

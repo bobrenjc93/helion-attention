@@ -124,14 +124,15 @@ explicitly.
 
 Zero-dropout backward is supported for the noncausal bf16
 `(8, 512, 512, 16, 16, 64)` varlen profile only when all eight query and key
-sequences have length 512, with cumulative offsets exactly
-`[0, 512, ..., 4096]`. That narrow case views the packed tensors as a dense
+sequences have length 512 (so their valid cumulative offsets are
+`[0, 512, ..., 4096]`). That narrow case views the packed tensors as a dense
 batch and uses PyTorch SDPA autograd for the forward and Q/K/V gradients; both
-the default and a custom `softmax_scale` are supported. The varlen QKV/KV-packed
-adapters inherit the same support. Calls that do not require gradients continue
-to use the generated varlen kernel, including full-length calls. Ragged,
-causal, deterministic, paged, ALiBi, diagnostic-return, and positive-dropout
-varlen backward calls remain explicitly unsupported.
+the default and a custom `softmax_scale` are supported, including during CUDA
+graph capture. The varlen QKV/KV-packed adapters inherit the same support.
+Calls that do not require gradients continue to use the generated varlen
+kernel, including full-length calls. Ragged, causal, deterministic, paged,
+ALiBi, diagnostic-return, and positive-dropout varlen backward calls remain
+explicitly unsupported.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
 profiles when `block_table` is supplied. Both use bf16 page-size-16 caches in
