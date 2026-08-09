@@ -381,7 +381,7 @@ Paged rows use identical logical caches with each implementation's native page s
 | batch=1 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1494 | 354 | 471 | 506 | 263 | 92 | **4.22x slower** |
 | batch=1 seqlen_q=64 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 28 | 350 | 216 | n/a | 327 | 3 | **12.73x faster** |
 | batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 5155 | 742 | 1498 | 1589 | 890 | 93 | **6.95x slower** |
-| batch=1 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1609 | n/a | 1671 | 1803 | 1025 | 342 | n/a |
+| batch=1 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1598 | 868 | 1678 | 1821 | 1016 | 344 | **1.84x slower** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=16 head_dim=256 dtype=bf16 causal=False | 273 | 309 | 200 | 200 | n/a | 126 | **1.13x faster** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True | 110 | 350 | 198 | 197 | 196 | 78 | **3.19x faster** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=False | 130 | 303 | 199 | 195 | 195 | 132 | **2.33x faster** |
@@ -405,9 +405,9 @@ Paged rows use identical logical caches with each implementation's native page s
 | paged page_size=16 batch=2 seqlen_q=200 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 103 | 312 | 209 | n/a | n/a | 2 | **3.02x faster** |
 | paged page_size=16 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 121 | 267 | 95 | n/a | n/a | 0 | **2.20x faster** |
 
-Against FlashAttention 3, Helion is faster on 16 kernel workloads and slower on 15 kernel workloads.
+Against FlashAttention 3, Helion is faster on 16 kernel workloads and slower on 16 kernel workloads.
 
-Geomean speedup over FlashAttention 3 across all 31 comparable kernel workloads: **1.36x**.
+Geomean speedup over FlashAttention 3 across all 32 comparable kernel workloads: **1.32x**.
 
 Helion is the fastest measured implementation on 15 of 35 workloads; FA2, FA3, or a PyTorch SDPA backend is faster on the remainder.
 <!-- BENCHMARKS:END -->
