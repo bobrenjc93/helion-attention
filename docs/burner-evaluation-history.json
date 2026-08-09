@@ -1843,6 +1843,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:0a7fc9dd62ee70d9dbed7d54c51fee783cf7c5fa",
+      "commit": "0a7fc9dd62ee70d9dbed7d54c51fee783cf7c5fa",
+      "recordedAt": "2026-08-09T17:15:23.424Z",
+      "label": "base 0a7fc9d",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:90",
+      "recordedAt": "2026-08-09T17:15:23.424Z",
+      "label": "PR #90",
+      "kind": "leaf",
+      "prNumber": 90,
+      "title": "Accept page-256 paged decode through the KV-cache API",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
