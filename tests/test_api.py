@@ -35,6 +35,10 @@ GRAPH_DECODE_SHAPES = [
 LONG_DECODE = next(
     entry for entry in DECODE_SHAPES if int(entry["seqlen_k"]) == 16384
 )
+REMAP_DECODE_KEY = "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal"
+REMAP_DECODE = spec_from_manifest_entry(
+    next(entry for entry in DECODE_SHAPES if entry["key"] == REMAP_DECODE_KEY)
+)
 BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
 ENCODER_TRAINING = spec_from_manifest_entry(BACKWARD_SHAPES[0])
 BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
@@ -128,6 +132,42 @@ def make_inputs(
         rand(spec.seqlen_k, spec.nheads_kv),
         rand(spec.seqlen_k, spec.nheads_kv),
     )
+
+
+def make_remapped_kvcache_inputs(
+    *, cache_batch: int = 3, seed: int = 424242
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    q = torch.randn(
+        (
+            REMAP_DECODE.batch,
+            REMAP_DECODE.seqlen_q,
+            REMAP_DECODE.nheads_q,
+            REMAP_DECODE.head_dim,
+        ),
+        device="cuda",
+        dtype=REMAP_DECODE.dtype,
+        generator=generator,
+    )
+    cache_shape = (
+        cache_batch,
+        REMAP_DECODE.seqlen_k,
+        REMAP_DECODE.nheads_kv,
+        REMAP_DECODE.head_dim,
+    )
+    k_cache = torch.randn(
+        cache_shape,
+        device="cuda",
+        dtype=REMAP_DECODE.dtype,
+        generator=generator,
+    )
+    v_cache = torch.randn(
+        cache_shape,
+        device="cuda",
+        dtype=REMAP_DECODE.dtype,
+        generator=generator,
+    )
+    return q, k_cache, v_cache
 
 
 def make_rotary_tables(
@@ -3275,6 +3315,276 @@ def test_kvcache_entry_point_matches_plain_attention(
         shape=spec,
     )
     torch.testing.assert_close(cached, plain)
+
+
+@requires_cuda
+@pytest.mark.parametrize("row", [0, 2], ids=["first-row", "last-row"])
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+@pytest.mark.parametrize("return_softmax_lse", [False, True], ids=["out", "out-lse"])
+def test_kvcache_batch_remap_matches_fp32_without_mutating_cache(
+    row: int,
+    softmax_scale: float | None,
+    return_softmax_lse: bool,
+) -> None:
+    q, k_cache, v_cache = make_remapped_kvcache_inputs()
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    cache_batch_idx = torch.tensor([row], device=q.device, dtype=torch.int32)
+    scale = (
+        1.0 / math.sqrt(REMAP_DECODE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_batch_idx=cache_batch_idx,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_softmax_lse=return_softmax_lse,
+        shape=REMAP_DECODE,
+    )
+    selected_k = k_cache[row : row + 1]
+    selected_v = v_cache[row : row + 1]
+    expected_out = reference_attention(
+        q, selected_k, selected_v, REMAP_DECODE, scale
+    )
+
+    if return_softmax_lse:
+        assert isinstance(result, tuple)
+        out, lse = result
+        expected_lse = reference_single_token_lse(
+            q, selected_k, REMAP_DECODE, scale
+        )
+        assert lse.shape == (1, REMAP_DECODE.nheads_q, 1)
+        assert lse.dtype == torch.float32
+        torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+    else:
+        assert isinstance(result, torch.Tensor)
+        out = result
+    torch.testing.assert_close(out.float(), expected_out, atol=5e-2, rtol=2e-2)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.23],
+    ids=["default-scale", "custom-scale"],
+)
+@pytest.mark.parametrize("return_softmax_lse", [False, True], ids=["out", "out-lse"])
+def test_kvcache_batch_remap_matches_fa2(
+    softmax_scale: float | None,
+    return_softmax_lse: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    q, k_cache, v_cache = make_remapped_kvcache_inputs(seed=515151)
+    cache_batch_idx = torch.tensor([1], device=q.device, dtype=torch.int32)
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_batch_idx=cache_batch_idx,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_softmax_lse=return_softmax_lse,
+        shape=REMAP_DECODE,
+    )
+    expected = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_batch_idx=cache_batch_idx,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_softmax_lse=return_softmax_lse,
+    )
+
+    if return_softmax_lse:
+        assert isinstance(got, tuple)
+        assert isinstance(expected, tuple)
+        got_out, got_lse = got
+        expected_out, expected_lse = expected
+        torch.testing.assert_close(got_lse, expected_lse, atol=2e-5, rtol=1e-5)
+    else:
+        assert isinstance(got, torch.Tensor)
+        assert isinstance(expected, torch.Tensor)
+        got_out, expected_out = got, expected
+    torch.testing.assert_close(
+        got_out.float(), expected_out.float(), atol=5e-3, rtol=1e-3
+    )
+
+
+@requires_cuda
+def test_kvcache_batch_idx_none_preserves_exact_dispatch(monkeypatch) -> None:
+    q, k_cache, v_cache = make_inputs(REMAP_DECODE, seed=616161)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+
+    def kernel(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+    ) -> torch.Tensor:
+        assert scale_arg == 1.0 / math.sqrt(REMAP_DECODE.head_dim)
+        calls.append((q_arg, k_arg, v_arg))
+        return sentinel
+
+    monkeypatch.setattr(helion_attention, "lookup", lambda _spec: kernel)
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_batch_idx=None,
+        causal=True,
+        shape=REMAP_DECODE,
+    )
+
+    assert result is sentinel
+    assert len(calls) == 1
+    called_q, called_k, called_v = calls[0]
+    assert called_q is q
+    assert called_k is k_cache
+    assert called_v is v_cache
+
+
+@requires_cuda
+def test_kvcache_batch_remap_rejects_before_attention_dispatch(monkeypatch) -> None:
+    q, k_cache, v_cache = make_remapped_kvcache_inputs(seed=717171)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    valid_idx = torch.tensor([1], device=q.device, dtype=torch.int32)
+
+    def reject_dispatch(_spec: AttnShape):
+        raise AssertionError("attention dispatch must not be reached")
+
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+
+    def reject(
+        error: type[Exception],
+        match: str,
+        *,
+        cache_batch_idx: object = valid_idx,
+        q_arg: torch.Tensor = q,
+        k_arg: torch.Tensor = k_cache,
+        v_arg: torch.Tensor = v_cache,
+        **kwargs: object,
+    ) -> None:
+        with pytest.raises(error, match=match):
+            helion_attention.flash_attn_with_kvcache(
+                q_arg,
+                k_arg,
+                v_arg,
+                cache_batch_idx=cache_batch_idx,
+                causal=True,
+                shape=REMAP_DECODE,
+                **kwargs,
+            )
+        assert torch.equal(k_cache, original_k)
+        assert torch.equal(v_cache, original_v)
+
+    reject(TypeError, "torch.Tensor", cache_batch_idx=object())
+    reject(
+        ValueError,
+        "shape",
+        cache_batch_idx=torch.tensor([[1]], device=q.device, dtype=torch.int32),
+    )
+    reject(
+        ValueError,
+        "torch.int32",
+        cache_batch_idx=valid_idx.to(torch.int64),
+    )
+    reject(ValueError, "CUDA tensor", cache_batch_idx=valid_idx.cpu())
+    reject(
+        ValueError,
+        "inclusive range",
+        cache_batch_idx=torch.tensor([-1], device=q.device, dtype=torch.int32),
+    )
+    reject(
+        ValueError,
+        "inclusive range",
+        cache_batch_idx=torch.tensor(
+            [k_cache.shape[0]], device=q.device, dtype=torch.int32
+        ),
+    )
+    reject(
+        ValueError,
+        "larger than",
+        k_arg=k_cache[:1].contiguous(),
+        v_arg=v_cache[:1].contiguous(),
+    )
+    reject(
+        NotImplementedError,
+        "read-only",
+        k=k_cache[:1, :1].contiguous(),
+        v=v_cache[:1, :1].contiguous(),
+        cache_seqlens=REMAP_DECODE.seqlen_k - 1,
+    )
+    reject(
+        NotImplementedError,
+        "partial or ragged",
+        cache_seqlens=REMAP_DECODE.seqlen_k - 1,
+    )
+    reject(
+        NotImplementedError,
+        "tensor-valued cache_seqlens",
+        cache_seqlens=torch.tensor(
+            [REMAP_DECODE.seqlen_k - 1],
+            device=q.device,
+            dtype=torch.int32,
+        ),
+    )
+    reject(
+        NotImplementedError,
+        "rotary embeddings",
+        rotary_cos=q,
+        rotary_sin=q,
+    )
+    reject(
+        NotImplementedError,
+        "autograd",
+        q_arg=q.detach().requires_grad_(),
+    )
+
+    other = min(
+        (
+            spec_from_manifest_entry(entry)
+            for entry in DECODE_SHAPES
+            if entry["key"] != REMAP_DECODE_KEY
+        ),
+        key=lambda candidate: candidate.seqlen_k,
+    )
+    other_q, _, _ = make_inputs(other, seed=818181)
+    other_cache_shape = (
+        2,
+        other.seqlen_k,
+        other.nheads_kv,
+        other.head_dim,
+    )
+    other_k = torch.randn(
+        other_cache_shape, device="cuda", dtype=other.dtype
+    )
+    other_v = torch.randn_like(other_k)
+    with pytest.raises(NotImplementedError, match="implemented only"):
+        helion_attention.flash_attn_with_kvcache(
+            other_q,
+            other_k,
+            other_v,
+            cache_batch_idx=torch.tensor(
+                [0], device=other_q.device, dtype=torch.int32
+            ),
+            causal=other.causal,
+            shape=other,
+        )
 
 
 @requires_cuda

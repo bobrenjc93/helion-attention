@@ -211,6 +211,14 @@ bounds recoverably, so it rejects CUDA graph capture and autograd. Omitting the
 length or passing the full length as a Python integer retains the checked-in
 split-KV generated kernel.
 
+The causal bf16 dense profile `(1, 1, 4096, 32, 8, 128)` accepts a contiguous
+CUDA int32 `cache_batch_idx` tensor shaped `[1]` on read-only calls. It selects
+any in-range row from a larger contiguous dense K/V cache batch, with the
+default or a custom `softmax_scale` and optional LSE. Bounds validation
+synchronizes once, so this path rejects CUDA graph capture and autograd. It
+never updates the source cache; omitting `cache_batch_idx` retains the original
+batch-one generated-kernel dispatch.
+
 Two exact bf16 profiles also accept a read-only page-size-16 cache through
 `flash_attn_with_kvcache`: chunked prefill `(2, 200, 320, 8, 2, 128)` with
 `causal=True`, and decode `(4, 1, 1024, 8, 2, 128)` with either causal mode.
@@ -542,6 +550,7 @@ doing something else:
   the exact read-only page-size-16 decode profile above; paged ALiBi cannot be
   combined with LSE, updates, rotary, or autograd
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
+  dense cache-batch remapping outside the exact read-only 4K profile above,
   dense tensor lengths outside the exact read-only 16K profile above, scalar
   partial caches, paged profiles other than the exact read-only page-size-16
   profiles above, paged LSE outside the exact decode profile above, and

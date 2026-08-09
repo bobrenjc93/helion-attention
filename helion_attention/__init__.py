@@ -120,6 +120,9 @@ _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
 _TENSOR_LENGTH_DENSE_KVCACHE_KEY = (
     "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
 )
+_BATCH_REMAP_DENSE_KVCACHE_KEY = (
+    "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal"
+)
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
         (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
@@ -686,6 +689,101 @@ def _tensor_length_dense_kvcache_forward(
     output, packed_lse = result
     softmax_lse = packed_lse.transpose(0, 1).contiguous().unsqueeze(-1)
     return output.reshape(output_shape), softmax_lse
+
+
+def _select_dense_kvcache_row(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_batch_idx: torch.Tensor,
+    spec: AttnShape,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate and select the one supported dense cache-batch remap."""
+    if not isinstance(cache_batch_idx, torch.Tensor):
+        raise TypeError("cache_batch_idx must be a torch.Tensor or None")
+    if cache_batch_idx.layout != torch.strided:
+        raise ValueError("cache_batch_idx must use torch.strided layout")
+    if tuple(cache_batch_idx.shape) != (1,):
+        raise ValueError(
+            "cache_batch_idx must have shape (1,), got "
+            f"{tuple(cache_batch_idx.shape)}"
+        )
+    if cache_batch_idx.dtype != torch.int32:
+        raise ValueError("cache_batch_idx must have dtype torch.int32")
+    if not cache_batch_idx.is_cuda:
+        raise ValueError(
+            "cache_batch_idx must be a CUDA tensor, got device "
+            f"{cache_batch_idx.device}"
+        )
+    if cache_batch_idx.device != q.device:
+        raise ValueError(
+            "cache_batch_idx must be on the same CUDA device as q, k_cache, "
+            "and v_cache"
+        )
+    if not cache_batch_idx.is_contiguous():
+        raise ValueError("cache_batch_idx must be contiguous")
+
+    expected_tail = (spec.seqlen_k, spec.nheads_kv, spec.head_dim)
+    for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
+        if not isinstance(cache, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor")
+        if cache.layout != torch.strided:
+            raise ValueError(f"{name} must use torch.strided layout")
+        if cache.ndim != 4 or tuple(cache.shape[1:]) != expected_tail:
+            raise ValueError(
+                f"{name} must have shape [cache_batch, {spec.seqlen_k}, "
+                f"{spec.nheads_kv}, {spec.head_dim}], got {tuple(cache.shape)}"
+            )
+        if cache.dtype != spec.dtype:
+            raise ValueError(
+                f"{name} has dtype {cache.dtype} but shape declares {spec.dtype}"
+            )
+        if not cache.is_cuda:
+            raise ValueError(
+                f"{name} must be a CUDA tensor, got device {cache.device}"
+            )
+        if cache.device != q.device:
+            raise ValueError(
+                "q, k_cache, v_cache, and cache_batch_idx must be on the "
+                "same CUDA device"
+            )
+        if not cache.is_contiguous():
+            raise ValueError(
+                f"{name} must be contiguous in "
+                "[cache_batch, seqlen, nheads_kv, head_dim] layout"
+            )
+
+    cache_batch = k_cache.shape[0]
+    if v_cache.shape[0] != cache_batch:
+        raise ValueError(
+            "k_cache and v_cache must have the same cache batch size, got "
+            f"{cache_batch} and {v_cache.shape[0]}"
+        )
+    if cache_batch <= spec.batch:
+        raise ValueError(
+            "cache_batch_idx requires a dense cache batch larger than the "
+            f"declared query batch ({spec.batch}), got {cache_batch}"
+        )
+
+    # Bounds failures must be recoverable host exceptions rather than device
+    # assertions. The resulting synchronization also makes this deliberately
+    # narrow path unsuitable for CUDA graph capture.
+    with torch.cuda.device(q.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "cache_batch_idx is not supported during CUDA graph capture"
+            )
+        row = int(cache_batch_idx.detach().item())
+    if row < 0 or row >= cache_batch:
+        raise ValueError(
+            "cache_batch_idx values must be in the inclusive range "
+            f"[0, {cache_batch - 1}], got {row}"
+        )
+
+    selected_k = k_cache.narrow(0, row, 1)
+    selected_v = v_cache.narrow(0, row, 1)
+    check_tensors(q, selected_k, selected_v, spec)
+    return selected_k, selected_v
 
 
 def _generic_dense_diagnostic_forward(
@@ -1643,11 +1741,14 @@ def flash_attn_with_kvcache(
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
-    bf16 ``(1, 1, 16384, 32, 8, 128)`` profile additionally accepts a contiguous
-    CUDA int32 tensor shaped ``[1]`` selecting a prefix of length 1 through
-    16384. This tensor-length path synchronizes once for recoverable bounds
-    validation and rejects CUDA graph capture and autograd. A paired, one-token
-    ``k`` and ``v`` update is supported when a Python integer
+    bf16 ``(1, 1, 4096, 32, 8, 128)`` profile additionally accepts a contiguous
+    CUDA int32 ``cache_batch_idx`` shaped ``[1]`` to select one row from a
+    larger contiguous dense cache batch. The causal bf16
+    ``(1, 1, 16384, 32, 8, 128)`` profile accepts a contiguous CUDA int32
+    ``cache_seqlens`` tensor shaped ``[1]`` selecting a prefix of length 1
+    through 16384. These device-indexed paths synchronize once for recoverable
+    bounds validation and reject CUDA graph capture and autograd. A paired,
+    one-token ``k`` and ``v`` update is supported when a Python integer
     ``cache_seqlens`` is exactly one less than the declared length; the update
     is copied into the final cache slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
@@ -1681,8 +1782,15 @@ def flash_attn_with_kvcache(
     if (rotary_cos is None) != (rotary_sin is None):
         raise ValueError("rotary_cos and rotary_sin must be provided together")
     apply_rotary = rotary_cos is not None
-    if cache_batch_idx is not None:
-        raise NotImplementedError("cache_batch_idx is not implemented")
+    remap_cache_batch = cache_batch_idx is not None
+    if remap_cache_batch and append_kv:
+        raise NotImplementedError(
+            "cache_batch_idx is implemented only for read-only KV-cache calls"
+        )
+    if remap_cache_batch and block_table is not None:
+        raise NotImplementedError(
+            "cache_batch_idx is implemented only for a dense KV cache"
+        )
     if cache_leftpad is not None:
         raise NotImplementedError("cache_leftpad is not implemented")
     if num_splits != 0:
@@ -1720,6 +1828,11 @@ def flash_attn_with_kvcache(
         raise NotImplementedError(
             "flash_attn_with_kvcache currently supports only seqlen_q=1 "
             "with a non-empty cache"
+        )
+    if remap_cache_batch and spec.key != _BATCH_REMAP_DENSE_KVCACHE_KEY:
+        raise NotImplementedError(
+            "cache_batch_idx is implemented only for read-only "
+            f"{_BATCH_REMAP_DENSE_KVCACHE_KEY}"
         )
     tensor_cache_seqlens = (
         cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
@@ -1772,9 +1885,12 @@ def flash_attn_with_kvcache(
     # Dispatch directly after the KV-cache-specific checks. Routing back
     # through flash_attn_func would repeat normalization and validation on
     # every latency-sensitive decode step.
-    check_tensors(q, k_cache, v_cache, spec)
-    if k_cache.device != q.device or v_cache.device != q.device:
-        raise ValueError("q, k_cache, and v_cache must be on the same CUDA device")
+    if not remap_cache_batch:
+        check_tensors(q, k_cache, v_cache, spec)
+        if k_cache.device != q.device or v_cache.device != q.device:
+            raise ValueError(
+                "q, k_cache, and v_cache must be on the same CUDA device"
+            )
     if append_kv:
         assert k is not None and v is not None
         expected_update = (spec.batch, 1, spec.nheads_kv, spec.head_dim)
@@ -1837,6 +1953,31 @@ def flash_attn_with_kvcache(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    if remap_cache_batch:
+        assert cache_batch_idx is not None
+        selected_k, selected_v = _select_dense_kvcache_row(
+            q,
+            k_cache,
+            v_cache,
+            cache_batch_idx,
+            spec,
+        )
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError("cache_batch_idx does not support autograd")
+        # Resolve the generated specialization only after every remap-specific
+        # feature, tensor, bounds, and autograd check has succeeded.
+        kernel = lookup(spec)
+        if return_softmax_lse:
+            return kernel(
+                q,
+                selected_k,
+                selected_v,
+                scale,
+                return_softmax_lse=True,
+            )
+        return kernel(q, selected_k, selected_v, scale)
     if tensor_cache_seqlens is not None:
         _validate_dense_kvcache_tensor_length(
             tensor_cache_seqlens,
