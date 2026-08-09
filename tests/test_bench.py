@@ -4,28 +4,88 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
 
-from benchmarks.inventory import benchmark_entries
-from benchmarks.inventory import benchmark_key
-from benchmarks.render import render_markdown
-from benchmarks.timing import timing_metadata
 from helion_attention._sdpa import sdpa_causal_options
 from helion_attention._shape import AttnShape
 
 REPO_ROOT = Path(__file__).parents[1]
-UPDATE_README_PATH = Path(__file__).parents[1] / "tools" / "update_readme.py"
-UPDATE_README_SPEC = importlib.util.spec_from_file_location(
-    "helion_attention_update_readme", UPDATE_README_PATH
+
+
+def _load_repo_module(name: str, path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+benchmark_inventory = _load_repo_module(
+    "helion_attention_benchmark_inventory", REPO_ROOT / "benchmarks" / "inventory.py"
 )
-assert UPDATE_README_SPEC is not None
-assert UPDATE_README_SPEC.loader is not None
-update_readme = importlib.util.module_from_spec(UPDATE_README_SPEC)
-UPDATE_README_SPEC.loader.exec_module(update_readme)
+benchmark_timing = _load_repo_module(
+    "helion_attention_benchmark_timing", REPO_ROOT / "benchmarks" / "timing.py"
+)
+
+# The renderer and README updater retain their production import path while they
+# load, without requiring or replacing the top-level ``benchmarks`` package.
+_missing = object()
+_previous_timing = sys.modules.get("benchmarks.timing", _missing)
+sys.modules["benchmarks.timing"] = benchmark_timing
+try:
+    benchmark_render = _load_repo_module(
+        "helion_attention_benchmark_render", REPO_ROOT / "benchmarks" / "render.py"
+    )
+    update_readme = _load_repo_module(
+        "helion_attention_update_readme", REPO_ROOT / "tools" / "update_readme.py"
+    )
+finally:
+    if _previous_timing is _missing:
+        del sys.modules["benchmarks.timing"]
+    else:
+        sys.modules["benchmarks.timing"] = _previous_timing
+
+benchmark_entries = benchmark_inventory.benchmark_entries
+benchmark_key = benchmark_inventory.benchmark_key
+render_markdown = benchmark_render.render_markdown
+timing_metadata = benchmark_timing.timing_metadata
+
+
+def test_collects_with_unrelated_benchmarks_package_preloaded() -> None:
+    test_path = str(Path(__file__).resolve())
+    script = f"""
+import sys
+import types
+
+shadowed_package = types.ModuleType("benchmarks")
+shadowed_package.__path__ = []
+shadowed_package.marker = object()
+sys.modules["benchmarks"] = shadowed_package
+
+import pytest
+
+result = pytest.main(["--collect-only", "-q", {test_path!r}])
+assert sys.modules["benchmarks"] is shadowed_package
+raise SystemExit(result)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_decode_omits_all_true_causal_mask_for_fused_sdpa() -> None:
