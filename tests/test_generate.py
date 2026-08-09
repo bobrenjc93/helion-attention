@@ -432,6 +432,11 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
         persistent_mha_2k,
         nheads_kv=8,
     )
+    persistent_llama_8k = replace(
+        persistent_llama_2k,
+        seqlen_q=8192,
+        seqlen_k=8192,
+    )
     for exact in (
         persistent_16k,
         persistent_qwen_2k,
@@ -439,6 +444,7 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
         persistent_qwen_b4_4k,
         persistent_qwen_b4_8k,
         persistent_llama_2k,
+        persistent_llama_8k,
         persistent_mha_2k,
     ):
         assert (

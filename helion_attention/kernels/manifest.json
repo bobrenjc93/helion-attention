@@ -833,11 +833,10 @@
     },
     {
       "autotuning_provenance": {
-        "autotuning_wall_time_seconds": 1492.333,
+        "autotuning_wall_time_seconds": 0.0,
         "configs": [
           {
             "config": {
-              "atomic_indexing": [],
               "block_sizes": [
                 128,
                 128
@@ -845,55 +844,21 @@
               "indexing": [
                 "pointer",
                 "tensor_descriptor",
-                "tensor_descriptor",
+                "block_ptr",
+                "pointer",
                 "pointer"
               ],
-              "l2_groupings": [
-                32
-              ],
-              "load_eviction_policies": [
-                "last",
-                "",
-                "first"
-              ],
-              "loop_orders": [
-                [
-                  1,
-                  0
-                ]
-              ],
-              "num_sm_multiplier": 16,
+              "num_sm_multiplier": 1,
               "num_stages": 3,
               "num_warps": 8,
-              "pid_type": "persistent_interleaved",
-              "range_flattens": [
-                false,
-                false,
-                true
-              ],
-              "range_multi_buffers": [
-                null,
-                null,
-                null
-              ],
-              "range_num_stages": [
-                3,
-                4,
-                4
-              ],
-              "range_unroll_factors": [
-                0,
-                3,
-                3
-              ],
-              "range_warp_specializes": []
+              "pid_type": "persistent_interleaved"
             },
-            "kernel": "causal_attention_bshd"
+            "kernel": "causal_attention_bshd_16k"
           }
         ],
         "helion_version": "1.4.0",
-        "measured_time_ms": 5.442768,
-        "selection": "autotuned"
+        "measured_time_ms": 1.555056,
+        "selection": "fixed"
       },
       "backward": false,
       "batch": 1,
