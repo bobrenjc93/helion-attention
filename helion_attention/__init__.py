@@ -890,17 +890,12 @@ def _paged_kvcache_forward(
     causal: bool,
     return_softmax_lse: bool,
     shape: ShapeLike,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Adapt exact read-only dense-query paged profiles to core varlen."""
     if append_kv:
         raise NotImplementedError(
             "paged KV-cache updates are not implemented; paged caches are read-only"
         )
-    if return_softmax_lse:
-        raise NotImplementedError(
-            "return_softmax_lse is not implemented for paged KV caches"
-        )
-
     spec = normalize_shape(shape, q.dtype, causal)
     for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
         if not isinstance(cache, torch.Tensor):
@@ -917,6 +912,21 @@ def _paged_kvcache_forward(
         )
     page_size = k_cache.shape[1]
     _check_core_paged_kvcache_spec(spec, page_size)
+    requested = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    )
+    if return_softmax_lse and requested != _CORE_PAGED_KVCACHE_SHAPE:
+        raise NotImplementedError(
+            "return_softmax_lse=True for paged KV caches is implemented only "
+            "for the bf16 page-size-16 batch=4 seqlen_q=1 seqlen_k=1024 "
+            "nheads=8 (GQA 8:2) head_dim=128 decode profile"
+        )
 
     expected_q = (
         spec.batch,
@@ -981,6 +991,64 @@ def _paged_kvcache_forward(
             cache_seqlens.cumsum(dim=0, dtype=torch.int32),
         )
     )
+    if return_softmax_lse:
+        # The generated paged specialization intentionally stays on the lean
+        # output-only contract. Reuse the vLLM-compatible single-launch
+        # runtime only for the diagnostic return it already computes.
+        check_paged_varlen_tensors(
+            packed_q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_table,
+            spec,
+        )
+        from ._paged_attention import paged_attention
+
+        # The generic kernel indexes per-request lengths as a flat array and
+        # therefore requires unit-stride storage. Preserve the public adapter's
+        # support for valid strided metadata by normalizing only this argument.
+        seqused_k = cache_seqlens.contiguous()
+        result = paged_attention(
+            packed_q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            seqused_k,
+            block_table,
+            max_seqlen_q=spec.seqlen_q,
+            max_seqlen_k=spec.seqlen_k,
+            dynamic_max_seqlen_q=None,
+            dynamic_max_seqlen_k=None,
+            softmax_scale=scale,
+            causal=spec.causal,
+            window_size=(-1, -1),
+            softcap=0.0,
+            alibi_slopes=None,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            s_aux=None,
+            q_v=None,
+            cp_world_size=1,
+            cp_rank=0,
+            cp_tot_seqused_k=None,
+            out=None,
+            return_softmax_lse=True,
+            shift_fa2_lse=False,
+            fa_version=2,
+        )
+        if not isinstance(result, tuple):  # pragma: no cover - contract guard
+            raise RuntimeError("generic paged attention did not return softmax LSE")
+        packed_out, packed_lse = result
+        softmax_lse = (
+            packed_lse.reshape(spec.nheads_q, spec.batch, spec.seqlen_q)
+            .permute(1, 0, 2)
+            .contiguous()
+        )
+        return packed_out.reshape(expected_q), softmax_lse
+
     packed_out = flash_attn_varlen_func(
         packed_q,
         k_cache,
@@ -1032,8 +1100,9 @@ def flash_attn_with_kvcache(
     ``block_table``. Bf16 ``(2, 200, 320, 8, 2, 128)`` supports only
     ``causal=True`` and uses bottom-right causal alignment for chunked prefill.
     Bf16 ``(4, 1, 1024, 8, 2, 128)`` supports both causal modes, which are
-    equivalent for single-token bottom-right decode. Both route through
-    :func:`flash_attn_varlen_func` and support ragged logical caches.
+    equivalent for single-token bottom-right decode. Output-only calls route
+    through :func:`flash_attn_varlen_func`; both profiles support ragged logical
+    caches.
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. A paired,
@@ -1041,7 +1110,9 @@ def flash_attn_with_kvcache(
     ``cache_seqlens`` is exactly one less than that length; the update is copied
     into the final cache slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
-    ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. Cache
+    ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
+    decode profile supports the same return through the generic single-launch
+    paged runtime; output-only calls retain the generated specialization. Cache
     tensors created in inference mode must also be updated in inference mode,
     and an append requires disjoint query, K-cache, and V-cache memory. Dense
     tensor-valued/partial lengths and multi-token updates fail explicitly. A
@@ -1049,8 +1120,9 @@ def flash_attn_with_kvcache(
     final-slot append: it may cover the full head or the first 64 dimensions of
     a 128-dimensional head, must use the default interleaved layout, and rotates
     both ``q`` and the appended ``k`` at ``cache_seqlens``. Read-only rotary
-    calls and other paged profiles fail explicitly. Paged updates, rotary,
-    softmax LSE, and autograd are unsupported for both paged profiles.
+    calls and other paged profiles fail explicitly. Paged updates, rotary, and
+    autograd are unsupported for both paged profiles. Paged softmax LSE is
+    unsupported for chunked prefill, other profiles, and other page sizes.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")

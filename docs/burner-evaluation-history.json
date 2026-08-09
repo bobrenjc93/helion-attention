@@ -1153,6 +1153,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:649b02131ffa98490819cea40e9122be4e9db5cc",
+      "commit": "649b02131ffa98490819cea40e9122be4e9db5cc",
+      "recordedAt": "2026-08-09T01:41:51.190Z",
+      "label": "base 649b021",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 81,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:51",
+      "recordedAt": "2026-08-09T01:41:51.190Z",
+      "label": "PR #51",
+      "kind": "leaf",
+      "prNumber": 51,
+      "title": "Return LSE for the exposed paged decode cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 81,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
