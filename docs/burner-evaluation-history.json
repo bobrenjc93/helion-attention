@@ -2233,6 +2233,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:4b6614fa506a3e0a4dffa41d38cec5faa94c767f",
+      "commit": "4b6614fa506a3e0a4dffa41d38cec5faa94c767f",
+      "recordedAt": "2026-08-09T22:51:59.460Z",
+      "label": "base 4b6614f",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 67,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:105",
+      "recordedAt": "2026-08-09T22:51:59.460Z",
+      "label": "PR #105",
+      "kind": "leaf",
+      "prNumber": 105,
+      "title": "Enable ALiBi on the 4K dense decode cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 68,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
