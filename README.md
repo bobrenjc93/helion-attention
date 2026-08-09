@@ -193,7 +193,8 @@ out = helion_attention.flash_attn_with_kvcache(
 For dense caches, pass `return_softmax_lse=True` to receive
 `(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
 FlashAttention's KV-cache API. The exact paged decode profile below supports
-the same return for both the default and a custom `softmax_scale`.
+the same return for both the default and a custom `softmax_scale`, as does the
+exact paged chunked-prefill profile.
 
 Two exact bf16 profiles also accept a read-only page-size-16 cache through
 `flash_attn_with_kvcache`: chunked prefill `(2, 200, 320, 8, 2, 128)` with
@@ -230,12 +231,12 @@ out = helion_attention.flash_attn_with_kvcache(
 
 Slope-free output-only calls on these narrow paged paths route through their
 checked-in paged-varlen kernels. ALiBi decode calls use the generic single-launch
-paged runtime, as does requesting LSE without ALiBi; the latter returns fp32
-`[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. Neither path mutates the
-cache. ALiBi with LSE, paged updates, rotary, and autograd are rejected before
-dispatch. ALiBi on chunked prefill, LSE on chunked prefill, non-causal chunked
-prefill, every other paged profile, and every other page size are also rejected
-before dispatch.
+paged runtime, as does requesting LSE without ALiBi. LSE returns are fp32:
+`[2, 8, 200]` alongside chunked-prefill output and `[4, 8, 1]` alongside decode
+output. Neither path mutates the cache. ALiBi with LSE, paged updates, rotary,
+and autograd are rejected before dispatch. ALiBi on chunked prefill, non-causal
+chunked prefill, every other paged profile, and every other page size are also
+rejected before dispatch.
 
 The dense decode path also appends one paired K/V token when a scalar cache
 length points at the final slot declared by `shape`:
@@ -522,8 +523,8 @@ doing something else:
   combined with LSE, updates, rotary, or autograd
 - KV-cache mutation beyond the dense paired one-token final-slot append above;
   dense partial/ragged caches, paged profiles other than the exact read-only
-  page-size-16 profiles above, paged LSE outside the exact decode profile
-  above, and KV-cache rotary outside the full-head or D128 half-head
+  page-size-16 profiles above, paged LSE outside those exact profiles, and
+  KV-cache rotary outside the full-head or D128 half-head
   interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
   KV-packed calls, dense/KV-packed calls for the three Llama GQA decode

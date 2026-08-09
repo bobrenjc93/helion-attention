@@ -329,6 +329,40 @@ def reference_paged_single_token_lse(
     return torch.stack(lse)
 
 
+def reference_paged_chunked_prefill_lse(
+    q: torch.Tensor,
+    logical_caches: list[tuple[torch.Tensor, torch.Tensor]],
+    spec: AttnShape,
+    scale: float,
+) -> torch.Tensor:
+    """Compute bottom-right causal ragged GQA LSE for every query row."""
+    group = spec.nheads_q // spec.nheads_kv
+    lse: list[torch.Tensor] = []
+    for query, (logical_k, _) in zip(q, logical_caches):
+        grouped_q = (
+            query.float()
+            .reshape(spec.seqlen_q, spec.nheads_kv, group, spec.head_dim)
+            .permute(1, 2, 0, 3)
+        )
+        grouped_k_t = logical_k.float().permute(1, 2, 0).unsqueeze(1)
+        scores = torch.matmul(grouped_q, grouped_k_t) * scale
+        row = torch.arange(spec.seqlen_q, device=q.device)[:, None]
+        col = torch.arange(logical_k.shape[0], device=q.device)[None, :]
+        visible = col <= row + logical_k.shape[0] - spec.seqlen_q
+        scores.masked_fill_(~visible[None, None], float("-inf"))
+        request_lse = torch.logsumexp(scores, dim=-1).reshape(
+            spec.nheads_q, spec.seqlen_q
+        )
+        # FlashAttention 2 reports +inf for fully masked query rows.
+        request_lse = torch.where(
+            visible.any(dim=-1).unsqueeze(0),
+            request_lse,
+            torch.full_like(request_lse, float("inf")),
+        )
+        lse.append(request_lse)
+    return torch.stack(lse)
+
+
 def reference_paged_single_token_alibi(
     q: torch.Tensor,
     logical_caches: list[tuple[torch.Tensor, torch.Tensor]],
@@ -2333,6 +2367,77 @@ def test_paged_kvcache_alibi_matches_fa2_and_fp32_for_ragged_permuted_pages(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
+def test_paged_kvcache_chunked_prefill_returns_fp32_lse_for_ragged_permuted_pages(
+    softmax_scale: float | None,
+) -> None:
+    spec = PAGED_CHUNKED_PREFILL
+    q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
+        make_paged_kvcache_inputs(
+            spec=spec,
+            lengths=[113, 271],
+            seed=20260809,
+        )
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_softmax_lse=True,
+        shape=spec,
+    )
+    assert isinstance(result, tuple)
+    out, lse = result
+
+    expected_out = []
+    for query, (logical_k, logical_v) in zip(q, logical_caches):
+        row = torch.arange(query.shape[0], device=q.device)[:, None]
+        col = torch.arange(logical_k.shape[0], device=q.device)[None, :]
+        bottom_right_mask = col <= row + logical_k.shape[0] - query.shape[0]
+        expected_out.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                query.float().transpose(0, 1).unsqueeze(0),
+                logical_k.float().transpose(0, 1).unsqueeze(0),
+                logical_v.float().transpose(0, 1).unsqueeze(0),
+                attn_mask=bottom_right_mask,
+                scale=scale,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+    expected_lse = reference_paged_chunked_prefill_lse(
+        q, logical_caches, spec, scale
+    )
+
+    assert out.shape == (2, 200, 8, 128)
+    assert out.dtype == q.dtype
+    assert lse.shape == (2, 8, 200)
+    assert lse.dtype == torch.float32
+    assert lse.device == q.device
+    torch.testing.assert_close(
+        out.float(), torch.stack(expected_out), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(lse, expected_lse, atol=2e-3, rtol=1e-3)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
 @pytest.mark.parametrize(
     "length_stride", [1, 2], ids=["contiguous-lengths", "stride-2-lengths"]
 )
@@ -2697,6 +2802,7 @@ def test_paged_kvcache_alibi_rejects_other_profiles_before_dispatch(
             block_table=block_table,
             causal=True,
             alibi_slopes=slopes,
+            return_softmax_lse=True,
             shape=spec,
         )
 
@@ -2893,19 +2999,30 @@ def test_paged_kvcache_chunked_prefill_rejects_unsupported_modes_before_dispatch
 
     with pytest.raises(NotImplementedError, match="read-only"):
         helion_attention.flash_attn_with_kvcache(
-            q, k_cache, v_cache, k=update_k, v=update_v, **base
-        )
-    with pytest.raises(NotImplementedError, match="return_softmax_lse"):
-        helion_attention.flash_attn_with_kvcache(
-            q, k_cache, v_cache, return_softmax_lse=True, **base
+            q,
+            k_cache,
+            v_cache,
+            k=update_k,
+            v=update_v,
+            return_softmax_lse=True,
+            **base,
         )
     with pytest.raises(NotImplementedError, match="rotary embeddings"):
         helion_attention.flash_attn_with_kvcache(
-            q, k_cache, v_cache, rotary_cos=q, **base
+            q,
+            k_cache,
+            v_cache,
+            rotary_cos=q,
+            return_softmax_lse=True,
+            **base,
         )
     with pytest.raises(NotImplementedError, match="autograd"):
         helion_attention.flash_attn_with_kvcache(
-            q.detach().requires_grad_(), k_cache, v_cache, **base
+            q.detach().requires_grad_(),
+            k_cache,
+            v_cache,
+            return_softmax_lse=True,
+            **base,
         )
     with pytest.raises(UnsupportedShapeError, match="causal=True"):
         helion_attention.flash_attn_with_kvcache(
@@ -2915,6 +3032,7 @@ def test_paged_kvcache_chunked_prefill_rejects_unsupported_modes_before_dispatch
             cache_seqlens=cache_seqlens,
             block_table=block_table,
             causal=False,
+            return_softmax_lse=True,
             shape=(2, 200, 320, 8, 2, 128),
         )
 
@@ -2926,7 +3044,21 @@ def test_paged_kvcache_chunked_prefill_rejects_unsupported_modes_before_dispatch
             q,
             k_cache,
             v_cache,
+            return_softmax_lse=True,
             **{**base, "shape": other_profile},
+        )
+
+    page_32_k = torch.empty(
+        1, 32, spec.nheads_kv, spec.head_dim, device=q.device, dtype=spec.dtype
+    )
+    page_32_v = torch.empty_like(page_32_k)
+    with pytest.raises(UnsupportedShapeError, match="page_size=16"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            page_32_k,
+            page_32_v,
+            return_softmax_lse=True,
+            **base,
         )
 
     assert torch.equal(k_cache, original_k)

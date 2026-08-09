@@ -11,7 +11,8 @@ direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
 profiles, and diagnostics on the shipped causal varlen profile use a generic
 Triton forward kernel. The exposed page-16 decode cache also uses the generic
-paged runtime when ALiBi is supplied.
+paged runtime when ALiBi is supplied, and both exposed paged profiles use it
+for LSE returns.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -1222,11 +1223,15 @@ def _paged_kvcache_forward(
         spec.head_dim,
         spec.dtype,
     )
-    if return_softmax_lse and requested != _CORE_PAGED_KVCACHE_SHAPE:
+    if return_softmax_lse and requested not in {
+        _CORE_PAGED_CHUNKED_PREFILL_SHAPE,
+        _CORE_PAGED_KVCACHE_SHAPE,
+    }:
         raise NotImplementedError(
             "return_softmax_lse=True for paged KV caches is implemented only "
-            "for the bf16 page-size-16 batch=4 seqlen_q=1 seqlen_k=1024 "
-            "nheads=8 (GQA 8:2) head_dim=128 decode profile"
+            "for the bf16 page-size-16 batch=2 seqlen_q=200 seqlen_k=320 "
+            "chunked-prefill and batch=4 seqlen_q=1 seqlen_k=1024 decode "
+            "profiles with nheads=8 (GQA 8:2) head_dim=128"
         )
     if alibi_slopes is not None:
         if requested != _CORE_PAGED_KVCACHE_SHAPE:
@@ -1445,9 +1450,10 @@ def flash_attn_with_kvcache(
     into the final cache slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
-    decode profile supports the same return through the generic single-launch
-    paged runtime; slope-free output-only calls retain the generated
-    specialization. ALiBi cannot be combined with that LSE return. Cache tensors
+    profiles support the same return through the generic single-launch paged
+    runtime, with LSE shapes ``[2, 8, 200]`` for chunked prefill and
+    ``[4, 8, 1]`` for decode; slope-free output-only calls retain the generated
+    specializations. ALiBi cannot be combined with an LSE return. Cache tensors
     created in inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Dense
     tensor-valued/partial lengths and multi-token updates fail explicitly. A
@@ -1458,8 +1464,7 @@ def flash_attn_with_kvcache(
     calls and other paged profiles fail explicitly. Paged updates, rotary, and
     autograd are unsupported for both paged profiles. Paged ALiBi is unsupported
     for chunked prefill, updates, LSE returns, other profiles, and other page
-    sizes. Paged softmax LSE is unsupported for chunked prefill, other profiles,
-    and other page sizes.
+    sizes. Paged softmax LSE is unsupported for other profiles and page sizes.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
