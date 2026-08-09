@@ -1243,6 +1243,36 @@
         "eval_5b403bea": 96,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:681a6d64c8b4108cdcd99cdb51c0d662564d161a",
+      "commit": "681a6d64c8b4108cdcd99cdb51c0d662564d161a",
+      "recordedAt": "2026-08-09T03:53:13.477Z",
+      "label": "base 681a6d6",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 82,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:55",
+      "recordedAt": "2026-08-09T03:53:13.477Z",
+      "label": "PR #55",
+      "kind": "leaf",
+      "prNumber": 55,
+      "title": "Return diagnostics for shipped causal varlen attention",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 82,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
