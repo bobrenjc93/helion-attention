@@ -13,10 +13,11 @@ profiles, and diagnostics on the shipped causal varlen profile use a generic
 Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
 forward-only Gemma-2 profile. The exposed page-16 decode cache uses the generic
 paged runtime when ALiBi is supplied.
-Positive dropout on the shipped encoder-training profile, grad-enabled dense
-calls without a generated backward, and both full-length varlen profiles use
-PyTorch SDPA autograd. The explicit shape validates these paths and makes
-specialization introspection independent of fallback coverage.
+Positive dropout on the shipped encoder-training profile and its full-length
+causal varlen form use PyTorch SDPA autograd, as do grad-enabled dense calls
+without a generated backward and both full-length varlen profiles. The explicit
+shape validates these paths and makes specialization introspection independent
+of fallback coverage.
 """
 
 from __future__ import annotations
@@ -111,6 +112,9 @@ _VARLEN_ALIBI_KEYS = frozenset(
     }
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+_VARLEN_DROPOUT_SDPA_KEY = (
+    "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+)
 _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
     {
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
@@ -1118,18 +1122,20 @@ def flash_attn_varlen_func(
     zero.
 
     Both causal modes support zero-dropout backward when all eight query and
-    key sequences have length 512. That exact full-length layout is reshaped
-    to dense BSHD and uses PyTorch SDPA autograd. Ragged, deterministic, paged,
-    ALiBi, and diagnostic varlen backward remain unsupported. Calls that do
-    not need backward retain the generated packed kernel, including
-    full-length calls.
+    key sequences have length 512. The causal profile also supports
+    ``0 < dropout_p < 1`` for that exact full-length layout. These calls are
+    reshaped to dense BSHD and use PyTorch SDPA autograd. Ragged,
+    deterministic, paged, ALiBi, and diagnostic varlen dropout/backward remain
+    unsupported. Zero-dropout calls that do not need backward retain the
+    generated packed kernel, including full-length calls.
     """
-    _reject_unsupported(
+    dropout = _reject_unsupported(
         dropout_p,
         window_size,
         softcap,
         alibi_slopes,
         return_attn_probs,
+        allow_dropout=True,
         allow_alibi=block_table is None,
         allow_return_attn_probs=True,
     )
@@ -1137,6 +1143,22 @@ def flash_attn_varlen_func(
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
 
     spec = normalize_shape(shape, q.dtype, causal)
+    if dropout != 0.0:
+        requested = f"varlen_{spec.key}"
+        if block_table is not None:
+            raise NotImplementedError(
+                "dropout is not implemented for paged varlen calls with "
+                "block_table"
+            )
+        if requested != _VARLEN_DROPOUT_SDPA_KEY:
+            raise NotImplementedError(
+                "varlen dropout is implemented only for eight full-length "
+                f"sequences on {_VARLEN_DROPOUT_SDPA_KEY}; got {requested}"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "deterministic=True is not supported with varlen dropout"
+            )
     if max_seqlen_q != spec.seqlen_q or max_seqlen_k != spec.seqlen_k:
         raise ValueError(
             "max_seqlen_q/max_seqlen_k must match the maximum sequence lengths "
@@ -1211,7 +1233,7 @@ def flash_attn_varlen_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in grad_tensors
     )
-    if needs_backward:
+    if needs_backward or dropout != 0.0:
         if return_attn_probs:
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented for grad-enabled "
@@ -1235,6 +1257,12 @@ def flash_attn_varlen_func(
                 "SDPA autograd fallback"
             )
         if not _has_full_varlen_token_totals(q, k, spec):
+            if dropout != 0.0:
+                raise NotImplementedError(
+                    "varlen dropout requires all eight query and key sequences "
+                    "to have the canonical length 512; partial or ragged "
+                    "batches do not support dropout"
+                )
             raise NotImplementedError(
                 "varlen backward requires all eight query and key sequences "
                 "to have the canonical length 512; partial or ragged batches "
@@ -1252,7 +1280,12 @@ def flash_attn_varlen_func(
             spec.batch, spec.seqlen_k, spec.nheads_kv, spec.head_dim
         )
         dense_out = dense_attention_sdpa(
-            dense_q, dense_k, dense_v, float(softmax_scale), spec
+            dense_q,
+            dense_k,
+            dense_v,
+            float(softmax_scale),
+            spec,
+            dropout,
         )
         return dense_out.reshape(q.shape)
     if softmax_scale is None:

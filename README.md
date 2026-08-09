@@ -90,10 +90,11 @@ shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
 ALiBi backward is not implemented. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
-Other dropout calls, local windows, softcap outside the exact Gemma-2 subset
-above, dense diagnostic returns outside the subsets above, and deterministic
-dropout still fail explicitly as described below. Unregistered calls must also
-fit the generic kernel's signed 32-bit Q/output and K/V element offsets.
+Other dense dropout calls, local windows, softcap outside the exact Gemma-2
+subset above, dense diagnostic returns outside the subsets above, and
+deterministic dropout still fail explicitly as described below. Unregistered
+calls must also fit the generic kernel's signed 32-bit Q/output and K/V element
+offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -145,16 +146,18 @@ specialization. Other varlen profiles and paged calls made directly through the
 core varlen API still reject ALiBi explicitly; the narrow KV-cache decode path
 described below is the only paged exception.
 
-Zero-dropout backward is supported for both causal modes of the bf16
+Backward is supported for both causal modes of the bf16
 `(8, 512, 512, 16, 16, 64)` varlen profile only when all eight query and key
 sequences have length 512 (so their valid cumulative offsets are
 `[0, 512, ..., 4096]`). That narrow case views the packed tensors as a dense
 batch and uses PyTorch SDPA autograd for the forward and Q/K/V gradients; both
 the default and a custom `softmax_scale` are supported, including during CUDA
-graph capture. The varlen QKV/KV-packed adapters inherit the same support.
-Calls that do not require gradients continue to use the generated varlen
-kernel, including full-length calls. Ragged, deterministic, paged, ALiBi,
-diagnostic-return, and positive-dropout varlen backward calls remain explicitly
+graph capture. The causal profile additionally accepts `0 < dropout_p < 1`
+for this full-length layout, matching direct SDPA's RNG-dependent forward and
+Q/K/V gradients. The varlen QKV/KV-packed adapters inherit the same support.
+Zero-dropout calls that do not require gradients continue to use the generated
+varlen kernel, including full-length calls. Ragged, noncausal, deterministic,
+paged, ALiBi, and diagnostic-return varlen dropout calls remain explicitly
 unsupported.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
@@ -531,8 +534,9 @@ doing something else:
 - backward for dense or varlen ALiBi, ragged varlen batches, and KV-cache calls
 - `deterministic=True` when using the dense or full-length varlen SDPA autograd
   fallback
-- dropout outside the exact encoder-training profile above, or combined with
-  ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
+- dropout outside the exact dense encoder-training profile or its full-length
+  causal varlen form above, or combined with ALiBi, diagnostic returns, local
+  windows, softcap, or deterministic mode
 - sliding-window attention
 - softcap except for no-backward dense/KV-packed causal bf16
   `(1, 4096, 4096, 16, 8, 256)` calls with exactly `softcap=50.0`; the supported
