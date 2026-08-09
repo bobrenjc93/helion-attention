@@ -406,31 +406,51 @@ import threading as _threading
 
 from .._launcher import launcher_context as _launcher_context
 
-# Keep scratch alive between decode steps. Workspaces are stream-local, and
-# the lock keeps each partial/combine launch pair adjacent on a shared stream.
+# Captured graphs always get call-owned scratch so distinct graph executables
+# cannot race during replay. Eager calls retain a small, hard-capped stream
+# cache to avoid allocator churn on common decode stream pools.
+_SPLIT_KV_MAX_CACHED_STREAMS_PER_DEVICE = 4
 _SPLIT_KV_WORKSPACES = {{}}
+_SPLIT_KV_CACHE_LOCK = _threading.Lock()
+
+def _new_split_kv_workspace(q: torch.Tensor, num_splits: int):
+    return (
+        torch.empty(
+            (q.size(0), q.size(2), num_splits, 1, q.size(3)),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        torch.empty(
+            (q.size(0), q.size(2), 2, num_splits, 1),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        _threading.Lock(),
+    )
 
 def _split_kv_workspace(q: torch.Tensor, num_splits: int):
-    key = (
-        q.device.index,
-        torch.cuda.current_stream(q.device).cuda_stream,
-    )
+    current_stream = torch.cuda.current_stream(q.device)
+    if torch.cuda.is_current_stream_capturing():
+        return _new_split_kv_workspace(q, num_splits)
+
+    device_index = q.device.index
+    key = (device_index, current_stream.cuda_stream)
     workspace = _SPLIT_KV_WORKSPACES.get(key)
     if workspace is None:
-        candidate = (
-            torch.empty(
-                (q.size(0), q.size(2), num_splits, 1, q.size(3)),
-                dtype=torch.float32,
-                device=q.device,
-            ),
-            torch.empty(
-                (q.size(0), q.size(2), 2, num_splits, 1),
-                dtype=torch.float32,
-                device=q.device,
-            ),
-            _threading.Lock(),
-        )
-        workspace = _SPLIT_KV_WORKSPACES.setdefault(key, candidate)
+        with _SPLIT_KV_CACHE_LOCK:
+            workspace = _SPLIT_KV_WORKSPACES.get(key)
+            cached_on_device = sum(
+                cached_device == device_index
+                for cached_device, _ in _SPLIT_KV_WORKSPACES
+            )
+            if (
+                workspace is None
+                and cached_on_device < _SPLIT_KV_MAX_CACHED_STREAMS_PER_DEVICE
+            ):
+                workspace = _new_split_kv_workspace(q, num_splits)
+                _SPLIT_KV_WORKSPACES[key] = workspace
+    if workspace is None:
+        workspace = _new_split_kv_workspace(q, num_splits)
     return workspace
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float, *, _launcher=_default_launcher):

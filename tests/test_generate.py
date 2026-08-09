@@ -800,6 +800,12 @@ def test_split_kv_modules_are_composed_without_constexpr_collisions() -> None:
         generate._SPLIT_KV_DECODE_ENTRY_POINT
     )
     assert "torch.cuda.current_stream" in generate._SPLIT_KV_DECODE_ENTRY_POINT
+    assert "torch.cuda.is_current_stream_capturing" in (
+        generate._SPLIT_KV_DECODE_ENTRY_POINT
+    )
+    assert "_SPLIT_KV_MAX_CACHED_STREAMS_PER_DEVICE = 4" in (
+        generate._SPLIT_KV_DECODE_ENTRY_POINT
+    )
     assert "with workspace_lock" in generate._SPLIT_KV_DECODE_ENTRY_POINT
 
 
