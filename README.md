@@ -55,7 +55,8 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
 
-One forward-only Gemma-2 profile supports score capping: causal bf16
+Score capping is limited to two forward-only inference profiles. The dense
+causal-bf16 Gemma-2 profile
 `(1, 4096, 4096, 16, 8, 256)` accepts exactly `softcap=50.0` through
 `flash_attn_func` and `flash_attn_kvpacked_func`, with either the default or a
 custom `softmax_scale`. It uses the generic packed Triton runtime and applies
@@ -94,10 +95,11 @@ use raw PyTorch BSHD Flash gradients, falling back to the generated backward
 when Flash is unavailable. Explicit-scale, non-SM90, and deterministic calls
 retain the generated backward. The same profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
-Other dropout calls, local windows, softcap outside the exact Gemma-2 subset
-above, dense diagnostic returns outside the subsets above, and deterministic
-dropout still fail explicitly as described below. Unregistered calls must also
-fit the generic kernel's signed 32-bit Q/output and K/V element offsets.
+Other dropout calls, local windows, softcap outside the exact dense and varlen
+subsets described here, dense diagnostic returns outside the subsets above,
+and deterministic dropout still fail explicitly as described below.
+Unregistered calls must also fit the generic kernel's signed 32-bit Q/output
+and K/V element offsets.
 
 Packed variable-length batches use FlashAttention's THD layout and cumulative
 sequence lengths. The sequence dimensions in `shape` are the declared maxima;
@@ -129,6 +131,15 @@ out = helion_attention.flash_attn_varlen_func(
 `cu_seqlens_q` and `cu_seqlens_k` remain on the GPU and may describe different
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
+
+This shipped causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts
+exactly `softcap=50.0` for calls that do not require backward. Dynamic ragged
+query/key lengths and the default or a custom `softmax_scale` are supported by
+the unpacked and QKV/KV-packed entry points. Softcapped calls use the generic
+packed Triton runtime and apply `50 * tanh(scores / 50)` before softmax;
+`softcap=0` retains the generated specialization. Other caps and profiles,
+gradients, dropout, ALiBi, local windows, diagnostic returns, and paged calls
+remain unsupported with softcap.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
 `return_attn_probs=True` for forward-only calls with otherwise default options
@@ -558,9 +569,10 @@ forward-only. These unsupported FlashAttention features also raise
 - dropout outside the exact encoder-training profile above, or combined with
   ALiBi, diagnostic returns, local windows, softcap, or deterministic mode
 - sliding-window attention
-- softcap except for no-backward dense/KV-packed causal bf16
-  `(1, 4096, 4096, 16, 8, 256)` calls with exactly `softcap=50.0`; the supported
-  softcap cannot be combined with dropout, ALiBi, or diagnostic returns
+- softcap except for no-backward causal bf16 calls with exactly `softcap=50.0`
+  on dense/KV-packed `(1, 4096, 4096, 16, 8, 256)` or unpacked/QKV/KV-packed
+  varlen `(8, 512, 512, 16, 16, 64)`; the supported softcap cannot be combined
+  with dropout, ALiBi, local windows, diagnostic returns, or paged caches
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 profiles above; paged ALiBi cannot be combined

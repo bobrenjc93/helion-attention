@@ -37,6 +37,8 @@ VARLEN_ALIBI_NONCAUSAL = AttnShape(
 )
 VARLEN_ALIBI_PROFILES = (VARLEN_ALIBI_CAUSAL, VARLEN_ALIBI_NONCAUSAL)
 VARLEN_DIAGNOSTIC = VARLEN_ALIBI_CAUSAL
+VARLEN_SOFTCAP = VARLEN_ALIBI_CAUSAL
+VARLEN_SOFTCAP_VALUE = 50.0
 PAGED_DECODE = AttnShape(
     batch=4,
     seqlen_q=1,
@@ -335,6 +337,42 @@ def reference_packed(
             enable_gqa=q.size(1) != k.size(1),
         )
         out[q_start : q_start + seqlen_q] = result[0].transpose(0, 1)
+        q_start += seqlen_q
+        k_start += seqlen_k
+    return out
+
+
+def reference_softcap_packed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lengths_q: list[int],
+    lengths_k: list[int],
+    *,
+    causal: bool,
+    scale: float,
+    softcap: float,
+) -> torch.Tensor:
+    """Compute ragged softcapped attention directly in fp32."""
+    out = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+    q_start = 0
+    k_start = 0
+    for seqlen_q, seqlen_k in zip(lengths_q, lengths_k):
+        q_seq = q[q_start : q_start + seqlen_q].float().transpose(0, 1)
+        k_seq = k[k_start : k_start + seqlen_k].float().transpose(0, 1)
+        v_seq = v[k_start : k_start + seqlen_k].float().transpose(0, 1)
+        scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * scale
+        scores = softcap * torch.tanh(scores / softcap)
+        if causal:
+            row = torch.arange(seqlen_q, device=q.device)[:, None]
+            col = torch.arange(seqlen_k, device=q.device)[None, :]
+            keep = col <= row + seqlen_k - seqlen_q
+            scores.masked_fill_(~keep[None], float("-inf"))
+        probabilities = torch.softmax(scores, dim=-1)
+        # Bottom-right alignment can leave leading query rows with no keys.
+        probabilities.nan_to_num_(nan=0.0)
+        result = torch.matmul(probabilities, v_seq).transpose(0, 1)
+        out[q_start : q_start + seqlen_q] = result
         q_start += seqlen_q
         k_start += seqlen_k
     return out
@@ -1103,7 +1141,7 @@ def test_full_varlen_no_grad_retains_generated_dispatch(
     ],
     ids=["unpacked", "qkv-packed", "kv-packed"],
 )
-def test_ragged_causal_no_grad_retains_generated_dispatch(
+def test_ragged_causal_no_grad_softcap_zero_retains_generated_dispatch(
     name: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spec = VARLEN_ALIBI_CAUSAL
@@ -1118,8 +1156,14 @@ def test_ragged_causal_no_grad_retains_generated_dispatch(
     def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
         raise AssertionError("no-grad ragged varlen call reached SDPA")
 
+    def reject_softcap(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("softcap=0 call reached softcap dispatch")
+
     monkeypatch.setattr(helion_attention, "lookup_varlen", lambda _spec: generated)
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_softcap_forward", reject_softcap
+    )
     with torch.no_grad():
         if name == "flash_attn_varlen_func":
             out = helion_attention.flash_attn_varlen_func(
@@ -1131,6 +1175,7 @@ def test_ragged_causal_no_grad_retains_generated_dispatch(
                 spec.seqlen_q,
                 spec.seqlen_k,
                 causal=True,
+                softcap=0.0,
                 shape=spec,
             )
         elif name == "flash_attn_varlen_qkvpacked_func":
@@ -1140,6 +1185,7 @@ def test_ragged_causal_no_grad_retains_generated_dispatch(
                 cu_seqlens,
                 spec.seqlen_q,
                 causal=True,
+                softcap=0.0,
                 shape=spec,
             )
         else:
@@ -1152,6 +1198,7 @@ def test_ragged_causal_no_grad_retains_generated_dispatch(
                 spec.seqlen_q,
                 spec.seqlen_k,
                 causal=True,
+                softcap=0.0,
                 shape=spec,
             )
 
@@ -1544,6 +1591,224 @@ def test_causal_varlen_return_attn_probs_rejects_out_of_scope_calls(
             spec.seqlen_q,
             spec.seqlen_k,
             **kwargs,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("softmax_scale", "variant"),
+    [
+        pytest.param(None, 0, id="default-scale-ragged-a"),
+        pytest.param(0.37, 1, id="custom-scale-ragged-b"),
+    ],
+)
+def test_causal_varlen_softcap_matches_fa2_and_fp32_for_dynamic_ragged_calls(
+    softmax_scale: float | None, variant: int
+) -> None:
+    spec = VARLEN_SOFTCAP
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=variant, seed=20260809
+    )
+    # Exercise the nonlinear region of a cap as large as 50; unscaled random
+    # inputs would make capped and ordinary attention nearly identical.
+    q.mul_(4.0)
+    k.mul_(4.0)
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            softcap=VARLEN_SOFTCAP_VALUE,
+            shape=spec,
+        )
+        expected_fp32 = reference_softcap_packed(
+            q,
+            k,
+            v,
+            lengths_q,
+            lengths_k,
+            causal=True,
+            scale=scale,
+            softcap=VARLEN_SOFTCAP_VALUE,
+        )
+
+    assert got.shape == q.shape
+    assert got.dtype == torch.bfloat16
+    assert got.is_contiguous()
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+    # FlashAttention is an optional benchmark dependency. Keep the independent
+    # fp32 assertion above active in environments with only the dev extras.
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    with torch.no_grad():
+        expected_fa2 = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            softcap=VARLEN_SOFTCAP_VALUE,
+        )
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "name",
+    ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
+    ids=["qkv-packed", "kv-packed"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_varlen_packed_entry_points_inherit_softcap_support(
+    name: str, softmax_scale: float | None
+) -> None:
+    spec = VARLEN_SOFTCAP
+    if name == "flash_attn_varlen_qkvpacked_func":
+        q, k, v, cu_q, _ = make_ragged_self_packed(spec, seed=314159)
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, *_ = make_packed(
+            spec, variant=1, seed=271828
+        )
+
+    with torch.no_grad():
+        expected = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            softcap=VARLEN_SOFTCAP_VALUE,
+            shape=spec,
+        )
+        if name == "flash_attn_varlen_qkvpacked_func":
+            got = helion_attention.flash_attn_varlen_qkvpacked_func(
+                torch.stack((q, k, v), dim=1),
+                cu_q,
+                spec.seqlen_q,
+                softmax_scale=softmax_scale,
+                causal=True,
+                softcap=VARLEN_SOFTCAP_VALUE,
+                shape=spec,
+            )
+        else:
+            got = helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=1),
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                softcap=VARLEN_SOFTCAP_VALUE,
+                shape=spec,
+            )
+
+    torch.testing.assert_close(got, expected)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("other-cap", "only as softcap=50.0"),
+        ("noncausal", "only.*causal varlen"),
+        ("other-shape", "only.*causal varlen"),
+        ("fp16", "only.*causal varlen"),
+        ("gradient", "forward-only"),
+        ("dropout", "dropout"),
+        ("alibi", "softcap combined with ALiBi"),
+        ("window", "sliding-window"),
+        ("diagnostic", "return_attn_probs=True.*softcap"),
+        ("paged", "paged block_table"),
+    ],
+)
+def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = VARLEN_SOFTCAP
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0, seed=223607)
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "softcap": VARLEN_SOFTCAP_VALUE,
+        "shape": spec,
+    }
+    if case == "other-cap":
+        kwargs["softcap"] = 49.0
+    elif case == "noncausal":
+        spec = VARLEN_ALIBI_NONCAUSAL
+        kwargs.update(causal=False, shape=spec)
+    elif case == "other-shape":
+        spec = AttnShape(8, 256, 256, 16, 16, 64, torch.bfloat16, True)
+        kwargs["shape"] = spec
+    elif case == "fp16":
+        spec = AttnShape(8, 512, 512, 16, 16, 64, torch.float16, True)
+        q, k, v = (tensor.to(torch.float16) for tensor in (q, k, v))
+        kwargs["shape"] = spec
+    elif case == "gradient":
+        q.requires_grad_()
+    elif case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "diagnostic":
+        kwargs["return_attn_probs"] = True
+    elif case == "paged":
+        kwargs["block_table"] = torch.zeros(
+            spec.batch, 1, device=q.device, dtype=torch.int32
+        )
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope varlen softcap call reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_softcap_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            **kwargs,  # type: ignore[arg-type]
         )
 
 

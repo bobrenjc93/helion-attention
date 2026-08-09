@@ -1783,6 +1783,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:5f35a59d13bc8a75cf0a222eaa03d41a03302b45",
+      "commit": "5f35a59d13bc8a75cf0a222eaa03d41a03302b45",
+      "recordedAt": "2026-08-09T16:33:30.470Z",
+      "label": "base 5f35a59",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 89,
+        "eval_1afd133e": 66,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:88",
+      "recordedAt": "2026-08-09T16:33:30.470Z",
+      "label": "PR #88",
+      "kind": "leaf",
+      "prNumber": 88,
+      "title": "Enable softcap 50 on shipped causal varlen inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 67,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
