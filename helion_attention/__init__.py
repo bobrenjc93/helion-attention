@@ -1911,16 +1911,18 @@ def flash_attn_with_kvcache(
     *,
     shape: ShapeLike,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Read from, or append one token to, a FlashAttention-style KV cache.
+    """Read from, or append a bounded update to, a FlashAttention-style KV cache.
 
     The general supported path is a dense, contiguous cache and exactly one
     query token. As with every entry point in this package, ``shape`` is
     required and describes ``q`` plus the cache:
     ``(batch, query_len, cache_len, nheads_q, nheads_kv, head_dim)``. One
     additional speculative-decoding slice accepts exactly two query tokens:
-    causal bf16 ``(1, 2, 1024, 32, 8, 128)`` with a full, read-only dense
-    cache. It uses the generic packed runtime and supports the default or a
-    custom softmax scale, but not LSE, updates, partial lengths, rotary,
+    causal bf16 ``(1, 2, 1024, 32, 8, 128)`` with a full dense cache. It uses
+    the generic packed runtime and supports the default or a custom softmax
+    scale. A paired two-token K/V update is accepted only at
+    ``cache_seqlens=1022`` and fills the final two slots before attention.
+    This profile does not support LSE, partial read-only lengths, rotary,
     remapping, autograd, or noncausal attention.
 
     Two read-only paged profiles are also exposed with an int32 CUDA
@@ -1944,10 +1946,10 @@ def flash_attn_with_kvcache(
     ``[cache_leftpad, cache_seqlens)`` when
     ``0 <= cache_leftpad < cache_seqlens <= 16384``. This tensor-span path
     synchronizes once for recoverable bounds validation and rejects CUDA graph
-    capture and autograd. A paired, one-token ``k`` and ``v`` update is
-    supported when a Python integer
-    ``cache_seqlens`` is exactly one less than the declared length; the update
-    is copied into the final cache slot before attention runs. On this dense path,
+    capture and autograd. For the single-token dense paths, a paired ``k`` and
+    ``v`` update is supported when a Python integer ``cache_seqlens`` is exactly
+    one less than the declared length; the update is copied into the final cache
+    slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
     decode profile supports the same return for page sizes 16 and 256 through
@@ -1957,14 +1959,15 @@ def flash_attn_with_kvcache(
     created in inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
     lengths and left padding on updates and other dense profiles, scalar partial
-    lengths, and multi-token updates fail explicitly. A
-    paired ``rotary_cos``/``rotary_sin`` table may be supplied only for this
-    final-slot append: the default interleaved layout may cover the full head or
-    the first 64 dimensions of a 128-dimensional head, while the non-interleaved
-    GPT-NeoX layout requires full-head rotation. Both layouts rotate ``q`` and
-    the appended ``k`` at ``cache_seqlens``. Read-only rotary calls and other
-    paged profiles fail explicitly. Paged updates, rotary, and autograd are
-    unsupported for both paged profiles. Paged ALiBi is unsupported for updates,
+    lengths, and multi-token updates outside the exact two-token profile fail
+    explicitly. A paired ``rotary_cos``/``rotary_sin`` table may be supplied
+    only for the one-token final-slot append: the default interleaved layout may
+    cover the full head or the first 64 dimensions of a 128-dimensional head,
+    while the non-interleaved GPT-NeoX layout requires full-head rotation. Both
+    layouts rotate ``q`` and the appended ``k`` at ``cache_seqlens``. Read-only
+    rotary calls and other paged profiles fail explicitly. Paged updates,
+    rotary, and autograd are unsupported for both paged profiles. Paged ALiBi
+    is unsupported for updates,
     LSE returns, other profiles, and page sizes other than 16. Paged softmax LSE
     is unsupported for chunked prefill, other profiles, and page sizes other
     than 16 or 256.
@@ -2023,23 +2026,23 @@ def flash_attn_with_kvcache(
         )
 
     spec = normalize_shape(shape, q.dtype, causal)
-    is_two_token_dense_read = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
-    if not spec.is_decode and not is_two_token_dense_read:
+    is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
+    if not spec.is_decode and not is_two_token_dense_profile:
         raise NotImplementedError(
             "flash_attn_with_kvcache supports multi-token dense queries only "
             "for causal bf16 (1, 2, 1024, 32, 8, 128); all other dense "
             "profiles require seqlen_q=1 with a non-empty cache"
         )
-    if is_two_token_dense_read:
-        if append_kv:
-            raise NotImplementedError(
-                "the two-token dense KV-cache profile is read-only; cache "
-                "updates are not implemented"
-            )
+    if is_two_token_dense_profile:
         if return_softmax_lse:
             raise NotImplementedError(
                 "return_softmax_lse is not implemented for the two-token "
                 "dense KV-cache profile"
+            )
+        if apply_rotary:
+            raise NotImplementedError(
+                "rotary embeddings are not implemented for the two-token "
+                "dense KV-cache update"
             )
     tensor_cache_seqlens = (
         cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
@@ -2088,7 +2091,14 @@ def flash_attn_with_kvcache(
                 f"cache_seqlens={cache_seqlens} is out of range for a cache "
                 f"of length {spec.seqlen_k}"
             )
-        if cache_seqlens + 1 != spec.seqlen_k:
+        if is_two_token_dense_profile:
+            if cache_seqlens + 2 != spec.seqlen_k:
+                raise NotImplementedError(
+                    "the two-token dense KV-cache update must fill the final "
+                    "two cache slots; cache_seqlens + 2 must equal the cache "
+                    "length declared by shape"
+                )
+        elif cache_seqlens + 1 != spec.seqlen_k:
             raise NotImplementedError(
                 "only a one-token update that fills the final cache slot is "
                 "implemented; cache_seqlens + 1 must equal the cache length "
@@ -2111,19 +2121,30 @@ def flash_attn_with_kvcache(
         raise ValueError("q, k_cache, and v_cache must be on the same CUDA device")
     if append_kv:
         assert k is not None and v is not None
-        expected_update = (spec.batch, 1, spec.nheads_kv, spec.head_dim)
+        update_tokens = 2 if is_two_token_dense_profile else 1
+        expected_update = (
+            spec.batch,
+            update_tokens,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
         for name, tensor in (("k", k), ("v", v)):
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"{name} must be a torch.Tensor")
-            if tensor.ndim == 4 and tensor.shape[1] != 1:
+            if (
+                not is_two_token_dense_profile
+                and tensor.ndim == 4
+                and tensor.shape[1] != 1
+            ):
                 raise NotImplementedError(
                     "multi-token KV-cache updates are not implemented; "
                     f"{name} must contain exactly one token"
                 )
             if tuple(tensor.shape) != expected_update:
                 raise ValueError(
-                    f"{name} has shape {tuple(tensor.shape)} but a one-token "
-                    f"update for the declared shape requires {expected_update}"
+                    f"{name} has shape {tuple(tensor.shape)} but a "
+                    f"{update_tokens}-token update for the declared shape "
+                    f"requires {expected_update}"
                 )
             if tensor.dtype != spec.dtype:
                 raise ValueError(
@@ -2141,7 +2162,7 @@ def flash_attn_with_kvcache(
             if not tensor.is_contiguous():
                 raise ValueError(
                     f"{name} must be contiguous in "
-                    "[batch, 1, nheads_kv, head_dim] layout"
+                    f"[batch, {update_tokens}, nheads_kv, head_dim] layout"
                 )
         if _contiguous_tensors_overlap(k_cache, v_cache):
             raise ValueError("k_cache and v_cache must not overlap when updating")
@@ -2195,41 +2216,50 @@ def flash_attn_with_kvcache(
             return_softmax_lse=return_softmax_lse,
         )
 
-    if is_two_token_dense_read:
+    if is_two_token_dense_profile:
         if torch.is_grad_enabled() and any(
-            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+            tensor.requires_grad
+            for tensor in (q, k_cache, v_cache, k, v)
+            if tensor is not None
         ):
             raise NotImplementedError(
                 "the two-token dense KV-cache profile does not support autograd"
             )
-        return _generic_dense_forward(
-            q,
-            k_cache,
-            v_cache,
-            scale,
-            spec,
-            None,
-        )
+        if not append_kv:
+            return _generic_dense_forward(
+                q,
+                k_cache,
+                v_cache,
+                scale,
+                spec,
+                None,
+            )
+        # This normally cannot reject the exact bounded profile, but perform
+        # the generic dispatch's shape validation before either cache write.
+        _validate_generic_dense_layout(spec)
 
     # Preserve the scalar full-cache/update dispatch: those calls still resolve
     # and launch the same checked-in specialization as before.
-    kernel = lookup(spec)
-    needs_backward = torch.is_grad_enabled() and any(
-        tensor.requires_grad
-        for tensor in (q, k_cache, v_cache, k, v, rotary_cos, rotary_sin)
-        if tensor is not None
-    )
-    if needs_backward:
-        if append_kv:
-            raise NotImplementedError("KV-cache updates do not support autograd")
-        lookup_backward(spec)
-        return attention_autograd(q, k_cache, v_cache, scale, spec)
+    kernel = None
+    if not is_two_token_dense_profile:
+        kernel = lookup(spec)
+        needs_backward = torch.is_grad_enabled() and any(
+            tensor.requires_grad
+            for tensor in (q, k_cache, v_cache, k, v, rotary_cos, rotary_sin)
+            if tensor is not None
+        )
+        if needs_backward:
+            if append_kv:
+                raise NotImplementedError("KV-cache updates do not support autograd")
+            lookup_backward(spec)
+            return attention_autograd(q, k_cache, v_cache, scale, spec)
 
     # All input, feature, dispatch, and autograd validation must precede both
     # writes so a rejected call cannot leave a half-updated cache.
     q_for_attention = q
     if append_kv:
         assert k is not None and v is not None and cache_seqlens is not None
+        update_tokens = 2 if is_two_token_dense_profile else 1
         cache_tensors = (k_cache, v_cache)
         if apply_rotary:
             assert rotary_cos is not None and rotary_sin is not None
@@ -2253,8 +2283,19 @@ def flash_attn_with_kvcache(
             if any(_contiguous_tensors_overlap(v, cache) for cache in cache_tensors)
             else v
         )
-        k_cache[:, cache_seqlens : cache_seqlens + 1].copy_(update_k)
-        v_cache[:, cache_seqlens : cache_seqlens + 1].copy_(update_v)
+        update_end = cache_seqlens + update_tokens
+        k_cache[:, cache_seqlens:update_end].copy_(update_k)
+        v_cache[:, cache_seqlens:update_end].copy_(update_v)
+    if is_two_token_dense_profile:
+        return _generic_dense_forward(
+            q_for_attention,
+            k_cache,
+            v_cache,
+            scale,
+            spec,
+            None,
+        )
+    assert kernel is not None
     if return_softmax_lse:
         return kernel(
             q_for_attention,

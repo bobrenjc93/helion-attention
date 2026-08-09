@@ -218,10 +218,12 @@ out = helion_attention.flash_attn_with_kvcache(
 )
 ```
 
-One strict speculative-decoding slice reads two query tokens from a full dense
+One strict speculative-decoding slice handles two query tokens with a dense
 cache: causal bf16 `(1, 2, 1024, 32, 8, 128)`. It accepts either the default or
-a custom `softmax_scale` and uses the generic packed Triton runtime. This path
-is read-only and output-only: LSE, cache updates, partial or tensor-valued
+a custom `softmax_scale` and uses the generic packed Triton runtime. The
+read-only form requires the full cache. It also accepts a paired two-token K/V
+update only at `cache_seqlens=1022`, filling slots 1022 and 1023 before
+attention. This path remains output-only: LSE, other update positions or
 lengths, rotary, cache remapping, autograd, noncausal mode, and every other
 multi-token KV-cache shape remain unsupported.
 
@@ -287,8 +289,8 @@ are rejected before dispatch. LSE on chunked prefill, non-causal chunked
 prefill, every other paged profile, and every page size other than 16 or 256
 are also rejected before dispatch.
 
-The dense decode path also appends one paired K/V token when a scalar cache
-length points at the final slot declared by `shape`:
+The single-token dense decode paths append one paired K/V token when a scalar
+cache length points at the final slot declared by `shape`:
 
 ```python
 new_k = torch.randn(B, 1, H_KV, D, device="cuda", dtype=torch.bfloat16)
@@ -306,16 +308,20 @@ out = helion_attention.flash_attn_with_kvcache(
 ```
 
 The append mutates both dense caches in place and attends over the updated full
-cache. Dense read-only calls may omit `cache_seqlens` or pass the full cache
-length; the exact 16K profile above additionally accepts its documented tensor
-prefix or left-padded span. Dense update lengths must be Python integers and
-satisfy `cache_seqlens + 1 == S_CACHE`; unpaired or multi-token updates, scalar
-partial lengths, and tensor lengths on every other dense profile are rejected
-explicitly. Caches created inside `torch.inference_mode()` must be updated while
-that mode remains enabled. For an append, `q`, `k_cache`, and `v_cache` must
-occupy disjoint memory; update `k`/`v` aliases are staged safely.
+cache. The exact two-token profile above similarly accepts paired K/V tensors
+shaped `[1, 2, 8, 128]` when the Python integer `cache_seqlens` is 1022, and
+mutates only the final two slots. Dense read-only calls may omit
+`cache_seqlens` or pass the full cache length; the exact 16K profile above
+additionally accepts its documented tensor prefix or left-padded span.
+Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`; the
+two-token update must satisfy `cache_seqlens + 2 == 1024`. Other multi-token
+updates, scalar partial lengths, and tensor lengths on every other dense
+profile are rejected explicitly. Caches created inside
+`torch.inference_mode()` must be updated while that mode remains enabled. For
+an append, `q`, `k_cache`, and `v_cache` must occupy disjoint memory; update
+`k`/`v` aliases are staged safely.
 
-This same final-slot append accepts paired, contiguous `rotary_cos` and
+The one-token final-slot append accepts paired, contiguous `rotary_cos` and
 `rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
 `seqlen_ro >= S_CACHE` and the same CUDA dtype/device as `q`. The default
 interleaved layout rotates adjacent pairs in `q` and `new_k` at position
@@ -579,7 +585,8 @@ forward-only. These unsupported FlashAttention features also raise
   `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
   the exact read-only page-size-16 profiles above; paged ALiBi cannot be combined
   with LSE, updates, rotary, or autograd and is not supported with page size 256
-- KV-cache mutation beyond the dense paired one-token final-slot append above;
+- KV-cache mutation beyond the dense paired one-token final-slot append and
+  exact two-token final-two-slot append above;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
   partial caches, `cache_leftpad` outside that profile or combined with updates,
   remapping, rotary, or autograd, paged profiles and page sizes other than the
