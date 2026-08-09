@@ -115,6 +115,16 @@ TWO_TOKEN_KVCACHE = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+DENSE_ALIBI_KVCACHE = AttnShape(
+    batch=1,
+    seqlen_q=1,
+    seqlen_k=4096,
+    nheads_q=32,
+    nheads_kv=8,
+    head_dim=128,
+    dtype=torch.bfloat16,
+    causal=True,
+)
 CHUNKED_PREFILL_KEY = "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal"
 GENERIC_DENSE_SPECS = [
     AttnShape(2, 23, 23, 4, 4, 32, torch.bfloat16, False),
@@ -5206,6 +5216,306 @@ def test_shape_normalization_rejects_bad_tuples() -> None:
         normalize_shape((1, 2, 3, 0), torch.bfloat16, False)
     with pytest.raises(ValueError):
         normalize_shape((1, 8, 8, 6, 4, 64), torch.bfloat16, False)
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+def test_dense_4k_kvcache_alibi_matches_fa2_and_fp32(
+    causal: bool,
+    softmax_scale: float | None,
+    batched_slopes: bool,
+) -> None:
+    q, k_cache, v_cache = make_inputs(DENSE_ALIBI_KVCACHE, seed=20260809)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    head_slopes = torch.linspace(
+        0.01,
+        0.2,
+        DENSE_ALIBI_KVCACHE.nheads_q,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    slopes = head_slopes.unsqueeze(0) if batched_slopes else head_slopes
+    scale = (
+        1.0 / math.sqrt(DENSE_ALIBI_KVCACHE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    shape = (
+        DENSE_ALIBI_KVCACHE
+        if causal
+        else (1, 1, 4096, 32, 8, 128)
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        alibi_slopes=slopes,
+        shape=shape,
+    )
+    expected_fp32 = reference_paged_alibi(
+        q,
+        [(k_cache[0], v_cache[0])],
+        DENSE_ALIBI_KVCACHE,
+        scale,
+        slopes,
+        causal=causal,
+    )
+
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        alibi_slopes=slopes,
+    )
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+def test_dense_4k_kvcache_alibi_dispatch_is_opt_in_and_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q, k_cache, v_cache = make_inputs(DENSE_ALIBI_KVCACHE, seed=112358)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    slopes = torch.linspace(
+        0.01,
+        0.2,
+        DENSE_ALIBI_KVCACHE.nheads_q,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    generated_out = torch.full_like(q, 3.0)
+    generic_out = torch.full_like(q, 7.0)
+    generated_calls: list[tuple[AttnShape, float]] = []
+    generic_calls: list[tuple[AttnShape, float, torch.Tensor | None]] = []
+
+    def generated(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+    ) -> torch.Tensor:
+        assert q_arg is q and k_arg is k_cache and v_arg is v_cache
+        generated_calls.append((DENSE_ALIBI_KVCACHE, scale_arg))
+        return generated_out
+
+    def fake_lookup(spec_arg: AttnShape) -> object:
+        assert spec_arg == DENSE_ALIBI_KVCACHE
+        return generated
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert q_arg is q and k_arg is k_cache and v_arg is v_cache
+        generic_calls.append((spec_arg, scale_arg, slopes_arg))
+        return generic_out
+
+    monkeypatch.setattr(helion_attention, "lookup", fake_lookup)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+
+    slope_free = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        causal=True,
+        shape=DENSE_ALIBI_KVCACHE,
+    )
+    with_alibi = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=0.19,
+        causal=True,
+        alibi_slopes=slopes,
+        shape=DENSE_ALIBI_KVCACHE,
+    )
+
+    assert slope_free is generated_out
+    assert with_alibi is generic_out
+    assert generated_calls == [
+        (DENSE_ALIBI_KVCACHE, 1.0 / math.sqrt(DENSE_ALIBI_KVCACHE.head_dim))
+    ]
+    assert generic_calls == [(DENSE_ALIBI_KVCACHE, 0.19, slopes)]
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("lse", "return_softmax_lse", id="lse"),
+        pytest.param("update", "read-only", id="update"),
+        pytest.param("partial-scalar", "partial or ragged", id="partial-scalar"),
+        pytest.param("partial-tensor", "tensor-valued", id="partial-tensor"),
+        pytest.param("remapping", "cache_batch_idx", id="remapping"),
+        pytest.param(
+            "leftpad", "cache_leftpad.*implemented only", id="left-padding"
+        ),
+        pytest.param("rotary", "rotary embeddings", id="rotary"),
+        pytest.param("window", "sliding-window", id="window"),
+        pytest.param("softcap", "softcap.*implemented only", id="softcap"),
+        pytest.param("q-grad", "ALiBi backward", id="query-autograd"),
+        pytest.param("slope-grad", "ALiBi backward", id="slope-autograd"),
+        pytest.param(
+            "other-profile", "dense KV-cache ALiBi.*only", id="other-profile"
+        ),
+    ],
+)
+def test_dense_4k_kvcache_alibi_rejects_out_of_scope_modes_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = DENSE_ALIBI_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec)
+    slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "alibi_slopes": slopes,
+        "shape": spec,
+    }
+    if case == "lse":
+        kwargs["return_softmax_lse"] = True
+    elif case == "update":
+        update_shape = (spec.batch, 1, spec.nheads_kv, spec.head_dim)
+        kwargs["k"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
+        kwargs["v"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
+        kwargs["cache_seqlens"] = spec.seqlen_k - 1
+    elif case == "partial-scalar":
+        kwargs["cache_seqlens"] = spec.seqlen_k - 1
+    elif case == "partial-tensor":
+        kwargs["cache_seqlens"] = torch.tensor(
+            [spec.seqlen_k - 1], device=q.device, dtype=torch.int32
+        )
+    elif case == "remapping":
+        kwargs["cache_batch_idx"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
+        )
+    elif case == "leftpad":
+        kwargs["cache_seqlens"] = torch.tensor(
+            [spec.seqlen_k], device=q.device, dtype=torch.int32
+        )
+        kwargs["cache_leftpad"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
+        )
+    elif case == "rotary":
+        kwargs["rotary_cos"] = q
+        kwargs["rotary_sin"] = q
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "q-grad":
+        q.requires_grad_()
+    elif case == "slope-grad":
+        slopes.requires_grad_()
+    else:
+        spec = AttnShape(1, 1, 1024, 32, 8, 128, torch.bfloat16, True)
+        q, k_cache, v_cache = make_inputs(spec)
+        slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
+        kwargs = {"causal": True, "alibi_slopes": slopes, "shape": spec}
+
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope dense KV-cache ALiBi reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("not-tensor", "torch.Tensor", id="not-tensor"),
+        pytest.param("dtype", "dtype torch.float32", id="dtype"),
+        pytest.param("head-shape", "shape.*nheads_q", id="head-shape"),
+        pytest.param("batch-shape", "shape.*nheads_q", id="batch-shape"),
+        pytest.param("rank", "shape.*nheads_q", id="rank"),
+        pytest.param("cpu", "CUDA tensor", id="cpu"),
+        pytest.param(
+            "last-stride", "contiguous.*last dimension", id="last-dimension-stride"
+        ),
+    ],
+)
+def test_dense_4k_kvcache_alibi_rejects_malformed_slopes_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = DENSE_ALIBI_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec)
+    if case == "not-tensor":
+        slopes: object = [0.1] * spec.nheads_q
+    elif case == "dtype":
+        slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float16)
+    elif case == "head-shape":
+        slopes = torch.ones(spec.nheads_q - 1, device=q.device)
+    elif case == "batch-shape":
+        slopes = torch.ones(spec.batch + 1, spec.nheads_q, device=q.device)
+    elif case == "rank":
+        slopes = torch.ones(spec.batch, 1, spec.nheads_q, device=q.device)
+    elif case == "cpu":
+        slopes = torch.ones(spec.nheads_q)
+    else:
+        slopes = torch.ones(spec.nheads_q, 2, device=q.device)[:, 0]
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("malformed dense KV-cache ALiBi reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    with pytest.raises((TypeError, ValueError), match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            causal=True,
+            alibi_slopes=slopes,  # type: ignore[arg-type]
+            shape=spec,
+        )
 
 
 @requires_cuda

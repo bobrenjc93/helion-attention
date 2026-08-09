@@ -15,7 +15,9 @@ kernel. That runtime also provides ``softcap=50.0`` for one forward-only
 Gemma-2 profile, the shipped causal varlen profile, and read-only page-256
 paged decode. Both exposed page-16 paged KV-cache profiles and page-256 decode
 use the generic paged runtime when ALiBi is supplied, without expanding the
-core paged-varlen API.
+core paged-varlen API. Read-only 4K dense decode likewise uses the generic
+runtime for ALiBi while retaining its generated specialization when slopes are
+omitted.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -148,6 +150,15 @@ _TENSOR_LENGTH_DENSE_KVCACHE_KEY = (
 )
 _TWO_TOKEN_DENSE_KVCACHE_KEY = (
     "b1_sq2_sk1024_hq32_hkv8_d128_bf16_causal"
+)
+_DENSE_KVCACHE_ALIBI_PROFILE = (
+    1,
+    1,
+    4096,
+    32,
+    8,
+    128,
+    torch.bfloat16,
 )
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
@@ -2239,6 +2250,11 @@ def flash_attn_with_kvcache(
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
+    and noncausal bf16 ``(1, 1, 4096, 32, 8, 128)`` profiles additionally accept
+    forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]``. These calls
+    use the generic packed runtime; omitting slopes retains the generated
+    specialization. ALiBi cannot be combined with LSE, updates, partial lengths,
+    remapping, left padding, rotary, windows, softcap, or autograd. The causal
     bf16 ``(1, 1, 16384, 32, 8, 128)`` profile additionally accepts a contiguous
     CUDA int32 ``cache_seqlens`` tensor shaped ``[1]`` selecting the end of a
     prefix. A matching ``cache_leftpad`` tensor selects the half-open cache span
@@ -2306,7 +2322,9 @@ def flash_attn_with_kvcache(
         softcap,
         alibi_slopes,
         False,
-        allow_alibi=block_table is not None,
+        # Paged and the exact dense profile below perform their narrower ALiBi
+        # validation after shape normalization.
+        allow_alibi=True,
         allowed_softcap=(
             _PAGE256_PAGED_KVCACHE_SOFTCAP
             if block_table is not None
@@ -2335,6 +2353,33 @@ def flash_attn_with_kvcache(
         )
 
     spec = normalize_shape(shape, q.dtype, causal)
+    has_dense_alibi = alibi_slopes is not None
+    if has_dense_alibi:
+        requested = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+            spec.dtype,
+        )
+        if requested != _DENSE_KVCACHE_ALIBI_PROFILE:
+            raise NotImplementedError(
+                "dense KV-cache ALiBi is implemented only for read-only bf16 "
+                "(1, 1, 4096, 32, 8, 128) decode with either causal flag; "
+                f"got {spec.describe()}"
+            )
+        if append_kv:
+            raise NotImplementedError(
+                "dense KV-cache ALiBi is implemented only for read-only calls; "
+                "updates are not supported"
+            )
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "return_softmax_lse=True is not implemented with dense "
+                "KV-cache ALiBi"
+            )
     is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
     if not spec.is_decode and not is_two_token_dense_profile:
         raise NotImplementedError(
@@ -2423,6 +2468,16 @@ def flash_attn_with_kvcache(
     check_tensors(q, k_cache, v_cache, spec)
     if k_cache.device != q.device or v_cache.device != q.device:
         raise ValueError("q, k_cache, and v_cache must be on the same CUDA device")
+    if has_dense_alibi:
+        assert alibi_slopes is not None
+        _validate_alibi_slopes(alibi_slopes, q, spec)
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache, alibi_slopes)
+        ):
+            raise NotImplementedError(
+                "ALiBi backward is not implemented; dense KV-cache ALiBi "
+                "calls are forward-only"
+            )
     if append_kv:
         assert k is not None and v is not None
         update_tokens = 2 if is_two_token_dense_profile else 1
@@ -2519,6 +2574,17 @@ def flash_attn_with_kvcache(
             scale,
             spec,
             return_softmax_lse=return_softmax_lse,
+        )
+
+    if has_dense_alibi:
+        assert alibi_slopes is not None
+        return _generic_dense_forward(
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            spec,
+            alibi_slopes,
         )
 
     if is_two_token_dense_profile:
