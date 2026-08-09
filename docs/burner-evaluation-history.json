@@ -2143,6 +2143,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:9de847bcf756bcc8410f2e853ab41a4343b6e0d5",
+      "commit": "9de847bcf756bcc8410f2e853ab41a4343b6e0d5",
+      "recordedAt": "2026-08-09T21:30:13.266Z",
+      "label": "base 9de847b",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 91,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:101",
+      "recordedAt": "2026-08-09T21:30:13.266Z",
+      "label": "PR #101",
+      "kind": "leaf",
+      "prNumber": 101,
+      "title": "Rotate the exact two-token final-cache append",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 91,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

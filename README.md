@@ -250,9 +250,11 @@ cache: causal bf16 `(1, 2, 1024, 32, 8, 128)`. It accepts either the default or
 a custom `softmax_scale` and uses the generic packed Triton runtime. The
 read-only form requires the full cache. It also accepts a paired two-token K/V
 update only at `cache_seqlens=1022`, filling slots 1022 and 1023 before
-attention. This path remains output-only: LSE, other update positions or
-lengths, rotary, cache remapping, autograd, noncausal mode, and every other
-multi-token KV-cache shape remain unsupported.
+attention. Full-head interleaved rotary tables optionally rotate Q and the
+appended K at positions 1022 and 1023. This path remains output-only: LSE,
+other update positions or lengths, partial or GPT-NeoX rotary, cache remapping,
+autograd, noncausal mode, and every other multi-token KV-cache shape remain
+unsupported.
 
 For supported single-token dense caches, pass `return_softmax_lse=True` to receive
 `(out, softmax_lse)`. The LSE is fp32 with shape `[batch, heads_q, 1]`, matching
@@ -360,7 +362,9 @@ interleaved layout rotates adjacent pairs in `q` and `new_k` at position
 the full head dimension, or 64 for a D128 head; the latter preserves dimensions
 64 through 127 unchanged. Passing `rotary_interleaved=False` selects the GPT-NeoX
 split-half pair layout and is supported only for full-head rotation. Other
-partial rotary dimensions and rotary on a read-only call are rejected.
+partial rotary dimensions and rotary on a read-only call are rejected. The
+exact two-token append accepts only the full-head interleaved layout and uses
+consecutive positions 1022 and 1023 for the two Q/K tokens.
 
 `shape` accepts:
 
@@ -638,7 +642,8 @@ else:
   remapping, rotary, or autograd, paged profiles and page sizes other than the
   exact read-only page-size-16 profiles and page-size-256 decode above, paged LSE
   outside the exact decode profile above, and KV-cache rotary outside the
-  full-head interleaved/NeoX or D128 half-head interleaved final-slot append
+  full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
+  the exact full-head interleaved two-token append
 - `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
   KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
   profiles, dense/KV-packed calls for the causal bf16 Gemma-2 profile with

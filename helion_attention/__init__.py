@@ -255,8 +255,9 @@ def _validate_kvcache_rotary(
     spec: AttnShape,
     *,
     rotary_interleaved: bool,
+    full_head_interleaved_only: bool = False,
 ) -> None:
-    """Validate the narrow rotary contract for a final-slot append."""
+    """Validate the narrow rotary contract for a final-cache append."""
     for name, tensor in (("rotary_cos", rotary_cos), ("rotary_sin", rotary_sin)):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor or None")
@@ -274,6 +275,15 @@ def _validate_kvcache_rotary(
             f"{tuple(rotary_cos.shape)} and {tuple(rotary_sin.shape)}"
         )
     rotary_dim = rotary_cos.shape[1] * 2
+    if full_head_interleaved_only and (
+        not rotary_interleaved or rotary_dim != spec.head_dim
+    ):
+        raise NotImplementedError(
+            "the two-token dense KV-cache update supports only full-head "
+            "interleaved rotary embeddings; rotary_interleaved must be True "
+            f"and rotary_dim must equal head_dim={spec.head_dim}, got "
+            f"rotary_interleaved={rotary_interleaved} and rotary_dim={rotary_dim}"
+        )
     if not rotary_interleaved and rotary_dim != spec.head_dim:
         raise NotImplementedError(
             "non-interleaved rotary embeddings are implemented only for "
@@ -338,6 +348,27 @@ def _apply_interleaved_rotary(
     if rotary_dim == tensor.shape[-1]:
         return rotated_prefix
     return torch.cat((rotated_prefix, tensor[..., rotary_dim:]), dim=-1)
+
+
+def _apply_consecutive_interleaved_rotary(
+    tensor: torch.Tensor,
+    rotary_cos: torch.Tensor,
+    rotary_sin: torch.Tensor,
+    start_position: int,
+) -> torch.Tensor:
+    """Rotate sequence tokens at consecutive cache positions."""
+    return torch.cat(
+        tuple(
+            _apply_interleaved_rotary(
+                tensor[:, token_index : token_index + 1],
+                rotary_cos,
+                rotary_sin,
+                start_position + token_index,
+            )
+            for token_index in range(tensor.shape[1])
+        ),
+        dim=1,
+    )
 
 
 def _apply_neox_rotary(
@@ -2166,7 +2197,9 @@ def flash_attn_with_kvcache(
     the generic packed runtime and supports the default or a custom softmax
     scale. A paired two-token K/V update is accepted only at
     ``cache_seqlens=1022`` and fills the final two slots before attention.
-    This profile does not support LSE, partial read-only lengths, rotary,
+    That update accepts full-head interleaved rotary tables and rotates the two
+    query/key tokens at positions 1022 and 1023. This profile does not support
+    LSE, partial read-only lengths, partial or non-interleaved rotary,
     remapping, autograd, or noncausal attention.
 
     Two read-only paged profiles are also exposed with an int32 CUDA
@@ -2206,13 +2239,14 @@ def flash_attn_with_kvcache(
     lengths and left padding on updates and other dense profiles, scalar partial
     lengths, and multi-token updates outside the exact two-token profile fail
     explicitly. A paired ``rotary_cos``/``rotary_sin`` table may be supplied
-    only for the one-token final-slot append: the default interleaved layout may
+    for the one-token final-slot append: the default interleaved layout may
     cover the full head or the first 64 dimensions of a 128-dimensional head,
     while the non-interleaved GPT-NeoX layout requires full-head rotation. Both
-    layouts rotate ``q`` and the appended ``k`` at ``cache_seqlens``. Read-only
-    rotary calls and other paged profiles fail explicitly. Paged updates,
-    rotary, and autograd are unsupported for both paged profiles. Paged ALiBi
-    is unsupported for updates,
+    layouts rotate ``q`` and the appended ``k`` at ``cache_seqlens``. The exact
+    two-token append accepts only full-head interleaved rotary and rotates its
+    tokens at consecutive positions. Read-only rotary calls and other paged
+    profiles fail explicitly. Paged updates, rotary, and autograd are
+    unsupported for both paged profiles. Paged ALiBi is unsupported for updates,
     LSE returns, other profiles, and page sizes other than 16. Paged softcap is
     unsupported for updates, page-size-16 caches, other profiles, ALiBi,
     windows, and autograd. Paged softmax LSE is unsupported for chunked
@@ -2224,7 +2258,8 @@ def flash_attn_with_kvcache(
     has_rotary_metadata = rotary_cos is not None or rotary_sin is not None
     if has_rotary_metadata and not append_kv:
         raise NotImplementedError(
-            "rotary embeddings are implemented only for a one-token KV-cache append"
+            "rotary embeddings are implemented only for a one-token KV-cache "
+            "append or the exact two-token append"
         )
     if (rotary_cos is None) != (rotary_sin is None):
         raise ValueError("rotary_cos and rotary_sin must be provided together")
@@ -2290,11 +2325,6 @@ def flash_attn_with_kvcache(
             raise NotImplementedError(
                 "return_softmax_lse is not implemented for the two-token "
                 "dense KV-cache profile"
-            )
-        if apply_rotary:
-            raise NotImplementedError(
-                "rotary embeddings are not implemented for the two-token "
-                "dense KV-cache update"
             )
     tensor_cache_seqlens = (
         cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
@@ -2440,6 +2470,7 @@ def flash_attn_with_kvcache(
                 q,
                 spec,
                 rotary_interleaved=rotary_interleaved,
+                full_head_interleaved_only=is_two_token_dense_profile,
             )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
@@ -2471,7 +2502,7 @@ def flash_attn_with_kvcache(
     if is_two_token_dense_profile:
         if torch.is_grad_enabled() and any(
             tensor.requires_grad
-            for tensor in (q, k_cache, v_cache, k, v)
+            for tensor in (q, k_cache, v_cache, k, v, rotary_cos, rotary_sin)
             if tensor is not None
         ):
             raise NotImplementedError(
@@ -2515,15 +2546,25 @@ def flash_attn_with_kvcache(
         cache_tensors = (k_cache, v_cache)
         if apply_rotary:
             assert rotary_cos is not None and rotary_sin is not None
-            apply_rotary_fn = (
-                _apply_interleaved_rotary
-                if rotary_interleaved
-                else _apply_neox_rotary
-            )
-            update_k = apply_rotary_fn(k, rotary_cos, rotary_sin, cache_seqlens)
-            q_for_attention = apply_rotary_fn(
-                q, rotary_cos, rotary_sin, cache_seqlens
-            )
+            if is_two_token_dense_profile:
+                update_k = _apply_consecutive_interleaved_rotary(
+                    k, rotary_cos, rotary_sin, cache_seqlens
+                )
+                q_for_attention = _apply_consecutive_interleaved_rotary(
+                    q, rotary_cos, rotary_sin, cache_seqlens
+                )
+            else:
+                apply_rotary_fn = (
+                    _apply_interleaved_rotary
+                    if rotary_interleaved
+                    else _apply_neox_rotary
+                )
+                update_k = apply_rotary_fn(
+                    k, rotary_cos, rotary_sin, cache_seqlens
+                )
+                q_for_attention = apply_rotary_fn(
+                    q, rotary_cos, rotary_sin, cache_seqlens
+                )
         else:
             update_k = (
                 k.clone()
