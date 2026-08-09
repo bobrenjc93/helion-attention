@@ -341,12 +341,19 @@ def test_matches_fp32_sdpa(entry: dict[str, object]) -> None:
     "entry", BACKWARD_SHAPES, ids=[str(entry["key"]) for entry in BACKWARD_SHAPES]
 )
 @pytest.mark.parametrize(
-    "softmax_scale",
-    [None, 0.137, 1.0],
-    ids=["default-scale", "near-default-scale", "large-scale"],
+    ("softmax_scale", "deterministic"),
+    [
+        pytest.param(None, False, id="sdpa-gradients-default-scale"),
+        pytest.param(0.137, False, id="sdpa-gradients-custom-scale"),
+        pytest.param(None, True, id="generated-backward-default-scale"),
+        pytest.param(0.137, True, id="generated-backward-near-default-scale"),
+        pytest.param(1.0, True, id="generated-backward-large-scale"),
+    ],
 )
 def test_gradients_match_fp32_sdpa(
-    entry: dict[str, object], softmax_scale: float | None
+    entry: dict[str, object],
+    softmax_scale: float | None,
+    deterministic: bool,
 ) -> None:
     spec = spec_from_manifest_entry(entry)
     q, k, v = make_inputs(spec, seed=123)
@@ -361,8 +368,19 @@ def test_gradients_match_fp32_sdpa(
         v,
         softmax_scale=softmax_scale,
         causal=False,
+        deterministic=deterministic,
         shape=spec,
     )
+    with torch.no_grad():
+        generated = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=False,
+            deterministic=deterministic,
+            shape=spec,
+        )
     got_grads = torch.autograd.grad(got, (q, k, v), grad_out)
 
     q_ref = q.float().detach().requires_grad_()
@@ -376,6 +394,8 @@ def test_gradients_match_fp32_sdpa(
         expected, (q_ref, k_ref, v_ref), grad_out.float()
     )
 
+    assert torch.equal(got, generated)
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
     for actual, reference in zip(got_grads, expected_grads):
         torch.testing.assert_close(
             actual.float(), reference, atol=5e-2, rtol=2e-2
@@ -383,7 +403,107 @@ def test_gradients_match_fp32_sdpa(
 
 
 @requires_cuda
-def test_generated_backward_retains_exact_dispatch(
+def test_encoder_qkvpacked_uses_generated_values_and_sdpa_gradients() -> None:
+    spec = ENCODER_TRAINING
+    q, k, v = make_inputs(spec, seed=20260808)
+    qkv = torch.stack((q, k, v), dim=2).requires_grad_()
+    grad_out = make_inputs(spec, seed=20260809)[0]
+
+    got = helion_attention.flash_attn_qkvpacked_func(qkv, shape=spec)
+    with torch.no_grad():
+        generated = helion_attention.flash_attn_qkvpacked_func(qkv, shape=spec)
+    got_grad = torch.autograd.grad(got, qkv, grad_out)[0]
+
+    qkv_ref = qkv.float().detach().requires_grad_()
+    q_ref, k_ref, v_ref = (qkv_ref[:, :, index] for index in range(3))
+    expected = reference_attention(
+        q_ref, k_ref, v_ref, spec, 1.0 / math.sqrt(spec.head_dim)
+    )
+    expected_grad = torch.autograd.grad(
+        expected, qkv_ref, grad_out.float()
+    )[0]
+
+    assert torch.equal(got, generated)
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        got_grad.float(), expected_grad, atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("entry_point", ["dense", "qkvpacked", "kvpacked"])
+def test_encoder_training_forward_and_gradients_match_fa2(
+    entry_point: str,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = ENCODER_TRAINING
+    q, k, v = make_inputs(spec, seed=20260810)
+    grad_out = make_inputs(spec, seed=20260811)[0]
+
+    if entry_point == "dense":
+        inputs = tuple(tensor.requires_grad_() for tensor in (q, k, v))
+        got = helion_attention.flash_attn_func(*inputs, shape=spec)
+        expected = flash_attn.flash_attn_func(*inputs)
+        got_grads = torch.autograd.grad(got, inputs, grad_out)
+        expected_grads = torch.autograd.grad(expected, inputs, grad_out)
+    elif entry_point == "qkvpacked":
+        qkv = torch.stack((q, k, v), dim=2).requires_grad_()
+        got = helion_attention.flash_attn_qkvpacked_func(qkv, shape=spec)
+        expected = flash_attn.flash_attn_qkvpacked_func(qkv)
+        got_grads = (torch.autograd.grad(got, qkv, grad_out)[0],)
+        expected_grads = (torch.autograd.grad(expected, qkv, grad_out)[0],)
+    else:
+        q = q.requires_grad_()
+        kv = torch.stack((k, v), dim=2).requires_grad_()
+        got = helion_attention.flash_attn_kvpacked_func(q, kv, shape=spec)
+        expected = flash_attn.flash_attn_kvpacked_func(q, kv)
+        got_grads = torch.autograd.grad(got, (q, kv), grad_out)
+        expected_grads = torch.autograd.grad(expected, (q, kv), grad_out)
+
+    torch.testing.assert_close(got, expected, atol=5e-2, rtol=2e-2)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(
+            actual.float(), reference.float(), atol=5e-2, rtol=2e-2
+        )
+
+
+@requires_cuda
+def test_nondeterministic_encoder_backward_dispatches_to_sdpa_gradients(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(BACKWARD_SHAPES[0])
+    q, k, v = make_inputs(spec)
+    q.requires_grad_()
+    sentinel = torch.empty_like(q)
+    dispatched: list[AttnShape] = []
+
+    def hybrid(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        dispatched.append(spec_arg)
+        return sentinel
+
+    def reject_generated(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("non-deterministic call reached generated backward")
+
+    monkeypatch.setattr(helion_attention, "attention_with_sdpa_gradients", hybrid)
+    monkeypatch.setattr(helion_attention, "attention_autograd", reject_generated)
+
+    out = helion_attention.flash_attn_func(
+        q, k, v, dropout_p=0.0, shape=spec
+    )
+
+    assert out is sentinel
+    assert dispatched == [spec]
+
+
+@requires_cuda
+def test_deterministic_encoder_backward_retains_generated_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = spec_from_manifest_entry(BACKWARD_SHAPES[0])
@@ -404,13 +524,15 @@ def test_generated_backward_retains_exact_dispatch(
         return sentinel
 
     def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
-        raise AssertionError("generated backward shape reached SDPA")
+        raise AssertionError("deterministic call reached SDPA gradients")
 
     monkeypatch.setattr(helion_attention, "attention_autograd", generated)
-    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    monkeypatch.setattr(
+        helion_attention, "attention_with_sdpa_gradients", reject_sdpa
+    )
 
     out = helion_attention.flash_attn_func(
-        q, k, v, dropout_p=0.0, shape=spec
+        q, k, v, dropout_p=0.0, deterministic=True, shape=spec
     )
 
     assert out is sentinel
@@ -444,6 +566,9 @@ def test_registered_shape_without_backward_dispatches_to_sdpa(
 
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", fallback)
     monkeypatch.setattr(helion_attention, "attention_autograd", reject_generated)
+    monkeypatch.setattr(
+        helion_attention, "attention_with_sdpa_gradients", reject_generated
+    )
 
     out = helion_attention.flash_attn_func(
         q, k, v, causal=spec.causal, shape=spec
@@ -1106,6 +1231,9 @@ def test_encoder_dropout_dispatches_to_sdpa(
 
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", fallback)
     monkeypatch.setattr(helion_attention, "attention_autograd", reject_generated)
+    monkeypatch.setattr(
+        helion_attention, "attention_with_sdpa_gradients", reject_generated
+    )
     monkeypatch.setattr(helion_attention, "lookup", reject_generated)
 
     out = helion_attention.flash_attn_func(

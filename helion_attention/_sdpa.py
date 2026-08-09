@@ -17,6 +17,20 @@ def dense_attention_cudnn_default_scale(
     k: torch.Tensor,
     v: torch.Tensor,
 ) -> torch.Tensor | None:
+    """Run causal direct cuDNN SDPA with its default scale when usable."""
+    return dense_attention_cudnn(
+        q, k, v, softmax_scale=None, is_causal=True
+    )
+
+
+def dense_attention_cudnn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float | None,
+    *,
+    is_causal: bool,
+) -> torch.Tensor | None:
     """Run direct cuDNN SDPA, or return ``None`` when it is not usable."""
     query = q.transpose(1, 2)
     key = k.transpose(1, 2)
@@ -48,11 +62,16 @@ def dense_attention_cudnn_default_scale(
         # than deriving all device properties from the tensors. Preserve the
         # caller's device while making both the probe and launch tensor-local.
         with torch.cuda.device(q.device):
-            params = params_type(query, key, value, None, 0.0, True, False)
+            params = params_type(
+                query, key, value, None, 0.0, is_causal, False
+            )
             if not can_use_cudnn(params):
                 return None
             cudnn_attention = (
                 torch.ops.aten._scaled_dot_product_cudnn_attention.default
+            )
+            needs_backward = torch.is_grad_enabled() and any(
+                tensor.requires_grad for tensor in (q, k, v)
             )
             with torch.autocast(device_type=q.device.type, enabled=False):
                 out = cudnn_attention(
@@ -60,10 +79,11 @@ def dense_attention_cudnn_default_scale(
                     key,
                     value,
                     None,
-                    False,
+                    needs_backward,
                     0.0,
-                    True,
+                    is_causal,
                     False,
+                    scale=softmax_scale,
                 )[0]
     except torch.cuda.OutOfMemoryError:
         raise

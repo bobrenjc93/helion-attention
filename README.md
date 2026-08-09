@@ -66,7 +66,9 @@ bottom-right causal masking. Grad-enabled calls without a generated backward
 use PyTorch SDPA autograd instead. Dense ALiBi forward calls accept fp32 slopes
 shaped `[nheads]` or `[batch, nheads]` and always use the generic Triton path;
 ALiBi backward is not implemented. The shipped noncausal bf16
-`(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
+`(8, 512, 512, 16, 16, 64)` encoder-training profile retains generated forward
+values and uses SDPA gradients for zero-dropout, non-deterministic training;
+`deterministic=True` retains its generated backward. The same profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
 Other dropout calls, local windows, softcap, diagnostic returns outside the
 decode subset above, and deterministic dropout still fail explicitly as
@@ -458,13 +460,15 @@ same page-16 logical cache as Helion.
 
 ## What is not implemented
 
-The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape uses
-its checked-in generated backward when dropout is zero and PyTorch SDPA
-autograd when `0 < dropout_p < 1`. Default-option dense MHA, GQA, and
-cross-attention calls without a generated backward also use PyTorch SDPA
-autograd, including fp16/bf16 and bottom-right causal masking. Packed varlen and
-KV-cache calls remain forward-only. These unsupported FlashAttention features
-also raise `NotImplementedError` rather than silently doing something else:
+The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape keeps
+its generated forward and uses SDPA gradients when dropout is zero and
+`deterministic=False`; deterministic calls retain its checked-in generated
+backward. It uses PyTorch SDPA throughout when `0 < dropout_p < 1`.
+Default-option dense MHA, GQA, and cross-attention calls without a generated
+backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
+causal masking. Packed varlen and KV-cache calls remain forward-only. These
+unsupported FlashAttention features also raise `NotImplementedError` rather
+than silently doing something else:
 
 - backward for dense ALiBi, varlen, and KV-cache calls
 - `deterministic=True` when using the dense SDPA autograd fallback

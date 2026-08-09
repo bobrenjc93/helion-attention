@@ -9,10 +9,11 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except one evidenced SM90 long-context MHA
 fast path that uses direct cuDNN SDPA; compatible unregistered dense shapes,
 dense ALiBi calls, and ALiBi on one shipped causal varlen profile use a generic
-Triton forward kernel. Positive dropout on the shipped encoder-training profile
-and grad-enabled dense calls without a generated backward use PyTorch SDPA
-autograd. The explicit shape validates these paths and makes specialization
-introspection independent of fallback coverage.
+Triton forward kernel. Non-deterministic training on the shipped encoder profile
+keeps its generated forward values and uses PyTorch SDPA gradients. Positive
+dropout on that profile and grad-enabled dense calls without a generated
+backward use PyTorch SDPA throughout. The explicit shape validates these paths
+and makes specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ from numbers import Real
 import torch
 
 from ._autograd import attention_autograd
+from ._autograd import attention_with_sdpa_gradients
 from ._registry import UnsupportedShapeError
 from ._registry import available_paged_shapes
 from ._registry import available_shapes
@@ -83,7 +85,7 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
-_DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+_ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _CUDNN_SDPA_FAST_PATH_KEY = "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal"
 _VARLEN_ALIBI_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
@@ -577,6 +579,9 @@ def flash_attn_func(
     call uses direct cuDNN SDPA on SM90 when eligible, falling back to its
     generated kernel otherwise. Grad-enabled calls without ALiBi or a generated
     backward, plus supported positive-dropout calls, use PyTorch SDPA autograd.
+    Zero-dropout, non-deterministic training on the shipped encoder profile
+    retains generated forward values while routing gradients through SDPA;
+    ``deterministic=True`` retains its generated backward as well.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
@@ -592,10 +597,10 @@ def flash_attn_func(
     )
     spec = normalize_shape(shape, q.dtype, causal)
     if dropout != 0.0:
-        if spec.key != _DROPOUT_SDPA_KEY:
+        if spec.key != _ENCODER_TRAINING_KEY:
             raise NotImplementedError(
                 "dropout is implemented only for the shipped encoder-training "
-                f"profile {_DROPOUT_SDPA_KEY}; got {spec.key}"
+                f"profile {_ENCODER_TRAINING_KEY}; got {spec.key}"
             )
         if deterministic:
             raise NotImplementedError(
@@ -644,6 +649,13 @@ def flash_attn_func(
         return dense_attention_sdpa(q, k, v, scale, spec, dropout)
     if needs_backward:
         if has_backward(spec):
+            if (
+                not deterministic
+                and not torch.are_deterministic_algorithms_enabled()
+                and not torch.backends.cudnn.deterministic
+                and spec.key == _ENCODER_TRAINING_KEY
+            ):
+                return attention_with_sdpa_gradients(q, k, v, scale, spec)
             return attention_autograd(q, k, v, scale, spec)
         if deterministic:
             raise NotImplementedError(
