@@ -42,8 +42,10 @@ BERT_DIAGNOSTIC = spec_from_manifest_entry(
 )
 FLASH_FAST_PATH_KEY = "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
 CUDNN_GQA_FAST_PATH_KEY = "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal"
+CUDNN_QWEN_FAST_PATH_KEY = "b1_sq8192_sk8192_hq28_hkv4_d128_bf16_causal"
 CUDNN_FAST_PATH_KEYS = (
     CUDNN_GQA_FAST_PATH_KEY,
+    CUDNN_QWEN_FAST_PATH_KEY,
     "b2_sq8192_sk8192_hq16_hkv16_d128_bf16_causal",
     "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
 )
@@ -390,7 +392,11 @@ def test_matches_fp32_sdpa(
     expected = reference_attention(q, k, v, spec, 1.0 / math.sqrt(spec.head_dim))
     assert got.is_contiguous()
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
-    if spec.key in {CUDNN_GQA_FAST_PATH_KEY, FLASH_FAST_PATH_KEY}:
+    if spec.key in {
+        CUDNN_GQA_FAST_PATH_KEY,
+        CUDNN_QWEN_FAST_PATH_KEY,
+        FLASH_FAST_PATH_KEY,
+    }:
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             autocast_got = helion_attention.flash_attn_func(
                 q, k, v, causal=spec.causal, shape=spec

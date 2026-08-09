@@ -17,8 +17,9 @@ the shape at the call site validates both paths and keeps acceleration explicit.
 
 One measured Hopper encoder profile invokes PyTorch's Flash SDPA operator
 directly: the exact noncausal bf16 `(2, 1024, 1024, 16, 16, 256)` MHA call.
-Three more Hopper profiles invoke PyTorch's cuDNN SDPA operator directly: the
+Four more Hopper profiles invoke PyTorch's cuDNN SDPA operator directly: the
 exact causal bf16 `(1, 4096, 4096, 32, 8, 128)` GQA,
+`(1, 8192, 8192, 28, 4, 128)` GQA,
 `(2, 8192, 8192, 16, 16, 128)` MHA, and
 `(4, 4096, 4096, 32, 32, 128)` MHA calls route there on SM90 when no backward
 is needed, `softmax_scale` is left at its default, and all other options retain
@@ -437,7 +438,7 @@ Paged rows use identical logical caches with each implementation's native page s
 | batch=1 seqlen_q=4096 seqlen_k=4096 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 390 | 352 | 424 | 457 | 242 | 309 | **1.11x slower** |
 | batch=1 seqlen_q=4096 seqlen_k=4096 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 289 | 354 | 472 | 503 | 260 | 475 | **1.22x faster** |
 | batch=1 seqlen_q=64 seqlen_k=320 nheads=8 (GQA 8:2) head_dim=128 dtype=bf16 causal=True | 28 | 350 | 216 | n/a | 327 | 3 | **12.73x faster** |
-| batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 5155 | 742 | 1498 | 1589 | 890 | 93 | **6.95x slower** |
+| batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True | 856 | 742 | 1446 | 1562 | 853 | 562 | **1.15x slower** |
 | batch=1 seqlen_q=8192 seqlen_k=8192 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True | 1598 | 868 | 1678 | 1821 | 1016 | 344 | **1.84x slower** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=16 head_dim=256 dtype=bf16 causal=False | 154 | 309 | 201 | 202 | n/a | 223 | **2.01x faster** |
 | batch=2 seqlen_q=1024 seqlen_k=1024 nheads=32 head_dim=64 dtype=bf16 causal=True | 110 | 350 | 198 | 197 | 196 | 78 | **3.19x faster** |
@@ -464,7 +465,7 @@ Paged rows use identical logical caches with each implementation's native page s
 
 Against FlashAttention 3, Helion is faster on 17 kernel workloads and slower on 15 kernel workloads.
 
-Geomean speedup over FlashAttention 3 across all 32 comparable kernel workloads: **1.51x**.
+Geomean speedup over FlashAttention 3 across all 32 comparable kernel workloads: **1.60x**.
 
 Helion is the fastest measured implementation on 16 of 35 workloads; FA2, FA3, or a PyTorch SDPA backend is faster on the remainder.
 <!-- BENCHMARKS:END -->
