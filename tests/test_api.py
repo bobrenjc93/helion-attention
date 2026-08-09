@@ -165,6 +165,26 @@ def reference_interleaved_rotary(
     return torch.cat((rotated_prefix, tensor[..., rotary_dim:]), dim=-1)
 
 
+def reference_neox_rotary(
+    tensor: torch.Tensor,
+    rotary_cos: torch.Tensor,
+    rotary_sin: torch.Tensor,
+    position: int,
+) -> torch.Tensor:
+    half_dim = tensor.shape[-1] // 2
+    first_half = tensor[..., :half_dim].float()
+    second_half = tensor[..., half_dim:].float()
+    cos = rotary_cos[position].float()
+    sin = rotary_sin[position].float()
+    return torch.cat(
+        (
+            first_half * cos - second_half * sin,
+            first_half * sin + second_half * cos,
+        ),
+        dim=-1,
+    ).to(tensor.dtype)
+
+
 def page_logical_caches(
     spec: AttnShape,
     logical_caches: list[tuple[torch.Tensor, torch.Tensor]],
@@ -2835,6 +2855,19 @@ def test_paged_kvcache_rejects_unsupported_modes_before_varlen_dispatch(
             return_softmax_lse=True,
             **base,
         )
+    rotary_cos, rotary_sin = make_rotary_tables(PAGED_KVCACHE)
+    with pytest.raises(NotImplementedError, match="read-only"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            k=update_k,
+            v=update_v,
+            rotary_cos=rotary_cos,
+            rotary_sin=rotary_sin,
+            rotary_interleaved=False,
+            **base,
+        )
     with pytest.raises(NotImplementedError, match="rotary embeddings"):
         helion_attention.flash_attn_with_kvcache(
             q,
@@ -3384,10 +3417,18 @@ def test_kvcache_appends_one_token_in_place_and_attends_to_it(
 )
 @pytest.mark.parametrize("return_softmax_lse", [False, True], ids=["out", "out-lse"])
 @pytest.mark.parametrize(
-    "rotary_dim", [64, 128], ids=["half-head", "full-head"]
+    ("rotary_interleaved", "rotary_dim"),
+    [
+        pytest.param(True, 64, id="interleaved-half-head"),
+        pytest.param(True, 128, id="interleaved-full-head"),
+        pytest.param(False, 128, id="neox-full-head"),
+    ],
 )
-def test_kvcache_interleaved_rotary_append_matches_fa2(
-    entry: dict[str, object], return_softmax_lse: bool, rotary_dim: int
+def test_kvcache_rotary_append_matches_fa2(
+    entry: dict[str, object],
+    return_softmax_lse: bool,
+    rotary_interleaved: bool,
+    rotary_dim: int,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = spec_from_manifest_entry(entry)
@@ -3410,6 +3451,7 @@ def test_kvcache_interleaved_rotary_append_matches_fa2(
         v=new_v,
         rotary_cos=rotary_cos,
         rotary_sin=rotary_sin,
+        rotary_interleaved=rotary_interleaved,
         cache_seqlens=position,
         causal=spec.causal,
         return_softmax_lse=return_softmax_lse,
@@ -3427,14 +3469,18 @@ def test_kvcache_interleaved_rotary_append_matches_fa2(
         v=new_v,
         rotary_cos=rotary_cos,
         rotary_sin=rotary_sin,
+        rotary_interleaved=rotary_interleaved,
         cache_seqlens=position,
         causal=spec.causal,
         return_softmax_lse=return_softmax_lse,
     )
 
-    expected_appended_k = reference_interleaved_rotary(
-        new_k, rotary_cos, rotary_sin, position
+    reference_rotary = (
+        reference_interleaved_rotary
+        if rotary_interleaved
+        else reference_neox_rotary
     )
+    expected_appended_k = reference_rotary(new_k, rotary_cos, rotary_sin, position)
     assert torch.equal(q_helion, q)
     assert torch.equal(q_fa2, q)
     assert torch.equal(new_k, initial_k[:, :1])
@@ -3455,7 +3501,10 @@ def test_kvcache_interleaved_rotary_append_matches_fa2(
         assert isinstance(expected, torch.Tensor)
         got_out, expected_out = got, expected
     torch.testing.assert_close(
-        got_out.float(), expected_out.float(), atol=1e-3, rtol=0.0
+        got_out.float(),
+        expected_out.float(),
+        atol=1e-3 if rotary_interleaved else 2e-3,
+        rtol=0.0,
     )
 
 
@@ -3586,6 +3635,34 @@ def test_kvcache_rejects_invalid_rotary_before_mutating_either_cache(
     reject(ValueError, "provided together", rotary_cos=None)
     reject(NotImplementedError, "non-interleaved", rotary_interleaved=False)
     reject(NotImplementedError, "one-token KV-cache append", k=None, v=None)
+
+    full_cos, full_sin = make_rotary_tables(
+        spec, rotary_dim=spec.head_dim, seed=17320
+    )
+    reject(
+        NotImplementedError,
+        "one-token KV-cache append",
+        k=None,
+        v=None,
+        rotary_cos=full_cos,
+        rotary_sin=full_sin,
+        rotary_interleaved=False,
+    )
+    reject(
+        NotImplementedError,
+        "final cache slot",
+        rotary_cos=full_cos,
+        rotary_sin=full_sin,
+        rotary_interleaved=False,
+        cache_seqlens=spec.seqlen_k - 2,
+    )
+    reject(
+        ValueError,
+        "dtype",
+        rotary_cos=full_cos.float(),
+        rotary_sin=full_sin,
+        rotary_interleaved=False,
+    )
 
     partial_cos = rotary_cos[:, :-1].contiguous()
     partial_sin = rotary_sin[:, :-1].contiguous()

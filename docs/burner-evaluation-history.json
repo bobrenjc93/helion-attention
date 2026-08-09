@@ -1558,6 +1558,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:532752ce408951b8d10e20f69843b3ac69e5c00d",
+      "commit": "532752ce408951b8d10e20f69843b3ac69e5c00d",
+      "recordedAt": "2026-08-09T11:35:59.372Z",
+      "label": "base 532752c",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 87,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:74",
+      "recordedAt": "2026-08-09T11:35:59.372Z",
+      "label": "PR #74",
+      "kind": "leaf",
+      "prNumber": 74,
+      "title": "Add NeoX rotary to final-slot cache appends",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 87,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

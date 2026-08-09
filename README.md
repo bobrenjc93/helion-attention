@@ -279,8 +279,9 @@ This same final-slot append accepts paired, contiguous `rotary_cos` and
 interleaved layout rotates adjacent pairs in `q` and `new_k` at position
 `cache_seqlens`; the rotated key is what the cache stores. `rotary_dim` may be
 the full head dimension, or 64 for a D128 head; the latter preserves dimensions
-64 through 127 unchanged. Other partial rotary dimensions,
-`rotary_interleaved=False`, and rotary on a read-only call are rejected.
+64 through 127 unchanged. Passing `rotary_interleaved=False` selects the GPT-NeoX
+split-half pair layout and is supported only for full-head rotation. Other
+partial rotary dimensions and rotary on a read-only call are rejected.
 
 `shape` accepts:
 
@@ -533,8 +534,8 @@ doing something else:
   dense tensor lengths outside the exact read-only 16K profile above, scalar
   partial caches, paged profiles other than the exact read-only page-size-16
   profiles above, paged LSE outside the exact decode profile above, and
-  KV-cache rotary outside the full-head or D128 half-head interleaved final-slot
-  append
+  KV-cache rotary outside the full-head interleaved/NeoX or D128 half-head
+  interleaved final-slot append
 - `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
   KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
   profiles, and the causal bf16 varlen profile described above

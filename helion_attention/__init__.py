@@ -201,6 +201,8 @@ def _validate_kvcache_rotary(
     rotary_sin: torch.Tensor,
     q: torch.Tensor,
     spec: AttnShape,
+    *,
+    rotary_interleaved: bool,
 ) -> None:
     """Validate the narrow rotary contract for a final-slot append."""
     for name, tensor in (("rotary_cos", rotary_cos), ("rotary_sin", rotary_sin)):
@@ -220,6 +222,12 @@ def _validate_kvcache_rotary(
             f"{tuple(rotary_cos.shape)} and {tuple(rotary_sin.shape)}"
         )
     rotary_dim = rotary_cos.shape[1] * 2
+    if not rotary_interleaved and rotary_dim != spec.head_dim:
+        raise NotImplementedError(
+            "non-interleaved rotary embeddings are implemented only for "
+            "full-head rotation; "
+            f"rotary_dim must equal head_dim={spec.head_dim}, got {rotary_dim}"
+        )
     supported_rotary_dims = {spec.head_dim}
     if spec.head_dim == 128:
         supported_rotary_dims.add(64)
@@ -278,6 +286,27 @@ def _apply_interleaved_rotary(
     if rotary_dim == tensor.shape[-1]:
         return rotated_prefix
     return torch.cat((rotated_prefix, tensor[..., rotary_dim:]), dim=-1)
+
+
+def _apply_neox_rotary(
+    tensor: torch.Tensor,
+    rotary_cos: torch.Tensor,
+    rotary_sin: torch.Tensor,
+    position: int,
+) -> torch.Tensor:
+    """Rotate full-head split-half pairs in the GPT-NeoX layout."""
+    half_dim = tensor.shape[-1] // 2
+    first_half = tensor[..., :half_dim].float()
+    second_half = tensor[..., half_dim:].float()
+    cos = rotary_cos[position].float()
+    sin = rotary_sin[position].float()
+    return torch.cat(
+        (
+            first_half * cos - second_half * sin,
+            first_half * sin + second_half * cos,
+        ),
+        dim=-1,
+    ).to(dtype=tensor.dtype)
 
 
 def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
@@ -1584,14 +1613,15 @@ def flash_attn_with_kvcache(
     lengths on updates and other dense profiles, scalar partial lengths, and
     multi-token updates fail explicitly. A
     paired ``rotary_cos``/``rotary_sin`` table may be supplied only for this
-    final-slot append: it may cover the full head or the first 64 dimensions of
-    a 128-dimensional head, must use the default interleaved layout, and rotates
-    both ``q`` and the appended ``k`` at ``cache_seqlens``. Read-only rotary
-    calls and other paged profiles fail explicitly. Paged updates, rotary, and
-    autograd are unsupported for both paged profiles. Paged ALiBi is unsupported
-    for chunked prefill, updates, LSE returns, other profiles, and other page
-    sizes. Paged softmax LSE is unsupported for chunked prefill, other profiles,
-    and other page sizes.
+    final-slot append: the default interleaved layout may cover the full head or
+    the first 64 dimensions of a 128-dimensional head, while the non-interleaved
+    GPT-NeoX layout requires full-head rotation. Both layouts rotate ``q`` and
+    the appended ``k`` at ``cache_seqlens``. Read-only rotary calls and other
+    paged profiles fail explicitly. Paged updates, rotary, and autograd are
+    unsupported for both paged profiles. Paged ALiBi is unsupported for chunked
+    prefill, updates, LSE returns, other profiles, and other page sizes. Paged
+    softmax LSE is unsupported for chunked prefill, other profiles, and other
+    page sizes.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
@@ -1604,11 +1634,6 @@ def flash_attn_with_kvcache(
     if (rotary_cos is None) != (rotary_sin is None):
         raise ValueError("rotary_cos and rotary_sin must be provided together")
     apply_rotary = rotary_cos is not None
-    if apply_rotary and not rotary_interleaved:
-        raise NotImplementedError(
-            "non-interleaved rotary embeddings are not implemented; pass "
-            "rotary_interleaved=True"
-        )
     if cache_batch_idx is not None:
         raise NotImplementedError("cache_batch_idx is not implemented")
     if cache_leftpad is not None:
@@ -1755,7 +1780,13 @@ def flash_attn_with_kvcache(
             )
         if apply_rotary:
             assert rotary_cos is not None and rotary_sin is not None
-            _validate_kvcache_rotary(rotary_cos, rotary_sin, q, spec)
+            _validate_kvcache_rotary(
+                rotary_cos,
+                rotary_sin,
+                q,
+                spec,
+                rotary_interleaved=rotary_interleaved,
+            )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
@@ -1803,10 +1834,13 @@ def flash_attn_with_kvcache(
         cache_tensors = (k_cache, v_cache)
         if apply_rotary:
             assert rotary_cos is not None and rotary_sin is not None
-            update_k = _apply_interleaved_rotary(
-                k, rotary_cos, rotary_sin, cache_seqlens
+            apply_rotary_fn = (
+                _apply_interleaved_rotary
+                if rotary_interleaved
+                else _apply_neox_rotary
             )
-            q_for_attention = _apply_interleaved_rotary(
+            update_k = apply_rotary_fn(k, rotary_cos, rotary_sin, cache_seqlens)
+            q_for_attention = apply_rotary_fn(
                 q, rotary_cos, rotary_sin, cache_seqlens
             )
         else:
