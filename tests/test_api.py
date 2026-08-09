@@ -36,6 +36,7 @@ LONG_DECODE = next(
 )
 BACKWARD_SHAPES = [entry for entry in SHAPES if bool(entry.get("backward", False))]
 ENCODER_TRAINING = spec_from_manifest_entry(BACKWARD_SHAPES[0])
+FLASH_FAST_PATH_KEY = "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
 CUDNN_GQA_FAST_PATH_KEY = "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal"
 CUDNN_FAST_PATH_KEYS = (
     CUDNN_GQA_FAST_PATH_KEY,
@@ -59,6 +60,16 @@ CUDNN_FAST_PATHS = [
     for key in CUDNN_FAST_PATH_KEYS
 ]
 CUDNN_FAST_PATH = CUDNN_FAST_PATHS[0]
+FLASH_FAST_PATH = spec_from_manifest_entry(
+    next(entry for entry in SHAPES if entry["key"] == FLASH_FAST_PATH_KEY)
+)
+SDPA_FAST_PATH_CASES = [
+    (FLASH_FAST_PATH, "dense_attention_flash_default_scale", "flash"),
+    *[
+        (spec, "dense_attention_cudnn_default_scale", "cudnn")
+        for spec in CUDNN_FAST_PATHS
+    ],
+]
 PAGED_KVCACHE = AttnShape(
     batch=4,
     seqlen_q=1,
@@ -375,7 +386,7 @@ def test_matches_fp32_sdpa(
     expected = reference_attention(q, k, v, spec, 1.0 / math.sqrt(spec.head_dim))
     assert got.is_contiguous()
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
-    if spec.key == CUDNN_GQA_FAST_PATH_KEY:
+    if spec.key in {CUDNN_GQA_FAST_PATH_KEY, FLASH_FAST_PATH_KEY}:
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             autocast_got = helion_attention.flash_attn_func(
                 q, k, v, causal=spec.causal, shape=spec
@@ -384,10 +395,13 @@ def test_matches_fp32_sdpa(
         torch.testing.assert_close(
             autocast_got.float(), expected, atol=5e-2, rtol=2e-2
         )
+        helper_name = (
+            "dense_attention_flash_default_scale"
+            if spec.key == FLASH_FAST_PATH_KEY
+            else "dense_attention_cudnn_default_scale"
+        )
         monkeypatch.setattr(
-            helion_attention,
-            "dense_attention_cudnn_default_scale",
-            lambda q_arg, k_arg, v_arg: None,
+            helion_attention, helper_name, lambda q_arg, k_arg, v_arg: None
         )
         fallback = helion_attention.flash_attn_func(
             q, k, v, causal=spec.causal, shape=spec
@@ -516,9 +530,16 @@ def test_registered_shape_without_backward_dispatches_to_sdpa(
 
 
 @requires_cuda
-@pytest.mark.parametrize("spec", CUDNN_FAST_PATHS, ids=CUDNN_FAST_PATH_KEYS)
-def test_cudnn_fast_path_dispatch_is_narrow(
-    monkeypatch: pytest.MonkeyPatch, spec: AttnShape
+@pytest.mark.parametrize(
+    ("spec", "helper_name", "backend"),
+    SDPA_FAST_PATH_CASES,
+    ids=[spec.key for spec, _, _ in SDPA_FAST_PATH_CASES],
+)
+def test_direct_sdpa_fast_path_dispatch_is_narrow(
+    monkeypatch: pytest.MonkeyPatch,
+    spec: AttnShape,
+    helper_name: str,
+    backend: str,
 ) -> None:
     def empty(seqlen: int, nheads: int) -> torch.Tensor:
         return torch.empty(
@@ -536,13 +557,13 @@ def test_cudnn_fast_path_dispatch_is_narrow(
     sentinel = torch.empty((), device="cuda")
     dispatched: list[str] = []
 
-    def cudnn(
+    def direct_sdpa(
         q_arg: torch.Tensor,
         k_arg: torch.Tensor,
         v_arg: torch.Tensor,
     ) -> torch.Tensor:
         del q_arg, k_arg, v_arg
-        dispatched.append("cudnn")
+        dispatched.append(backend)
         return sentinel
 
     def lookup_stub(spec_arg: AttnShape):
@@ -571,9 +592,7 @@ def test_cudnn_fast_path_dispatch_is_narrow(
         dispatched.append("autograd")
         return sentinel
 
-    monkeypatch.setattr(
-        helion_attention, "dense_attention_cudnn_default_scale", cudnn
-    )
+    monkeypatch.setattr(helion_attention, helper_name, direct_sdpa)
     monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
     monkeypatch.setattr(
         helion_attention, "dense_attention_sdpa", autograd_fallback
@@ -581,10 +600,10 @@ def test_cudnn_fast_path_dispatch_is_narrow(
     monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
 
     out = helion_attention.flash_attn_func(
-        q, k, v, causal=True, shape=spec
+        q, k, v, causal=spec.causal, shape=spec
     )
     assert out is sentinel
-    assert dispatched == ["cudnn"]
+    assert dispatched == [backend]
 
     # Supplying even the numerical default explicitly retains generated-kernel
     # dispatch; the fast path is specifically for an omitted/default scale.
@@ -594,7 +613,7 @@ def test_cudnn_fast_path_dispatch_is_narrow(
         k,
         v,
         softmax_scale=1.0 / math.sqrt(spec.head_dim),
-        causal=True,
+        causal=spec.causal,
         shape=spec,
     )
     assert out is sentinel
@@ -602,7 +621,7 @@ def test_cudnn_fast_path_dispatch_is_narrow(
 
     dispatched.clear()
     out = helion_attention.flash_attn_func(
-        q, k, v, causal=True, deterministic=True, shape=spec
+        q, k, v, causal=spec.causal, deterministic=True, shape=spec
     )
     assert out is sentinel
     assert dispatched == ["generated"]
@@ -610,7 +629,7 @@ def test_cudnn_fast_path_dispatch_is_narrow(
     dispatched.clear()
     monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: False)
     out = helion_attention.flash_attn_func(
-        q, k, v, causal=True, shape=spec
+        q, k, v, causal=spec.causal, shape=spec
     )
     assert out is sentinel
     assert dispatched == ["generated"]
@@ -618,12 +637,10 @@ def test_cudnn_fast_path_dispatch_is_narrow(
     dispatched.clear()
     monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
     monkeypatch.setattr(
-        helion_attention,
-        "dense_attention_cudnn_default_scale",
-        lambda q_arg, k_arg, v_arg: None,
+        helion_attention, helper_name, lambda q_arg, k_arg, v_arg: None
     )
     out = helion_attention.flash_attn_func(
-        q, k, v, causal=True, shape=spec
+        q, k, v, causal=spec.causal, shape=spec
     )
     assert out is sentinel
     assert dispatched == ["generated"]
@@ -646,10 +663,103 @@ def test_cudnn_fast_path_dispatch_is_narrow(
     dispatched.clear()
     q.requires_grad_()
     out = helion_attention.flash_attn_func(
-        q, k, v, causal=True, shape=spec
+        q, k, v, causal=spec.causal, shape=spec
     )
     assert out is sentinel
     assert dispatched == ["autograd"]
+
+    # requires_grad tensors still use the inference fast path when autograd is
+    # explicitly disabled for the call.
+    dispatched.clear()
+    monkeypatch.setattr(helion_attention, helper_name, direct_sdpa)
+    with torch.no_grad():
+        out = helion_attention.flash_attn_func(
+            q, k, v, causal=spec.causal, shape=spec
+        )
+    assert out is sentinel
+    assert dispatched == [backend]
+
+
+@requires_cuda
+def test_flash_fast_path_falls_back_when_ineligible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = FLASH_FAST_PATH
+
+    def empty() -> torch.Tensor:
+        return torch.empty(
+            spec.batch,
+            spec.seqlen_q,
+            spec.nheads_q,
+            spec.head_dim,
+            device="cuda",
+            dtype=spec.dtype,
+        )
+
+    q, k, v = empty(), empty(), empty()
+    sentinel = torch.empty((), device="cuda")
+    generated_calls = 0
+
+    def lookup_stub(spec_arg: AttnShape):
+        assert spec_arg == spec
+
+        def generated(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            nonlocal generated_calls
+            del q_arg, k_arg, v_arg
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            generated_calls += 1
+            return sentinel
+
+        return generated
+
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    monkeypatch.setattr(helion_attention, "_is_sm90", lambda device: True)
+
+    deterministic_enabled = torch.are_deterministic_algorithms_enabled()
+    deterministic_warn_only = (
+        torch.is_deterministic_algorithms_warn_only_enabled()
+    )
+    try:
+        torch.use_deterministic_algorithms(True)
+        out = helion_attention.flash_attn_func(q, k, v, shape=spec)
+    finally:
+        torch.use_deterministic_algorithms(
+            deterministic_enabled, warn_only=deterministic_warn_only
+        )
+    assert out is sentinel
+    assert generated_calls == 1
+
+    eligibility: list[tuple[bool, bool]] = []
+
+    def reject_flash(params: object) -> bool:
+        eligibility.append(
+            (
+                bool(getattr(params, "is_causal")),
+                bool(getattr(params, "enable_gqa")),
+            )
+        )
+        return False
+
+    monkeypatch.setattr(
+        torch.backends.cuda, "can_use_flash_attention", reject_flash
+    )
+    out = helion_attention.flash_attn_func(q, k, v, shape=spec)
+    assert out is sentinel
+    assert generated_calls == 2
+    assert eligibility == [(False, False)]
+
+    monkeypatch.setattr(
+        torch.backends.cuda, "flash_sdp_enabled", lambda: False
+    )
+    out = helion_attention.flash_attn_func(q, k, v, shape=spec)
+    assert out is sentinel
+    assert generated_calls == 3
+    assert eligibility == [(False, False)]
 
 
 @requires_cuda
