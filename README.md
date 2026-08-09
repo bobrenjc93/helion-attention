@@ -54,6 +54,15 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
 
+The checked-in noncausal bf16 BERT-base encoder profile
+`(16, 512, 512, 12, 12, 64)` supports `return_attn_probs=True` through the
+dense, QKV-packed, and KV-packed entry points. A forward-only, dropout-free
+call returns `(out, softmax_lse, S_dmask)` with fp32 LSE shaped
+`[16, 12, 512]` and an empty bf16 `S_dmask`, matching FA2. Diagnostic calls
+use the generic packed runtime; ordinary calls retain the generated
+specialization. Causal mode, ALiBi, and other dense profiles remain outside
+this encoder diagnostic subset.
+
 The three checked-in batch-1 Llama GQA decode profiles (one query token and a
 1K, 4K, or 16K KV sequence) support `return_attn_probs=True` through both
 `flash_attn_func` and `flash_attn_kvpacked_func`. For calls that do not require
@@ -73,7 +82,7 @@ ALiBi backward is not implemented. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile accepts
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
 Other dropout calls, local windows, softcap, dense diagnostic returns outside
-the decode subset above, and deterministic dropout still fail explicitly as
+the subsets above, and deterministic dropout still fail explicitly as
 described below. Unregistered calls must also fit the generic kernel's signed
 32-bit Q/output and K/V element offsets.
 
@@ -515,9 +524,9 @@ doing something else:
   page-size-16 profiles above, paged LSE outside the exact decode profile
   above, and KV-cache rotary outside the full-head or D128 half-head
   interleaved final-slot append
-- `return_attn_probs=True` outside the no-backward dense/KV-packed calls for the
-  three Llama GQA decode profiles and the causal bf16 varlen profile described
-  above
+- `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
+  KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
+  profiles, and the causal bf16 varlen profile described above
 
 ## How the kernels are made
 

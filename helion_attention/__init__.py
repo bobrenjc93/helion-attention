@@ -8,9 +8,10 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, ALiBi on both shipped varlen profiles, and diagnostics on the
-shipped causal varlen profile use a generic Triton forward kernel. The exposed
-page-16 decode cache also uses the generic paged runtime when ALiBi is supplied.
+ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
+profiles, and diagnostics on the shipped causal varlen profile use a generic
+Triton forward kernel. The exposed page-16 decode cache also uses the generic
+paged runtime when ALiBi is supplied.
 Positive dropout on the shipped encoder-training profile, grad-enabled dense
 calls without a generated backward, and both full-length varlen profiles use
 PyTorch SDPA autograd. The explicit shape validates these paths and makes
@@ -88,6 +89,7 @@ _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+_BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
 _FLASH_SDPA_FAST_PATH_KEY = (
     "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
 )
@@ -163,7 +165,7 @@ def _reject_unsupported(
 
 
 def _supports_diagnostic_return(spec: AttnShape) -> bool:
-    """Whether ``spec`` has one of the three LSE-capable decode kernels."""
+    """Whether ``spec`` has a validated dense diagnostic path."""
     profile = (
         spec.batch,
         spec.seqlen_q,
@@ -175,7 +177,10 @@ def _supports_diagnostic_return(spec: AttnShape) -> bool:
     )
     # Causal and non-causal are equivalent for a bottom-right single-token
     # query, and the registry maps both modes to the same checked-in kernel.
-    return profile in _DIAGNOSTIC_DECODE_PROFILES and has_kernel(spec)
+    return (
+        spec.key == _BERT_DIAGNOSTIC_KEY
+        or profile in _DIAGNOSTIC_DECODE_PROFILES
+    ) and has_kernel(spec)
 
 
 def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bool:
@@ -506,6 +511,75 @@ def _generic_dense_forward(
     )
 
 
+def _generic_dense_diagnostic_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return FA2-compatible dense diagnostics from the packed runtime."""
+    total_q, total_k = _validate_generic_dense_layout(spec)
+
+    # The packed runtime stores LSE as [heads, total_q]. Dense FA2 callers
+    # receive the same values rearranged as [batch, heads, seqlen_q].
+    packed_q = q.view(total_q, spec.nheads_q, spec.head_dim)
+    packed_k = k.view(total_k, spec.nheads_kv, spec.head_dim)
+    packed_v = v.view(total_k, spec.nheads_kv, spec.head_dim)
+    request_ids = torch.arange(
+        spec.batch + 1, device=q.device, dtype=torch.int32
+    )
+    cu_seqlens_q = request_ids * spec.seqlen_q
+    cu_seqlens_k = (
+        cu_seqlens_q
+        if spec.seqlen_q == spec.seqlen_k
+        else request_ids * spec.seqlen_k
+    )
+
+    from ._paged_attention import packed_attention
+
+    packed_result = packed_attention(
+        packed_q,
+        packed_k,
+        packed_v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=False,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=True,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_result, tuple):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention did not return softmax LSE")
+    packed_out, packed_lse = packed_result
+    out = packed_out.view(
+        spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
+    )
+    softmax_lse = (
+        packed_lse.view(spec.nheads_q, spec.batch, spec.seqlen_q)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
+    return out, softmax_lse, q.new_empty((0,))
+
+
 def _generic_varlen_alibi_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -658,11 +732,11 @@ def flash_attn_func(
         causal: bottom-right causal masking, including unequal sequence lengths.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
-        return_attn_probs: for the three shipped bf16 Llama GQA decode
-            profiles, return FlashAttention's diagnostic tuple. This is
-            available only when no backward is needed and all options other
-            than ``softmax_scale`` and the equivalent decode ``causal`` mode
-            retain their defaults.
+        return_attn_probs: for the shipped bf16 BERT-base encoder and three
+            Llama GQA decode profiles, return FlashAttention's diagnostic
+            tuple. This is available only when no backward is needed and all
+            options other than ``softmax_scale`` (and the equivalent decode
+            ``causal`` mode) retain their defaults.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -670,9 +744,9 @@ def flash_attn_func(
     Returns:
         ``[batch, seqlen_q, nheads_q, head_dim]``. With the supported
         ``return_attn_probs=True`` subset, returns ``(out, softmax_lse,
-        S_dmask)``. The LSE is fp32 with shape ``[batch, nheads_q, 1]`` and
-        ``S_dmask`` is an empty input-dtype tensor, matching FlashAttention
-        when dropout is zero.
+        S_dmask)``. The LSE is fp32 with shape
+        ``[batch, nheads_q, seqlen_q]`` and ``S_dmask`` is an empty
+        input-dtype tensor, matching FlashAttention when dropout is zero.
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256`` and all ALiBi calls
     use a generic packed Triton forward kernel. The exact default-option,
@@ -734,9 +808,12 @@ def flash_attn_func(
             )
         if not _supports_diagnostic_return(spec):
             raise NotImplementedError(
-                "return_attn_probs=True is implemented only for the three "
+                "return_attn_probs=True is implemented only for the shipped "
+                f"{_BERT_DIAGNOSTIC_KEY} BERT-base encoder and the three "
                 "shipped batch-1, single-token bf16 Llama GQA decode profiles"
             )
+        if spec.key == _BERT_DIAGNOSTIC_KEY:
+            return _generic_dense_diagnostic_forward(q, k, v, scale, spec)
         out, softmax_lse = lookup(spec)(
             q, k, v, scale, return_softmax_lse=True
         )

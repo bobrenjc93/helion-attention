@@ -1453,6 +1453,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:62",
+      "recordedAt": "2026-08-09T06:42:27.782Z",
+      "label": "PR #62",
+      "kind": "leaf",
+      "prNumber": 62,
+      "title": "Return diagnostics for the shipped BERT-base encoder",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 85,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
