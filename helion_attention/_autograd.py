@@ -1,4 +1,4 @@
-"""Autograd bridge for shapes that ship generated backward kernels."""
+"""Autograd bridges for generated attention forwards."""
 
 from __future__ import annotations
 
@@ -8,7 +8,30 @@ import torch
 
 from ._registry import lookup
 from ._registry import lookup_backward
+from ._sdpa import dense_attention_flash_default_scale
 from ._shape import AttnShape
+
+
+class _GeneratedForwardWithFlashGradients(torch.autograd.Function):
+    """Expose generated values while differentiating a Flash surrogate."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        generated: torch.Tensor,
+        flash: torch.Tensor,
+    ) -> torch.Tensor:
+        del ctx, flash
+        # Returning an independent tensor avoids the custom-Function view
+        # restrictions while preserving every generated bf16 value exactly.
+        return generated.clone()
+
+    @staticmethod
+    def backward(
+        ctx: Any, grad_out: torch.Tensor
+    ) -> tuple[None, torch.Tensor]:
+        del ctx
+        return None, grad_out
 
 
 class _Attention(torch.autograd.Function):
@@ -65,3 +88,19 @@ def attention_autograd(
 ) -> torch.Tensor:
     """Run a generated forward and attach its matching generated backward."""
     return _Attention.apply(q, k, v, softmax_scale, spec)
+
+
+def attention_with_flash_gradients(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Use raw BSHD Flash gradients, falling back to generated backward."""
+    flash = dense_attention_flash_default_scale(q, k, v)
+    if flash is None or not flash.requires_grad:
+        return attention_autograd(q, k, v, softmax_scale, spec)
+    with torch.no_grad():
+        generated = lookup(spec)(q, k, v, softmax_scale)
+    return _GeneratedForwardWithFlashGradients.apply(generated, flash)

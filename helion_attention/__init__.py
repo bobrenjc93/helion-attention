@@ -13,10 +13,12 @@ profiles, and diagnostics on the shipped causal varlen profile use a generic
 Triton forward kernel. That runtime also provides ``softcap=50.0`` for one
 forward-only Gemma-2 profile. Both exposed page-16 paged KV-cache profiles use
 the generic paged runtime when ALiBi is supplied.
-Positive dropout on the shipped encoder-training profile, grad-enabled dense
-calls without a generated backward, and both full-length varlen profiles use
-PyTorch SDPA autograd. The explicit shape validates these paths and makes
-specialization introspection independent of fallback coverage.
+Default-scale SM90 training on the shipped encoder profile keeps its generated
+forward values and uses raw PyTorch BSHD Flash gradients, falling back to its
+generated backward when Flash is unavailable. Positive dropout on that profile,
+grad-enabled dense calls without a generated backward, and both full-length
+varlen profiles use PyTorch SDPA autograd. The explicit shape validates these
+paths and makes specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from numbers import Real
 import torch
 
 from ._autograd import attention_autograd
+from ._autograd import attention_with_flash_gradients
 from ._registry import UnsupportedShapeError
 from ._registry import available_paged_shapes
 from ._registry import available_shapes
@@ -89,7 +92,7 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
 _CORE_PAGED_VARLEN_PAGE_SIZE = 16
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
-_DROPOUT_SDPA_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+_ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
 _GEMMA2_SOFTCAP_KEY = "b1_sq4096_sk4096_hq16_hkv8_d256_bf16_causal"
 _GEMMA2_SOFTCAP = 50.0
@@ -986,6 +989,11 @@ def flash_attn_func(
     calls use direct cuDNN SDPA. All five paths fall back to their generated
     kernels when ineligible. Grad-enabled calls without ALiBi or a generated
     backward, plus supported positive-dropout calls, use PyTorch SDPA autograd.
+    Zero-dropout training on the shipped encoder profile retains generated
+    forward values. Its omitted/default-scale SM90 path uses raw BSHD PyTorch
+    Flash gradients, falling back to the generated backward when Flash is
+    unavailable. Explicit-scale, non-SM90, and deterministic calls retain the
+    generated backward.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
@@ -1009,10 +1017,10 @@ def flash_attn_func(
             f"got {spec.describe()}"
         )
     if dropout != 0.0:
-        if spec.key != _DROPOUT_SDPA_KEY:
+        if spec.key != _ENCODER_TRAINING_KEY:
             raise NotImplementedError(
                 "dropout is implemented only for the shipped encoder-training "
-                f"profile {_DROPOUT_SDPA_KEY}; got {spec.key}"
+                f"profile {_ENCODER_TRAINING_KEY}; got {spec.key}"
             )
         if deterministic:
             raise NotImplementedError(
@@ -1079,6 +1087,13 @@ def flash_attn_func(
         return dense_attention_sdpa(q, k, v, scale, spec, dropout)
     if needs_backward:
         if has_backward(spec):
+            if (
+                default_softmax_scale
+                and not deterministic
+                and spec.key == _ENCODER_TRAINING_KEY
+                and _is_sm90(q.device)
+            ):
+                return attention_with_flash_gradients(q, k, v, scale, spec)
             return attention_autograd(q, k, v, scale, spec)
         if deterministic:
             raise NotImplementedError(
