@@ -15,7 +15,7 @@ from helion_attention._registry import spec_from_manifest_entry
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 VARLEN_SHAPES = helion_attention.available_varlen_shapes()
 VARLEN_IDS = [str(entry["key"]) for entry in VARLEN_SHAPES]
-VARLEN_ALIBI = AttnShape(
+VARLEN_ALIBI_CAUSAL = AttnShape(
     batch=8,
     seqlen_q=512,
     seqlen_k=512,
@@ -25,6 +25,17 @@ VARLEN_ALIBI = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+VARLEN_ALIBI_NONCAUSAL = AttnShape(
+    batch=8,
+    seqlen_q=512,
+    seqlen_k=512,
+    nheads_q=16,
+    nheads_kv=16,
+    head_dim=64,
+    dtype=torch.bfloat16,
+    causal=False,
+)
+VARLEN_ALIBI_PROFILES = (VARLEN_ALIBI_CAUSAL, VARLEN_ALIBI_NONCAUSAL)
 PAGED_DECODE = AttnShape(
     batch=4,
     seqlen_q=1,
@@ -566,6 +577,9 @@ def test_varlen_matches_fp32_sdpa_with_dynamic_token_totals(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+@pytest.mark.parametrize(
     ("batched_slopes", "softmax_scale", "variant"),
     [
         pytest.param(False, None, 0, id="head-default-scale"),
@@ -575,9 +589,11 @@ def test_varlen_matches_fp32_sdpa_with_dynamic_token_totals(
     ],
 )
 def test_varlen_alibi_matches_fa2_and_fp32_for_dynamic_ragged_calls(
-    batched_slopes: bool, softmax_scale: float | None, variant: int
+    spec: AttnShape,
+    batched_slopes: bool,
+    softmax_scale: float | None,
+    variant: int,
 ) -> None:
-    spec = VARLEN_ALIBI
     q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
         spec, variant=variant, seed=20260808
     )
@@ -599,7 +615,7 @@ def test_varlen_alibi_matches_fa2_and_fp32_for_dynamic_ragged_calls(
         spec.seqlen_q,
         spec.seqlen_k,
         softmax_scale=softmax_scale,
-        causal=True,
+        causal=spec.causal,
         alibi_slopes=slopes,
         shape=spec,
     )
@@ -614,7 +630,7 @@ def test_varlen_alibi_matches_fa2_and_fp32_for_dynamic_ragged_calls(
         v,
         lengths_q,
         lengths_k,
-        causal=True,
+        causal=spec.causal,
         scale=scale,
         alibi_slopes=slopes,
     )
@@ -636,7 +652,7 @@ def test_varlen_alibi_matches_fa2_and_fp32_for_dynamic_ragged_calls(
         spec.seqlen_q,
         spec.seqlen_k,
         softmax_scale=softmax_scale,
-        causal=True,
+        causal=spec.causal,
         alibi_slopes=slopes,
     )
     torch.testing.assert_close(
@@ -646,7 +662,7 @@ def test_varlen_alibi_matches_fa2_and_fp32_for_dynamic_ragged_calls(
 
 @requires_cuda
 def test_varlen_packed_entry_points_inherit_alibi_support() -> None:
-    spec = VARLEN_ALIBI
+    spec = VARLEN_ALIBI_NONCAUSAL
     slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device="cuda")
 
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2, seed=314159)
@@ -658,7 +674,7 @@ def test_varlen_packed_entry_points_inherit_alibi_support() -> None:
         cu_k,
         spec.seqlen_q,
         spec.seqlen_k,
-        causal=True,
+        causal=spec.causal,
         alibi_slopes=slopes,
         shape=spec,
     )
@@ -667,7 +683,7 @@ def test_varlen_packed_entry_points_inherit_alibi_support() -> None:
         qkv,
         cu_q,
         spec.seqlen_q,
-        causal=True,
+        causal=spec.causal,
         alibi_slopes=slopes,
         shape=spec,
     )
@@ -685,7 +701,7 @@ def test_varlen_packed_entry_points_inherit_alibi_support() -> None:
         cu_k,
         spec.seqlen_q,
         spec.seqlen_k,
-        causal=True,
+        causal=spec.causal,
         alibi_slopes=batched_slopes,
         shape=spec,
     )
@@ -697,7 +713,7 @@ def test_varlen_packed_entry_points_inherit_alibi_support() -> None:
         cu_k,
         spec.seqlen_q,
         spec.seqlen_k,
-        causal=True,
+        causal=spec.causal,
         alibi_slopes=batched_slopes,
         shape=spec,
     )
@@ -708,7 +724,7 @@ def test_varlen_packed_entry_points_inherit_alibi_support() -> None:
 def test_varlen_without_alibi_retains_generated_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = VARLEN_ALIBI
+    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     sentinel = torch.empty_like(q)
     seen: list[AttnShape] = []
@@ -735,7 +751,7 @@ def test_varlen_without_alibi_retains_generated_dispatch(
         cu_k,
         spec.seqlen_q,
         spec.seqlen_k,
-        causal=True,
+        causal=spec.causal,
         alibi_slopes=None,
         shape=spec,
     )
@@ -748,7 +764,7 @@ def test_varlen_without_alibi_retains_generated_dispatch(
 def test_varlen_alibi_bypasses_generated_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = VARLEN_ALIBI
+    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=1)
     slopes = torch.ones(spec.nheads_q, device=q.device)
     sentinel = torch.empty_like(q)
@@ -782,7 +798,7 @@ def test_varlen_alibi_bypasses_generated_dispatch(
         spec.seqlen_q,
         spec.seqlen_k,
         softmax_scale=0.37,
-        causal=True,
+        causal=spec.causal,
         alibi_slopes=slopes,
         shape=spec,
     )
@@ -796,8 +812,8 @@ def test_varlen_alibi_bypasses_generated_dispatch(
     "spec",
     [
         pytest.param(
-            AttnShape(8, 512, 512, 16, 16, 64, torch.bfloat16, False),
-            id="noncausal-profile",
+            AttnShape(8, 512, 512, 16, 16, 64, torch.float16, False),
+            id="other-dtype",
         ),
         pytest.param(
             AttnShape(8, 256, 256, 16, 16, 64, torch.bfloat16, True),
@@ -838,7 +854,7 @@ def test_varlen_alibi_rejects_other_profiles(spec: AttnShape) -> None:
 def test_varlen_alibi_rejects_gradients_before_dispatch(
     gradient_source: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = VARLEN_ALIBI
+    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     slopes = torch.ones(spec.nheads_q, device=q.device)
     if gradient_source == "q":
@@ -861,7 +877,7 @@ def test_varlen_alibi_rejects_gradients_before_dispatch(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=True,
+            causal=spec.causal,
             alibi_slopes=slopes,
             shape=spec,
         )
@@ -880,11 +896,11 @@ def test_varlen_alibi_rejects_gradients_before_dispatch(
 def test_varlen_alibi_rejects_incompatible_options(
     option: str, value: object, message: str
 ) -> None:
-    spec = VARLEN_ALIBI
+    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     kwargs = {
         option: value,
-        "causal": True,
+        "causal": spec.causal,
         "alibi_slopes": torch.ones(spec.nheads_q, device=q.device),
         "shape": spec,
     }
@@ -917,7 +933,7 @@ def test_varlen_alibi_rejects_incompatible_options(
 def test_varlen_alibi_rejects_malformed_slopes_before_dispatch(
     case: str, message: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = VARLEN_ALIBI
+    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     if case == "not-tensor":
         slopes: object = [0.1] * spec.nheads_q
@@ -949,7 +965,7 @@ def test_varlen_alibi_rejects_malformed_slopes_before_dispatch(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=True,
+            causal=spec.causal,
             alibi_slopes=slopes,  # type: ignore[arg-type]
             shape=spec,
         )
