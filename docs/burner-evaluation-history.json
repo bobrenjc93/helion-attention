@@ -1948,6 +1948,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:712eb1fcff682cab40ddeb518d5d10482fab41e8",
+      "commit": "712eb1fcff682cab40ddeb518d5d10482fab41e8",
+      "recordedAt": "2026-08-09T18:41:59.593Z",
+      "label": "base 712eb1f",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 89,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:94",
+      "recordedAt": "2026-08-09T18:41:59.593Z",
+      "label": "PR #94",
+      "kind": "leaf",
+      "prNumber": 94,
+      "title": "Add dropout to the checked-in BERT-base encoder",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
