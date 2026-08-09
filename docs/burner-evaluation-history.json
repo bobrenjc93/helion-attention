@@ -1693,6 +1693,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6dfa4557d693c483bcd5881488f4d2e7bd6fdf2e",
+      "commit": "6dfa4557d693c483bcd5881488f4d2e7bd6fdf2e",
+      "recordedAt": "2026-08-09T15:12:40.256Z",
+      "label": "base 6dfa455",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 88,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:85",
+      "recordedAt": "2026-08-09T15:12:40.256Z",
+      "label": "PR #85",
+      "kind": "leaf",
+      "prNumber": 85,
+      "title": "Use raw BSHD Flash gradients for default-scale encoder training",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 90,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
