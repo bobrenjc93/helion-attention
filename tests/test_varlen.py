@@ -247,9 +247,9 @@ def make_paged_inputs(
     lengths_k: list[int],
     *,
     seed: int,
+    page_size: int = 16,
 ) -> PagedInputs:
     """Build ragged packed queries and reverse-mapped physical cache pages."""
-    page_size = 16
     generator = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(
         sum(lengths_q),
@@ -295,7 +295,7 @@ def make_paged_inputs(
     v = torch.zeros_like(k)
     block_table = torch.zeros(
         spec.batch,
-        spec.seqlen_k // page_size,
+        (spec.seqlen_k + page_size - 1) // page_size,
         device="cuda",
         dtype=torch.int32,
     )
@@ -324,7 +324,7 @@ def make_paged_inputs(
 
 
 def make_paged_decode(
-    *, seed: int = 2026
+    *, seed: int = 2026, page_size: int = 16
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -342,6 +342,7 @@ def make_paged_decode(
             [1] * PAGED_DECODE.batch,
             [37, 128, 1024, 5],
             seed=seed,
+            page_size=page_size,
         )
     )
     return q, k, v, cu_q, cu_k, block_table, lengths_k, request_kv
@@ -352,6 +353,7 @@ def make_paged_chunked_prefill(
     lengths_q: tuple[int, int] = (137, 200),
     lengths_k: tuple[int, int] = (233, 320),
     seed: int = 2027,
+    page_size: int = 16,
 ) -> PagedInputs:
     """Build ragged chunked-prefill inputs on reverse-mapped cache pages."""
     return make_paged_inputs(
@@ -359,6 +361,7 @@ def make_paged_chunked_prefill(
         list(lengths_q),
         list(lengths_k),
         seed=seed,
+        page_size=page_size,
     )
 
 
@@ -3981,6 +3984,72 @@ def test_core_varlen_paged_decode_matches_fp32_with_permuted_pages() -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_core_varlen_page256_decode_matches_fa2_and_fp32_for_ragged_permuted_pages(
+    causal: bool, softmax_scale: float | None
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, _, request_kv = make_paged_decode(
+        page_size=256, seed=20260809
+    )
+    scale = (
+        1.0 / math.sqrt(PAGED_DECODE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    got = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        PAGED_DECODE.seqlen_q,
+        PAGED_DECODE.seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        block_table=block_table,
+        shape=(4, 1, 1024, 8, 2, 128),
+    )
+    expected_fp32 = torch.cat(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                query.float().transpose(0, 1).unsqueeze(0),
+                key.float().transpose(0, 1).unsqueeze(0),
+                value.float().transpose(0, 1).unsqueeze(0),
+                scale=scale,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+            for query, (key, value) in zip(q.split(1), request_kv)
+        ]
+    )
+
+    assert got.shape == q.shape
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    expected_fa2 = flash_attn.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        PAGED_DECODE.seqlen_q,
+        PAGED_DECODE.seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        block_table=block_table,
+    )
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     ("lengths_q", "lengths_k"),
     [
@@ -4036,7 +4105,13 @@ def test_core_varlen_derives_paged_used_lengths_on_device(
         assert page_size == 16
         return fake_kernel
 
+    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("page-16 decode reached generic paged dispatch")
+
     monkeypatch.setattr(helion_attention, "lookup_paged", fake_lookup)
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_generic
+    )
     result = helion_attention.flash_attn_varlen_func(
         q,
         k,
@@ -4061,6 +4136,59 @@ def test_core_varlen_derives_paged_used_lengths_on_device(
         seqused_k, torch.tensor(lengths_k, device="cuda", dtype=torch.int32)
     )
     torch.testing.assert_close(result, torch.zeros_like(q))
+
+
+@requires_cuda
+def test_core_varlen_page256_decode_uses_generic_paged_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k, v, cu_q, cu_k, block_table, lengths_k, _ = make_paged_decode(
+        page_size=256
+    )
+    sentinel = torch.full_like(q, 7.0)
+    seen: dict[str, object] = {}
+
+    def reject_generated(*args: object, **kwargs: object) -> object:
+        raise AssertionError("page-256 decode reached generated page-16 dispatch")
+
+    def fake_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_generated)
+    monkeypatch.setattr(generic_attention, "paged_attention", fake_generic)
+    result = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        PAGED_DECODE.seqlen_q,
+        PAGED_DECODE.seqlen_k,
+        softmax_scale=0.19,
+        causal=False,
+        block_table=block_table,
+        shape=(4, 1, 1024, 8, 2, 128),
+    )
+
+    args = seen["args"]
+    kwargs = seen["kwargs"]
+    assert isinstance(args, tuple)
+    assert isinstance(kwargs, dict)
+    assert args[:4] == (q, k, v, cu_q)
+    assert args[5] is block_table
+    seqused_k = args[4]
+    assert isinstance(seqused_k, torch.Tensor)
+    torch.testing.assert_close(
+        seqused_k, torch.tensor(lengths_k, device=q.device, dtype=torch.int32)
+    )
+    assert kwargs["softmax_scale"] == 0.19
+    assert kwargs["causal"] is False
+    assert kwargs["return_softmax_lse"] is False
+    assert result is sentinel
 
 
 @requires_cuda
@@ -4138,6 +4266,25 @@ def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
             shape=PAGED_DECODE,
         )
 
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_chunked_prefill(
+        page_size=256
+    )
+    with pytest.raises(
+        helion_attention.UnsupportedShapeError, match="page_size=256"
+    ):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_CHUNKED_PREFILL.seqlen_q,
+            PAGED_CHUNKED_PREFILL.seqlen_k,
+            causal=True,
+            block_table=block_table,
+            shape=PAGED_CHUNKED_PREFILL,
+        )
+
     unsupported = AttnShape(2, 199, 320, 8, 2, 128, torch.bfloat16, True)
     q = q[:2]
     k = torch.zeros(1, 16, 2, 128, device="cuda", dtype=unsupported.dtype)
@@ -4161,15 +4308,21 @@ def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
 
 
 @requires_cuda
+@pytest.mark.parametrize("page_size", [16, 256], ids=["page-16", "page-256"])
 def test_core_varlen_paged_rejects_alibi_before_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, page_size: int
 ) -> None:
-    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode()
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
+        page_size=page_size
+    )
 
     def reject_lookup(*args: object, **kwargs: object) -> object:
         raise AssertionError("paged ALiBi call reached kernel lookup")
 
     monkeypatch.setattr(helion_attention, "lookup_paged", reject_lookup)
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_lookup
+    )
     with pytest.raises(NotImplementedError, match="ALiBi"):
         helion_attention.flash_attn_varlen_func(
             q,
@@ -4183,6 +4336,57 @@ def test_core_varlen_paged_rejects_alibi_before_dispatch(
             alibi_slopes=torch.ones(PAGED_DECODE.nheads_q, device=q.device),
             block_table=block_table,
             shape=PAGED_DECODE,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("dropout", "dropout", id="dropout"),
+        pytest.param("window", "sliding-window", id="window"),
+        pytest.param("softcap", "paged block_table", id="softcap"),
+        pytest.param("diagnostic", "return_attn_probs", id="diagnostic"),
+        pytest.param("deterministic", "deterministic=True", id="deterministic"),
+    ],
+)
+def test_core_varlen_page256_decode_rejects_optional_features_before_dispatch(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=256)
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "block_table": block_table,
+        "shape": PAGED_DECODE,
+    }
+    if case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "window":
+        kwargs["window_size"] = (1, 1)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "diagnostic":
+        kwargs["return_attn_probs"] = True
+    else:
+        kwargs["deterministic"] = True
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
+        raise AssertionError("unsupported page-256 option reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            **kwargs,  # type: ignore[arg-type]
         )
 
 
@@ -4219,13 +4423,15 @@ def test_core_varlen_paged_chunked_prefill_rejects_noncausal_mode_before_lookup(
 @requires_cuda
 @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize(
-    ("spec", "factory"),
+    ("spec", "factory", "page_size"),
     [
-        pytest.param(PAGED_DECODE, make_paged_decode, id="decode"),
+        pytest.param(PAGED_DECODE, make_paged_decode, 16, id="decode-page-16"),
+        pytest.param(PAGED_DECODE, make_paged_decode, 256, id="decode-page-256"),
         pytest.param(
             PAGED_CHUNKED_PREFILL,
             make_paged_chunked_prefill,
-            id="chunked-prefill",
+            16,
+            id="chunked-prefill-page-16",
         ),
     ],
 )
@@ -4233,15 +4439,19 @@ def test_core_varlen_paged_rejects_gradients_before_launch(
     monkeypatch: pytest.MonkeyPatch,
     spec: AttnShape,
     factory: object,
+    page_size: int,
     deterministic: bool,
 ) -> None:
     assert callable(factory)
-    q, k, v, cu_q, cu_k, block_table, *_ = factory()
+    q, k, v, cu_q, cu_k, block_table, *_ = factory(page_size=page_size)
 
     def reject_lookup(*args: object, **kwargs: object) -> object:
         raise AssertionError("gradient-bearing input reached paged kernel lookup")
 
     monkeypatch.setattr(helion_attention, "lookup_paged", reject_lookup)
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_lookup
+    )
     q.requires_grad_()
     with pytest.raises(NotImplementedError, match="paged-cache backward"):
         helion_attention.flash_attn_varlen_func(
