@@ -3703,6 +3703,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:db7ec2e98914b56841ba5a5da180aaed9673604c",
+      "commit": "db7ec2e98914b56841ba5a5da180aaed9673604c",
+      "recordedAt": "2026-08-10T22:02:41.974Z",
+      "label": "base db7ec2e",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 98,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:163",
+      "recordedAt": "2026-08-10T22:02:41.974Z",
+      "label": "PR #163",
+      "kind": "leaf",
+      "prNumber": 163,
+      "title": "Apply ALiBi to tensor-selected causal 4K prefixes",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
