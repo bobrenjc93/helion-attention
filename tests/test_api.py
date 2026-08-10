@@ -12,6 +12,7 @@ from threading import local
 
 import pytest
 import torch
+from torch.nn.attention.bias import causal_lower_right
 
 import helion_attention
 import helion_attention._autograd as autograd_bridge
@@ -138,6 +139,9 @@ DENSE_ALIBI_KVCACHE = AttnShape(
     causal=True,
 )
 CHUNKED_PREFILL_KEY = "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal"
+DENSE_CHUNKED_PREFILL = spec_from_manifest_entry(
+    next(entry for entry in SHAPES if entry["key"] == CHUNKED_PREFILL_KEY)
+)
 GENERIC_DENSE_SPECS = [
     AttnShape(2, 23, 23, 4, 4, 32, torch.bfloat16, False),
     AttnShape(2, 19, 31, 8, 2, 64, torch.bfloat16, True),
@@ -2034,6 +2038,121 @@ def test_causal_dropout_forward_and_qkv_gradients_match_direct_sdpa(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
+)
+@pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+def test_chunked_prefill_dropout_forward_and_gradients_match_direct_sdpa(
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    spec = DENSE_CHUNKED_PREFILL
+    q, k, v = make_inputs(spec, seed=20260809)
+    grad_out = make_inputs(spec, seed=20260810)[0]
+    dropout_p = 0.25
+
+    if entry_point == "dense":
+        q.requires_grad_()
+        k.requires_grad_()
+        v.requires_grad_()
+        torch.cuda.manual_seed_all(20260809)
+        got = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=True,
+            shape=spec,
+        )
+        q_ref, k_ref, v_ref = q, k, v
+        grad_inputs = (q, k, v)
+    else:
+        q.requires_grad_()
+        kv = torch.stack((k, v), dim=2).requires_grad_()
+        torch.cuda.manual_seed_all(20260809)
+        got = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=True,
+            shape=spec,
+        )
+        q_ref = q
+        k_ref, v_ref = (
+            kv[:, :, index].contiguous() for index in range(2)
+        )
+        grad_inputs = (q, kv)
+
+    torch.cuda.manual_seed_all(20260809)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q_ref.transpose(1, 2),
+        k_ref.transpose(1, 2),
+        v_ref.transpose(1, 2),
+        attn_mask=causal_lower_right(spec.seqlen_q, spec.seqlen_k),
+        dropout_p=dropout_p,
+        scale=softmax_scale,
+        enable_gqa=True,
+    ).transpose(1, 2).contiguous()
+
+    got_grads = torch.autograd.grad(got, grad_inputs, grad_out)
+    expected_grads = torch.autograd.grad(expected, grad_inputs, grad_out)
+
+    torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(actual, reference, atol=2e-3, rtol=1e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+def test_chunked_prefill_zero_dropout_retains_generated_dispatch(
+    entry_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = DENSE_CHUNKED_PREFILL
+    q, k, v = make_inputs(spec, seed=20260811)
+    sentinel = torch.empty_like(q)
+    dispatched: list[AttnShape] = []
+
+    def kernel(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        dispatched.append(spec)
+        return sentinel
+
+    def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("zero-dropout call reached SDPA")
+
+    monkeypatch.setattr(helion_attention, "lookup", lambda _spec: kernel)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+
+    if entry_point == "dense":
+        out = helion_attention.flash_attn_func(
+            q, k, v, dropout_p=0.0, causal=True, shape=spec
+        )
+    else:
+        out = helion_attention.flash_attn_kvpacked_func(
+            q,
+            torch.stack((k, v), dim=2),
+            dropout_p=0.0,
+            causal=True,
+            shape=spec,
+        )
+
+    assert out is sentinel
+    assert dispatched == [spec]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "entry_point",
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
@@ -3518,6 +3637,75 @@ def test_causal_dropout_rejects_out_of_scope_calls_before_dispatch(
             q,
             **kwargs,  # type: ignore[arg-type]
         )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("other-shape", "only for the shipped dense profiles"),
+        ("noncausal", "only for the shipped dense profiles"),
+        ("fp16", "only for the shipped dense profiles"),
+        ("deterministic", "deterministic=True"),
+        ("alibi", "dropout combined with ALiBi"),
+        ("window", "sliding-window"),
+        ("softcap", "softcap combined with dropout"),
+        ("diagnostic", "return_attn_probs=True"),
+    ],
+)
+@pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+def test_chunked_prefill_dropout_rejects_out_of_scope_calls_before_dispatch(
+    case: str,
+    message: str,
+    entry_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
+    kwargs: dict[str, object] = {
+        "dropout_p": 0.25,
+        "causal": True,
+        "shape": (1, 64, 320, 8, 2, 128),
+    }
+    if case == "other-shape":
+        kwargs["shape"] = (1, 63, 320, 8, 2, 128)
+    elif case == "noncausal":
+        kwargs["causal"] = False
+    elif case == "fp16":
+        q = q.to(torch.float16)
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(8)
+    elif case == "window":
+        kwargs["window_size"] = (64, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    else:
+        kwargs["return_attn_probs"] = True
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope dropout call reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "attention_autograd", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+
+    with pytest.raises(NotImplementedError, match=message):
+        if entry_point == "dense":
+            helion_attention.flash_attn_func(
+                q,
+                q,
+                q,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        else:
+            helion_attention.flash_attn_kvpacked_func(
+                q,
+                torch.stack((q, q), dim=2),
+                **kwargs,  # type: ignore[arg-type]
+            )
 
 
 @requires_cuda

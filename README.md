@@ -92,6 +92,15 @@ runtime, while output-only calls retain the generated specialization. Gradients,
 positive dropout, noncausal mode, deterministic mode, ALiBi, local windows,
 softcap, other dtypes, and other profiles remain outside this diagnostic subset.
 
+The checked-in causal bf16 chunked-prefill GQA profile
+`(1, 64, 320, 8, 2, 128)` accepts `0 < dropout_p < 1` through the dense and
+KV-packed entry points, with either the default or a custom `softmax_scale`.
+PyTorch SDPA supplies bottom-right causal masking, GQA, dropout, and autograd;
+under identical CUDA RNG state its outputs and Q/K/V gradients match a direct
+SDPA call. Zero dropout retains the generated specialization. Deterministic
+dropout, diagnostic returns, local windows, ALiBi, softcap, noncausal mode,
+other dtypes, and other shapes remain unsupported.
+
 The three checked-in batch-1 Llama GQA decode profiles (one query token and a
 1K, 4K, or 16K KV sequence) support `return_attn_probs=True` through both
 `flash_attn_func` and `flash_attn_kvpacked_func`. For calls that do not require
@@ -116,14 +125,15 @@ use raw PyTorch BSHD Flash gradients, falling back to the generated backward
 when Flash is unavailable. Explicit-scale, non-SM90, and deterministic calls
 retain the generated backward. This profile, the BERT-base profile above, and
 the shipped causal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2 profile accept
-`0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs,
-with either the default or a custom scale. Zero-dropout calls that do not need
-backward retain each generated specialization. Zero-dropout GPT-2 training also
-accepts `deterministic=True` with either scale through the direct math operator
-used by BERT-base. Other dropout calls, local windows, softcap outside the exact
-dense, varlen, and paged subsets described here, dense diagnostic returns
-outside the subsets above, and deterministic dropout still fail explicitly as
-described below.
+`0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs.
+The asymmetric causal GQA profile above accepts it through the dense and
+KV-packed APIs. Both the default and a custom scale are supported.
+Zero-dropout calls that do not need backward retain each generated
+specialization. Zero-dropout GPT-2 training also accepts `deterministic=True`
+with either scale through the direct math operator used by BERT-base. Other
+dropout calls, local windows, softcap outside the exact dense, varlen, and paged
+subsets described here, dense diagnostic returns outside the subsets above,
+and deterministic dropout still fail explicitly as described below.
 Unregistered calls must also fit the generic kernel's signed 32-bit Q/output
 and K/V element offsets.
 
@@ -679,8 +689,9 @@ use raw PyTorch BSHD Flash gradients with a generated-backward fallback;
 custom-scale, non-SM90, and deterministic calls retain the checked-in generated
 backward. The BERT-base and causal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2
 profiles use the direct math SDPA operator for deterministic zero-dropout
-training. The encoder-training profile, BERT-base profile, and causal GPT-2
-profile use PyTorch SDPA when `0 < dropout_p < 1`.
+training. The encoder-training profile, BERT-base profile, causal GPT-2
+profile, and causal bf16 `(1, 64, 320, 8, 2, 128)` GQA profile use PyTorch SDPA
+when `0 < dropout_p < 1`; the GQA profile supports the dense and KV-packed APIs.
 Default-option dense MHA, GQA, and cross-attention calls without a generated
 backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
 causal masking. Packed varlen calls remain forward-only except for the two
@@ -696,9 +707,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   except for zero-dropout training on the exact bf16 BERT-base and causal GPT-2
   `(2, 1024, 1024, 32, 32, 64)` profiles and the exact full-length causal bf16
   varlen `(8, 512, 512, 16, 16, 64)` profile
-- dropout outside the exact encoder-training, BERT-base, and causal GPT-2
-  profiles above, or combined with ALiBi, diagnostic returns, local windows,
-  softcap, or deterministic mode
+- dropout outside the exact encoder-training, BERT-base, causal GPT-2, and
+  causal `(1, 64, 320, 8, 2, 128)` GQA profiles above, or combined with ALiBi,
+  diagnostic returns, local windows, softcap, or deterministic mode
 - sliding-window attention outside finite symmetric calls on the noncausal
   bf16 varlen self-attention profile above, including ragged windowed backward
   and all KV-cache window calls

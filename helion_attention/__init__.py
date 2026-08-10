@@ -23,8 +23,9 @@ generated specialization when slopes are omitted.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
-that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
-profile, grad-enabled dense calls without a generated backward, both
+that profile, the checked-in BERT-base encoder, one shipped causal GPT-2
+profile, and the shipped asymmetric causal GQA chunked-prefill profile,
+grad-enabled dense calls without a generated backward, both
 full-length varlen profiles, and ragged causal attention use PyTorch SDPA
 autograd. Full-length symmetric-window training on the shipped noncausal
 varlen profile uses the same bounded SDPA bridge. Deterministic zero-dropout
@@ -111,11 +112,19 @@ _INT32_MAX = 2**31 - 1
 _ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
 _CAUSAL_DROPOUT_KEY = "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal"
+_CHUNKED_PREFILL_DROPOUT_KEY = (
+    "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal"
+)
 _GENERIC_DENSE_DIAGNOSTIC_KEYS = frozenset(
     {_BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
 )
 _DROPOUT_SDPA_KEYS = frozenset(
-    {_ENCODER_TRAINING_KEY, _BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
+    {
+        _ENCODER_TRAINING_KEY,
+        _BERT_DIAGNOSTIC_KEY,
+        _CAUSAL_DROPOUT_KEY,
+        _CHUNKED_PREFILL_DROPOUT_KEY,
+    }
 )
 _DENSE_DETERMINISTIC_BACKWARD_KEYS = frozenset(
     {_BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
@@ -1432,7 +1441,8 @@ def flash_attn_func(
         dropout_p: values in ``(0, 1)`` are supported only for the shipped
             noncausal bf16 ``(8, 512, 512, 16, 16, 64)`` encoder-training and
             ``(16, 512, 512, 12, 12, 64)`` BERT-base profiles, plus causal bf16
-            ``(2, 1024, 1024, 32, 32, 64)`` attention.
+            ``(2, 1024, 1024, 32, 32, 64)`` attention and asymmetric causal
+            bf16 ``(1, 64, 320, 8, 2, 128)`` GQA.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
         softcap: exactly ``50.0`` is supported for forward-only causal bf16
