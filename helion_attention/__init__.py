@@ -18,11 +18,11 @@ varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes page-256 decode with optional ALiBi but
 without softcap through the core varlen API. The KV-cache adapter also uses the
 generic paged runtime for ALiBi on both exposed page-16 profiles and page-256
-decode. Read-only 4K dense decode likewise uses the generic runtime for ALiBi
-or a bounded Python-int prefix. The same prefix runtime handles a paired
-one-token K/V append before the final slot, including full-head interleaved
-rotary, while slope-free full reads and final-slot appends retain the generated
-specialization.
+decode. Read-only causal 1K and both causal variants of 4K dense decode likewise
+use the generic runtime for a bounded Python-int prefix; the 4K profile also
+uses it for ALiBi. The 4K prefix runtime handles a paired one-token K/V append
+before the final slot, including full-head interleaved rotary, while full reads
+and final-slot appends retain the generated specializations.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -197,6 +197,9 @@ _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE = (
     8,
     128,
     torch.bfloat16,
+)
+_CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY = (
+    "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal"
 )
 _DENSE_KVCACHE_ALIBI_PROFILE = _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
@@ -2531,15 +2534,21 @@ def flash_attn_with_kvcache(
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
-    and noncausal bf16 ``(1, 1, 4096, 32, 8, 128)`` profiles additionally accept
-    Python integers from 1 through 4095 for slope-free, read-only prefixes and
-    paired one-token K/V updates at positions 0 through 4094. The prefix path
-    uses the generic packed runtime with the default or a custom softmax scale
-    and optional fp32 LSE. An update mutates its selected slot and attends
-    through that newly appended token. Non-final updates optionally rotate the
-    query and appended key with full-head interleaved rotary tables. Omitted
-    and full Python-int reads, plus the existing update at position 4095,
-    retain the generated specialization.
+    bf16 ``(1, 1, 1024, 32, 8, 128)`` profile additionally accepts Python
+    integers from 1 through 1023 for read-only prefixes. This path uses the
+    generic packed runtime with the default or a custom softmax scale and
+    optional fp32 LSE, while omitted and full Python-int reads retain the
+    generated specialization. It does not widen the profile's existing
+    final-slot-only update support. The causal and noncausal bf16
+    ``(1, 1, 4096, 32, 8, 128)`` profiles likewise accept Python integers from
+    1 through 4095 for slope-free, read-only prefixes and paired one-token K/V
+    updates at positions 0 through 4094. The prefix path uses the generic
+    packed runtime with the default or a custom softmax scale and optional fp32
+    LSE. An update mutates its selected slot and attends through that newly
+    appended token. Non-final updates optionally rotate the query and appended
+    key with full-head interleaved rotary tables. Omitted and full Python-int
+    reads, plus the existing update at position 4095, retain the generated
+    specialization.
     The same 4K profiles accept
     forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]`` only for the
     full cache. Those calls use the generic packed runtime; omitting slopes
@@ -2572,8 +2581,9 @@ def flash_attn_with_kvcache(
     inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
     lengths and left padding on updates and other dense profiles, scalar partial
-    lengths and non-final appends outside the exact 4K profile, and multi-token
-    updates outside the exact two-token profile fail explicitly. Partial 4K
+    lengths outside the exact causal 1K and either-causal 4K read-only profiles,
+    non-final appends outside the exact 4K profile, and multi-token updates
+    outside the exact two-token profile fail explicitly. Partial 4K
     updates reject autograd, partial rotary dimensions, and non-interleaved
     rotary before either cache is mutated. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied
@@ -2718,8 +2728,12 @@ def flash_attn_with_kvcache(
         spec.head_dim,
         spec.dtype,
     )
-    is_scalar_prefix_dense_profile = (
+    is_4k_scalar_prefix_dense_profile = (
         requested_dense_profile == _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
+    )
+    is_scalar_prefix_dense_profile = (
+        is_4k_scalar_prefix_dense_profile
+        or spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
     )
     has_dense_alibi = alibi_slopes is not None
     if has_dense_alibi:
@@ -2821,7 +2835,7 @@ def flash_attn_with_kvcache(
                     "length declared by shape"
                 )
         elif (
-            is_scalar_prefix_dense_profile
+            is_4k_scalar_prefix_dense_profile
             and cache_seqlens < spec.seqlen_k - 1
         ):
             scalar_cache_append_position = cache_seqlens

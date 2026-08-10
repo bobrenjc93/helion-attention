@@ -2953,6 +2953,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:647a6b35f8eec1e108ff1f8352c1355f31a0f0fd",
+      "commit": "647a6b35f8eec1e108ff1f8352c1355f31a0f0fd",
+      "recordedAt": "2026-08-10T10:17:53.000Z",
+      "label": "base 647a6b3",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 95,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:133",
+      "recordedAt": "2026-08-10T10:17:53.000Z",
+      "label": "PR #133",
+      "kind": "leaf",
+      "prNumber": 133,
+      "title": "Read a scalar prefix from the 1K dense cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 95,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
