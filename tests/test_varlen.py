@@ -2010,21 +2010,26 @@ def test_llama3_varlen_ragged_self_attention_matches_fp32_and_fa2(
 
 @requires_cuda
 @pytest.mark.parametrize("softmax_scale", [None, 0.29], ids=["default", "custom"])
-def test_llama3_varlen_kvpacked_inherits_ragged_support(
+def test_llama3_varlen_kvpacked_inherits_cross_attention_support(
     softmax_scale: float | None,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = LLAMA3_VARLEN_INFERENCE
-    q, k, v, cu_seqlens, _ = make_ragged_self_packed(
-        spec, lengths=[91, 0, 256, 13], seed=271828
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=0, seed=271828
     )
     kv = torch.stack((k, v), dim=1)
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
 
     got = helion_attention.flash_attn_varlen_kvpacked_func(
         q,
         kv,
-        cu_seqlens,
-        cu_seqlens,
+        cu_q,
+        cu_k,
         spec.seqlen_q,
         spec.seqlen_k,
         softmax_scale=softmax_scale,
@@ -2034,52 +2039,92 @@ def test_llama3_varlen_kvpacked_inherits_ragged_support(
     expected = flash_attn.flash_attn_varlen_kvpacked_func(
         q,
         kv,
-        cu_seqlens,
-        cu_seqlens,
+        cu_q,
+        cu_k,
         spec.seqlen_q,
         spec.seqlen_k,
         softmax_scale=softmax_scale,
         causal=True,
     )
+    expected_fp32 = reference_packed(
+        q,
+        k,
+        v,
+        lengths_q,
+        lengths_k,
+        causal=True,
+        scale=scale,
+    )
+    assert cu_q.data_ptr() != cu_k.data_ptr()
+    assert q.shape[0] != k.shape[0]
     torch.testing.assert_close(
         got.float(), expected.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        got.float(), expected_fp32, atol=5e-2, rtol=2e-2
     )
 
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "offset_kind", ["cross", "equal-copy"], ids=["cross", "unshared-copy"]
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_llama3_varlen_rejects_unshared_query_key_offsets(
-    offset_kind: str, monkeypatch: pytest.MonkeyPatch
+def test_llama3_varlen_ragged_cross_attention_matches_fp32_and_fa2(
+    softmax_scale: float | None,
 ) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
     spec = LLAMA3_VARLEN_INFERENCE
-    if offset_kind == "cross":
-        q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
-    else:
-        q, k, v, cu_q, _ = make_ragged_self_packed(
-            spec, lengths=[256, 0, 37, 11]
-        )
-        cu_k = cu_q.clone()
-
-    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
-        raise AssertionError("unshared offsets reached generic dispatch")
-
-    monkeypatch.setattr(
-        helion_attention, "_generic_varlen_forward", reject_generic
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=0, seed=20260809
     )
-    with pytest.raises(NotImplementedError, match="self-attention with shared"):
-        helion_attention.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            spec.seqlen_q,
-            spec.seqlen_k,
-            causal=True,
-            shape=spec,
-        )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    got = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=True,
+        shape=spec,
+    )
+    expected_fp32 = reference_packed(
+        q,
+        k,
+        v,
+        lengths_q,
+        lengths_k,
+        causal=True,
+        scale=scale,
+    )
+    expected_fa2 = flash_attn.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        softmax_scale=softmax_scale,
+        causal=True,
+    )
+
+    assert all(length > 0 for length in lengths_q + lengths_k)
+    assert cu_q.data_ptr() != cu_k.data_ptr()
+    assert q.shape[0] != k.shape[0]
+    torch.testing.assert_close(
+        got.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
 
 
 @requires_cuda

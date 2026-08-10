@@ -149,14 +149,14 @@ alignment, including zero output for fully masked query rows.
 One deliberately unregistered varlen profile is also callable through the
 generic packed Triton runtime: causal bf16 Llama-3 GQA with maximum shape
 `(4, 256, 256, 32, 8, 128)`. It supports only calls that do not require
-backward, with equal packed Q/K token totals and `cu_seqlens_q` and
-`cu_seqlens_k` sharing the same storage for self-attention. Their device-side
-values may describe arbitrary ragged lengths, including mixed empty and
-nonempty slots. The unpacked and KV-packed entry points accept the default or a
-custom `softmax_scale`; dropout, windows, softcap, ALiBi, deterministic mode,
-diagnostic returns, cross-attention offsets, and paged caches remain
-unsupported. Because this is generic fallback coverage rather than a generated
-specialization, `is_varlen_shape_supported` remains false for the profile.
+backward. Device-side `cu_seqlens_q` and `cu_seqlens_k` may independently
+describe ragged query and key lengths with different packed token totals;
+shared-offset self-attention continues to support mixed empty and nonempty
+slots. The unpacked and KV-packed entry points accept the default or a custom
+`softmax_scale`; dropout, windows, softcap, ALiBi, deterministic mode,
+diagnostic returns, and paged caches remain unsupported. Because this is
+generic fallback coverage rather than a generated specialization,
+`is_varlen_shape_supported` remains false for the profile.
 
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
 symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for

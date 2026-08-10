@@ -1139,8 +1139,8 @@ def _generic_varlen_forward(
 ) -> torch.Tensor:
     """Run the exact validated Llama-3 varlen inference profile generically."""
     # This intentionally is not a general missing-specialization fallback.
-    # The dispatcher requires these arguments to alias the same storage, which
-    # preserves device-resident, graph-capturable ragged lengths.
+    # Both cumulative-length tensors remain device-resident, preserving
+    # graph-capturable ragged self- and cross-attention lengths.
     from ._paged_attention import packed_attention
 
     packed_out = packed_attention(
@@ -1608,13 +1608,14 @@ def flash_attn_varlen_func(
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
     ``[16]`` or ``[8, 16]``.
 
-    Causal bf16 Llama-3 GQA self-attention with maximum shape
+    Causal bf16 Llama-3 GQA attention with maximum shape
     ``(4, 256, 256, 32, 8, 128)`` is also supported when no backward or
-    optional feature is requested. Query and key offsets must share storage;
-    their device-resident values may describe arbitrary ragged lengths,
-    including a mix of empty and nonempty slots. This unregistered profile
-    uses the generic packed Triton runtime and accepts the default or a custom
-    ``softmax_scale``. Registered profiles retain generated dispatch.
+    optional feature is requested. Its device-resident query and key offsets
+    may independently describe arbitrary ragged lengths. Shared-offset
+    self-attention continues to support a mix of empty and nonempty slots.
+    This unregistered profile uses the generic packed Triton runtime and
+    accepts the default or a custom ``softmax_scale``. Registered profiles
+    retain generated dispatch.
 
     The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
@@ -1942,13 +1943,6 @@ def flash_attn_varlen_func(
             alibi_slopes,
         )
     if is_llama3_varlen_inference:
-        if q.shape[0] != k.shape[0] or (
-            cu_seqlens_q.data_ptr() != cu_seqlens_k.data_ptr()
-        ):
-            raise NotImplementedError(
-                "the Llama-3 varlen inference profile supports only "
-                "self-attention with shared cu_seqlens_q/cu_seqlens_k storage"
-            )
         return _generic_varlen_forward(
             q,
             k,

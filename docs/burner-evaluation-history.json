@@ -2443,6 +2443,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:c1888c466efb3f8e283408cc34196958ccc97a57",
+      "commit": "c1888c466efb3f8e283408cc34196958ccc97a57",
+      "recordedAt": "2026-08-10T01:31:28.658Z",
+      "label": "base c1888c4",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:112",
+      "recordedAt": "2026-08-10T01:31:28.658Z",
+      "label": "PR #112",
+      "kind": "leaf",
+      "prNumber": 112,
+      "title": "Allow cross-attention offsets in the Llama-3 varlen slice",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
