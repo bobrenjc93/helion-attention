@@ -3643,6 +3643,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:7f490d8b55c81a5d5eb9b91558aae09df09454aa",
+      "commit": "7f490d8b55c81a5d5eb9b91558aae09df09454aa",
+      "recordedAt": "2026-08-10T21:09:46.514Z",
+      "label": "base 7f490d8",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:161",
+      "recordedAt": "2026-08-10T21:09:46.514Z",
+      "label": "PR #161",
+      "kind": "leaf",
+      "prNumber": 161,
+      "title": "Expose one full-length causal varlen left window",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

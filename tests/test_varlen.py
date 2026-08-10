@@ -38,6 +38,8 @@ VARLEN_ALIBI_NONCAUSAL = AttnShape(
 VARLEN_ALIBI_PROFILES = (VARLEN_ALIBI_CAUSAL, VARLEN_ALIBI_NONCAUSAL)
 VARLEN_DIAGNOSTIC = VARLEN_ALIBI_CAUSAL
 VARLEN_SYMMETRIC_WINDOW = VARLEN_ALIBI_NONCAUSAL
+VARLEN_CAUSAL_LEFT_WINDOW = VARLEN_ALIBI_CAUSAL
+VARLEN_CAUSAL_LEFT_WINDOW_SIZE = (127, 0)
 VARLEN_SOFTCAP = VARLEN_ALIBI_CAUSAL
 VARLEN_SOFTCAP_VALUE = 50.0
 LLAMA3_VARLEN_INFERENCE = AttnShape(
@@ -3082,6 +3084,443 @@ def test_llama3_varlen_neighboring_shapes_remain_unsupported(
             spec.seqlen_q,
             spec.seqlen_k,
             causal=spec.causal,
+            shape=spec,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["unpacked", "qkvpacked", "kvpacked"],
+    ids=["unpacked", "qkv-packed", "kv-packed"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_full_causal_varlen_left_window_adapters_match_fp32_and_fa2(
+    entry_point: str, softmax_scale: float | None
+) -> None:
+    spec = VARLEN_CAUSAL_LEFT_WINDOW
+    q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=2, seed=20260810
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    with torch.no_grad():
+        if entry_point == "unpacked":
+            got = helion_attention.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+                shape=spec,
+            )
+        elif entry_point == "qkvpacked":
+            got = helion_attention.flash_attn_varlen_qkvpacked_func(
+                torch.stack((q, k, v), dim=1),
+                cu_q,
+                spec.seqlen_q,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+                shape=spec,
+            )
+        else:
+            got = helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=1),
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+                shape=spec,
+            )
+        expected_fp32 = reference_packed(
+            q,
+            k,
+            v,
+            lengths_q,
+            lengths_k,
+            causal=True,
+            scale=scale,
+            window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+        )
+
+    assert got.shape == q.shape
+    assert got.dtype == torch.bfloat16
+    assert got.is_contiguous()
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    with torch.no_grad():
+        if entry_point == "unpacked":
+            expected_fa2 = flash_attn.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+            )
+        elif entry_point == "qkvpacked":
+            expected_fa2 = flash_attn.flash_attn_varlen_qkvpacked_func(
+                torch.stack((q, k, v), dim=1),
+                cu_q,
+                spec.seqlen_q,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+            )
+        else:
+            expected_fa2 = flash_attn.flash_attn_varlen_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=1),
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+            )
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=2e-2, rtol=1e-2
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["unpacked", "qkvpacked", "kvpacked"],
+    ids=["unpacked", "qkv-packed", "kv-packed"],
+)
+def test_causal_varlen_global_window_adapters_retain_generated_dispatch(
+    entry_point: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = VARLEN_CAUSAL_LEFT_WINDOW
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2, seed=161803)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[object, ...]] = []
+
+    def generated(*args: object) -> torch.Tensor:
+        calls.append(args)
+        return sentinel
+
+    def reject_generic(*args: object, **kwargs: object) -> object:
+        raise AssertionError("global-window call reached generic dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup_varlen", lambda _spec: generated)
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_varlen_causal_left_window_forward",
+        reject_generic,
+    )
+    if entry_point == "unpacked":
+        out = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            shape=spec,
+        )
+    elif entry_point == "qkvpacked":
+        out = helion_attention.flash_attn_varlen_qkvpacked_func(
+            torch.stack((q, k, v), dim=1),
+            cu_q,
+            spec.seqlen_q,
+            causal=True,
+            shape=spec,
+        )
+    else:
+        out = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            torch.stack((k, v), dim=1),
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            shape=spec,
+        )
+
+    assert out is sentinel
+    assert len(calls) == 1
+    assert len(calls[0]) == 9
+
+
+@requires_cuda
+def test_full_causal_varlen_left_window_uses_fixed_generic_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_CAUSAL_LEFT_WINDOW
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
+    sentinel = torch.empty_like(q)
+    seen: list[tuple[float, AttnShape]] = []
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        cu_q_arg: torch.Tensor,
+        cu_k_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> torch.Tensor:
+        assert q_arg is q
+        assert k_arg is k
+        assert v_arg is v
+        assert cu_q_arg is cu_q
+        assert cu_k_arg is cu_k
+        seen.append((scale_arg, spec_arg))
+        return sentinel
+
+    def reject_generated(*args: object, **kwargs: object) -> object:
+        raise AssertionError("causal left window reached generated dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_causal_left_window_forward", generic
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_generated)
+    out = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        softmax_scale=0.29,
+        causal=True,
+        window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+        shape=spec,
+    )
+
+    assert out is sentinel
+    assert seen == [(0.29, spec)]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "offset_case",
+    ["short-total", "noncanonical-full-total"],
+    ids=["short-total", "noncanonical-full-total"],
+)
+def test_causal_varlen_left_window_rejects_ragged_offsets_before_dispatch(
+    offset_case: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = VARLEN_CAUSAL_LEFT_WINDOW
+    variant = 0 if offset_case == "short-total" else 2
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=variant)
+    if offset_case == "noncanonical-full-total":
+        cu_q = cu_q.clone()
+        cu_k = cu_k.clone()
+        cu_q[1] -= 1
+        cu_k[3] -= 1
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("ragged causal window reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_varlen_causal_left_window_forward",
+        reject_dispatch,
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    with pytest.raises(NotImplementedError, match="full-length|ragged offsets"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+            shape=spec,
+        )
+
+
+@requires_cuda
+def test_causal_varlen_left_window_rejects_gradients_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_CAUSAL_LEFT_WINDOW
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
+    q.requires_grad_()
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("grad-enabled causal window reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_varlen_causal_left_window_forward",
+        reject_dispatch,
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    with pytest.raises(NotImplementedError, match="forward-only|gradients"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+            shape=spec,
+        )
+
+
+@pytest.mark.parametrize(
+    "window_size",
+    [(126, 0), (128, 0), (127, 1), (31, 31), (-1, 0)],
+    ids=["smaller-left", "larger-left", "positive-right", "symmetric", "open-left"],
+)
+def test_causal_varlen_left_window_rejects_every_other_window(
+    window_size: tuple[int, int], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = VARLEN_CAUSAL_LEFT_WINDOW
+    q = torch.zeros(1, spec.nheads_q, spec.head_dim, dtype=spec.dtype)
+    cu_seqlens = torch.zeros(spec.batch + 1, dtype=torch.int32)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("unsupported causal window reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_varlen_causal_left_window_forward",
+        reject_dispatch,
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    with pytest.raises(NotImplementedError, match="implemented only"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            window_size=window_size,
+            shape=spec,
+        )
+
+
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("dropout_p", 0.1, "dropout"),
+        ("return_attn_probs", True, "return_attn_probs"),
+        ("alibi_slopes", torch.ones(16), "ALiBi"),
+        ("softcap", VARLEN_SOFTCAP_VALUE, "softcap"),
+    ],
+    ids=["dropout", "diagnostics", "alibi", "softcap"],
+)
+def test_causal_varlen_left_window_rejects_optional_features_before_dispatch(
+    option: str,
+    value: object,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_CAUSAL_LEFT_WINDOW
+    q = torch.zeros(1, spec.nheads_q, spec.head_dim, dtype=spec.dtype)
+    cu_seqlens = torch.zeros(spec.batch + 1, dtype=torch.int32)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("optional causal-window feature reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_varlen_causal_left_window_forward",
+        reject_dispatch,
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    kwargs = {
+        option: value,
+        "causal": True,
+        "window_size": VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+        "shape": spec,
+    }
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(VARLEN_ALIBI_NONCAUSAL, id="noncausal"),
+        pytest.param(
+            AttnShape(8, 512, 512, 16, 16, 64, torch.float16, True),
+            id="fp16",
+        ),
+        pytest.param(
+            AttnShape(8, 256, 256, 16, 16, 64, torch.bfloat16, True),
+            id="other-maxima",
+        ),
+    ],
+)
+def test_causal_varlen_left_window_rejects_other_profiles_before_dispatch(
+    spec: AttnShape, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    q = torch.zeros(1, spec.nheads_q, spec.head_dim, dtype=spec.dtype)
+    cu_seqlens = torch.zeros(spec.batch + 1, dtype=torch.int32)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("unsupported causal-window profile reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_varlen_causal_left_window_forward",
+        reject_dispatch,
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    with pytest.raises(NotImplementedError, match="implemented only"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            q,
+            q,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=spec.causal,
+            window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
             shape=spec,
         )
 

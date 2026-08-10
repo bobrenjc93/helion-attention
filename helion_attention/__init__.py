@@ -12,10 +12,13 @@ ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
 varlen inference profile, ALiBi with optional diagnostics on that profile and
 the shipped causal varlen profile, ALiBi on both shipped varlen profiles, and
 symmetric windows on the shipped noncausal varlen profile use a generic Triton
-forward kernel. The same runtime exposes exactly a 511-token left plus
-current-token causal window for the bf16 batch-1 2K Llama GQA profile while its
-global-window call retains generated dispatch. Grad-enabled calls use a bounded
-PyTorch SDPA autograd bridge. That runtime also provides
+forward kernel. The same runtime exposes exactly a 127-token left plus
+current-token causal window for the full-length shipped causal varlen profile,
+while its global-window call retains generated dispatch. It also exposes
+exactly a 511-token left plus current-token causal window for the bf16 batch-1
+2K Llama GQA profile while its global-window call retains generated dispatch.
+Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime
+also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and read-only page-256 paged decode through both the core
 varlen and KV-cache APIs. The same runtime exposes page-256/page-512 decode
@@ -179,6 +182,10 @@ _VARLEN_ALIBI_DIAGNOSTIC_KEYS = frozenset(
 _VARLEN_SYMMETRIC_WINDOW_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 )
+_VARLEN_CAUSAL_LEFT_WINDOW_KEY = (
+    "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+)
+_VARLEN_CAUSAL_LEFT_WINDOW_SIZE = (127, 0)
 _VARLEN_SOFTCAP_KEY = _VARLEN_DIAGNOSTIC_KEY
 _VARLEN_SOFTCAP = 50.0
 _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
@@ -821,6 +828,43 @@ def _has_full_varlen_token_totals(
     )
 
 
+def _validate_full_length_varlen_offsets(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    spec: AttnShape,
+) -> None:
+    """Require the canonical dense-equivalent offsets for a varlen call."""
+    if not _has_full_varlen_token_totals(q, k, spec):
+        raise NotImplementedError(
+            "causal varlen left-window attention is implemented only for "
+            "full-length inputs with all eight query and key sequences at "
+            "length 512; ragged offsets are not supported"
+        )
+
+    expected_q = tuple(index * spec.seqlen_q for index in range(spec.batch + 1))
+    expected_k = tuple(index * spec.seqlen_k for index in range(spec.batch + 1))
+    with torch.cuda.device(q.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "causal varlen left-window attention cannot verify full-length "
+                "offsets during CUDA graph capture"
+            )
+        offsets_q = tuple(cu_seqlens_q.tolist())
+        offsets_k = (
+            offsets_q
+            if cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
+            else tuple(cu_seqlens_k.tolist())
+        )
+    if offsets_q != expected_q or offsets_k != expected_k:
+        raise NotImplementedError(
+            "causal varlen left-window attention is implemented only for "
+            "canonical full-length offsets with all eight query and key "
+            "sequences at length 512; ragged offsets are not supported"
+        )
+
+
 def _ragged_varlen_attention_lengths(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1447,6 +1491,51 @@ def _generic_varlen_symmetric_window_forward(
     return packed_out
 
 
+def _generic_varlen_causal_left_window_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Run the exact full-length causal left window through generic Triton."""
+    from ._paged_attention import packed_attention
+
+    packed_out = packed_attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=_VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+        softcap=0.0,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
+    return packed_out
+
+
 def _generic_varlen_softcap_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1938,6 +2027,13 @@ def flash_attn_varlen_func(
     ``softmax_scale``. The global ``(-1, -1)`` default retains its existing
     dispatch.
 
+    The causal version of that profile supports exactly
+    ``window_size=(127, 0)`` when all eight query and key sequences have length
+    512. This forward-only path accepts the default or a custom
+    ``softmax_scale`` and uses the generic packed Triton runtime. Ragged
+    offsets and every other optional feature remain unsupported for this
+    window. Its global ``(-1, -1)`` call retains the generated specialization.
+
     The causal version of that profile accepts exactly ``softcap=50.0`` for
     calls that do not need backward, with either the default or a custom
     ``softmax_scale``. Softcapped calls use the generic packed Triton runtime;
@@ -2010,28 +2106,43 @@ def flash_attn_varlen_func(
             f"({max_seqlen_q}, {max_seqlen_k})"
         )
 
-    is_llama3_varlen_inference = (
-        f"varlen_{spec.key}" == _LLAMA3_VARLEN_INFERENCE_KEY
-    )
+    requested_varlen = f"varlen_{spec.key}"
+    is_llama3_varlen_inference = requested_varlen == _LLAMA3_VARLEN_INFERENCE_KEY
     if is_llama3_varlen_inference and deterministic:
         raise NotImplementedError(
             "deterministic=True is not implemented for the Llama-3 varlen "
             "inference profile"
         )
 
-    has_symmetric_window = window != (-1, -1)
-    if has_symmetric_window:
-        if window[0] < 0 or window[0] != window[1]:
+    has_window = window != (-1, -1)
+    has_symmetric_window = False
+    has_causal_left_window = False
+    if has_window:
+        if window == _VARLEN_CAUSAL_LEFT_WINDOW_SIZE:
+            if requested_varlen != _VARLEN_CAUSAL_LEFT_WINDOW_KEY:
+                raise NotImplementedError(
+                    "causal varlen window_size=(127, 0) is implemented only "
+                    f"for {_VARLEN_CAUSAL_LEFT_WINDOW_KEY}; got "
+                    f"{requested_varlen}"
+                )
+            has_causal_left_window = True
+        elif window[0] >= 0 and window[0] == window[1]:
+            if requested_varlen != _VARLEN_SYMMETRIC_WINDOW_KEY:
+                raise NotImplementedError(
+                    "varlen sliding-window attention with symmetric bounds is "
+                    "implemented only for "
+                    f"{_VARLEN_SYMMETRIC_WINDOW_KEY}; got {requested_varlen}"
+                )
+            has_symmetric_window = True
+        elif requested_varlen == _VARLEN_CAUSAL_LEFT_WINDOW_KEY:
+            raise NotImplementedError(
+                "causal varlen sliding-window attention is implemented only "
+                "for exact window_size=(127, 0)"
+            )
+        else:
             raise NotImplementedError(
                 "varlen sliding-window attention is implemented only for "
                 "finite window_size=(radius, radius) with radius >= 0"
-            )
-        requested = f"varlen_{spec.key}"
-        if requested != _VARLEN_SYMMETRIC_WINDOW_KEY:
-            raise NotImplementedError(
-                "varlen sliding-window attention with symmetric bounds is "
-                "implemented only for "
-                f"{_VARLEN_SYMMETRIC_WINDOW_KEY}; got {requested}"
             )
         if block_table is not None:
             raise NotImplementedError(
@@ -2046,12 +2157,12 @@ def flash_attn_varlen_func(
         if alibi_slopes is not None:
             raise NotImplementedError(
                 "varlen sliding-window attention is not implemented with "
-                "ALiBi slopes, including symmetric windows"
+                "ALiBi slopes"
             )
         if return_attn_probs:
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented with varlen "
-                "symmetric-window attention"
+                "sliding-window attention"
             )
         if deterministic:
             raise NotImplementedError(
@@ -2176,6 +2287,15 @@ def flash_attn_varlen_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in grad_tensors
     )
+    if has_causal_left_window:
+        _validate_full_length_varlen_offsets(
+            q, k, cu_seqlens_q, cu_seqlens_k, spec
+        )
+        if needs_backward:
+            raise NotImplementedError(
+                "causal varlen left-window attention is forward-only; "
+                "gradients are not implemented"
+            )
     if has_symmetric_window:
         _validate_varlen_self_attention_offsets(
             q, k, cu_seqlens_q, cu_seqlens_k
@@ -2287,6 +2407,16 @@ def flash_attn_varlen_func(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    if has_causal_left_window:
+        return _generic_varlen_causal_left_window_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            scale,
+            spec,
+        )
     if has_symmetric_window:
         return _generic_varlen_symmetric_window_forward(
             q,
