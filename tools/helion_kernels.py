@@ -457,16 +457,27 @@ def causal_attention_bshd_16k(
         for tile_n in hl.tile(0, key_stop):
             k_blk = k[b, tile_n, h_kv, :]
             qk = hl.dot(q_blk, k_blk.T, out_dtype=torch.float32) * qk_scale
-            score_mask = tile_n.index[None, :] <= (
-                tile_m.index + causal_offset
-            )[:, None]
-            qk = torch.where(score_mask, qk, float("-inf"))
-            m_ij = torch.maximum(m_i, torch.amax(qk, -1))
-            has_key = m_ij != float("-inf")
-            p = torch.exp2(
-                torch.where(score_mask, qk - m_ij[:, None], float("-inf"))
-            )
-            alpha = torch.where(has_key, torch.exp2(m_i - m_ij), 1.0)
+            # Equal-length causal tiles before the diagonal are fully visible.
+            # Keep their online-softmax path free of elementwise masks.
+            if m_dim == n_dim and tile_n.end <= tile_m.begin:
+                m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                p = torch.exp2(qk - m_ij[:, None])
+                alpha = torch.exp2(m_i - m_ij)
+            else:
+                score_mask = tile_n.index[None, :] <= (
+                    tile_m.index + causal_offset
+                )[:, None]
+                qk = torch.where(score_mask, qk, float("-inf"))
+                m_ij = torch.maximum(m_i, torch.amax(qk, -1))
+                has_key = m_ij != float("-inf")
+                p = torch.exp2(
+                    torch.where(
+                        score_mask, qk - m_ij[:, None], float("-inf")
+                    )
+                )
+                alpha = torch.where(
+                    has_key, torch.exp2(m_i - m_ij), 1.0
+                )
             l_i = l_i * alpha + torch.sum(p, -1)
             acc = acc * alpha[:, None]
             v_blk = v[b, tile_n, h_kv, :]
@@ -479,6 +490,30 @@ def causal_attention_bshd_16k(
         )
         out[b, tile_m, h, :] = result.to(out.dtype)
     return out
+
+
+# D64 leaves enough shared memory for descriptor loads of both K and V and
+# enough occupancy for two persistent CTAs per SM.  Reuse the fixed causal
+# source while retaining its conservative D128 configuration above.
+causal_attention_bshd_d64 = helion.kernel(
+    causal_attention_bshd_16k.fn,
+    config=helion.Config(
+        block_sizes=[128, 64],
+        num_warps=4,
+        num_stages=3,
+        pid_type="persistent_interleaved",
+        num_sm_multiplier=2,
+        l2_groupings=[32],
+        indexing=[
+            "pointer",
+            "tensor_descriptor",
+            "tensor_descriptor",
+            "pointer",
+            "pointer",
+        ],
+    ),
+    settings=causal_attention_bshd_16k.settings,
+)
 
 
 @helion.kernel(

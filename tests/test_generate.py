@@ -437,6 +437,16 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
         seqlen_q=8192,
         seqlen_k=8192,
     )
+    persistent_b8_mha_2k = AttnShape(
+        batch=8,
+        seqlen_q=2048,
+        seqlen_k=2048,
+        nheads_q=16,
+        nheads_kv=16,
+        head_dim=64,
+        dtype=torch.bfloat16,
+        causal=True,
+    )
     for exact in (
         persistent_16k,
         persistent_qwen_2k,
@@ -451,6 +461,10 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
             generate.select_dense_kernel_name(exact)
             == "causal_attention_bshd_16k"
         )
+    assert (
+        generate.select_dense_kernel_name(persistent_b8_mha_2k)
+        == "causal_attention_bshd_d64"
+    )
 
     incompatible = [
         replace(persistent_16k, batch=2),
@@ -486,6 +500,11 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
         replace(persistent_mha_2k, seqlen_q=4096, seqlen_k=4096),
         replace(persistent_mha_2k, head_dim=64),
         replace(persistent_mha_2k, dtype=torch.float16),
+        replace(persistent_b8_mha_2k, batch=4),
+        replace(persistent_b8_mha_2k, seqlen_q=4096, seqlen_k=4096),
+        replace(persistent_b8_mha_2k, nheads_q=8, nheads_kv=8),
+        replace(persistent_b8_mha_2k, head_dim=128),
+        replace(persistent_b8_mha_2k, dtype=torch.float16),
     ]
     for candidate in incompatible:
         assert generate.select_dense_kernel_name(candidate) == "causal_attention_bshd"
