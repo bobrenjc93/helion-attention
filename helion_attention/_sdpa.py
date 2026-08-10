@@ -224,16 +224,25 @@ def dense_attention_sdpa(
     dropout_p: float = 0.0,
     *,
     symmetric_window_radius: int | None = None,
+    causal_window_left: int | None = None,
 ) -> torch.Tensor:
     """Run a validated dense call through PyTorch's native SDPA autograd.
 
     ``symmetric_window_radius`` is reserved for the bounded equal-length,
     noncausal varlen bridge validated by the public dispatcher.
+    ``causal_window_left`` is reserved for the equal-length causal Llama
+    bridge with a zero-token right window.
     """
     query = q.transpose(1, 2)
     key = k.transpose(1, 2)
     value = v.transpose(1, 2)
     enable_gqa = spec.nheads_q != spec.nheads_kv
+
+    if (
+        symmetric_window_radius is not None
+        and causal_window_left is not None
+    ):
+        raise ValueError("only one SDPA window mode may be selected")
 
     window_mask = None
     if symmetric_window_radius is not None:
@@ -248,15 +257,26 @@ def dense_attention_sdpa(
         window_mask = (
             positions[:, None] - positions[None, :]
         ).abs() <= symmetric_window_radius
+    elif causal_window_left is not None:
+        if not spec.causal or spec.seqlen_q != spec.seqlen_k:
+            raise ValueError(
+                "causal left-window SDPA requires equal-length causal "
+                "self-attention"
+            )
+        if causal_window_left < 0:
+            raise ValueError("causal_window_left must be non-negative")
+        positions = torch.arange(spec.seqlen_q, device=q.device)
+        relative_position = positions[:, None] - positions[None, :]
+        window_mask = (relative_position >= 0) & (
+            relative_position <= causal_window_left
+        )
 
     # FlashAttention returns the input dtype even under cross-dtype autocast.
     # SDPA is autocast-eligible, so keep its native fp16/bf16 contract explicit.
     with torch.autocast(device_type=q.device.type, enabled=False):
         if window_mask is not None:
             if dropout_p != 0.0:
-                raise ValueError(
-                    "symmetric-window SDPA requires dropout_p=0.0"
-                )
+                raise ValueError("windowed SDPA requires dropout_p=0.0")
             out = torch.nn.functional.scaled_dot_product_attention(
                 query,
                 key,

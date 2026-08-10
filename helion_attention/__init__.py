@@ -14,9 +14,9 @@ ALiBi on both
 shipped varlen profiles, symmetric windows on the shipped noncausal varlen
 profile, and diagnostics on the shipped causal varlen profile use a generic
 Triton forward kernel. The same runtime exposes exactly a 511-token left plus
-current-token causal window for the forward-only bf16 batch-1 2K Llama GQA
-profile while its global-window call retains generated dispatch. That runtime
-also provides
+current-token causal window for the bf16 batch-1 2K Llama GQA profile while
+its global-window call retains generated dispatch. Grad-enabled calls use a
+bounded PyTorch SDPA autograd bridge. That runtime also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes slope-free page-512 decode and page-256 decode
@@ -1577,7 +1577,7 @@ def flash_attn_func(
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
         window_size: ``(-1, -1)`` selects global attention. Exactly ``(511, 0)``
-            is additionally supported for forward-only causal bf16
+            is additionally supported for zero-dropout causal bf16
             ``(1, 2048, 2048, 32, 8, 128)`` Llama GQA attention through this
             entry point and :func:`flash_attn_kvpacked_func`.
         softcap: exactly ``50.0`` is supported for forward-only causal bf16
@@ -1608,9 +1608,10 @@ def flash_attn_func(
     Unregistered fp16/bf16 shapes with ``head_dim <= 256``, all ALiBi calls, and
     the supported Gemma-2 softcap call use a generic packed Triton forward
     kernel. The exact Llama GQA local-window call described above also uses that
-    runtime with either the default or a custom scale; gradients and all other
-    optional features are unsupported, and ``window_size=(-1, -1)`` retains its
-    generated specialization. The exact default-option,
+    runtime for calls that do not need backward. Grad-enabled calls use a
+    bounded PyTorch SDPA bridge with either the default or a custom scale. All
+    other optional features are unsupported, and ``window_size=(-1, -1)``
+    retains its generated specialization. The exact default-option,
     default-scale, no-backward noncausal bf16
     ``(2, 1024, 1024, 16, 16, 256)`` call uses direct PyTorch Flash SDPA on
     SM90 when eligible. The corresponding causal bf16
@@ -1651,7 +1652,7 @@ def flash_attn_func(
         if spec.key != _LLAMA_2K_LEFT_WINDOW_KEY:
             raise NotImplementedError(
                 "dense sliding-window attention is implemented only for the "
-                "no-backward causal bf16 Llama GQA profile "
+                "causal bf16 Llama GQA profile "
                 "(1, 2048, 2048, 32, 8, 128) with window_size=(511, 0); "
                 f"got {spec.describe()}"
             )
@@ -1705,9 +1706,13 @@ def flash_attn_func(
     )
     if has_left_window:
         if needs_backward:
-            raise NotImplementedError(
-                "the Llama 2K left window is forward-only and does not support "
-                "autograd"
+            return dense_attention_sdpa(
+                q,
+                k,
+                v,
+                scale,
+                spec,
+                causal_window_left=_LLAMA_2K_LEFT_WINDOW_SIZE[0],
             )
         return _generic_dense_forward(
             q,
