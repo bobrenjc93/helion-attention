@@ -8776,15 +8776,19 @@ def test_kvcache_4k_partial_append_matches_fa2_and_fp32(
     ids=["output", "output-lse"],
 )
 @pytest.mark.parametrize(
-    "rotary_dim",
-    [64, 128],
-    ids=["half-head", "full-head"],
+    ("rotary_interleaved", "rotary_dim"),
+    [
+        pytest.param(True, 64, id="interleaved-half-head"),
+        pytest.param(True, 128, id="interleaved-full-head"),
+        pytest.param(False, 128, id="neox-full-head"),
+    ],
 )
 def test_kvcache_4k_partial_rotary_append_matches_fa2_and_fp32(
     position: int,
     softmax_scale: float | None,
     causal: bool,
     return_softmax_lse: bool,
+    rotary_interleaved: bool,
     rotary_dim: int,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
@@ -8817,12 +8821,13 @@ def test_kvcache_4k_partial_rotary_append_matches_fa2_and_fp32(
     rotary_cos, rotary_sin = make_rotary_tables(
         spec, rotary_dim=rotary_dim, seed=20260816
     )
-    rotated_q = reference_interleaved_rotary(
-        q, rotary_cos, rotary_sin, position
+    reference_rotary = (
+        reference_interleaved_rotary
+        if rotary_interleaved
+        else reference_neox_rotary
     )
-    rotated_k = reference_interleaved_rotary(
-        new_k, rotary_cos, rotary_sin, position
-    )
+    rotated_q = reference_rotary(q, rotary_cos, rotary_sin, position)
+    rotated_k = reference_rotary(new_k, rotary_cos, rotary_sin, position)
     expected_k = initial_k.clone()
     expected_v = initial_v.clone()
     expected_k[:, position : position + 1] = rotated_k
@@ -8846,6 +8851,7 @@ def test_kvcache_4k_partial_rotary_append_matches_fa2_and_fp32(
         v=new_v,
         rotary_cos=rotary_cos,
         rotary_sin=rotary_sin,
+        rotary_interleaved=rotary_interleaved,
         cache_seqlens=position,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -8864,6 +8870,7 @@ def test_kvcache_4k_partial_rotary_append_matches_fa2_and_fp32(
         v=new_v,
         rotary_cos=rotary_cos,
         rotary_sin=rotary_sin,
+        rotary_interleaved=rotary_interleaved,
         cache_seqlens=position,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -9053,14 +9060,8 @@ def test_kvcache_4k_final_slot_append_retains_generated_dispatch(
         pytest.param(
             "neox-half-head-rotary",
             NotImplementedError,
-            "only interleaved rotary",
+            "only for full-head rotation",
             id="neox-half-head-rotary",
-        ),
-        pytest.param(
-            "neox-full-head-rotary",
-            NotImplementedError,
-            "only interleaved rotary",
-            id="neox-full-head-rotary",
         ),
         pytest.param(
             "tensor-length",
@@ -9136,13 +9137,6 @@ def test_kvcache_4k_partial_append_rejects_before_mutation(
         kwargs.update(rotary_cos=unsupported_cos, rotary_sin=unsupported_sin)
     elif case == "neox-half-head-rotary":
         kwargs["rotary_interleaved"] = False
-    elif case == "neox-full-head-rotary":
-        full_cos, full_sin = make_rotary_tables(spec, seed=20260819)
-        kwargs.update(
-            rotary_cos=full_cos,
-            rotary_sin=full_sin,
-            rotary_interleaved=False,
-        )
     elif case == "tensor-length":
         kwargs["cache_seqlens"] = torch.tensor(
             [position], device=q.device, dtype=torch.int32
@@ -9166,14 +9160,25 @@ def test_kvcache_4k_partial_append_rejects_before_mutation(
     elif case == "autograd":
         q.requires_grad_()
     elif case == "rotary-autograd":
-        kwargs["rotary_cos"] = rotary_cos.detach().requires_grad_()
+        full_cos, full_sin = make_rotary_tables(spec, seed=20260819)
+        kwargs.update(
+            rotary_cos=full_cos.detach().requires_grad_(),
+            rotary_sin=full_sin,
+            rotary_interleaved=False,
+        )
     elif case == "multi-token":
         kwargs["k"] = torch.cat((new_k, new_k), dim=1)
         kwargs["v"] = torch.cat((new_v, new_v), dim=1)
     else:
-        kwargs["cache_seqlens"] = 1022
-        kwargs["shape"] = AttnShape(
-            1, 1, 1024, 32, 8, 128, torch.bfloat16, True
+        full_cos, full_sin = make_rotary_tables(spec, seed=20260820)
+        kwargs.update(
+            rotary_cos=full_cos,
+            rotary_sin=full_sin,
+            rotary_interleaved=False,
+            cache_seqlens=1022,
+            shape=AttnShape(
+                1, 1, 1024, 32, 8, 128, torch.bfloat16, True
+            ),
         )
 
     def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
