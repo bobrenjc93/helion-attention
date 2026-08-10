@@ -57,14 +57,15 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 mask alignment.
 
 One dense local-window profile is exposed through `flash_attn_func` and
-`flash_attn_kvpacked_func`: forward-only causal bf16 Llama GQA with exact shape
+`flash_attn_kvpacked_func`: causal bf16 Llama GQA with exact shape
 `(1, 2048, 2048, 32, 8, 128)` accepts `window_size=(511, 0)`. Each query sees
-itself and up to 511 preceding keys, for a 512-key window, through the generic
-packed Triton runtime. Both the default and a custom `softmax_scale` are
-supported. `window_size=(-1, -1)` retains the checked-in generated
-specialization. Other windows and shapes, autograd, dropout, softcap, ALiBi,
-`deterministic=True`, and diagnostic returns remain unsupported for this local
-window.
+itself and up to 511 preceding keys, for a 512-key window. Calls that do not
+need backward use the generic packed Triton runtime; grad-enabled calls use a
+bounded PyTorch SDPA autograd bridge for Q/K/V gradients. Both the default and
+a custom `softmax_scale` are supported. `window_size=(-1, -1)` retains the
+checked-in generated specialization when no backward is needed. Other windows
+and shapes, dropout, softcap, ALiBi, `deterministic=True`, and diagnostic
+returns remain unsupported for this local window.
 
 Score capping is limited to the forward-only inference profiles described
 below. The dense causal-bf16 Gemma-2 profile

@@ -1575,6 +1575,134 @@ def test_llama_2k_left_window_dense_and_kvpacked_match_fa2_and_fp32(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_llama_2k_left_window_backward_matches_fa2_and_fp32(
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA_2K_LEFT_WINDOW
+    base_q, base_k, base_v = make_inputs(spec, seed=20260810)
+    grad_out = make_inputs(spec, seed=20260811)[0]
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    q_ref = base_q.float().requires_grad_()
+    k_ref = base_k.float().requires_grad_()
+    v_ref = base_v.float().requires_grad_()
+    expected_fp32 = reference_causal_left_window_attention(
+        q_ref,
+        k_ref,
+        v_ref,
+        spec,
+        scale,
+        LLAMA_2K_LEFT_WINDOW_SIZE[0],
+    )
+    expected_fp32_grads = torch.autograd.grad(
+        expected_fp32, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    q = base_q.detach().requires_grad_()
+    k = base_k.detach().requires_grad_()
+    v = base_v.detach().requires_grad_()
+    dense = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+        shape=spec,
+    )
+    dense_grads = torch.autograd.grad(dense, (q, k, v), grad_out)
+
+    q_fa2 = base_q.detach().requires_grad_()
+    k_fa2 = base_k.detach().requires_grad_()
+    v_fa2 = base_v.detach().requires_grad_()
+    expected_dense = flash_attn.flash_attn_func(
+        q_fa2,
+        k_fa2,
+        v_fa2,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+    )
+    expected_dense_grads = torch.autograd.grad(
+        expected_dense, (q_fa2, k_fa2, v_fa2), grad_out
+    )
+
+    q_packed = base_q.detach().requires_grad_()
+    kv = torch.stack((base_k, base_v), dim=2).requires_grad_()
+    packed = helion_attention.flash_attn_kvpacked_func(
+        q_packed,
+        kv,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+        shape=spec,
+    )
+    q_grad, kv_grad = torch.autograd.grad(packed, (q_packed, kv), grad_out)
+    packed_grads = (q_grad, kv_grad[:, :, 0], kv_grad[:, :, 1])
+
+    q_packed_fa2 = base_q.detach().requires_grad_()
+    kv_fa2 = torch.stack((base_k, base_v), dim=2).requires_grad_()
+    expected_packed = flash_attn.flash_attn_kvpacked_func(
+        q_packed_fa2,
+        kv_fa2,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+    )
+    q_grad_fa2, kv_grad_fa2 = torch.autograd.grad(
+        expected_packed, (q_packed_fa2, kv_fa2), grad_out
+    )
+    expected_packed_grads = (
+        q_grad_fa2,
+        kv_grad_fa2[:, :, 0],
+        kv_grad_fa2[:, :, 1],
+    )
+
+    assert dense.shape == packed.shape == base_q.shape
+    assert dense.dtype == packed.dtype == torch.bfloat16
+    assert dense.is_contiguous() and packed.is_contiguous()
+    for actual, expected_fa2 in (
+        (dense, expected_dense),
+        (packed, expected_packed),
+    ):
+        torch.testing.assert_close(
+            actual, expected_fa2, atol=5e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            actual.float(), expected_fp32, atol=5e-2, rtol=2e-2
+        )
+
+    gradient_atol = 5e-2 if softmax_scale is None else 1.5e-1
+    for actual_grads, expected_fa2_grads in (
+        (dense_grads, expected_dense_grads),
+        (packed_grads, expected_packed_grads),
+    ):
+        for actual, expected_fa2, expected_fp32_grad in zip(
+            actual_grads, expected_fa2_grads, expected_fp32_grads
+        ):
+            torch.testing.assert_close(
+                actual.float(),
+                expected_fa2.float(),
+                atol=gradient_atol,
+                rtol=5e-2,
+            )
+            torch.testing.assert_close(
+                actual.float(),
+                expected_fp32_grad,
+                atol=gradient_atol,
+                rtol=5e-2,
+            )
+
+
+@requires_cuda
 def test_llama_2k_global_window_retains_generated_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1689,12 +1817,6 @@ def test_llama_2k_left_window_rejects_out_of_scope_calls_before_dispatch(
             "implemented only",
         ),
         (
-            (q.detach().requires_grad_(), k, v),
-            spec,
-            {"window_size": LLAMA_2K_LEFT_WINDOW_SIZE},
-            "forward-only",
-        ),
-        (
             (q, k, v),
             spec,
             {"window_size": LLAMA_2K_LEFT_WINDOW_SIZE, "dropout_p": 0.1},
@@ -1740,17 +1862,6 @@ def test_llama_2k_left_window_rejects_out_of_scope_calls_before_dispatch(
                 shape=case_spec,
                 **kwargs,  # type: ignore[arg-type]
             )
-
-    kv = torch.stack((k, v), dim=2).requires_grad_()
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        helion_attention.flash_attn_kvpacked_func(
-            q,
-            kv,
-            causal=True,
-            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
-            shape=spec,
-        )
-
 
 @requires_cuda
 @pytest.mark.parametrize(
