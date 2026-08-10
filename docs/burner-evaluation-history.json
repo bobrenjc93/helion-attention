@@ -3793,6 +3793,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:50228de59aa6c2a2ee70dd13cc6c956b7bd3342b",
+      "commit": "50228de59aa6c2a2ee70dd13cc6c956b7bd3342b",
+      "recordedAt": "2026-08-10T23:21:03.451Z",
+      "label": "base 50228de",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:166",
+      "recordedAt": "2026-08-10T23:21:03.451Z",
+      "label": "PR #166",
+      "kind": "leaf",
+      "prNumber": 166,
+      "title": "Backpropagate the causal varlen left window",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 57,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
