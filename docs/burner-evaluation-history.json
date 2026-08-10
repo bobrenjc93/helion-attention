@@ -2353,6 +2353,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6a3bc3776771eb3ba195ce6919f2ee9ad3c0d747",
+      "commit": "6a3bc3776771eb3ba195ce6919f2ee9ad3c0d747",
+      "recordedAt": "2026-08-10T00:20:26.575Z",
+      "label": "base 6a3bc37",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:109",
+      "recordedAt": "2026-08-10T00:20:26.575Z",
+      "label": "PR #109",
+      "kind": "leaf",
+      "prNumber": 109,
+      "title": "Expose one Llama-3 GQA varlen inference profile",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
