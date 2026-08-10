@@ -2773,6 +2773,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:1bbe763e776b6fb460fa3d79143ad183f092989d",
+      "commit": "1bbe763e776b6fb460fa3d79143ad183f092989d",
+      "recordedAt": "2026-08-10T07:31:19.487Z",
+      "label": "base 1bbe763",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 93,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:126",
+      "recordedAt": "2026-08-10T07:31:19.487Z",
+      "label": "PR #126",
+      "kind": "leaf",
+      "prNumber": 126,
+      "title": "Add one 64-token Llama-3 GQA prefill kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 95,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
