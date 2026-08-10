@@ -3214,6 +3214,134 @@ def test_full_causal_varlen_left_window_adapters_match_fp32_and_fa2(
     ["unpacked", "qkvpacked", "kvpacked"],
     ids=["unpacked", "qkv-packed", "kv-packed"],
 )
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_full_causal_varlen_left_window_backward_matches_fp32_and_fa2(
+    entry_point: str, softmax_scale: float | None
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = VARLEN_CAUSAL_LEFT_WINDOW
+    base_q, base_k, base_v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=2, seed=20260810
+    )
+    generator = torch.Generator(device=base_q.device).manual_seed(20260811)
+    grad_out = torch.randn(
+        base_q.shape,
+        device=base_q.device,
+        dtype=base_q.dtype,
+        generator=generator,
+    )
+
+    def run(
+        package: object,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        kwargs: dict[str, object] = {
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "window_size": VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+        }
+        if package is helion_attention:
+            kwargs["shape"] = spec
+
+        if entry_point == "unpacked":
+            q = base_q.detach().requires_grad_()
+            k = base_k.detach().requires_grad_()
+            v = base_v.detach().requires_grad_()
+            out = package.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                **kwargs,
+            )
+            grads = torch.autograd.grad(out, (q, k, v), grad_out)
+        elif entry_point == "qkvpacked":
+            qkv = torch.stack((base_q, base_k, base_v), dim=1).requires_grad_()
+            out = package.flash_attn_varlen_qkvpacked_func(
+                qkv,
+                cu_q,
+                spec.seqlen_q,
+                **kwargs,
+            )
+            packed_grad = torch.autograd.grad(out, qkv, grad_out)[0]
+            grads = tuple(packed_grad[:, index] for index in range(3))
+        else:
+            q = base_q.detach().requires_grad_()
+            kv = torch.stack((base_k, base_v), dim=1).requires_grad_()
+            out = package.flash_attn_varlen_kvpacked_func(
+                q,
+                kv,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                **kwargs,
+            )
+            q_grad, packed_grad = torch.autograd.grad(out, (q, kv), grad_out)
+            grads = (q_grad, packed_grad[:, 0], packed_grad[:, 1])
+
+        assert isinstance(out, torch.Tensor)
+        return out, grads
+
+    got, got_grads = run(helion_attention)
+    expected_fa2, expected_fa2_grads = run(flash_attn)
+
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    q_ref = base_q.float().requires_grad_()
+    k_ref = base_k.float().requires_grad_()
+    v_ref = base_v.float().requires_grad_()
+    expected_fp32 = reference_packed(
+        q_ref,
+        k_ref,
+        v_ref,
+        lengths_q,
+        lengths_k,
+        causal=True,
+        scale=scale,
+        window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+    )
+    expected_fp32_grads = torch.autograd.grad(
+        expected_fp32, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    assert got.shape == base_q.shape
+    assert got.dtype == torch.bfloat16
+    assert got.is_contiguous()
+    torch.testing.assert_close(
+        got.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+    gradient_atol = 8e-2 if softmax_scale is None else 1.5e-1
+    for actual, reference, reference_fa2 in zip(
+        got_grads, expected_fp32_grads, expected_fa2_grads
+    ):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=gradient_atol, rtol=5e-2
+        )
+        torch.testing.assert_close(
+            actual.float(),
+            reference_fa2.float(),
+            atol=gradient_atol,
+            rtol=5e-2,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["unpacked", "qkvpacked", "kvpacked"],
+    ids=["unpacked", "qkv-packed", "kv-packed"],
+)
 def test_causal_varlen_global_window_adapters_retain_generated_dispatch(
     entry_point: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -3366,35 +3494,62 @@ def test_causal_varlen_left_window_rejects_ragged_offsets_before_dispatch(
 
 
 @requires_cuda
-def test_causal_varlen_left_window_rejects_gradients_before_dispatch(
+@pytest.mark.parametrize(
+    ("window_size", "expected_kwargs"),
+    [
+        pytest.param(
+            VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
+            {"causal_window_left": VARLEN_CAUSAL_LEFT_WINDOW_SIZE[0]},
+            id="finite-window",
+        ),
+        pytest.param((-1, -1), {}, id="global-window"),
+    ],
+)
+def test_causal_varlen_backward_uses_narrow_dense_sdpa_dispatch(
+    window_size: tuple[int, int],
+    expected_kwargs: dict[str, int],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = VARLEN_CAUSAL_LEFT_WINDOW
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
     q.requires_grad_()
+    sentinel = torch.empty_like(q)
+    seen: list[dict[str, object]] = []
 
-    def reject_dispatch(*args: object, **kwargs: object) -> object:
-        raise AssertionError("grad-enabled causal window reached dispatch")
+    def sdpa(*args: object, **kwargs: object) -> torch.Tensor:
+        q_arg = args[0]
+        assert isinstance(q_arg, torch.Tensor)
+        assert args[4] == spec
+        seen.append(kwargs)
+        return sentinel.view_as(q_arg)
 
+    def reject_forward_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("causal backward reached forward dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", sdpa)
     monkeypatch.setattr(
         helion_attention,
         "_generic_varlen_causal_left_window_forward",
-        reject_dispatch,
+        reject_forward_dispatch,
     )
-    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
-    with pytest.raises(NotImplementedError, match="forward-only|gradients"):
-        helion_attention.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            spec.seqlen_q,
-            spec.seqlen_k,
-            causal=True,
-            window_size=VARLEN_CAUSAL_LEFT_WINDOW_SIZE,
-            shape=spec,
-        )
+    monkeypatch.setattr(
+        helion_attention, "lookup_varlen", reject_forward_dispatch
+    )
+    out = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=True,
+        window_size=window_size,
+        shape=spec,
+    )
+
+    assert out.data_ptr() == sentinel.data_ptr()
+    assert seen == [expected_kwargs]
 
 
 @pytest.mark.parametrize(
@@ -3440,8 +3595,10 @@ def test_causal_varlen_left_window_rejects_every_other_window(
         ("return_attn_probs", True, "return_attn_probs"),
         ("alibi_slopes", torch.ones(16), "ALiBi"),
         ("softcap", VARLEN_SOFTCAP_VALUE, "softcap"),
+        ("deterministic", True, "deterministic"),
+        ("block_table", torch.zeros(1, 1, dtype=torch.int32), "block_table"),
     ],
-    ids=["dropout", "diagnostics", "alibi", "softcap"],
+    ids=["dropout", "diagnostics", "alibi", "softcap", "determinism", "paging"],
 )
 def test_causal_varlen_left_window_rejects_optional_features_before_dispatch(
     option: str,

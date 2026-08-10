@@ -230,8 +230,8 @@ def dense_attention_sdpa(
 
     ``symmetric_window_radius`` is reserved for the bounded equal-length,
     noncausal varlen bridge validated by the public dispatcher.
-    ``causal_window_left`` is reserved for the equal-length causal Llama
-    bridge with a zero-token right window.
+    ``causal_window_left`` is reserved for validated equal-length causal
+    bridges with a zero-token right window.
     """
     query = q.transpose(1, 2)
     key = k.transpose(1, 2)
