@@ -26,9 +26,10 @@ profile, grad-enabled dense calls without a generated backward, both
 full-length varlen profiles, and ragged causal attention use PyTorch SDPA
 autograd. Full-length symmetric-window training on the shipped noncausal
 varlen profile uses the same bounded SDPA bridge. Deterministic zero-dropout
-BERT-base training uses the direct math operator without changing process-wide
-SDPA backend state. The explicit shape validates these paths and makes
-specialization introspection independent of fallback coverage.
+BERT-base training and full-length causal varlen training use the direct math
+operator without changing process-wide SDPA backend state. The explicit shape
+validates these paths and makes specialization introspection independent of
+fallback coverage.
 """
 
 from __future__ import annotations
@@ -145,6 +146,9 @@ _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
+)
+_VARLEN_DETERMINISTIC_BACKWARD_KEY = (
+    "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 )
 _RAGGED_VARLEN_SDPA_BACKWARD_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
@@ -1643,8 +1647,10 @@ def flash_attn_varlen_func(
     inputs are reshaped to one dense BSHD call; ragged inputs use one bounded
     PyTorch SDPA call per nonempty sequence. All-empty batches, empty
     cross-attention, ragged noncausal (including windowed calls), graph-captured
-    ragged, deterministic, paged, ALiBi, and diagnostic varlen backward remain
-    unsupported. Calls that do not need backward retain the generated packed
+    ragged, paged, ALiBi, and diagnostic varlen backward remain unsupported.
+    Deterministic zero-dropout backward is supported only for the full-length
+    causal profile, using direct math SDPA; the noncausal and all ragged forms
+    still reject it. Calls that do not need backward retain the generated packed
     kernel, including ragged and full-length calls with the global window.
     """
     window = _validate_varlen_window_size(window_size)
@@ -1826,12 +1832,15 @@ def flash_attn_varlen_func(
                 f"{supported} with eight full-length "
                 "sequences"
             )
-        if deterministic:
-            raise NotImplementedError(
-                "deterministic=True is not supported by the varlen PyTorch "
-                "SDPA autograd fallback"
-            )
         full_length = _has_full_varlen_token_totals(q, k, spec)
+        if deterministic and (
+            f"varlen_{spec.key}" != _VARLEN_DETERMINISTIC_BACKWARD_KEY
+            or not full_length
+        ):
+            raise NotImplementedError(
+                "deterministic=True is implemented only for full-length "
+                f"{_VARLEN_DETERMINISTIC_BACKWARD_KEY} zero-dropout training"
+            )
         if has_symmetric_window and not full_length:
             raise NotImplementedError(
                 "varlen sliding-window backward is implemented only when all "
@@ -1866,7 +1875,11 @@ def flash_attn_varlen_func(
         dense_v = v.reshape(
             spec.batch, spec.seqlen_k, spec.nheads_kv, spec.head_dim
         )
-        if has_symmetric_window:
+        if deterministic:
+            dense_out = dense_attention_math_sdpa(
+                dense_q, dense_k, dense_v, scale, spec
+            )
+        elif has_symmetric_window:
             dense_out = dense_attention_sdpa(
                 dense_q,
                 dense_k,

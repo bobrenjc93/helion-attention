@@ -210,13 +210,17 @@ SDPA call per nonempty sequence. Both paths provide forward and Q/K/V gradients
 for the default or a custom `softmax_scale`. The QKV-packed adapter inherits
 self-attention support; the KV-packed adapter accepts the same self-attention
 cases and also supports independent nonempty query/key offsets. Full-length
-training remains CUDA-graph capturable.
+training remains CUDA-graph capturable. The full-length causal profile also
+accepts `deterministic=True` with either scale, routing the reshaped batch
+through direct math SDPA for bitwise-repeatable outputs and Q/K/V gradients;
+both packed adapters inherit this path.
 Ragged training reads the cumulative offsets on the host for validation and
 therefore rejects graph capture. Calls that do not require gradients continue
 to use the generated varlen kernel, including ragged and full-length calls.
 Ragged noncausal batches, all-empty batches, empty cross-attention,
-deterministic mode, paged caches, ALiBi, diagnostic returns, and positive
-dropout remain explicitly unsupported for varlen backward.
+deterministic mode outside the exact full-length causal profile, paged caches,
+ALiBi, diagnostic returns, and positive dropout remain explicitly unsupported
+for varlen backward.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
 profiles when `block_table` is supplied. Both use bf16 page-size-16 caches in
@@ -659,7 +663,8 @@ also raise `NotImplementedError` rather than silently doing something else:
   all-empty or empty cross-attention batches, graph-captured ragged batches,
   and KV-cache calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback,
-  except for zero-dropout training on the exact bf16 BERT-base profile
+  except for zero-dropout training on the exact bf16 BERT-base profile and the
+  exact full-length causal bf16 varlen `(8, 512, 512, 16, 16, 64)` profile
 - dropout outside the exact encoder-training, BERT-base, and causal GPT-2
   profiles above, or combined with ALiBi, diagnostic returns, local windows,
   softcap, or deterministic mode
