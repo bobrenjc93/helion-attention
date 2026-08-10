@@ -1189,12 +1189,15 @@ def test_full_varlen_backward_matches_fp32_and_fa2(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_deterministic_full_causal_varlen_training_is_repeatable_and_matches_references(
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+def test_deterministic_full_varlen_training_is_repeatable_and_matches_references(
     name: str,
     softmax_scale: float | None,
+    spec: AttnShape,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
-    spec = VARLEN_ALIBI_CAUSAL
     base_q, base_k, base_v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
         spec, variant=2, seed=20260808
     )
@@ -1209,7 +1212,7 @@ def test_deterministic_full_causal_varlen_training_is_repeatable_and_matches_ref
     def run(api: object, *, pass_shape: bool) -> tuple[torch.Tensor, ...]:
         kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
-            "causal": True,
+            "causal": spec.causal,
             "deterministic": True,
         }
         if pass_shape:
@@ -1277,7 +1280,7 @@ def test_deterministic_full_causal_varlen_training_is_repeatable_and_matches_ref
         v_ref,
         lengths_q,
         lengths_k,
-        causal=True,
+        causal=spec.causal,
         scale=scale,
     )
     expected_grads = torch.autograd.grad(
@@ -1684,13 +1687,16 @@ def test_ragged_causal_cross_attention_no_grad_retains_generated_dispatch(
     ("deterministic", "expected_dispatch"),
     [(False, "ordinary"), (True, "math")],
 )
-def test_full_causal_varlen_deterministic_backward_dispatch_is_narrow(
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+def test_full_varlen_deterministic_backward_dispatch_is_narrow(
     name: str,
     deterministic: bool,
     expected_dispatch: str,
+    spec: AttnShape,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = VARLEN_ALIBI_CAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
     sentinel = torch.empty(
         spec.batch,
@@ -1735,7 +1741,7 @@ def test_full_causal_varlen_deterministic_backward_dispatch_is_narrow(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=True,
+            causal=spec.causal,
             deterministic=deterministic,
             shape=spec,
         )
@@ -1744,7 +1750,7 @@ def test_full_causal_varlen_deterministic_backward_dispatch_is_narrow(
             torch.stack((q, k, v), dim=1).requires_grad_(),
             cu_q,
             spec.seqlen_q,
-            causal=True,
+            causal=spec.causal,
             deterministic=deterministic,
             shape=spec,
         )
@@ -1756,7 +1762,7 @@ def test_full_causal_varlen_deterministic_backward_dispatch_is_narrow(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=True,
+            causal=spec.causal,
             deterministic=deterministic,
             shape=spec,
         )
@@ -1767,30 +1773,33 @@ def test_full_causal_varlen_deterministic_backward_dispatch_is_narrow(
 
 
 @requires_cuda
-def test_full_noncausal_varlen_backward_rejects_deterministic(
+def test_deterministic_varlen_backward_rejects_other_profile_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = VARLEN_ALIBI_NONCAUSAL
-    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
-    q.requires_grad_()
+    spec = AttnShape(1, 2, 2, 1, 1, 8, torch.bfloat16, False)
+    q = torch.randn(2, 1, 8, device="cuda", dtype=spec.dtype).requires_grad_()
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    cu_seqlens = _cumulative([2], q.device)
 
-    def reject_sdpa(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
-        raise AssertionError("unsupported varlen backward reached dense SDPA")
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported deterministic profile reached dispatch")
 
-    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
     monkeypatch.setattr(
-        helion_attention, "dense_attention_math_sdpa", reject_sdpa
+        helion_attention, "dense_attention_math_sdpa", reject_dispatch
     )
-    with pytest.raises(NotImplementedError, match="deterministic=True"):
+    with pytest.raises(
+        NotImplementedError, match="varlen backward is implemented only"
+    ):
         helion_attention.flash_attn_varlen_func(
             q,
             k,
             v,
-            cu_q,
-            cu_k,
+            cu_seqlens,
+            cu_seqlens,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=False,
             deterministic=True,
             shape=spec,
         )
@@ -1801,19 +1810,22 @@ def test_full_noncausal_varlen_backward_rejects_deterministic(
     ("option", "value", "message"),
     [
         ("dropout_p", 0.1, "dropout"),
-        ("window_size", (31, 31), "sliding-window"),
-        ("softcap", VARLEN_SOFTCAP_VALUE, "softcap backward"),
+        ("window_size", (31, 31), "window"),
+        ("softcap", VARLEN_SOFTCAP_VALUE, "softcap"),
         ("alibi_slopes", "slopes", "ALiBi backward"),
         ("return_attn_probs", True, "deterministic=False"),
     ],
 )
-def test_deterministic_full_causal_varlen_backward_rejects_optional_features(
+@pytest.mark.parametrize(
+    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+)
+def test_deterministic_full_varlen_backward_rejects_optional_features(
     option: str,
     value: object,
     message: str,
+    spec: AttnShape,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = VARLEN_ALIBI_CAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
     q.requires_grad_()
     if value == "slopes":
@@ -1835,7 +1847,7 @@ def test_deterministic_full_causal_varlen_backward_rejects_optional_features(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=True,
+            causal=spec.causal,
             deterministic=True,
             shape=spec,
             **{option: value},
@@ -1851,6 +1863,7 @@ def test_deterministic_full_causal_varlen_backward_rejects_optional_features(
         ("all-empty-self", "at least one nonempty query"),
         ("all-empty-query-cross", "at least one nonempty query"),
         ("deterministic", "deterministic=True"),
+        ("deterministic-noncausal", "deterministic=True"),
         ("deterministic-empty", "deterministic=True"),
         ("deterministic-empty-query-cross", "deterministic=True"),
     ],
@@ -1860,7 +1873,7 @@ def test_ragged_varlen_backward_rejects_out_of_scope_calls(
 ) -> None:
     spec = (
         VARLEN_ALIBI_NONCAUSAL
-        if case == "noncausal-empty-query"
+        if case in {"noncausal-empty-query", "deterministic-noncausal"}
         else VARLEN_ALIBI_CAUSAL
     )
     if case in {
@@ -1904,6 +1917,7 @@ def test_ragged_varlen_backward_rejects_out_of_scope_calls(
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
     deterministic = case in {
         "deterministic",
+        "deterministic-noncausal",
         "deterministic-empty",
         "deterministic-empty-query-cross",
     }

@@ -3223,6 +3223,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:e6402d24a2b8e64ddb719e833c7d03cc8c3b1555",
+      "commit": "e6402d24a2b8e64ddb719e833c7d03cc8c3b1555",
+      "recordedAt": "2026-08-10T13:44:48.974Z",
+      "label": "base e6402d2",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 95,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:142",
+      "recordedAt": "2026-08-10T13:44:48.974Z",
+      "label": "PR #142",
+      "kind": "leaf",
+      "prNumber": 142,
+      "title": "Honor deterministic backward on full-length noncausal varlen",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

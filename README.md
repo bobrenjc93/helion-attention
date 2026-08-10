@@ -251,16 +251,17 @@ self-attention support; the KV-packed adapter accepts the same independent
 query/key cases, including zero-length query slots paired with nonempty key
 slots. Full-length causal training additionally accepts the diagnostic return
 described above when `deterministic=False`. Training without diagnostics remains
-CUDA-graph capturable. The full-length causal profile also accepts
-`deterministic=True` with either scale when diagnostics are disabled, routing
-the reshaped batch through direct math SDPA for bitwise-repeatable outputs and
-Q/K/V gradients; both packed adapters inherit these paths.
+CUDA-graph capturable. Both full-length profiles also accept
+`deterministic=True` with either scale when diagnostics and local windows are
+disabled, routing the reshaped batch through direct math SDPA for
+bitwise-repeatable outputs and Q/K/V gradients; both packed adapters inherit
+these paths.
 Ragged training reads the cumulative offsets on the host for validation and
 therefore rejects graph capture. Calls that do not require gradients continue
 to use the generated varlen kernel, including ragged and full-length calls.
 Ragged noncausal batches, batches with no nonempty queries, cross-attention
-batches with any empty key slot, deterministic mode outside the exact
-full-length causal profile, paged caches, ALiBi, ragged diagnostic returns, and
+batches with any empty key slot, deterministic mode outside these exact
+full-length profiles, paged caches, ALiBi, ragged diagnostic returns, and
 positive dropout remain explicitly unsupported for varlen backward.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
@@ -781,8 +782,8 @@ also raise `NotImplementedError` rather than silently doing something else:
   key slots, graph-captured ragged batches, and KV-cache calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback,
   except for zero-dropout training on the exact bf16 BERT-base and causal GPT-2
-  `(2, 1024, 1024, 32, 32, 64)` profiles and the exact full-length causal bf16
-  varlen `(8, 512, 512, 16, 16, 64)` profile
+  `(2, 1024, 1024, 32, 32, 64)` profiles and the exact full-length bf16 varlen
+  `(8, 512, 512, 16, 16, 64)` profiles in either causal mode
 - dropout outside the exact encoder-training, BERT-base, and causal GPT-2
   profiles above, or combined with ALiBi, diagnostic returns, local windows,
   softcap, or deterministic mode
