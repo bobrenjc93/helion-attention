@@ -712,21 +712,17 @@ def _ragged_varlen_attention_lengths(
         raise ValueError(
             "cu_seqlens_q/cu_seqlens_k must be monotonically nondecreasing"
         )
-    has_empty_sequence = any(
-        length == 0 for length in (*lengths_q, *lengths_k)
-    )
-    if has_empty_sequence:
-        if offsets_q != offsets_k:
-            raise NotImplementedError(
-                "ragged varlen backward with empty sequence slots is "
-                "implemented only for causal self-attention with identical "
-                "cu_seqlens_q and cu_seqlens_k"
-            )
-        if not any(lengths_q):
-            raise NotImplementedError(
-                "ragged varlen backward requires at least one nonempty "
-                "self-attention sequence"
-            )
+    if not any(lengths_q):
+        raise NotImplementedError(
+            "ragged varlen backward requires at least one nonempty query "
+            "sequence"
+        )
+    if any(length == 0 for length in lengths_k) and offsets_q != offsets_k:
+        raise NotImplementedError(
+            "ragged varlen backward with empty key sequence slots is "
+            "implemented only for causal self-attention with identical "
+            "cu_seqlens_q and cu_seqlens_k"
+        )
     if any(length > spec.seqlen_q for length in lengths_q) or any(
         length > spec.seqlen_k for length in lengths_k
     ):
@@ -755,9 +751,9 @@ def _ragged_varlen_attention_sdpa(
     for q_sequence, k_sequence, v_sequence, seqlen_q, seqlen_k in zip(
         q_sequences, k_sequences, v_sequences, lengths_q, lengths_k
     ):
-        # Empty slots contain no packed rows. The length validator admits them
-        # only for self-attention, so both sides are empty and there is no SDPA
-        # subproblem to launch. At least one nonempty slot is guaranteed.
+        # Empty query slots contain no packed output rows, so there is no SDPA
+        # subproblem to launch. Their K/V slices remain unused and naturally
+        # receive zero gradients. At least one nonempty query is guaranteed.
         if seqlen_q == 0:
             continue
         # Preserve the established self-attention call exactly. Unequal
@@ -1716,11 +1712,12 @@ def flash_attn_varlen_func(
 
     Both causal modes support zero-dropout backward when all eight query and
     key sequences have length 512. The causal profile additionally supports
-    independent query and key cumulative offsets describing eight nonempty
-    sequences of length at most 512, plus self-attention with identical
-    query/key offsets containing a mix of empty and nonempty slots. Full-length
-    inputs are reshaped to one dense BSHD call; ragged inputs use one bounded
-    PyTorch SDPA call per nonempty sequence. All-empty batches, empty
+    independent query and key cumulative offsets describing eight nonempty key
+    sequences and a mix of empty and nonempty query sequences, all of length
+    at most 512. Self-attention with identical query/key offsets continues to
+    accept mixed empty and nonempty slots. Full-length inputs are reshaped to
+    one dense BSHD call; ragged inputs use one bounded PyTorch SDPA call per
+    nonempty query sequence. All-empty query batches, empty key slots in
     cross-attention, ragged noncausal (including windowed calls), graph-captured
     ragged, paged, ALiBi, and diagnostic varlen backward remain unsupported.
     Deterministic zero-dropout backward is supported only for the full-length

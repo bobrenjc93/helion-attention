@@ -52,7 +52,9 @@ LLAMA3_VARLEN_INFERENCE = AttnShape(
 )
 RAGGED_SELF_LENGTHS = [512, 401, 300, 255, 128, 63, 17, 1]
 MIXED_EMPTY_SELF_LENGTHS = [512, 0, 300, 255, 0, 63, 17, 0]
-EMPTY_FINAL_SLOT_LENGTHS = [512, 401, 300, 255, 128, 63, 18, 0]
+RAGGED_CROSS_QUERY_LENGTHS = [512, 401, 300, 255, 128, 63, 17, 1]
+RAGGED_CROSS_KEY_LENGTHS = [3, 29, 97, 191, 257, 319, 443, 511]
+MIXED_EMPTY_CROSS_QUERY_LENGTHS = [512, 0, 300, 255, 0, 63, 17, 0]
 PAGED_DECODE = AttnShape(
     batch=4,
     seqlen_q=1,
@@ -192,7 +194,11 @@ def make_ragged_self_packed(
 
 
 def make_ragged_cross_packed(
-    spec: AttnShape, *, seed: int = 123
+    spec: AttnShape,
+    *,
+    seed: int = 123,
+    lengths_q: list[int] | None = None,
+    lengths_k: list[int] | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -202,15 +208,14 @@ def make_ragged_cross_packed(
     list[int],
     list[int],
 ]:
-    lengths_q = [512, 401, 300, 255, 128, 63, 17, 1]
-    lengths_k = [3, 29, 97, 191, 257, 319, 443, 511]
+    if lengths_q is None:
+        lengths_q = RAGGED_CROSS_QUERY_LENGTHS
+    if lengths_k is None:
+        lengths_k = RAGGED_CROSS_KEY_LENGTHS
     assert spec.batch == len(lengths_q) == len(lengths_k)
     assert max(lengths_q) <= spec.seqlen_q
     assert max(lengths_k) <= spec.seqlen_k
-    assert all(
-        q_length != k_length
-        for q_length, k_length in zip(lengths_q, lengths_k)
-    )
+    assert lengths_q != lengths_k
     generator = torch.Generator(device="cuda").manual_seed(seed)
     q = torch.randn(
         (sum(lengths_q), spec.nheads_q, spec.head_dim),
@@ -681,13 +686,21 @@ def test_varlen_packed_entry_points_match_unpacked(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
+@pytest.mark.parametrize(
+    "empty_query_slots", [False, True], ids=["nonempty", "empty-query"]
+)
 def test_ragged_causal_varlen_cross_attention_backward_matches_fp32_and_fa2(
-    entry_point: str, softmax_scale: float | None
+    entry_point: str,
+    softmax_scale: float | None,
+    empty_query_slots: bool,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = VARLEN_ALIBI_CAUSAL
+    requested_lengths_q = (
+        MIXED_EMPTY_CROSS_QUERY_LENGTHS if empty_query_slots else None
+    )
     q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_ragged_cross_packed(
-        spec, seed=20260809
+        spec, seed=20260809, lengths_q=requested_lengths_q
     )
     generator = torch.Generator(device=q.device).manual_seed(20260810)
     grad_out = torch.randn(
@@ -817,6 +830,19 @@ def test_ragged_causal_varlen_cross_attention_backward_matches_fp32_and_fa2(
         torch.testing.assert_close(
             actual.float(), reference_fa2.float(), atol=5e-2, rtol=2e-2
         )
+
+    if empty_query_slots:
+        if entry_point == "unpacked":
+            k_grad, v_grad = got_grads[1:]
+        else:
+            k_grad, v_grad = got_grads[1].unbind(dim=1)
+        k_start = 0
+        for query_length, key_length in zip(lengths_q, lengths_k):
+            if query_length == 0:
+                key_slice = slice(k_start, k_start + key_length)
+                assert torch.count_nonzero(k_grad[key_slice]).item() == 0
+                assert torch.count_nonzero(v_grad[key_slice]).item() == 0
+            k_start += key_length
 
 
 @requires_cuda
@@ -1587,11 +1613,21 @@ def test_ragged_causal_no_grad_softcap_zero_retains_generated_dispatch(
     ["flash_attn_varlen_func", "flash_attn_varlen_kvpacked_func"],
     ids=["unpacked", "kv-packed"],
 )
+@pytest.mark.parametrize(
+    "empty_query_slots", [False, True], ids=["nonempty", "empty-query"]
+)
 def test_ragged_causal_cross_attention_no_grad_retains_generated_dispatch(
-    name: str, monkeypatch: pytest.MonkeyPatch
+    name: str,
+    empty_query_slots: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = VARLEN_ALIBI_CAUSAL
-    q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(spec)
+    requested_lengths_q = (
+        MIXED_EMPTY_CROSS_QUERY_LENGTHS if empty_query_slots else None
+    )
+    q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+        spec, lengths_q=requested_lengths_q
+    )
     sentinel = torch.empty_like(q)
     calls: list[tuple[object, ...]] = []
 
@@ -1810,12 +1846,13 @@ def test_deterministic_full_causal_varlen_backward_rejects_optional_features(
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        ("noncausal", "causal.*profile"),
-        ("empty-query-cross", "self-attention.*identical"),
-        ("empty-key-cross", "self-attention.*identical"),
-        ("all-empty", "at least one nonempty"),
+        ("noncausal-empty-query", "causal.*profile"),
+        ("empty-key-cross", "empty key sequence"),
+        ("all-empty-self", "at least one nonempty query"),
+        ("all-empty-query-cross", "at least one nonempty query"),
         ("deterministic", "deterministic=True"),
         ("deterministic-empty", "deterministic=True"),
+        ("deterministic-empty-query-cross", "deterministic=True"),
     ],
 )
 def test_ragged_varlen_backward_rejects_out_of_scope_calls(
@@ -1823,17 +1860,32 @@ def test_ragged_varlen_backward_rejects_out_of_scope_calls(
 ) -> None:
     spec = (
         VARLEN_ALIBI_NONCAUSAL
-        if case == "noncausal"
+        if case == "noncausal-empty-query"
         else VARLEN_ALIBI_CAUSAL
     )
-    q, k, v, cu_q, _ = make_ragged_self_packed(spec)
-    cu_k = cu_q.clone()
-    empty_offsets = _cumulative(EMPTY_FINAL_SLOT_LENGTHS, q.device)
-    if case == "empty-query-cross":
-        cu_q = empty_offsets
+    if case in {
+        "noncausal-empty-query",
+        "all-empty-query-cross",
+        "deterministic-empty-query-cross",
+    }:
+        lengths_q = (
+            [0] * spec.batch
+            if case == "all-empty-query-cross"
+            else MIXED_EMPTY_CROSS_QUERY_LENGTHS
+        )
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec, lengths_q=lengths_q
+        )
     elif case == "empty-key-cross":
-        cu_k = empty_offsets
-    elif case == "all-empty":
+        lengths_k = RAGGED_CROSS_KEY_LENGTHS.copy()
+        lengths_k[-1] = 0
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec, lengths_k=lengths_k
+        )
+    else:
+        q, k, v, cu_q, _ = make_ragged_self_packed(spec)
+        cu_k = cu_q.clone()
+    if case == "all-empty-self":
         q = q[:0].contiguous()
         k = k[:0].contiguous()
         v = v[:0].contiguous()
@@ -1850,6 +1902,11 @@ def test_ragged_varlen_backward_rejects_out_of_scope_calls(
         raise AssertionError("out-of-scope ragged backward reached SDPA")
 
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    deterministic = case in {
+        "deterministic",
+        "deterministic-empty",
+        "deterministic-empty-query-cross",
+    }
     with pytest.raises(NotImplementedError, match=message):
         helion_attention.flash_attn_varlen_func(
             q,
@@ -1860,7 +1917,7 @@ def test_ragged_varlen_backward_rejects_out_of_scope_calls(
             spec.seqlen_q,
             spec.seqlen_k,
             causal=spec.causal,
-            deterministic=case in {"deterministic", "deterministic-empty"},
+            deterministic=deterministic,
             shape=spec,
         )
 
@@ -1877,20 +1934,30 @@ def test_ragged_varlen_backward_rejects_out_of_scope_calls(
     ],
 )
 @pytest.mark.parametrize(
-    "empty_slots", [False, True], ids=["nonempty", "mixed-empty"]
+    "attention",
+    ["self", "self-empty", "cross-empty-query"],
+    ids=["self", "empty-self", "empty-query-cross"],
 )
 def test_ragged_causal_varlen_backward_rejects_incompatible_options(
     option: str,
     value: object,
     message: str,
-    empty_slots: bool,
+    attention: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = VARLEN_ALIBI_CAUSAL
-    requested_lengths = MIXED_EMPTY_SELF_LENGTHS if empty_slots else None
-    q, k, v, cu_seqlens, _ = make_ragged_self_packed(
-        spec, lengths=requested_lengths
-    )
+    if attention == "cross-empty-query":
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec, lengths_q=MIXED_EMPTY_CROSS_QUERY_LENGTHS
+        )
+    else:
+        requested_lengths = (
+            MIXED_EMPTY_SELF_LENGTHS if attention == "self-empty" else None
+        )
+        q, k, v, cu_q, _ = make_ragged_self_packed(
+            spec, lengths=requested_lengths
+        )
+        cu_k = cu_q
     q.requires_grad_()
     if option == "alibi_slopes":
         value = torch.ones(spec.nheads_q, device=q.device)
@@ -1905,8 +1972,8 @@ def test_ragged_causal_varlen_backward_rejects_incompatible_options(
             q,
             k,
             v,
-            cu_seqlens,
-            cu_seqlens,
+            cu_q,
+            cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
             causal=True,
@@ -4153,8 +4220,13 @@ def test_full_varlen_grad_enabled_supports_cuda_graph_capture(
 @requires_cuda
 @pytest.mark.parametrize(
     "attention",
-    ["self", "self-empty", "cross"],
-    ids=["self-attention", "empty-self-attention", "cross-attention"],
+    ["self", "self-empty", "cross", "cross-empty-query"],
+    ids=[
+        "self-attention",
+        "empty-self-attention",
+        "cross-attention",
+        "empty-query-cross-attention",
+    ],
 )
 def test_ragged_causal_backward_rejects_cuda_graph_capture(
     attention: str, monkeypatch: pytest.MonkeyPatch,
@@ -4171,7 +4243,14 @@ def test_ragged_causal_backward_rejects_cuda_graph_capture(
         )
         cu_k = cu_q
     else:
-        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(spec)
+        requested_lengths_q = (
+            MIXED_EMPTY_CROSS_QUERY_LENGTHS
+            if attention == "cross-empty-query"
+            else None
+        )
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec, lengths_q=requested_lengths_q
+        )
     q.requires_grad_()
 
     def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
