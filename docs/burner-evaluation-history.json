@@ -3103,6 +3103,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:d88653dcbe42938d96e8db932486151c35486110",
+      "commit": "d88653dcbe42938d96e8db932486151c35486110",
+      "recordedAt": "2026-08-10T12:12:49.727Z",
+      "label": "base d88653d",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:138",
+      "recordedAt": "2026-08-10T12:12:49.727Z",
+      "label": "PR #138",
+      "kind": "leaf",
+      "prNumber": 138,
+      "title": "Apply ALiBi to scalar 4K cache prefixes",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
