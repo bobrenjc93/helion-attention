@@ -420,6 +420,31 @@ def reference_single_token_lse(
     )
 
 
+def reference_dense_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    spec: AttnShape,
+    scale: float,
+) -> torch.Tensor:
+    grouped_q = q.float().permute(0, 2, 1, 3).reshape(
+        spec.batch,
+        spec.nheads_kv,
+        spec.nheads_q // spec.nheads_kv,
+        spec.seqlen_q,
+        spec.head_dim,
+    )
+    grouped_k_t = k.float().permute(0, 2, 3, 1).unsqueeze(2)
+    scores = torch.matmul(grouped_q, grouped_k_t) * scale
+    if spec.causal:
+        row = torch.arange(spec.seqlen_q, device=q.device)[:, None]
+        col = torch.arange(spec.seqlen_k, device=q.device)[None, :]
+        keep = col <= row + spec.seqlen_k - spec.seqlen_q
+        scores.masked_fill_(~keep, float("-inf"))
+    return torch.logsumexp(scores, dim=-1).reshape(
+        spec.batch, spec.nheads_q, spec.seqlen_q
+    )
+
+
 def reference_single_token_prefix_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3842,9 +3867,15 @@ def test_kvcache_shape_argument_is_required() -> None:
     [None, 0.37],
     ids=["default-scale", "custom-scale"],
 )
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["output-only", "with-lse"],
+)
 def test_four_token_dense_kvcache_matches_fp32_without_mutating_cache(
     cache_seqlens: int | None,
     softmax_scale: float | None,
+    return_softmax_lse: bool,
 ) -> None:
     spec = FOUR_TOKEN_KVCACHE
     q, k_cache, v_cache = make_inputs(spec, seed=20260816)
@@ -3867,20 +3898,34 @@ def test_four_token_dense_kvcache_matches_fp32_without_mutating_cache(
         v_cache,
         softmax_scale=softmax_scale,
         causal=True,
+        return_softmax_lse=return_softmax_lse,
         shape=spec,
         **cache_kwargs,
     )
     expected_fp32 = reference_attention(q, k_cache, v_cache, spec, scale)
 
-    assert isinstance(got, torch.Tensor)
-    assert got.shape == q.shape
-    assert got.dtype == q.dtype
+    if return_softmax_lse:
+        assert isinstance(got, tuple) and len(got) == 2
+        got_out, softmax_lse = got
+        expected_lse = reference_dense_lse(q, k_cache, spec, scale)
+        assert softmax_lse.shape == expected_lse.shape == (1, 32, 4)
+        assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+        torch.testing.assert_close(
+            softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+        )
+    else:
+        assert isinstance(got, torch.Tensor)
+        got_out = got
+    assert got_out.shape == q.shape
+    assert got_out.dtype == q.dtype
     assert k_cache.data_ptr() == k_pointer
     assert v_cache.data_ptr() == v_pointer
     assert torch.equal(k_cache, original_k)
     assert torch.equal(v_cache, original_v)
-    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
-    assert (got.float() - expected_fp32).abs().mean().item() < 1e-3
+    torch.testing.assert_close(
+        got_out.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+    assert (got_out.float() - expected_fp32).abs().mean().item() < 1e-3
 
 
 @requires_cuda
@@ -3894,9 +3939,15 @@ def test_four_token_dense_kvcache_matches_fp32_without_mutating_cache(
     [None, 0.37],
     ids=["default-scale", "custom-scale"],
 )
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["output-only", "with-lse"],
+)
 def test_four_token_dense_kvcache_matches_fa2(
     cache_seqlens: int | None,
     softmax_scale: float | None,
+    return_softmax_lse: bool,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = FOUR_TOKEN_KVCACHE
@@ -3913,6 +3964,7 @@ def test_four_token_dense_kvcache_matches_fa2(
         v_cache,
         softmax_scale=softmax_scale,
         causal=True,
+        return_softmax_lse=return_softmax_lse,
         shape=spec,
         **cache_kwargs,
     )
@@ -3922,15 +3974,29 @@ def test_four_token_dense_kvcache_matches_fa2(
         v_cache,
         softmax_scale=softmax_scale,
         causal=True,
+        return_softmax_lse=return_softmax_lse,
         **cache_kwargs,
     )
 
-    assert isinstance(got, torch.Tensor)
-    assert isinstance(expected_fa2, torch.Tensor)
+    if return_softmax_lse:
+        assert isinstance(got, tuple) and len(got) == 2
+        assert isinstance(expected_fa2, tuple) and len(expected_fa2) == 2
+        got_out, softmax_lse = got
+        expected_out, expected_lse = expected_fa2
+        assert softmax_lse.shape == expected_lse.shape == (1, 32, 4)
+        assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+        torch.testing.assert_close(
+            softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+        )
+    else:
+        assert isinstance(got, torch.Tensor)
+        assert isinstance(expected_fa2, torch.Tensor)
+        got_out = got
+        expected_out = expected_fa2
     assert torch.equal(k_cache, original_k)
     assert torch.equal(v_cache, original_v)
-    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
-    assert (got.float() - expected_fa2.float()).abs().mean().item() < 1e-3
+    torch.testing.assert_close(got_out, expected_out, atol=2e-2, rtol=1e-2)
+    assert (got_out.float() - expected_out.float()).abs().mean().item() < 1e-3
 
 
 @requires_cuda
@@ -3976,10 +4042,75 @@ def test_four_token_dense_kvcache_uses_generic_dispatch(
 
 
 @requires_cuda
+def test_four_token_dense_kvcache_lse_uses_diagnostic_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = FOUR_TOKEN_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    sentinel_out = torch.empty_like(q)
+    sentinel_lse = torch.empty(
+        spec.batch,
+        spec.nheads_q,
+        spec.seqlen_q,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    sentinel_s_dmask = q.new_empty((0,))
+    calls: list[AttnShape] = []
+
+    def diagnostic(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        spec_arg: AttnShape,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert query is q
+        assert key is k_cache
+        assert value is v_cache
+        assert scale == 1.0 / math.sqrt(spec.head_dim)
+        assert spec_arg is spec
+        calls.append(spec_arg)
+        return sentinel_out, sentinel_lse, sentinel_s_dmask
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("four-token LSE call reached output-only dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", diagnostic
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        causal=True,
+        return_softmax_lse=True,
+        shape=spec,
+    )
+
+    assert isinstance(got, tuple) and len(got) == 2
+    assert got[0] is sentinel_out
+    assert got[1] is sentinel_lse
+    assert calls == [spec]
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["output-only", "with-lse"],
+)
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        ("lse", "return_softmax_lse"),
         ("update", "read-only"),
         ("partial-scalar", "partial or ragged"),
         ("tensor-length", "tensor-valued cache_seqlens"),
@@ -3993,17 +4124,20 @@ def test_four_token_dense_kvcache_uses_generic_dispatch(
 def test_four_token_dense_kvcache_rejects_out_of_scope_calls_before_dispatch(
     case: str,
     message: str,
+    return_softmax_lse: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = FOUR_TOKEN_KVCACHE
     q, k_cache, v_cache = make_inputs(spec)
     original_k = k_cache.clone()
     original_v = v_cache.clone()
-    kwargs: dict[str, object] = {"causal": True, "shape": spec}
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "return_softmax_lse": return_softmax_lse,
+        "shape": spec,
+    }
 
-    if case == "lse":
-        kwargs["return_softmax_lse"] = True
-    elif case == "update":
+    if case == "update":
         kwargs.update(
             k=k_cache[:, : spec.seqlen_q].clone(),
             v=v_cache[:, : spec.seqlen_q].clone(),

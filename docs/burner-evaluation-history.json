@@ -2923,6 +2923,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:378267989cb7f8fcfa7921f867b542ee5084f167",
+      "commit": "378267989cb7f8fcfa7921f867b542ee5084f167",
+      "recordedAt": "2026-08-10T09:55:05.737Z",
+      "label": "base 3782679",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 66,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:132",
+      "recordedAt": "2026-08-10T09:55:05.737Z",
+      "label": "PR #132",
+      "kind": "leaf",
+      "prNumber": 132,
+      "title": "Return LSE for four-token 1K decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 67,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

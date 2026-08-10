@@ -2511,8 +2511,9 @@ def flash_attn_with_kvcache(
     A separate read-only speculative-decoding slice accepts exactly four query
     tokens: causal bf16 ``(1, 4, 1024, 32, 8, 128)`` with a full dense cache.
     It also uses the generic packed runtime and supports the default or a custom
-    softmax scale. This profile does not support LSE, cache updates, partial or
-    tensor-valued lengths, rotary, remapping, autograd, or noncausal attention.
+    softmax scale, plus an optional fp32 LSE return shaped ``[1, 32, 4]``. This
+    profile does not support cache updates, partial or tensor-valued lengths,
+    rotary, remapping, autograd, or noncausal attention.
 
     Two read-only paged profiles are also exposed with an int32 CUDA
     ``cache_seqlens`` tensor shaped ``[batch]`` and ``block_table``. Bf16
@@ -2756,11 +2757,6 @@ def flash_attn_with_kvcache(
             raise NotImplementedError(
                 "the four-token dense KV-cache profile is read-only; cache "
                 "updates are not implemented"
-            )
-        if return_softmax_lse:
-            raise NotImplementedError(
-                "return_softmax_lse is not implemented for the four-token "
-                "dense KV-cache profile"
             )
     if is_two_token_dense_profile:
         if return_softmax_lse:
@@ -3048,6 +3044,15 @@ def flash_attn_with_kvcache(
             raise NotImplementedError(
                 "the four-token dense KV-cache profile does not support autograd"
             )
+        if return_softmax_lse:
+            out, softmax_lse, _ = _generic_dense_diagnostic_forward(
+                q,
+                k_cache,
+                v_cache,
+                scale,
+                spec,
+            )
+            return out, softmax_lse
         return _generic_dense_forward(
             q,
             k_cache,
