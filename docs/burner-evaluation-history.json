@@ -3043,6 +3043,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:b02da7f8092e909afb4ec7f9836709476c1b2f17",
+      "commit": "b02da7f8092e909afb4ec7f9836709476c1b2f17",
+      "recordedAt": "2026-08-10T11:30:07.056Z",
+      "label": "base b02da7f",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 96,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:136",
+      "recordedAt": "2026-08-10T11:30:07.056Z",
+      "label": "PR #136",
+      "kind": "leaf",
+      "prNumber": 136,
+      "title": "Read tensor-selected spans from the 4K dense cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 96,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

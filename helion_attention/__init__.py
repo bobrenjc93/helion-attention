@@ -22,10 +22,11 @@ decode. The same runtime exposes page-256 decode with optional ALiBi but
 without softcap through the core varlen API. The KV-cache adapter also uses the
 generic paged runtime for ALiBi on both exposed page-16 profiles and page-256
 decode. Read-only causal 1K and both causal variants of 4K dense decode likewise
-use the generic runtime for a bounded Python-int prefix; the 4K profile also
-uses it for ALiBi. The 4K prefix runtime handles a paired one-token K/V append
-before the final slot, including full-head interleaved rotary, while full reads
-and final-slot appends retain the generated specializations.
+use the generic runtime for a bounded Python-int prefix. The 4K profiles also
+use it for read-only CUDA-tensor-selected spans and full-cache ALiBi. Their
+prefix runtime handles a paired one-token K/V append before the final slot,
+including full-head interleaved rotary, while full reads and final-slot appends
+retain the generated specializations.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -178,8 +179,16 @@ _VARLEN_DETERMINISTIC_BACKWARD_KEY = (
 _RAGGED_VARLEN_SDPA_BACKWARD_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 )
-_TENSOR_LENGTH_DENSE_KVCACHE_KEY = (
-    "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
+_TENSOR_SPAN_DENSE_KVCACHE_KEYS = frozenset(
+    {
+        "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal",
+        "b1_sq1_sk4096_hq32_hkv8_d128_bf16_noncausal",
+        "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal",
+    }
+)
+_TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION = (
+    "bf16 (1, 1, 4096, 32, 8, 128) with either causal flag or causal bf16 "
+    "(1, 1, 16384, 32, 8, 128)"
 )
 _EXPLICIT_SPLIT_DENSE_KVCACHE_PROFILE = (
     1,
@@ -2639,16 +2648,23 @@ def flash_attn_with_kvcache(
     key with full-head interleaved rotary tables. Omitted and full Python-int
     reads, plus the existing update at position 4095, retain the generated
     specialization.
+    The same 4K profiles additionally accept contiguous CUDA int32
+    ``cache_seqlens`` tensors shaped ``[1]`` for read-only, slope-free spans.
+    An optional matching ``cache_leftpad`` tensor selects
+    ``[cache_leftpad, cache_seqlens)`` when
+    ``0 <= cache_leftpad < cache_seqlens <= 4096``; without it, the span begins
+    at zero.
+    Tensor spans support either causal flag, the default or a custom softmax
+    scale, and optional fp32 LSE. They synchronize once for recoverable bounds
+    validation and reject CUDA graph capture, autograd, updates, remapping,
+    rotary, ALiBi, windows, softcap, and explicit split counts.
     The same 4K profiles accept
     forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]`` only for the
     full cache. Those calls use the generic packed runtime; omitting slopes
     retains the generated specialization. ALiBi cannot be combined with LSE,
     updates, partial lengths, remapping, left padding, rotary, windows, softcap,
-    or autograd. The causal bf16 ``(1, 1, 16384, 32, 8, 128)`` profile
-    additionally accepts a contiguous
-    CUDA int32 ``cache_seqlens`` tensor shaped ``[1]`` selecting the end of a
-    prefix. A matching ``cache_leftpad`` tensor selects the half-open cache span
-    ``[cache_leftpad, cache_seqlens)`` when
+    or autograd. The causal bf16 ``(1, 1, 16384, 32, 8, 128)`` profile accepts
+    the same contiguous CUDA int32 span tensors, with
     ``0 <= cache_leftpad < cache_seqlens <= 16384``. This tensor-span path
     synchronizes once for recoverable bounds validation and rejects CUDA graph
     capture and autograd. A full, read-only cache for that exact 16K profile may
@@ -2670,10 +2686,11 @@ def flash_attn_with_kvcache(
     noncausal result retains the mathematical LSE. Cache tensors created in
     inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
-    lengths and left padding on updates and other dense profiles, scalar partial
-    lengths outside the exact causal 1K and either-causal 4K read-only profiles,
-    non-final appends outside the exact 4K profile, and multi-token updates
-    outside the exact two-token profile fail explicitly. Partial 4K
+    lengths and left padding on updates or outside the exact either-causal 4K
+    and causal 16K profiles, scalar partial lengths outside the exact causal 1K
+    and either-causal 4K read-only profiles, non-final appends outside the exact
+    4K profile, and multi-token updates outside the exact two-token profile fail
+    explicitly. Partial 4K
     updates reject autograd, partial rotary dimensions, and non-interleaved
     rotary before either cache is mutated. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied
@@ -2790,7 +2807,7 @@ def flash_attn_with_kvcache(
     if tensor_cache_leftpad is not None and block_table is not None:
         raise NotImplementedError(
             "cache_leftpad is implemented only for the read-only dense "
-            f"{_TENSOR_LENGTH_DENSE_KVCACHE_KEY} tensor-length profile"
+            f"{_TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION} tensor-span profiles"
         )
     if block_table is not None:
         return _paged_kvcache_forward(
@@ -2880,10 +2897,10 @@ def flash_attn_with_kvcache(
             raise NotImplementedError(
                 "cache_leftpad requires tensor-valued cache_seqlens"
             )
-        if spec.key != _TENSOR_LENGTH_DENSE_KVCACHE_KEY:
+        if spec.key not in _TENSOR_SPAN_DENSE_KVCACHE_KEYS:
             raise NotImplementedError(
                 "cache_leftpad is implemented only for the read-only dense "
-                f"{_TENSOR_LENGTH_DENSE_KVCACHE_KEY} tensor-length profile"
+                f"{_TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION} tensor-span profiles"
             )
     if tensor_cache_seqlens is not None and append_kv:
         raise NotImplementedError(
@@ -2898,11 +2915,15 @@ def flash_attn_with_kvcache(
 
     if (
         tensor_cache_seqlens is not None
-        and spec.key != _TENSOR_LENGTH_DENSE_KVCACHE_KEY
+        and spec.key not in _TENSOR_SPAN_DENSE_KVCACHE_KEYS
     ):
         raise NotImplementedError(
             "tensor-valued cache_seqlens are implemented only for read-only "
-            f"{_TENSOR_LENGTH_DENSE_KVCACHE_KEY}"
+            f"dense {_TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION}"
+        )
+    if tensor_cache_seqlens is not None and has_dense_alibi:
+        raise NotImplementedError(
+            "tensor-valued dense KV-cache spans do not support ALiBi slopes"
         )
 
     scalar_cache_prefix: int | None = None
