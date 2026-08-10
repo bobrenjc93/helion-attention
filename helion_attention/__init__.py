@@ -18,8 +18,9 @@ varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes page-256 decode without softcap through the
 core varlen API. The KV-cache adapter also uses the generic paged runtime for
 ALiBi on both exposed page-16 profiles and page-256 decode. Read-only 4K dense
-decode likewise uses the generic runtime for ALiBi while retaining its
-generated specialization when slopes are omitted.
+decode likewise uses the generic runtime for ALiBi or a bounded Python-int
+prefix while retaining its generated specialization for a slope-free full
+cache.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -181,7 +182,7 @@ _TWO_TOKEN_DENSE_KVCACHE_KEY = (
 _FOUR_TOKEN_DENSE_KVCACHE_KEY = (
     "b1_sq4_sk1024_hq32_hkv8_d128_bf16_causal"
 )
-_DENSE_KVCACHE_ALIBI_PROFILE = (
+_SCALAR_PREFIX_DENSE_KVCACHE_PROFILE = (
     1,
     1,
     4096,
@@ -190,6 +191,7 @@ _DENSE_KVCACHE_ALIBI_PROFILE = (
     128,
     torch.bfloat16,
 )
+_DENSE_KVCACHE_ALIBI_PROFILE = _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
     {
         (1, 1, cache_length, 32, 8, 128, torch.bfloat16)
@@ -2463,11 +2465,16 @@ def flash_attn_with_kvcache(
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
     and noncausal bf16 ``(1, 1, 4096, 32, 8, 128)`` profiles additionally accept
-    forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]``. These calls
-    use the generic packed runtime; omitting slopes retains the generated
-    specialization. ALiBi cannot be combined with LSE, updates, partial lengths,
-    remapping, left padding, rotary, windows, softcap, or autograd. The causal
-    bf16 ``(1, 1, 16384, 32, 8, 128)`` profile additionally accepts a contiguous
+    Python integers from 1 through 4095 for slope-free, read-only prefixes. The
+    prefix path uses the generic packed runtime with the default or a custom
+    softmax scale and optional fp32 LSE; omitted and full Python-int lengths
+    retain the generated specialization. The same 4K profiles accept
+    forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]`` only for the
+    full cache. Those calls use the generic packed runtime; omitting slopes
+    retains the generated specialization. ALiBi cannot be combined with LSE,
+    updates, partial lengths, remapping, left padding, rotary, windows, softcap,
+    or autograd. The causal bf16 ``(1, 1, 16384, 32, 8, 128)`` profile
+    additionally accepts a contiguous
     CUDA int32 ``cache_seqlens`` tensor shaped ``[1]`` selecting the end of a
     prefix. A matching ``cache_leftpad`` tensor selects the half-open cache span
     ``[cache_leftpad, cache_seqlens)`` when
@@ -2492,8 +2499,9 @@ def flash_attn_with_kvcache(
     inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
     lengths and left padding on updates and other dense profiles, scalar partial
-    lengths, and multi-token updates outside the exact two-token profile fail
-    explicitly. A paired ``rotary_cos``/``rotary_sin`` table may be supplied
+    lengths outside the exact read-only 4K profile, and multi-token updates
+    outside the exact two-token profile fail explicitly. A paired
+    ``rotary_cos``/``rotary_sin`` table may be supplied
     for the one-token final-slot append: the default interleaved layout may
     cover the full head or the first 64 dimensions of a 128-dimensional head,
     while the non-interleaved GPT-NeoX layout requires full-head rotation. Both
@@ -2625,18 +2633,21 @@ def flash_attn_with_kvcache(
         )
 
     spec = normalize_shape(shape, q.dtype, causal)
+    requested_dense_profile = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    )
+    is_scalar_prefix_dense_profile = (
+        requested_dense_profile == _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
+    )
     has_dense_alibi = alibi_slopes is not None
     if has_dense_alibi:
-        requested = (
-            spec.batch,
-            spec.seqlen_q,
-            spec.seqlen_k,
-            spec.nheads_q,
-            spec.nheads_kv,
-            spec.head_dim,
-            spec.dtype,
-        )
-        if requested != _DENSE_KVCACHE_ALIBI_PROFILE:
+        if requested_dense_profile != _DENSE_KVCACHE_ALIBI_PROFILE:
             raise NotImplementedError(
                 "dense KV-cache ALiBi is implemented only for read-only bf16 "
                 "(1, 1, 4096, 32, 8, 128) decode with either causal flag; "
@@ -2719,6 +2730,7 @@ def flash_attn_with_kvcache(
             f"{_TENSOR_LENGTH_DENSE_KVCACHE_KEY}"
         )
 
+    scalar_cache_prefix: int | None = None
     if append_kv:
         if cache_seqlens is None:
             raise ValueError(
@@ -2742,13 +2754,26 @@ def flash_attn_with_kvcache(
                 "implemented; cache_seqlens + 1 must equal the cache length "
                 "declared by shape"
             )
-    elif tensor_cache_seqlens is None and (
-        cache_seqlens is not None and cache_seqlens != spec.seqlen_k
-    ):
+    elif tensor_cache_seqlens is None and cache_seqlens is not None:
+        if cache_seqlens != spec.seqlen_k:
+            if not is_scalar_prefix_dense_profile:
+                raise NotImplementedError(
+                    "partial or ragged scalar KV caches are not implemented "
+                    "for this read-only profile; cache_seqlens must equal the "
+                    "cache length declared by shape"
+                )
+            if cache_seqlens < 1 or cache_seqlens >= spec.seqlen_k:
+                raise ValueError(
+                    "cache_seqlens must be in the inclusive range "
+                    f"[1, {spec.seqlen_k}] for this dense KV cache, got "
+                    f"{cache_seqlens}"
+                )
+            scalar_cache_prefix = cache_seqlens
+
+    if scalar_cache_prefix is not None and has_dense_alibi:
         raise NotImplementedError(
-            "partial or ragged scalar KV caches are not implemented for "
-            "read-only calls; cache_seqlens must equal the cache length "
-            "declared by shape"
+            "partial or ragged scalar-prefix dense KV caches do not support "
+            "ALiBi slopes; omit cache_seqlens or pass the full cache length"
         )
 
     # Dispatch directly after the KV-cache-specific checks. Routing back
@@ -2860,6 +2885,31 @@ def flash_attn_with_kvcache(
             v_cache,
             tensor_cache_seqlens,
             tensor_cache_leftpad,
+            scale,
+            spec,
+            return_softmax_lse=return_softmax_lse,
+        )
+
+    if scalar_cache_prefix is not None:
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError(
+                "scalar-prefix dense KV-cache attention does not support "
+                "autograd"
+            )
+        scalar_cache_seqlens = torch.full(
+            (spec.batch,),
+            scalar_cache_prefix,
+            device=q.device,
+            dtype=torch.int32,
+        )
+        return _tensor_length_dense_kvcache_forward(
+            q,
+            k_cache,
+            v_cache,
+            scalar_cache_seqlens,
+            None,
             scale,
             spec,
             return_softmax_lse=return_softmax_lse,
