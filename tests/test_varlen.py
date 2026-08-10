@@ -2634,12 +2634,16 @@ def test_llama3_varlen_kvpacked_inherits_alibi_support(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "features", ["alibi", "diagnostics", "combined"]
+    "spec",
+    [
+        pytest.param(LLAMA3_VARLEN_INFERENCE, id="llama3-gqa"),
+        pytest.param(VARLEN_DIAGNOSTIC, id="shipped-causal"),
+    ],
 )
-def test_llama3_varlen_feature_dispatch_stays_separate(
-    features: str, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("features", ["alibi", "diagnostics", "combined"])
+def test_varlen_feature_dispatch_stays_separate(
+    spec: AttnShape, features: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    spec = LLAMA3_VARLEN_INFERENCE
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     slopes = torch.ones(spec.nheads_q, device=q.device)
     out = torch.empty_like(q)
@@ -2917,18 +2921,25 @@ def test_llama3_varlen_diagnostics_reject_incompatible_features_before_dispatch(
         pytest.param("q-gradient", "ALiBi backward", id="q-gradient"),
         pytest.param("slope-gradient", "ALiBi backward", id="slope-gradient"),
         pytest.param("paging", "block_table", id="paging"),
-        pytest.param("deterministic", "deterministic=True", id="deterministic"),
+        pytest.param("deterministic", "deterministic", id="deterministic"),
         pytest.param("dropout", "dropout", id="dropout"),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param("softcap", "softcap", id="softcap"),
     ],
 )
-def test_llama3_varlen_alibi_diagnostics_reject_incompatible_features(
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(LLAMA3_VARLEN_INFERENCE, id="llama3-gqa"),
+        pytest.param(VARLEN_DIAGNOSTIC, id="shipped-causal"),
+    ],
+)
+def test_varlen_alibi_diagnostics_reject_incompatible_features(
+    spec: AttnShape,
     case: str,
     message: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = LLAMA3_VARLEN_INFERENCE
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
     kwargs: dict[str, object] = {
@@ -3822,6 +3833,105 @@ def test_causal_varlen_return_attn_probs_matches_fa2_for_ragged_masked_rows(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
+)
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_causal_varlen_alibi_diagnostics_match_fa2(
+    attention: str,
+    batched_slopes: bool,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = VARLEN_DIAGNOSTIC
+    if attention == "self":
+        q, k, v, cu_q, _ = make_ragged_self_packed(
+            spec, seed=20260810
+        )
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, lengths_q, lengths_k = (
+            make_ragged_cross_packed(spec, seed=20260810)
+        )
+        assert all(length > 0 for length in lengths_q + lengths_k)
+        assert cu_q.data_ptr() != cu_k.data_ptr()
+        assert q.shape[0] != k.shape[0]
+
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(spec.batch)], dim=0
+        )
+        if batched_slopes
+        else head_slopes
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+        )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    assert isinstance(expected, tuple) and len(expected) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert slopes.shape == (
+        (spec.batch, spec.nheads_q) if batched_slopes else (spec.nheads_q,)
+    )
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.nheads_q,
+        q.shape[0],
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    finite_lse = torch.isfinite(expected_lse)
+    assert torch.equal(torch.isfinite(softmax_lse), finite_lse)
+    torch.testing.assert_close(
+        softmax_lse[finite_lse],
+        expected_lse[finite_lse],
+        atol=2e-3,
+        rtol=1e-5,
+    )
+    assert torch.equal(softmax_lse[~finite_lse], expected_lse[~finite_lse])
+
+
+@requires_cuda
 @pytest.mark.parametrize("entry_point", ["qkvpacked", "kvpacked"])
 def test_causal_varlen_packed_entry_points_inherit_diagnostic_return(
     entry_point: str,
@@ -3869,6 +3979,80 @@ def test_causal_varlen_packed_entry_points_inherit_diagnostic_return(
                 spec.seqlen_k,
                 softmax_scale=0.37,
                 causal=True,
+                return_attn_probs=True,
+                shape=spec,
+            )
+
+    assert isinstance(got, tuple) and isinstance(expected, tuple)
+    for actual_tensor, expected_tensor in zip(got, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["qkvpacked", "kvpacked"], ids=["qkv-packed", "kv-packed"]
+)
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+def test_causal_varlen_packed_entry_points_inherit_alibi_diagnostics(
+    entry_point: str,
+    batched_slopes: bool,
+) -> None:
+    spec = VARLEN_DIAGNOSTIC
+    if entry_point == "qkvpacked":
+        q, k, v, cu_q, _ = make_ragged_self_packed(spec, seed=271828)
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec, seed=271828
+        )
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(spec.batch)], dim=0
+        )
+        if batched_slopes
+        else head_slopes
+    )
+
+    with torch.no_grad():
+        expected = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=0.37,
+            causal=True,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        if entry_point == "qkvpacked":
+            got = helion_attention.flash_attn_varlen_qkvpacked_func(
+                torch.stack((q, k, v), dim=1),
+                cu_q,
+                spec.seqlen_q,
+                softmax_scale=0.37,
+                causal=True,
+                alibi_slopes=slopes,
+                return_attn_probs=True,
+                shape=spec,
+            )
+        else:
+            got = helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=1),
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=0.37,
+                causal=True,
+                alibi_slopes=slopes,
                 return_attn_probs=True,
                 shape=spec,
             )
@@ -4120,7 +4304,6 @@ def test_causal_varlen_return_attn_probs_false_retains_generated_dispatch(
         ("noncausal", "causal"),
         ("paged", "block_table"),
         ("grad", "grad-enabled"),
-        ("alibi", "ALiBi"),
         ("deterministic", "deterministic=False"),
         ("dropout", "dropout"),
         ("window", "sliding-window"),
@@ -4145,10 +4328,6 @@ def test_causal_varlen_return_attn_probs_rejects_out_of_scope_calls(
         kwargs["block_table"] = torch.zeros(1, device=q.device)
     elif case == "grad":
         q.requires_grad_()
-    elif case == "alibi":
-        kwargs["alibi_slopes"] = torch.ones(
-            spec.nheads_q, device=q.device, dtype=torch.float32
-        )
     elif case == "deterministic":
         kwargs["deterministic"] = True
     elif case == "dropout":

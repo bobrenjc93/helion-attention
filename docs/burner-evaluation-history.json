@@ -3433,6 +3433,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:9b2e51fbcaf253682d3474b02631b82fd5b0229e",
+      "commit": "9b2e51fbcaf253682d3474b02631b82fd5b0229e",
+      "recordedAt": "2026-08-10T17:13:12.538Z",
+      "label": "base 9b2e51f",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:150",
+      "recordedAt": "2026-08-10T17:13:12.538Z",
+      "label": "PR #150",
+      "kind": "leaf",
+      "prNumber": 150,
+      "title": "Combine ALiBi with shipped causal-varlen diagnostics",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

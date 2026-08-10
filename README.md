@@ -179,16 +179,15 @@ backward. Device-side `cu_seqlens_q` and `cu_seqlens_k` may independently
 describe ragged query and key lengths with different packed token totals;
 shared-offset self-attention continues to support mixed empty and nonempty
 slots. The unpacked and KV-packed entry points accept the default or a custom
-`softmax_scale`. Slope-free calls also accept `return_attn_probs=True` and
-return `(out, softmax_lse, S_dmask)`, with fp32 LSE shaped `[32, total_q]` and
-an empty bf16 `S_dmask`, for ragged self-attention and cross-attention with
-nonempty key sequences. The KV-packed adapter inherits this support. They also
-accept forward-only fp32 ALiBi slopes shaped `[32]` or `[4, 32]`; ordinary and
-ALiBi calls retain their existing generic dispatch. Dropout, windows, softcap,
-deterministic mode, paged caches, backward, and diagnostic returns combined
-with ALiBi remain unsupported. Because this is generic fallback coverage rather
-than a generated specialization, `is_varlen_shape_supported` remains false for
-the profile.
+`softmax_scale`. Calls also accept `return_attn_probs=True` and return
+`(out, softmax_lse, S_dmask)`, with fp32 LSE shaped `[32, total_q]` and an empty
+bf16 `S_dmask`, for ragged self-attention and cross-attention with nonempty key
+sequences. The KV-packed adapter inherits this support. Forward-only fp32 ALiBi
+slopes shaped `[32]` or `[4, 32]` may be supplied with or without the diagnostic
+return; ordinary and ALiBi-only calls retain their existing generic dispatch.
+Dropout, windows, softcap, deterministic mode, paged caches, and backward remain
+unsupported. Because this is generic fallback coverage rather than a generated
+specialization, `is_varlen_shape_supported` remains false for the profile.
 
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
 symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for
@@ -213,26 +212,31 @@ unsupported with softcap. Paged calls remain unsupported except for the exact
 core page-size-256 decode profile described below.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
-`return_attn_probs=True` with otherwise default options apart from
-`causal=True` and an optional custom `softmax_scale`. Forward calls may be
-ragged; backward is restricted to all eight query and key sequences having
-length 512. It returns `(out, softmax_lse, S_dmask)`, where LSE is fp32 with
-shape `[16, 4096]` for full-length inputs and `S_dmask` is an empty bf16 tensor.
-Only `out` contributes Q/K/V gradients; LSE and `S_dmask` gradients are ignored,
-matching FA2. Fully masked causal rows in ragged forward calls have zero output
-and `+inf` LSE. The generated specialization remains the path when the option
-is false; diagnostic calls use the generic packed runtime that produces LSE
-directly. The varlen QKV/KV-packed adapters inherit this support.
+`return_attn_probs=True` with otherwise default options apart from `causal=True`,
+an optional custom `softmax_scale`, and optional fp32 ALiBi slopes shaped `[16]`
+or `[8, 16]`. Forward calls may be ragged; slope-free backward is restricted to
+all eight query and key sequences having length 512. It returns
+`(out, softmax_lse, S_dmask)`, where LSE is fp32 with shape `[16, total_q]` and
+`S_dmask` is an empty bf16 tensor. Only `out` contributes Q/K/V gradients; LSE
+and `S_dmask` gradients are ignored, matching FA2. Fully masked causal rows in
+ragged forward calls have zero output and `+inf` LSE. The generated
+specialization remains the path when the option is false and no ALiBi slopes
+are supplied; diagnostic calls use the generic packed runtime that produces
+LSE directly. The varlen QKV/KV-packed adapters inherit this support. Combined
+ALiBi diagnostic calls remain forward-only and reject paging, deterministic
+mode, and other optional features.
 
 Both the causal and noncausal bf16 profiles at these maxima support forward-only
 ALiBi. Pass fp32 CUDA slopes shaped `[16]` or `[8, 16]` through `alibi_slopes`;
 both the unpacked API and the varlen QKV/KV-packed adapters accept them, with
-either the default or a custom `softmax_scale`. The causal bf16 Llama-3 profile
-above likewise accepts `[32]` or `[4, 32]` slopes through its unpacked and
-KV-packed entry points. ALiBi calls use the generic packed Triton runtime, while
-`alibi_slopes=None` retains each profile's existing dispatch. Other non-paged
-varlen profiles still reject ALiBi explicitly. The one direct core paged-varlen
-exception is forward-only bf16 page-size-256 decode
+either the default or a custom `softmax_scale`. On the causal profile these
+slopes may be combined with `return_attn_probs=True`. The causal bf16 Llama-3
+profile above likewise accepts `[32]` or `[4, 32]` slopes, including with its
+diagnostic return, through its unpacked and KV-packed entry points. ALiBi-only
+calls use the generic packed Triton runtime, while `alibi_slopes=None` retains
+each profile's existing dispatch. Other non-paged varlen profiles still reject
+ALiBi explicitly. The one direct core paged-varlen exception is forward-only
+bf16 page-size-256 decode
 `(4, 1, 1024, 8, 2, 128)`, which accepts fp32 CUDA slopes shaped `[8]` or
 `[4, 8]`; page-size-16 and page-size-512 calls, chunked prefill, and other
 paged profiles still reject them. The KV-cache paths described below have
