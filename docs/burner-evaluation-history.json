@@ -2863,6 +2863,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:f26f04f79b8caef6645aefa8682c4f092d935076",
+      "commit": "f26f04f79b8caef6645aefa8682c4f092d935076",
+      "recordedAt": "2026-08-10T08:59:37.125Z",
+      "label": "base f26f04f",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:129",
+      "recordedAt": "2026-08-10T08:59:37.125Z",
+      "label": "PR #129",
+      "kind": "leaf",
+      "prNumber": 129,
+      "title": "Return diagnostics on the Llama-3 varlen slice",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
