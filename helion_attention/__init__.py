@@ -29,9 +29,9 @@ the 4K profiles support full-cache or scalar-prefix ALiBi. The same two 4K
 profiles expose exactly a 511-token left plus current-token window for a
 forward-only full-cache read, while their global-window calls retain generated
 dispatch. Their prefix runtime handles a paired one-token K/V append before the
-final slot,
-including full-head or D64 half-head interleaved rotary, while full reads and
-final-slot appends retain the generated specializations.
+final slot, including full-head interleaved or GPT-NeoX rotary and D64
+half-head interleaved rotary, while full reads and final-slot appends retain
+the generated specializations.
 The page-16 1K paged decode profile likewise accepts one paired final-slot
 append when every device-resident length is 1023 and its logical pages map to
 disjoint physical blocks, then retains its generated reader for attention.
@@ -401,7 +401,6 @@ def _validate_kvcache_rotary(
     *,
     rotary_interleaved: bool,
     full_head_interleaved_only: bool = False,
-    interleaved_only: bool = False,
 ) -> None:
     """Validate the narrow rotary contract for a supported cache append."""
     for name, tensor in (("rotary_cos", rotary_cos), ("rotary_sin", rotary_sin)):
@@ -429,11 +428,6 @@ def _validate_kvcache_rotary(
             "interleaved rotary embeddings; rotary_interleaved must be True "
             f"and rotary_dim must equal head_dim={spec.head_dim}, got "
             f"rotary_interleaved={rotary_interleaved} and rotary_dim={rotary_dim}"
-        )
-    if interleaved_only and not rotary_interleaved:
-        raise NotImplementedError(
-            "this KV-cache update supports only interleaved rotary embeddings; "
-            "rotary_interleaved must be True"
         )
     if not rotary_interleaved and rotary_dim != spec.head_dim:
         raise NotImplementedError(
@@ -2997,10 +2991,10 @@ def flash_attn_with_kvcache(
     packed runtime with the default or a custom softmax scale; slope-free calls
     may additionally return fp32 LSE. An update mutates its selected slot and
     attends through that newly appended token. Non-final updates optionally
-    rotate the query and appended key with full-head or D64 half-head
-    interleaved rotary tables. Omitted and full Python-int slope-free reads,
-    plus the existing update at position 4095, retain the generated
-    specialization.
+    rotate the query and appended key with full-head interleaved or GPT-NeoX
+    rotary tables, or with D64 half-head interleaved tables. Omitted and full
+    Python-int slope-free reads, plus the existing update at position 4095,
+    retain the generated specialization.
     The same causal and noncausal 4K profiles accept exactly
     ``window_size=(511, 0)`` for a forward-only, slope-free read of the full
     cache, with ``cache_seqlens`` omitted or supplied as the Python integer
@@ -3054,18 +3048,19 @@ def flash_attn_with_kvcache(
     lengths outside the exact causal 1K and either-causal 4K read-only
     profiles, non-final appends outside the exact 4K profile, and multi-token
     updates outside the exact two-token profile fail explicitly. Partial 4K
-    updates reject
-    autograd, rotary dimensions other than full-head or D64 half-head, and
-    non-interleaved rotary before either cache is mutated. A paired
+    updates reject autograd, rotary dimensions other than full-head or D64
+    half-head, and non-interleaved partial-head rotary before either cache is
+    mutated. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied
     for the one-token final-slot append: the default interleaved layout may
     cover the full head or the first 64 dimensions of a 128-dimensional head,
     while the non-interleaved GPT-NeoX layout requires full-head rotation. Both
     layouts rotate ``q`` and the appended ``k`` at ``cache_seqlens``. A
-    non-final 4K append accepts the interleaved form with either full-head or
-    D64 half-head rotation. The exact two-token append remains full-head-only
-    and rotates its tokens at consecutive positions. Read-only rotary calls
-    and other paged profiles fail explicitly. Paged updates outside the exact
+    non-final 4K append accepts full-head rotation in either layout and D64
+    half-head rotation in the interleaved layout. The exact two-token append
+    remains full-head interleaved-only and rotates its tokens at consecutive
+    positions. Read-only rotary calls and other paged profiles fail explicitly.
+    Paged updates outside the exact
     page-16 final-slot slice above, paged rotary, and paged autograd are
     unsupported. Paged ALiBi LSE returns are limited to read-only page-256 and
     page-512 decode; updates, other profiles, and all other page sizes remain
@@ -3470,7 +3465,6 @@ def flash_attn_with_kvcache(
                 spec,
                 rotary_interleaved=rotary_interleaved,
                 full_head_interleaved_only=is_two_token_dense_profile,
-                interleaved_only=scalar_cache_append_position is not None,
             )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
