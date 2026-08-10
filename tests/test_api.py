@@ -4493,6 +4493,7 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
 
 
 @requires_cuda
+@pytest.mark.parametrize("page_size", [16, 256], ids=["page-16", "page-256"])
 @pytest.mark.parametrize(
     "softcap", [0.0, PAGED_KVCACHE_SOFTCAP_VALUE], ids=["no-cap", "softcap-50"]
 )
@@ -4503,14 +4504,15 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
 @pytest.mark.parametrize(
     "return_softmax_lse", [False, True], ids=["output-only", "with-lse"]
 )
-def test_page256_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages(
+def test_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages(
+    page_size: int,
     softcap: float,
     causal: bool,
     softmax_scale: float | None,
     return_softmax_lse: bool,
 ) -> None:
     q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
-        make_paged_kvcache_inputs(page_size=256, seed=20260809)
+        make_paged_kvcache_inputs(page_size=page_size, seed=20260809)
     )
     original_k = k_cache.clone()
     original_v = v_cache.clone()
@@ -4576,12 +4578,20 @@ def test_page256_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages(
         import flash_attn
     except ImportError:
         return
+    # FA2 requires page blocks to be a multiple of 256. Preserve the logical
+    # cache while re-paging page-16 inputs to FA2's native minimum.
+    if page_size == 16:
+        fa2_k, fa2_v, fa2_block_table = page_logical_caches(
+            PAGED_KVCACHE, logical_caches, page_size=256
+        )
+    else:
+        fa2_k, fa2_v, fa2_block_table = k_cache, v_cache, block_table
     expected_fa2 = flash_attn.flash_attn_with_kvcache(
         q,
-        k_cache,
-        v_cache,
+        fa2_k,
+        fa2_v,
         cache_seqlens=cache_seqlens,
-        block_table=block_table,
+        block_table=fa2_block_table,
         softmax_scale=softmax_scale,
         causal=causal,
         softcap=softcap,
@@ -5027,6 +5037,8 @@ def test_paged_kvcache_routes_through_core_varlen(
     spec: AttnShape,
     lengths: list[int],
 ) -> None:
+    import helion_attention._paged_attention as generic_attention
+
     q, k_cache, v_cache, cache_seqlens, block_table, _ = (
         make_paged_kvcache_inputs(spec=spec, lengths=lengths)
     )
@@ -5038,7 +5050,11 @@ def test_paged_kvcache_routes_through_core_varlen(
         seen["kwargs"] = kwargs
         return sentinel
 
+    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("uncapped page-16 call reached generic dispatch")
+
     monkeypatch.setattr(helion_attention, "flash_attn_varlen_func", fake_varlen)
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_generic)
     got = helion_attention.flash_attn_with_kvcache(
         q,
         k_cache,
@@ -5078,17 +5094,47 @@ def test_paged_kvcache_routes_through_core_varlen(
 
 
 @requires_cuda
-@pytest.mark.parametrize("return_softmax_lse", [False, True])
-@pytest.mark.parametrize("softcap", [0.0, PAGED_KVCACHE_SOFTCAP_VALUE])
-def test_page256_paged_kvcache_uses_generic_runtime(
+@pytest.mark.parametrize(
+    ("page_size", "softcap", "return_softmax_lse"),
+    [
+        pytest.param(256, 0.0, False, id="page-256-no-cap-output-only"),
+        pytest.param(256, 0.0, True, id="page-256-no-cap-with-lse"),
+        pytest.param(
+            256,
+            PAGED_KVCACHE_SOFTCAP_VALUE,
+            False,
+            id="page-256-softcap-output-only",
+        ),
+        pytest.param(
+            256,
+            PAGED_KVCACHE_SOFTCAP_VALUE,
+            True,
+            id="page-256-softcap-with-lse",
+        ),
+        pytest.param(
+            16,
+            PAGED_KVCACHE_SOFTCAP_VALUE,
+            False,
+            id="page-16-softcap-output-only",
+        ),
+        pytest.param(
+            16,
+            PAGED_KVCACHE_SOFTCAP_VALUE,
+            True,
+            id="page-16-softcap-with-lse",
+        ),
+    ],
+)
+def test_paged_kvcache_uses_generic_runtime_when_required(
     monkeypatch: pytest.MonkeyPatch,
-    return_softmax_lse: bool,
+    page_size: int,
     softcap: float,
+    return_softmax_lse: bool,
 ) -> None:
     import helion_attention._paged_attention as generic_attention
 
     q, k_cache, v_cache, cache_seqlens, block_table, _ = (
-        make_paged_kvcache_inputs(page_size=256)
+        make_paged_kvcache_inputs(page_size=page_size)
     )
     packed_out = torch.full_like(q.flatten(0, 1), 5.0)
     packed_lse = torch.arange(
@@ -5099,7 +5145,7 @@ def test_page256_paged_kvcache_uses_generic_runtime(
     seen: dict[str, object] = {}
 
     def reject_generated(*args: object, **kwargs: object) -> torch.Tensor:
-        raise AssertionError("page-256 decode reached generated page-16 dispatch")
+        raise AssertionError("generic paged decode reached generated dispatch")
 
     def fake_generic(
         *args: object, **kwargs: object
@@ -5163,12 +5209,6 @@ def test_page256_paged_kvcache_uses_generic_runtime(
             id="other-cap",
         ),
         pytest.param(
-            "page16",
-            NotImplementedError,
-            "page-size-256",
-            id="page-16",
-        ),
-        pytest.param(
             "page32",
             UnsupportedShapeError,
             "supports only",
@@ -5176,9 +5216,15 @@ def test_page256_paged_kvcache_uses_generic_runtime(
         ),
         pytest.param(
             "other-profile",
+            NotImplementedError,
+            "decode profile",
+            id="other-supported-profile",
+        ),
+        pytest.param(
+            "unsupported-profile",
             UnsupportedShapeError,
             "supports only",
-            id="other-profile",
+            id="unsupported-profile",
         ),
         pytest.param(
             "update", NotImplementedError, "read-only", id="update"
@@ -5197,7 +5243,7 @@ def test_page256_paged_kvcache_uses_generic_runtime(
         ),
     ],
 )
-def test_page256_paged_kvcache_softcap_rejects_out_of_scope_calls(
+def test_paged_kvcache_softcap_rejects_out_of_scope_calls(
     case: str,
     error: type[Exception],
     message: str,
@@ -5206,7 +5252,7 @@ def test_page256_paged_kvcache_softcap_rejects_out_of_scope_calls(
     import helion_attention._paged_attention as generic_attention
 
     q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
-        make_paged_kvcache_inputs(page_size=256)
+        make_paged_kvcache_inputs(page_size=16)
     )
     kwargs: dict[str, object] = {
         "cache_seqlens": cache_seqlens,
@@ -5217,18 +5263,23 @@ def test_page256_paged_kvcache_softcap_rejects_out_of_scope_calls(
     }
     if case == "other-cap":
         kwargs["softcap"] = 49.0
-    elif case == "page16":
-        q, k_cache, v_cache, cache_seqlens, block_table, _ = (
-            make_paged_kvcache_inputs(page_size=16)
-        )
-        kwargs["cache_seqlens"] = cache_seqlens
-        kwargs["block_table"] = block_table
     elif case == "page32":
         k_cache, v_cache, block_table = page_logical_caches(
             PAGED_KVCACHE, logical_caches, page_size=32
         )
         kwargs["block_table"] = block_table
     elif case == "other-profile":
+        q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+            make_paged_kvcache_inputs(
+                spec=PAGED_CHUNKED_PREFILL,
+                lengths=[113, 271],
+                page_size=16,
+            )
+        )
+        kwargs["cache_seqlens"] = cache_seqlens
+        kwargs["block_table"] = block_table
+        kwargs["shape"] = PAGED_CHUNKED_PREFILL
+    elif case == "unsupported-profile":
         kwargs["shape"] = AttnShape(
             4, 1, 512, 8, 2, 128, torch.bfloat16, True
         )

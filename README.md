@@ -384,16 +384,16 @@ page-size-256 decode combination of ALiBi with LSE. These return fp32
 `[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. For ALiBi, causal decode
 follows FA2's position-shifted diagnostic convention: each single-query LSE is
 the mathematical value plus `slope * (cache_seqlen - 1)`; noncausal decode is
-unshifted. Neither path mutates the cache. Read-only page-size-256 decode
-additionally accepts exactly
-`softcap=50.0`, with the default or a custom scale and with or without the LSE
-return. `softcap=0` preserves the existing dispatch, including the generated
-path for page-size-16 output-only calls. Other caps, page sizes, and profiles,
-plus ALiBi with softcap, ALiBi with LSE outside the exact read-only page-size-256
-decode profile, paged updates, rotary, windows, and autograd are rejected before
-dispatch. LSE on chunked prefill, non-causal chunked prefill, every other paged
-profile, and every page size other than 16 or 256 are also rejected before
-dispatch.
+unshifted. Neither path mutates the cache. Read-only decode with either page
+size additionally accepts exactly `softcap=50.0`, with the default or a custom
+scale and with or without the LSE return. Softcapped calls use the generic
+paged runtime; `softcap=0` preserves the existing dispatch, including the
+generated path for page-size-16 output-only calls. Other caps, page sizes, and
+profiles, plus ALiBi with softcap, ALiBi with LSE outside the exact read-only
+page-size-256 decode profile, paged updates, rotary, windows, and autograd are
+rejected before dispatch. LSE on chunked prefill, non-causal chunked prefill,
+every other paged profile, and every page size other than 16 or 256 are also
+rejected before dispatch.
 
 The single-token dense decode paths append one paired K/V token when a scalar
 cache length points at the final slot declared by `shape`:
@@ -705,9 +705,9 @@ also raise `NotImplementedError` rather than silently doing something else:
 - softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
   causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
   unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, or read-only
-  page-size-256 KV-cache decode `(4, 1, 1024, 8, 2, 128)` with either
-  decode-equivalent causal flag; the supported softcap cannot be combined with
-  dropout, ALiBi, local windows, or autograd; the dense/KV-packed Gemma-2
+  page-size-16 or page-size-256 KV-cache decode `(4, 1, 1024, 8, 2, 128)` with
+  either decode-equivalent causal flag; the supported softcap cannot be combined
+  with dropout, ALiBi, local windows, or autograd; the dense/KV-packed Gemma-2
   exception permits its diagnostic tuple described above, while the paged
   exception permits its documented LSE return
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16

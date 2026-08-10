@@ -14,12 +14,12 @@ profiles, symmetric windows on the shipped noncausal varlen profile, and
 diagnostics on the shipped causal varlen profile use a generic Triton forward
 kernel. That runtime also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
-varlen profile, and, only through the KV-cache API, read-only page-256 paged
-decode. The same runtime exposes page-256 decode without softcap through the
-core varlen API. The KV-cache adapter also uses the generic paged runtime for
-ALiBi on both exposed page-16 profiles and page-256 decode. Read-only 4K dense
-decode likewise uses the generic runtime for ALiBi while retaining its
-generated specialization when slopes are omitted.
+varlen profile, and, only through the KV-cache API, read-only page-16 and
+page-256 paged decode. The same runtime exposes page-256 decode without softcap
+through the core varlen API. The KV-cache adapter also uses the generic paged
+runtime for ALiBi on both exposed page-16 profiles and page-256 decode.
+Read-only 4K dense decode likewise uses the generic runtime for ALiBi while
+retaining its generated specialization when slopes are omitted.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -105,7 +105,7 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
 )
 _CORE_PAGED_GENERATED_PAGE_SIZE = 16
 _CORE_PAGED_DECODE_PAGE_SIZES = frozenset({16, 256})
-_PAGE256_PAGED_KVCACHE_SOFTCAP = 50.0
+_PAGED_KVCACHE_SOFTCAP = 50.0
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
@@ -2188,14 +2188,14 @@ def _paged_kvcache_forward(
     )
     has_softcap = softcap != 0.0
     if has_softcap and (
-        softcap != _PAGE256_PAGED_KVCACHE_SOFTCAP
+        softcap != _PAGED_KVCACHE_SOFTCAP
         or requested != _CORE_PAGED_KVCACHE_SHAPE
-        or page_size != 256
+        or page_size not in _CORE_PAGED_DECODE_PAGE_SIZES
     ):
         raise NotImplementedError(
             "softcap=50.0 for paged KV caches is implemented only for the "
-            "read-only bf16 page-size-256 batch=4 seqlen_q=1 seqlen_k=1024 "
-            "nheads=8 (GQA 8:2) head_dim=128 decode profile"
+            "read-only bf16 page-size-16 or page-size-256 batch=4 seqlen_q=1 "
+            "seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 decode profile"
         )
     if return_softmax_lse and requested != _CORE_PAGED_KVCACHE_SHAPE:
         raise NotImplementedError(
@@ -2316,8 +2316,8 @@ def _paged_kvcache_forward(
     ):
         # The generated paged specialization intentionally stays on the lean
         # page-16 slope-free output-only contract. Reuse the vLLM-compatible
-        # single-launch runtime for page-256 decode and its softcap support,
-        # ALiBi, or the diagnostic return it already computes.
+        # single-launch runtime for page-256 decode, softcap on either decode
+        # page size, ALiBi, or the diagnostic return it already computes.
         check_paged_varlen_tensors(
             packed_q,
             k_cache,
@@ -2454,11 +2454,12 @@ def flash_attn_with_kvcache(
     caches and supports both causal modes, which are equivalent for
     single-token bottom-right decode. Page-16 slope-free output-only calls
     route through :func:`flash_attn_varlen_func`; page-256 calls use the generic
-    paged runtime and accept exactly ``softcap=50.0`` for forward-only calls.
-    Both profiles support ragged logical caches. The page-16 profiles and the
-    page-256 decode profile additionally accept forward-only fp32 ALiBi slopes
-    shaped ``[8]`` or ``[batch, 8]`` through the generic paged runtime
-    (``[2, 8]`` for chunked prefill and ``[4, 8]`` for decode).
+    paged runtime. Decode with either page size accepts exactly
+    ``softcap=50.0`` for forward-only calls. Both profiles support ragged
+    logical caches. The page-16 profiles and the page-256 decode profile
+    additionally accept forward-only fp32 ALiBi slopes shaped ``[8]`` or
+    ``[batch, 8]`` through the generic paged runtime (``[2, 8]`` for chunked
+    prefill and ``[4, 8]`` for decode).
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
@@ -2503,8 +2504,8 @@ def flash_attn_with_kvcache(
     profiles fail explicitly. Paged updates, rotary, and autograd are
     unsupported for both paged profiles. Paged ALiBi LSE returns are limited to
     read-only page-256 decode; updates, other profiles, and all other page sizes
-    remain unsupported. Paged softcap is unsupported for updates,
-    page-size-16 caches, other profiles, ALiBi, windows, and autograd. Paged
+    remain unsupported. Paged softcap is unsupported for updates, page sizes
+    other than 16 or 256, other profiles, ALiBi, windows, and autograd. Paged
     softmax LSE is unsupported for chunked prefill, other profiles, and page
     sizes other than 16 or 256.
     """
@@ -2598,7 +2599,7 @@ def flash_attn_with_kvcache(
         # validation after shape normalization.
         allow_alibi=True,
         allowed_softcap=(
-            _PAGE256_PAGED_KVCACHE_SOFTCAP
+            _PAGED_KVCACHE_SOFTCAP
             if block_table is not None
             else None
         ),
