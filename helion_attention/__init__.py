@@ -23,9 +23,9 @@ decode. The same runtime exposes page-256 decode with optional ALiBi but
 without softcap through the core varlen API. The KV-cache adapter also uses the
 generic paged runtime for ALiBi on both exposed page-16 profiles and page-256
 decode. Read-only causal 1K and both causal variants of 4K dense decode likewise
-use the generic runtime for a bounded Python-int prefix. The 4K profiles also
-use it for read-only CUDA-tensor-selected spans and full-cache or scalar-prefix
-ALiBi. Their
+use the generic runtime for a bounded Python-int prefix. Those profiles and
+causal 16K decode also use it for read-only CUDA-tensor-selected spans, while
+the 4K profiles support full-cache or scalar-prefix ALiBi. Their
 prefix runtime handles a paired one-token K/V append before the final slot,
 including full-head or D64 half-head interleaved rotary, while full reads and
 final-slot appends retain the generated specializations.
@@ -184,13 +184,15 @@ _RAGGED_VARLEN_SDPA_BACKWARD_KEY = (
 )
 _TENSOR_SPAN_DENSE_KVCACHE_KEYS = frozenset(
     {
+        "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal",
         "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal",
         "b1_sq1_sk4096_hq32_hkv8_d128_bf16_noncausal",
         "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal",
     }
 )
 _TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION = (
-    "bf16 (1, 1, 4096, 32, 8, 128) with either causal flag or causal bf16 "
+    "causal bf16 (1, 1, 1024, 32, 8, 128), bf16 "
+    "(1, 1, 4096, 32, 8, 128) with either causal flag, or causal bf16 "
     "(1, 1, 16384, 32, 8, 128)"
 )
 _EXPLICIT_SPLIT_DENSE_KVCACHE_PROFILE = (
@@ -2680,16 +2682,17 @@ def flash_attn_with_kvcache(
     interleaved rotary tables. Omitted and full Python-int slope-free reads,
     plus the existing update at position 4095, retain the generated
     specialization.
-    The same 4K profiles additionally accept contiguous CUDA int32
-    ``cache_seqlens`` tensors shaped ``[1]`` for read-only, slope-free spans.
+    The causal 1K profile and both 4K profiles additionally accept contiguous
+    CUDA int32 ``cache_seqlens`` tensors shaped ``[1]`` for read-only,
+    slope-free spans.
     An optional matching ``cache_leftpad`` tensor selects
     ``[cache_leftpad, cache_seqlens)`` when
-    ``0 <= cache_leftpad < cache_seqlens <= 4096``; without it, the span begins
-    at zero.
-    Tensor spans support either causal flag, the default or a custom softmax
-    scale, and optional fp32 LSE. They synchronize once for recoverable bounds
-    validation and reject CUDA graph capture, autograd, updates, remapping,
-    rotary, ALiBi, windows, softcap, and explicit split counts.
+    ``0 <= cache_leftpad < cache_seqlens <= 1024`` or ``4096``, respectively;
+    without it, the span begins at zero. Tensor spans support the profile's
+    causal flag, the default or a custom softmax scale, and optional fp32 LSE.
+    They synchronize once for recoverable bounds validation and reject CUDA
+    graph capture, autograd, updates, remapping, rotary, ALiBi, windows,
+    softcap, and explicit split counts.
     The same 4K profiles accept forward-only fp32 ALiBi slopes shaped ``[32]``
     or ``[1, 32]`` for the full cache and Python-int prefixes. Those calls use
     the generic packed runtime. ALiBi cannot be combined with LSE, updates,
@@ -2717,13 +2720,13 @@ def flash_attn_with_kvcache(
     while its noncausal result retains the mathematical LSE. Cache tensors
     created in inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
-    lengths and left padding on updates or outside the exact either-causal 4K
-    and causal 16K profiles, scalar partial lengths outside the exact causal 1K
-    and either-causal 4K read-only profiles, non-final appends outside the exact
-    4K profile, and multi-token updates outside the exact two-token profile fail
-    explicitly. Partial 4K updates reject autograd, rotary dimensions other
-    than full-head or D64 half-head, and non-interleaved rotary before either
-    cache is mutated. A paired
+    lengths and left padding on updates or outside the exact causal 1K,
+    either-causal 4K, and causal 16K profiles, scalar partial lengths outside
+    the exact causal 1K and either-causal 4K read-only profiles, non-final
+    appends outside the exact 4K profile, and multi-token updates outside the
+    exact two-token profile fail explicitly. Partial 4K updates reject
+    autograd, rotary dimensions other than full-head or D64 half-head, and
+    non-interleaved rotary before either cache is mutated. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied
     for the one-token final-slot append: the default interleaved layout may
     cover the full head or the first 64 dimensions of a 128-dimensional head,
