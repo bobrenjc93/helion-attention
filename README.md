@@ -203,13 +203,17 @@ mode remain unsupported in combination with a varlen window.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts exactly
 `window_size=(127, 0)` when all eight query and key sequences have length 512.
-This is a forward-only 128-key window (the current token plus up to 127 tokens
-to its left) through the generic packed Triton runtime, with the default or a
+Calls that do not require backward use the generic packed Triton runtime for
+this 128-key window (the current token plus up to 127 tokens to its left).
+Zero-dropout backward reshapes the packed inputs to one dense batch and uses a
+bounded causal-window PyTorch SDPA call. Both paths accept the default or a
 custom `softmax_scale`. The unpacked and QKV/KV-packed varlen entry points all
-inherit this support. The global `(-1, -1)` call retains generated dispatch.
-Ragged offsets, other windows or profiles, gradients, diagnostics, ALiBi,
-softcap, dropout, paged caches, and deterministic mode remain unsupported for
-this causal window.
+inherit this support, and their grad-enabled paths provide Q/K/V gradients.
+The global `(-1, -1)` call retains generated dispatch when no backward is
+needed and its existing unwindowed SDPA bridge for backward. Ragged or
+noncanonical offsets, other windows or profiles, diagnostics, ALiBi, softcap,
+dropout, paged caches, deterministic mode, and CUDA graph capture remain
+unsupported for this causal window.
 
 This shipped causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts
 exactly `softcap=50.0` for calls that do not require backward. Dynamic ragged
@@ -848,9 +852,10 @@ Default-option dense MHA, GQA, and cross-attention calls without a generated
 backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
 causal masking. Packed varlen calls remain forward-only except for the two
 exact full-length profiles (including finite symmetric-window backward on the
-noncausal profile) and the causal ragged query/key contract described above;
-KV-cache calls remain forward-only. These unsupported FlashAttention features
-also raise `NotImplementedError` rather than silently doing something else:
+noncausal profile and exact `(127, 0)` causal-window backward on the causal
+profile) and the causal ragged query/key contract described above; KV-cache
+calls remain forward-only. These unsupported FlashAttention features also
+raise `NotImplementedError` rather than silently doing something else:
 
 - backward for dense or varlen ALiBi, ragged noncausal varlen batches,
   batches with no nonempty queries, ragged cross-attention batches with empty
@@ -866,8 +871,10 @@ also raise `NotImplementedError` rather than silently doing something else:
   `window_size=(radius, radius)` (`radius >= 0`) on the noncausal bf16 varlen
   self-attention profile, exact `window_size=(127, 0)` on the causal bf16
   varlen profile, and exact `window_size=(511, 0)` on the causal dense 2K
-  profile and the full-cache 4K KV-cache decode profile above; ragged windowed
-  backward and all other KV-cache window calls remain unsupported
+  profile and the full-cache 4K KV-cache decode profile above; causal varlen
+  window backward is limited to zero-dropout training on eight canonical
+  length-512 sequences, ragged symmetric-window backward remains unsupported,
+  and all other KV-cache window calls remain unsupported
 - softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
   causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
   unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, read-only core
