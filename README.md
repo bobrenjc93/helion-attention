@@ -232,9 +232,9 @@ KV-packed entry points. ALiBi calls use the generic packed Triton runtime, while
 varlen profiles still reject ALiBi explicitly. The one direct core paged-varlen
 exception is forward-only bf16 page-size-256 decode
 `(4, 1, 1024, 8, 2, 128)`, which accepts fp32 CUDA slopes shaped `[8]` or
-`[4, 8]`; page-size-16 calls, chunked prefill, and other paged profiles still
-reject them. The KV-cache paths described below have their own paged ALiBi
-support.
+`[4, 8]`; page-size-16 and page-size-512 calls, chunked prefill, and other
+paged profiles still reject them. The KV-cache paths described below have
+their own paged ALiBi support.
 
 Zero-dropout backward is supported for both the causal and noncausal bf16
 `(8, 512, 512, 16, 16, 64)` varlen profiles when all eight query and key
@@ -266,27 +266,29 @@ positive dropout remain explicitly unsupported for varlen backward.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
 profiles when `block_table` is supplied. Both accept bf16 page-size-16 caches;
-the single-token decode profile additionally accepts page-size-256 caches.
-Caches use `[num_blocks, page_size, heads_kv, head_dim]` layout. All supported
-paths handle ragged request lengths and permuted physical pages and accept the
-default or a custom `softmax_scale`:
+the single-token decode profile additionally accepts page-size-256 and
+page-size-512 caches. Caches use
+`[num_blocks, page_size, heads_kv, head_dim]` layout. All supported paths handle
+ragged request lengths and permuted physical pages and accept the default or a
+custom `softmax_scale`:
 
 | profile | page sizes | causal modes | dispatch | use |
 | --- | --- | --- | --- | --- |
 | `(2, 200, 320, 8, 2, 128)` | 16 | `True` | generated | chunked prefill |
-| `(4, 1, 1024, 8, 2, 128)` | 16, 256 | `True` or `False` | generated for 16; generic paged runtime for 256 | single-token decode |
+| `(4, 1, 1024, 8, 2, 128)` | 16, 256, 512 | `True` or `False` | generated for 16; generic paged runtime for 256/512 | single-token decode |
 
 As on the non-paged path, the shape sequence dimensions are maxima and actual
 lengths come from adjacent cumulative offsets. The chunked-prefill profile
 uses bottom-right causal alignment. The decode modes are equivalent because a
-bottom-right single-token query can see the whole used cache. Page-size-256
-decode supports the default option set plus either causal flag, a default or
-custom `softmax_scale`, and optional forward-only fp32 ALiBi slopes shaped `[8]`
-or `[4, 8]`. ALiBi uses the generic paged runtime and supports the same ragged,
-permuted logical caches. Gradients, dropout, sliding windows, softcap,
-`deterministic=True`, diagnostic returns, and combinations of ALiBi with those
-features remain unsupported. Other page sizes and paged core-varlen profiles
-are rejected explicitly.
+bottom-right single-token query can see the whole used cache. Page-size-256 and
+page-size-512 decode support the default option set plus either causal flag and
+a default or custom `softmax_scale`. Page-size-256 alone additionally accepts
+optional forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]`. ALiBi uses the
+generic paged runtime and supports the same ragged, permuted logical caches.
+Gradients, dropout, sliding windows, softcap, `deterministic=True`, diagnostic
+returns, page-size-512 ALiBi, and combinations of ALiBi with those features
+remain unsupported. Other page sizes and paged core-varlen profiles are
+rejected explicitly.
 
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus

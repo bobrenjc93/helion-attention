@@ -5022,11 +5022,12 @@ def test_core_varlen_paged_decode_matches_fp32_with_permuted_pages() -> None:
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_core_varlen_page256_decode_matches_fa2_and_fp32_for_ragged_permuted_pages(
-    causal: bool, softmax_scale: float | None
+@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
+def test_core_varlen_generic_paged_decode_matches_fa2_and_fp32_for_ragged_permuted_pages(
+    causal: bool, softmax_scale: float | None, page_size: int
 ) -> None:
     q, k, v, cu_q, cu_k, block_table, _, request_kv = make_paged_decode(
-        page_size=256, seed=20260809
+        page_size=page_size, seed=20260809
     )
     scale = (
         1.0 / math.sqrt(PAGED_DECODE.head_dim)
@@ -5257,19 +5258,22 @@ def test_core_varlen_derives_paged_used_lengths_on_device(
 
 
 @requires_cuda
-def test_core_varlen_page256_decode_uses_generic_paged_runtime(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
+def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
+    monkeypatch: pytest.MonkeyPatch, page_size: int
 ) -> None:
     import helion_attention._paged_attention as generic_attention
 
     q, k, v, cu_q, cu_k, block_table, lengths_k, _ = make_paged_decode(
-        page_size=256
+        page_size=page_size
     )
     sentinel = torch.full_like(q, 7.0)
     seen: dict[str, object] = {}
 
     def reject_generated(*args: object, **kwargs: object) -> object:
-        raise AssertionError("page-256 decode reached generated page-16 dispatch")
+        raise AssertionError(
+            f"page-{page_size} decode reached generated page-16 dispatch"
+        )
 
     def fake_generic(*args: object, **kwargs: object) -> torch.Tensor:
         seen["args"] = args
@@ -5425,9 +5429,9 @@ def test_core_varlen_paged_rejects_malformed_storage_before_lookup(
 
 @requires_cuda
 def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
-    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=512)
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=128)
     with pytest.raises(
-        helion_attention.UnsupportedShapeError, match="page_size=512"
+        helion_attention.UnsupportedShapeError, match="page_size=128"
     ):
         helion_attention.flash_attn_varlen_func(
             q,
@@ -5462,24 +5466,26 @@ def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
             shape=PAGED_DECODE,
         )
 
-    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_chunked_prefill(
-        page_size=256
-    )
-    with pytest.raises(
-        helion_attention.UnsupportedShapeError, match="page_size=256"
-    ):
-        helion_attention.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            PAGED_CHUNKED_PREFILL.seqlen_q,
-            PAGED_CHUNKED_PREFILL.seqlen_k,
-            causal=True,
-            block_table=block_table,
-            shape=PAGED_CHUNKED_PREFILL,
+    for page_size in (256, 512):
+        q, k, v, cu_q, cu_k, block_table, *_ = make_paged_chunked_prefill(
+            page_size=page_size
         )
+        with pytest.raises(
+            helion_attention.UnsupportedShapeError,
+            match=f"page_size={page_size}",
+        ):
+            helion_attention.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                PAGED_CHUNKED_PREFILL.seqlen_q,
+                PAGED_CHUNKED_PREFILL.seqlen_k,
+                causal=True,
+                block_table=block_table,
+                shape=PAGED_CHUNKED_PREFILL,
+            )
 
     unsupported = AttnShape(2, 199, 320, 8, 2, 128, torch.bfloat16, True)
     q = q[:2]
@@ -5505,23 +5511,26 @@ def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
 
 @requires_cuda
 @pytest.mark.parametrize(
-    ("spec", "factory"),
+    ("spec", "factory", "page_size"),
     [
-        pytest.param(PAGED_DECODE, make_paged_decode, id="decode-page-16"),
+        pytest.param(PAGED_DECODE, make_paged_decode, 16, id="decode-page-16"),
         pytest.param(
             PAGED_CHUNKED_PREFILL,
             make_paged_chunked_prefill,
+            16,
             id="chunked-prefill-page-16",
         ),
+        pytest.param(PAGED_DECODE, make_paged_decode, 512, id="decode-page-512"),
     ],
 )
-def test_core_varlen_page16_profiles_reject_alibi_before_dispatch(
+def test_core_varlen_unsupported_paged_alibi_rejected_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     spec: AttnShape,
     factory: object,
+    page_size: int,
 ) -> None:
     assert callable(factory)
-    q, k, v, cu_q, cu_k, block_table, *_ = factory(page_size=16)
+    q, k, v, cu_q, cu_k, block_table, *_ = factory(page_size=page_size)
 
     def reject_lookup(*args: object, **kwargs: object) -> object:
         raise AssertionError("paged ALiBi call reached kernel lookup")
@@ -5558,15 +5567,23 @@ def test_core_varlen_page16_profiles_reject_alibi_before_dispatch(
     ],
 )
 @pytest.mark.parametrize(
-    "with_alibi", [False, True], ids=["slope-free", "alibi"]
+    ("page_size", "with_alibi"),
+    [
+        pytest.param(256, False, id="page-256-slope-free"),
+        pytest.param(256, True, id="page-256-alibi"),
+        pytest.param(512, False, id="page-512-slope-free"),
+    ],
 )
-def test_core_varlen_page256_decode_rejects_optional_features_before_dispatch(
+def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispatch(
     case: str,
     message: str,
+    page_size: int,
     with_alibi: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=256)
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
+        page_size=page_size
+    )
     kwargs: dict[str, object] = {
         "causal": True,
         "block_table": block_table,
@@ -5590,7 +5607,9 @@ def test_core_varlen_page256_decode_rejects_optional_features_before_dispatch(
         kwargs["deterministic"] = True
 
     def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
-        raise AssertionError("unsupported page-256 feature reached dispatch")
+        raise AssertionError(
+            f"unsupported page-{page_size} feature reached dispatch"
+        )
 
     monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
     monkeypatch.setattr(
@@ -5684,6 +5703,7 @@ def test_core_varlen_paged_chunked_prefill_rejects_noncausal_mode_before_lookup(
     [
         pytest.param(PAGED_DECODE, make_paged_decode, 16, id="decode-page-16"),
         pytest.param(PAGED_DECODE, make_paged_decode, 256, id="decode-page-256"),
+        pytest.param(PAGED_DECODE, make_paged_decode, 512, id="decode-page-512"),
         pytest.param(
             PAGED_CHUNKED_PREFILL,
             make_paged_chunked_prefill,
