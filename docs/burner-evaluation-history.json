@@ -2623,6 +2623,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:e59d1047a2492771f7ddec77d9f833922e2afe81",
+      "commit": "e59d1047a2492771f7ddec77d9f833922e2afe81",
+      "recordedAt": "2026-08-10T04:29:48.557Z",
+      "label": "base e59d104",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:118",
+      "recordedAt": "2026-08-10T04:29:48.557Z",
+      "label": "PR #118",
+      "kind": "leaf",
+      "prNumber": 118,
+      "title": "Allow empty-query slots in causal varlen cross-attention backward",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
