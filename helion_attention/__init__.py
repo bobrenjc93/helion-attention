@@ -20,7 +20,7 @@ exactly a 511-token left plus current-token causal window for the bf16 batch-1
 Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime
 also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
-varlen profile, read-only page-256 core paged decode, and read-only
+varlen profile, read-only page-256/page-512 core paged decode, and read-only
 page-256/page-512 KV-cache decode. The same runtime exposes
 page-256/page-512 decode with optional ALiBi through the core varlen API. The
 KV-cache adapter also uses the generic paged runtime for ALiBi on both exposed
@@ -649,7 +649,7 @@ def _check_core_paged_varlen_alibi_spec(
 def _check_core_paged_varlen_softcap_spec(
     spec: AttnShape, page_size: int
 ) -> None:
-    """Restrict core paged-varlen softcap to validated page-256 decode."""
+    """Restrict core paged-varlen softcap to validated large-page decode."""
     requested = (
         spec.batch,
         spec.seqlen_q,
@@ -659,11 +659,12 @@ def _check_core_paged_varlen_softcap_spec(
         spec.head_dim,
         spec.dtype,
     )
-    if requested != _CORE_PAGED_KVCACHE_SHAPE or page_size != 256:
+    if requested != _CORE_PAGED_KVCACHE_SHAPE or page_size not in (256, 512):
         raise NotImplementedError(
             "core paged varlen softcap=50.0 is implemented only for the "
-            "no-backward bf16 page-size-256 batch=4 seqlen_q=1 "
-            "seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 decode profile"
+            "no-backward bf16 page-size-256 or page-size-512 batch=4 "
+            "seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 "
+            "decode profile"
         )
 
 
@@ -1991,13 +1992,13 @@ def flash_attn_varlen_func(
     shaped ``[num_blocks, 16, 2, 128]``. The decode profile additionally
     accepts page-size-256 and page-size-512 caches through the existing generic
     paged runtime; page-size-16 calls retain generated dispatch. Page-size-256
-    and page-size-512 decode also accept forward-only fp32 ALiBi slopes shaped
-    ``[8]`` or ``[4, 8]``; page-size-256 alone accepts exactly
-    ``softcap=50.0``. ALiBi and softcap cannot be combined. All paths derive
+    and page-size-512 decode also accept either forward-only fp32 ALiBi slopes
+    shaped ``[8]`` or ``[4, 8]``, or exactly ``softcap=50.0``. ALiBi and
+    softcap cannot be combined. All paths derive
     each request's used cache length from adjacent ``cu_seqlens_k`` offsets
     without copying them to the host. Large-page decode supports only forward
     calls with the default options, apart from either causal flag, a default or
-    custom ``softmax_scale``, optional ALiBi, and page-256 softcap.
+    custom ``softmax_scale``, optional ALiBi, and large-page softcap.
     The int32 CUDA cumulative-length tensors contain ``batch + 1`` offsets.
     ``shape`` uses the same forms as :func:`flash_attn_func`, but its sequence
     dimensions are the maximum query and key lengths rather than dense tensor
@@ -2048,7 +2049,7 @@ def flash_attn_varlen_func(
     ``softcap=0`` retains the generated specialization. Other caps and
     profiles, gradients, dropout, ALiBi, local windows, and diagnostic returns
     remain unsupported with softcap. Paged softcap remains unsupported except
-    for the exact page-size-256 decode profile described above.
+    for the exact page-size-256/page-size-512 decode profile described above.
 
     The causal version of that profile also supports
     ``return_attn_probs=True`` with ``causal=True`` and all options other than
