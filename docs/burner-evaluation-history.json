@@ -2413,6 +2413,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:b050481fb1222b822c3e92793b84a3d87aae8723",
+      "commit": "b050481fb1222b822c3e92793b84a3d87aae8723",
+      "recordedAt": "2026-08-10T01:11:37.578Z",
+      "label": "base b050481",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:111",
+      "recordedAt": "2026-08-10T01:11:37.578Z",
+      "label": "PR #111",
+      "kind": "leaf",
+      "prNumber": 111,
+      "title": "Return LSE with ALiBi on page-256 decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

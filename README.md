@@ -356,17 +356,21 @@ out = helion_attention.flash_attn_with_kvcache(
 
 Slope-free output-only page-size-16 calls route through their checked-in
 paged-varlen kernels. Page-size-256 decode calls and all paged ALiBi calls use
-the generic single-launch paged runtime, as does requesting LSE without ALiBi;
-the latter returns fp32 `[4, 8, 1]` LSE alongside the
-`[4, 1, 8, 128]` output for either decode page size. Neither path mutates the
-cache. Read-only page-size-256 decode additionally accepts exactly
+the generic single-launch paged runtime, as do slope-free LSE requests and the
+page-size-256 decode combination of ALiBi with LSE. These return fp32
+`[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. For ALiBi, causal decode
+follows FA2's position-shifted diagnostic convention: each single-query LSE is
+the mathematical value plus `slope * (cache_seqlen - 1)`; noncausal decode is
+unshifted. Neither path mutates the cache. Read-only page-size-256 decode
+additionally accepts exactly
 `softcap=50.0`, with the default or a custom scale and with or without the LSE
 return. `softcap=0` preserves the existing dispatch, including the generated
 path for page-size-16 output-only calls. Other caps, page sizes, and profiles,
-plus ALiBi with LSE or softcap, paged updates, rotary, windows, and autograd are
-rejected before dispatch. LSE on chunked prefill, non-causal
-chunked prefill, every other paged profile, and every page size other than 16
-or 256 are also rejected before dispatch.
+plus ALiBi with softcap, ALiBi with LSE outside the exact read-only page-size-256
+decode profile, paged updates, rotary, windows, and autograd are rejected before
+dispatch. LSE on chunked prefill, non-causal chunked prefill, every other paged
+profile, and every page size other than 16 or 256 are also rejected before
+dispatch.
 
 The single-token dense decode paths append one paired K/V token when a scalar
 cache length points at the final slot declared by `shape`:
@@ -685,8 +689,8 @@ also raise `NotImplementedError` rather than silently doing something else:
   page-size-16 profiles, and page-size-256 decode above; dense KV-cache ALiBi
   cannot be combined with LSE, updates, partial lengths, remapping, left
   padding, rotary, windows, softcap, or autograd; paged ALiBi cannot be combined
-  with LSE, softcap, updates, rotary, or autograd and is not supported with
-  other page sizes
+  with softcap, updates, rotary, windows, or autograd, and its LSE combination
+  is limited to the exact read-only page-size-256 decode profile above
 - KV-cache mutation beyond the dense paired one-token final-slot append and
   exact two-token final-two-slot append above; the exact four-token profile is
   read-only;
