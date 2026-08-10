@@ -95,11 +95,11 @@ Dense calls do not need a checked-in specialization. Contiguous CUDA fp16 and
 bf16 MHA/GQA inputs with `head_dim <= 256` use the generic Triton forward when
 their exact shape is absent, including unequal query/key lengths and
 bottom-right causal masking. Grad-enabled calls without a generated backward
-use PyTorch SDPA autograd instead; the exact BERT-base profile above uses its
-direct math operator when deterministic backward is requested. Dense ALiBi
-forward calls accept fp32 slopes shaped `[nheads]` or `[batch, nheads]` and
-always use the generic Triton path; ALiBi backward is not implemented. The
-shipped noncausal bf16
+use PyTorch SDPA autograd instead; the exact BERT-base profile above and causal
+GPT-2 profile below use its direct math operator when deterministic backward is
+requested. Dense ALiBi forward calls accept fp32 slopes shaped `[nheads]` or
+`[batch, nheads]` and always use the generic Triton path; ALiBi backward is not
+implemented. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile retains generated forward
 values during zero-dropout training. On SM90, calls that omit `softmax_scale`
 use raw PyTorch BSHD Flash gradients, falling back to the generated backward
@@ -108,10 +108,12 @@ retain the generated backward. This profile, the BERT-base profile above, and
 the shipped causal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2 profile accept
 `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs,
 with either the default or a custom scale. Zero-dropout calls that do not need
-backward retain each generated specialization. Other dropout calls, local
-windows, softcap outside the exact dense, varlen, and paged subsets described
-here, dense diagnostic returns outside the subsets above, and deterministic
-dropout still fail explicitly as described below.
+backward retain each generated specialization. Zero-dropout GPT-2 training also
+accepts `deterministic=True` with either scale through the direct math operator
+used by BERT-base. Other dropout calls, local windows, softcap outside the exact
+dense, varlen, and paged subsets described here, dense diagnostic returns
+outside the subsets above, and deterministic dropout still fail explicitly as
+described below.
 Unregistered calls must also fit the generic kernel's signed 32-bit Q/output
 and K/V element offsets.
 
@@ -657,10 +659,10 @@ The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape keeps
 its generated forward during zero-dropout training. Omitted-scale SM90 calls
 use raw PyTorch BSHD Flash gradients with a generated-backward fallback;
 custom-scale, non-SM90, and deterministic calls retain the checked-in generated
-backward. The BERT-base profile uses the direct math SDPA operator for
-deterministic zero-dropout training. The encoder-training profile, BERT-base
-profile, and causal bf16
-`(2, 1024, 1024, 32, 32, 64)` use PyTorch SDPA when `0 < dropout_p < 1`.
+backward. The BERT-base and causal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2
+profiles use the direct math SDPA operator for deterministic zero-dropout
+training. The encoder-training profile, BERT-base profile, and causal GPT-2
+profile use PyTorch SDPA when `0 < dropout_p < 1`.
 Default-option dense MHA, GQA, and cross-attention calls without a generated
 backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
 causal masking. Packed varlen calls remain forward-only except for the two
@@ -673,8 +675,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   all-empty or empty cross-attention batches, graph-captured ragged batches,
   and KV-cache calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback,
-  except for zero-dropout training on the exact bf16 BERT-base profile and the
-  exact full-length causal bf16 varlen `(8, 512, 512, 16, 16, 64)` profile
+  except for zero-dropout training on the exact bf16 BERT-base and causal GPT-2
+  `(2, 1024, 1024, 32, 32, 64)` profiles and the exact full-length causal bf16
+  varlen `(8, 512, 512, 16, 16, 64)` profile
 - dropout outside the exact encoder-training, BERT-base, and causal GPT-2
   profiles above, or combined with ALiBi, diagnostic returns, local windows,
   softcap, or deterministic mode

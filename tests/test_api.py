@@ -2038,8 +2038,10 @@ def test_causal_dropout_forward_and_qkv_gradients_match_direct_sdpa(
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
 )
+@pytest.mark.parametrize("deterministic", [False, True])
 def test_causal_zero_dropout_retains_generated_dispatch(
     entry_point: str,
+    deterministic: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = CAUSAL_DROPOUT
@@ -2062,15 +2064,25 @@ def test_causal_zero_dropout_retains_generated_dispatch(
 
     monkeypatch.setattr(helion_attention, "lookup", lambda _spec: kernel)
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", reject_sdpa
+    )
     if entry_point == "dense":
         out = helion_attention.flash_attn_func(
-            q, k, v, dropout_p=0.0, causal=True, shape=spec
+            q,
+            k,
+            v,
+            dropout_p=0.0,
+            causal=True,
+            deterministic=deterministic,
+            shape=spec,
         )
     elif entry_point == "qkvpacked":
         out = helion_attention.flash_attn_qkvpacked_func(
             torch.stack((q, k, v), dim=2),
             dropout_p=0.0,
             causal=True,
+            deterministic=deterministic,
             shape=spec,
         )
     else:
@@ -2079,6 +2091,7 @@ def test_causal_zero_dropout_retains_generated_dispatch(
             torch.stack((k, v), dim=2),
             dropout_p=0.0,
             causal=True,
+            deterministic=deterministic,
             shape=spec,
         )
 
@@ -2196,11 +2209,16 @@ def test_bert_dropout_packed_forward_and_gradients_match_direct_sdpa(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
 )
-def test_bert_deterministic_training_is_repeatable_and_matches_fp32(
+@pytest.mark.parametrize(
+    "spec",
+    [BERT_DIAGNOSTIC, CAUSAL_DROPOUT],
+    ids=["bert-base", "causal-gpt2"],
+)
+def test_dense_deterministic_training_is_repeatable_and_matches_fp32(
     entry_point: str,
     softmax_scale: float | None,
+    spec: AttnShape,
 ) -> None:
-    spec = BERT_DIAGNOSTIC
     base_q, base_k, base_v = make_inputs(spec, seed=271828)
     grad_out = make_inputs(spec, seed=314159)[0]
 
@@ -2214,6 +2232,7 @@ def test_bert_deterministic_training_is_repeatable_and_matches_fp32(
                 k,
                 v,
                 softmax_scale=softmax_scale,
+                causal=spec.causal,
                 deterministic=True,
                 shape=spec,
             )
@@ -2225,6 +2244,7 @@ def test_bert_deterministic_training_is_repeatable_and_matches_fp32(
             out = helion_attention.flash_attn_qkvpacked_func(
                 packed,
                 softmax_scale=softmax_scale,
+                causal=spec.causal,
                 deterministic=True,
                 shape=spec,
             )
@@ -2237,6 +2257,7 @@ def test_bert_deterministic_training_is_repeatable_and_matches_fp32(
                 q,
                 packed,
                 softmax_scale=softmax_scale,
+                causal=spec.causal,
                 deterministic=True,
                 shape=spec,
             )
@@ -2282,12 +2303,17 @@ def test_bert_deterministic_training_is_repeatable_and_matches_fp32(
     ("deterministic", "expected_dispatch"),
     [(False, "ordinary"), (True, "math")],
 )
-def test_bert_deterministic_training_dispatch_is_narrow(
+@pytest.mark.parametrize(
+    "spec",
+    [BERT_DIAGNOSTIC, CAUSAL_DROPOUT],
+    ids=["bert-base", "causal-gpt2"],
+)
+def test_dense_deterministic_training_dispatch_is_narrow(
     deterministic: bool,
     expected_dispatch: str,
+    spec: AttnShape,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = BERT_DIAGNOSTIC
     q, k, v = make_inputs(spec, seed=161803)
     q.requires_grad_()
     sentinel = torch.empty_like(q)
@@ -2317,7 +2343,12 @@ def test_bert_deterministic_training_dispatch_is_narrow(
     )
 
     out = helion_attention.flash_attn_func(
-        q, k, v, deterministic=deterministic, shape=spec
+        q,
+        k,
+        v,
+        causal=spec.causal,
+        deterministic=deterministic,
+        shape=spec,
     )
 
     assert out is sentinel
