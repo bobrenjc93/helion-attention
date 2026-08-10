@@ -18,9 +18,9 @@ current-token causal window for the bf16 batch-1 2K Llama GQA profile while
 its global-window call retains generated dispatch. Grad-enabled calls use a
 bounded PyTorch SDPA autograd bridge. That runtime also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
-varlen profile, and, only through the KV-cache API, read-only page-256 paged
-decode. The same runtime exposes slope-free page-512 decode and page-256 decode
-with optional ALiBi but without softcap through the core varlen API. The
+varlen profile, and read-only page-256 paged decode through both the core
+varlen and KV-cache APIs. The same runtime exposes slope-free page-512 decode
+and page-256 decode with optional ALiBi through the core varlen API. The
 KV-cache adapter also uses the generic paged runtime for ALiBi on both exposed
 page-16 profiles and page-256/page-512 decode. Read-only causal 1K and both
 causal variants of 4K dense decode likewise
@@ -632,6 +632,27 @@ def _check_core_paged_varlen_alibi_spec(
             "core paged varlen ALiBi slopes are implemented only for the bf16 "
             "page-size-256 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 "
             "(GQA 8:2) head_dim=128 decode profile"
+        )
+
+
+def _check_core_paged_varlen_softcap_spec(
+    spec: AttnShape, page_size: int
+) -> None:
+    """Restrict core paged-varlen softcap to validated page-256 decode."""
+    requested = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    )
+    if requested != _CORE_PAGED_KVCACHE_SHAPE or page_size != 256:
+        raise NotImplementedError(
+            "core paged varlen softcap=50.0 is implemented only for the "
+            "no-backward bf16 page-size-256 batch=4 seqlen_q=1 "
+            "seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 decode profile"
         )
 
 
@@ -1333,6 +1354,7 @@ def _generic_paged_varlen_forward(
     spec: AttnShape,
     *,
     alibi_slopes: torch.Tensor | None = None,
+    softcap: float = 0.0,
 ) -> torch.Tensor:
     """Run validated non-generated paged decode through Triton."""
     # Page 16 has checked-in generated specializations. This helper is kept
@@ -1354,7 +1376,7 @@ def _generic_paged_varlen_forward(
         softmax_scale=softmax_scale,
         causal=spec.causal,
         window_size=(-1, -1),
-        softcap=0.0,
+        softcap=softcap,
         alibi_slopes=alibi_slopes,
         q_descale=None,
         k_descale=None,
@@ -1870,12 +1892,13 @@ def flash_attn_varlen_func(
     shaped ``[num_blocks, 16, 2, 128]``. The decode profile additionally
     accepts page-size-256 and page-size-512 caches through the existing generic
     paged runtime; page-size-16 calls retain generated dispatch. Page-size-256
-    decode also accepts forward-only fp32 ALiBi slopes shaped ``[8]`` or
-    ``[4, 8]``. All paths derive each request's used cache length from adjacent
+    decode also accepts either forward-only fp32 ALiBi slopes shaped ``[8]`` or
+    ``[4, 8]``, or exactly ``softcap=50.0``. ALiBi and softcap cannot be
+    combined. All paths derive each request's used cache length from adjacent
     ``cu_seqlens_k`` offsets without copying them to the host. Page-size-256
     and page-size-512 decode support only forward calls with the default
     options, apart from either causal flag and a default or custom
-    ``softmax_scale``; only page-size-256 accepts the optional ALiBi slopes.
+    ``softmax_scale``; only page-size-256 accepts ALiBi or softcap.
     The int32 CUDA cumulative-length tensors contain ``batch + 1`` offsets.
     ``shape`` uses the same forms as :func:`flash_attn_func`, but its sequence
     dimensions are the maximum query and key lengths rather than dense tensor
@@ -1914,8 +1937,9 @@ def flash_attn_varlen_func(
     calls that do not need backward, with either the default or a custom
     ``softmax_scale``. Softcapped calls use the generic packed Triton runtime;
     ``softcap=0`` retains the generated specialization. Other caps and
-    profiles, paged caches, gradients, dropout, ALiBi, local windows, and
-    diagnostic returns remain unsupported with softcap.
+    profiles, gradients, dropout, ALiBi, local windows, and diagnostic returns
+    remain unsupported with softcap. Paged caches remain unsupported except
+    for the exact page-size-256 decode profile described above.
 
     The causal version of that profile also supports
     ``return_attn_probs=True`` with ``causal=True`` and all options other than
@@ -1961,11 +1985,11 @@ def flash_attn_varlen_func(
 
     spec = normalize_shape(shape, q.dtype, causal)
     has_softcap = softcap != 0.0
-    if has_softcap and block_table is not None:
-        raise NotImplementedError(
-            "varlen softcap is not implemented with paged block_table caches"
-        )
-    if has_softcap and f"varlen_{spec.key}" != _VARLEN_SOFTCAP_KEY:
+    if (
+        has_softcap
+        and block_table is None
+        and f"varlen_{spec.key}" != _VARLEN_SOFTCAP_KEY
+    ):
         raise NotImplementedError(
             "softcap=50.0 is implemented only for the no-backward causal "
             "varlen bf16 profile (8, 512, 512, 16, 16, 64); "
@@ -2057,6 +2081,8 @@ def flash_attn_varlen_func(
         )
         if alibi_slopes is not None:
             _check_core_paged_varlen_alibi_spec(spec, page_size)
+        if has_softcap:
+            _check_core_paged_varlen_softcap_spec(spec, page_size)
         _check_core_paged_varlen_spec(spec, page_size)
         if alibi_slopes is not None:
             _validate_alibi_slopes(alibi_slopes, q, spec)
@@ -2068,6 +2094,11 @@ def flash_attn_varlen_func(
         if torch.is_grad_enabled() and any(
             tensor.requires_grad for tensor in grad_tensors
         ):
+            if has_softcap:
+                raise NotImplementedError(
+                    "softcap backward is not implemented; core paged varlen "
+                    "softcap calls are forward-only"
+                )
             if alibi_slopes is not None:
                 raise NotImplementedError(
                     "ALiBi backward is not implemented; core paged varlen "
@@ -2088,11 +2119,11 @@ def flash_attn_varlen_func(
         # used lengths directly on CUDA and remains safe for graph capture.
         seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         if page_size != _CORE_PAGED_GENERATED_PAGE_SIZE:
-            generic_kwargs = (
-                {"alibi_slopes": alibi_slopes}
-                if alibi_slopes is not None
-                else {}
-            )
+            generic_kwargs: dict[str, object] = {}
+            if alibi_slopes is not None:
+                generic_kwargs["alibi_slopes"] = alibi_slopes
+            if has_softcap:
+                generic_kwargs["softcap"] = softcap
             return _generic_paged_varlen_forward(
                 q,
                 k,

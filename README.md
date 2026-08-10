@@ -208,8 +208,9 @@ query/key lengths and the default or a custom `softmax_scale` are supported by
 the unpacked and QKV/KV-packed entry points. Softcapped calls use the generic
 packed Triton runtime and apply `50 * tanh(scores / 50)` before softmax;
 `softcap=0` retains the generated specialization. Other caps and profiles,
-gradients, dropout, ALiBi, local windows, diagnostic returns, and paged calls
-remain unsupported with softcap.
+gradients, dropout, ALiBi, local windows, and diagnostic returns remain
+unsupported with softcap. Paged calls remain unsupported except for the exact
+core page-size-256 decode profile described below.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
 `return_attn_probs=True` with otherwise default options apart from
@@ -284,10 +285,12 @@ uses bottom-right causal alignment. The decode modes are equivalent because a
 bottom-right single-token query can see the whole used cache. Page-size-256 and
 page-size-512 decode support the default option set plus either causal flag and
 a default or custom `softmax_scale`. Page-size-256 alone additionally accepts
-optional forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]`. ALiBi uses the
-generic paged runtime and supports the same ragged, permuted logical caches.
-Gradients, dropout, sliding windows, softcap, `deterministic=True`, diagnostic
-returns, page-size-512 ALiBi, and combinations of ALiBi with those features
+either optional forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]`, or
+exactly `softcap=50.0`. Both use the generic paged runtime and support the same
+ragged, permuted logical caches, but cannot be combined. `softcap=0` preserves
+the existing slope-free dispatch. Gradients, dropout, sliding windows,
+`deterministic=True`, diagnostic returns, page-size-512 ALiBi, other caps and
+softcap page sizes, and combinations of ALiBi or softcap with those features
 remain unsupported. Other page sizes and paged core-varlen profiles are
 rejected explicitly.
 
@@ -820,12 +823,12 @@ also raise `NotImplementedError` rather than silently doing something else:
   KV-cache window calls
 - softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
   causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
-  unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, or read-only
-  page-size-256 KV-cache decode `(4, 1, 1024, 8, 2, 128)` with either
-  decode-equivalent causal flag; the supported softcap cannot be combined with
-  dropout, ALiBi, local windows, or autograd; the dense/KV-packed Gemma-2
-  exception permits its diagnostic tuple described above, while the paged
-  exception permits its documented LSE return
+  unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, or read-only core
+  paged-varlen and KV-cache page-size-256 decode `(4, 1, 1024, 8, 2, 128)` with
+  either decode-equivalent causal flag; the supported softcap cannot be
+  combined with dropout, ALiBi, local windows, or autograd; the dense/KV-packed
+  Gemma-2 exception permits its diagnostic tuple described above, while only
+  the paged KV-cache exception permits its documented LSE return
 - ALiBi slopes for non-paged varlen profiles other than the causal and
   noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
   `(4, 256, 256, 32, 8, 128)` profile above, for core paged-varlen calls outside

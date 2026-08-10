@@ -65,6 +65,7 @@ PAGED_DECODE = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+CORE_PAGED_SOFTCAP_VALUE = 50.0
 PAGED_CHUNKED_PREFILL = AttnShape(
     batch=2,
     seqlen_q=200,
@@ -452,6 +453,10 @@ def reference_softcap_packed(
         q_seq = q[q_start : q_start + seqlen_q].float().transpose(0, 1)
         k_seq = k[k_start : k_start + seqlen_k].float().transpose(0, 1)
         v_seq = v[k_start : k_start + seqlen_k].float().transpose(0, 1)
+        if q_seq.shape[0] != k_seq.shape[0]:
+            group_size = q_seq.shape[0] // k_seq.shape[0]
+            k_seq = k_seq.repeat_interleave(group_size, dim=0)
+            v_seq = v_seq.repeat_interleave(group_size, dim=0)
         scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * scale
         scores = softcap * torch.tanh(scores / softcap)
         if causal:
@@ -4330,7 +4335,6 @@ def test_varlen_packed_entry_points_inherit_softcap_support(
         ("alibi", "softcap combined with ALiBi"),
         ("window", "sliding-window"),
         ("diagnostic", "return_attn_probs=True.*softcap"),
-        ("paged", "paged block_table"),
     ],
 )
 def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
@@ -4367,10 +4371,6 @@ def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
         kwargs["window_size"] = (128, 0)
     elif case == "diagnostic":
         kwargs["return_attn_probs"] = True
-    elif case == "paged":
-        kwargs["block_table"] = torch.zeros(
-            spec.batch, 1, device=q.device, dtype=torch.int32
-        )
 
     def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
         raise AssertionError("out-of-scope varlen softcap call reached dispatch")
@@ -5089,6 +5089,81 @@ def test_core_varlen_generic_paged_decode_matches_fa2_and_fp32_for_ragged_permut
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
+def test_core_varlen_page256_softcap_matches_fa2_and_fp32_for_ragged_permuted_pages(
+    causal: bool, softmax_scale: float | None
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, lengths_k, request_kv = (
+        make_paged_decode(page_size=256, seed=20260809)
+    )
+    # Exercise the nonlinear part of a cap as large as 50. The logical and
+    # physical copies are independent, so scale both representations.
+    q.mul_(4.0)
+    k.mul_(4.0)
+    for logical_k, _ in request_kv:
+        logical_k.mul_(4.0)
+    scale = (
+        1.0 / math.sqrt(PAGED_DECODE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=CORE_PAGED_SOFTCAP_VALUE,
+            block_table=block_table,
+            shape=(4, 1, 1024, 8, 2, 128),
+        )
+        expected_fp32 = reference_softcap_packed(
+            q,
+            torch.cat([logical_k for logical_k, _ in request_kv]),
+            torch.cat([logical_v for _, logical_v in request_kv]),
+            [1] * PAGED_DECODE.batch,
+            lengths_k,
+            causal=causal,
+            scale=scale,
+            softcap=CORE_PAGED_SOFTCAP_VALUE,
+        )
+
+    assert got.shape == q.shape
+    assert got.dtype == torch.bfloat16
+    assert got.is_contiguous()
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    with torch.no_grad():
+        expected_fa2 = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=CORE_PAGED_SOFTCAP_VALUE,
+            block_table=block_table,
+        )
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
 @pytest.mark.parametrize(
     "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
 )
@@ -5258,9 +5333,20 @@ def test_core_varlen_derives_paged_used_lengths_on_device(
 
 
 @requires_cuda
-@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
+@pytest.mark.parametrize(
+    ("page_size", "softcap"),
+    [
+        pytest.param(256, 0.0, id="page-256-no-cap"),
+        pytest.param(
+            256,
+            CORE_PAGED_SOFTCAP_VALUE,
+            id="page-256-softcap-50",
+        ),
+        pytest.param(512, 0.0, id="page-512"),
+    ],
+)
 def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
-    monkeypatch: pytest.MonkeyPatch, page_size: int
+    monkeypatch: pytest.MonkeyPatch, page_size: int, softcap: float
 ) -> None:
     import helion_attention._paged_attention as generic_attention
 
@@ -5292,6 +5378,7 @@ def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
         PAGED_DECODE.seqlen_k,
         softmax_scale=0.19,
         causal=False,
+        softcap=softcap,
         block_table=block_table,
         shape=(4, 1, 1024, 8, 2, 128),
     )
@@ -5309,6 +5396,7 @@ def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
     )
     assert kwargs["softmax_scale"] == 0.19
     assert kwargs["causal"] is False
+    assert kwargs["softcap"] == softcap
     assert kwargs["alibi_slopes"] is None
     assert kwargs["return_softmax_lse"] is False
     assert result is sentinel
@@ -5369,6 +5457,7 @@ def test_core_varlen_page256_alibi_uses_generic_paged_runtime(
     )
     assert kwargs["softmax_scale"] == 0.19
     assert kwargs["causal"] is False
+    assert kwargs["softcap"] == 0.0
     assert kwargs["alibi_slopes"] is slopes
     assert kwargs["return_softmax_lse"] is False
     assert result is sentinel
@@ -5561,7 +5650,6 @@ def test_core_varlen_unsupported_paged_alibi_rejected_before_dispatch(
     [
         pytest.param("dropout", "dropout", id="dropout"),
         pytest.param("window", "sliding-window", id="window"),
-        pytest.param("softcap", "paged block_table", id="softcap"),
         pytest.param("diagnostic", "return_attn_probs", id="diagnostic"),
         pytest.param("deterministic", "deterministic=True", id="deterministic"),
     ],
@@ -5593,14 +5681,10 @@ def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispa
         kwargs["alibi_slopes"] = torch.ones(
             PAGED_DECODE.nheads_q, device=q.device, dtype=torch.float32
         )
-        if case == "softcap":
-            message = "softcap combined with ALiBi"
     if case == "dropout":
         kwargs["dropout_p"] = 0.1
     elif case == "window":
         kwargs["window_size"] = (1, 1)
-    elif case == "softcap":
-        kwargs["softcap"] = 50.0
     elif case == "diagnostic":
         kwargs["return_attn_probs"] = True
     else:
@@ -5624,6 +5708,96 @@ def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispa
             cu_k,
             PAGED_DECODE.seqlen_q,
             PAGED_DECODE.seqlen_k,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("other-cap", "only as softcap=50.0", id="other-cap"),
+        pytest.param("page-16", "page-size-256", id="page-16"),
+        pytest.param("page-512", "page-size-256", id="page-512"),
+        pytest.param("other-page", "page-size-256", id="other-page"),
+        pytest.param("other-profile", "decode profile", id="other-profile"),
+        pytest.param("fp16", "bf16", id="fp16"),
+        pytest.param("gradient", "softcap backward", id="gradient"),
+        pytest.param("dropout", "dropout", id="dropout"),
+        pytest.param(
+            "alibi", "softcap combined with ALiBi", id="alibi"
+        ),
+        pytest.param("window", "sliding-window", id="window"),
+        pytest.param(
+            "diagnostic",
+            "return_attn_probs=True.*softcap",
+            id="diagnostic",
+        ),
+        pytest.param(
+            "deterministic", "deterministic=True", id="deterministic"
+        ),
+    ],
+)
+def test_core_varlen_page256_softcap_rejects_out_of_scope_calls_before_dispatch(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=256)
+    spec = PAGED_DECODE
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "softcap": CORE_PAGED_SOFTCAP_VALUE,
+        "block_table": block_table,
+        "shape": spec,
+    }
+    if case == "other-cap":
+        kwargs["softcap"] = 49.0
+    elif case in {"page-16", "page-512", "other-page"}:
+        page_size = {"page-16": 16, "page-512": 512, "other-page": 128}[
+            case
+        ]
+        q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
+            page_size=page_size
+        )
+        kwargs["block_table"] = block_table
+    elif case == "other-profile":
+        spec = PAGED_CHUNKED_PREFILL
+        q, k, v, cu_q, cu_k, block_table, *_ = make_paged_chunked_prefill()
+        kwargs.update(block_table=block_table, shape=spec)
+    elif case == "fp16":
+        spec = AttnShape(4, 1, 1024, 8, 2, 128, torch.float16, True)
+        q, k, v = (tensor.to(torch.float16) for tensor in (q, k, v))
+        kwargs["shape"] = spec
+    elif case == "gradient":
+        q.requires_grad_()
+    elif case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (1, 1)
+    elif case == "diagnostic":
+        kwargs["return_attn_probs"] = True
+    else:
+        kwargs["deterministic"] = True
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
+        raise AssertionError("out-of-scope core paged softcap reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
             **kwargs,  # type: ignore[arg-type]
         )
 
