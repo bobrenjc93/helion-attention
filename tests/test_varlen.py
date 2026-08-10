@@ -5105,6 +5105,23 @@ def test_core_varlen_paged_rejects_malformed_storage_before_lookup(
 
 @requires_cuda
 def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=512)
+    with pytest.raises(
+        helion_attention.UnsupportedShapeError, match="page_size=512"
+    ):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            causal=True,
+            block_table=block_table,
+            shape=PAGED_DECODE,
+        )
+
     q, _, _, cu_q, cu_k, _, *_ = make_paged_decode()
     k = torch.zeros(
         1, 32, 2, 128, device="cuda", dtype=PAGED_DECODE.dtype

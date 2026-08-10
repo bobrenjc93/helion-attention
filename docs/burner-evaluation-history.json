@@ -3133,6 +3133,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:9ddf40611564320a3a8fddaaec803ccd45344aae",
+      "commit": "9ddf40611564320a3a8fddaaec803ccd45344aae",
+      "recordedAt": "2026-08-10T12:35:54.996Z",
+      "label": "base 9ddf406",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 95,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:139",
+      "recordedAt": "2026-08-10T12:35:54.996Z",
+      "label": "PR #139",
+      "kind": "leaf",
+      "prNumber": 139,
+      "title": "Expose page-512 KV-cache decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
