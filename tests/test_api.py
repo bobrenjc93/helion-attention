@@ -6062,7 +6062,12 @@ def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
             PAGED_KVCACHE_SOFTCAP_VALUE,
             id="page-256-softcap-50",
         ),
-        pytest.param(512, 0.0, id="page-512"),
+        pytest.param(512, 0.0, id="page-512-no-cap"),
+        pytest.param(
+            512,
+            PAGED_KVCACHE_SOFTCAP_VALUE,
+            id="page-512-softcap-50",
+        ),
     ],
 )
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
@@ -6082,6 +6087,13 @@ def test_large_page_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages
     q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
         make_paged_kvcache_inputs(page_size=page_size, seed=20260809)
     )
+    if softcap != 0.0:
+        # Exercise the nonlinear region of cap 50 in both physical and
+        # independently retained logical cache representations.
+        q.mul_(4.0)
+        k_cache.mul_(4.0)
+        for logical_k, _ in logical_caches:
+            logical_k.mul_(4.0)
     original_k = k_cache.clone()
     original_v = v_cache.clone()
     scale = (
@@ -6662,7 +6674,12 @@ def test_paged_kvcache_routes_through_core_varlen(
             PAGED_KVCACHE_SOFTCAP_VALUE,
             id="page-256-softcap-50",
         ),
-        pytest.param(512, 0.0, id="page-512"),
+        pytest.param(512, 0.0, id="page-512-no-cap"),
+        pytest.param(
+            512,
+            PAGED_KVCACHE_SOFTCAP_VALUE,
+            id="page-512-softcap-50",
+        ),
     ],
 )
 def test_large_page_paged_kvcache_uses_generic_runtime(
@@ -6753,14 +6770,14 @@ def test_large_page_paged_kvcache_uses_generic_runtime(
         pytest.param(
             "page16",
             NotImplementedError,
-            "page-size-256",
+            "page-size-256 or page-size-512",
             id="page-16",
         ),
         pytest.param(
-            "page512",
+            "page512-other-cap",
             NotImplementedError,
-            "page-size-256",
-            id="page-512",
+            "only as softcap=50.0",
+            id="page-512-other-cap",
         ),
         pytest.param(
             "page32",
@@ -6770,12 +6787,18 @@ def test_large_page_paged_kvcache_uses_generic_runtime(
         ),
         pytest.param(
             "other-profile",
-            UnsupportedShapeError,
-            "supports only",
+            NotImplementedError,
+            "decode profile",
             id="other-profile",
         ),
         pytest.param(
             "update", NotImplementedError, "read-only", id="update"
+        ),
+        pytest.param(
+            "page512-update",
+            NotImplementedError,
+            "read-only",
+            id="page-512-update",
         ),
         pytest.param(
             "window", NotImplementedError, "sliding-window", id="window"
@@ -6787,11 +6810,23 @@ def test_large_page_paged_kvcache_uses_generic_runtime(
             id="alibi",
         ),
         pytest.param(
+            "page512-alibi",
+            NotImplementedError,
+            "softcap combined with ALiBi",
+            id="page-512-alibi",
+        ),
+        pytest.param(
             "autograd", NotImplementedError, "autograd", id="autograd"
+        ),
+        pytest.param(
+            "page512-autograd",
+            NotImplementedError,
+            "autograd",
+            id="page-512-autograd",
         ),
     ],
 )
-def test_page256_paged_kvcache_softcap_rejects_out_of_scope_calls(
+def test_large_page_paged_kvcache_softcap_rejects_out_of_scope_calls(
     case: str,
     error: type[Exception],
     message: str,
@@ -6809,29 +6844,41 @@ def test_page256_paged_kvcache_softcap_rejects_out_of_scope_calls(
         "softcap": PAGED_KVCACHE_SOFTCAP_VALUE,
         "shape": PAGED_KVCACHE,
     }
-    if case == "other-cap":
+    scoped_case = case
+    if case.startswith("page512-"):
+        k_cache, v_cache, block_table = page_logical_caches(
+            PAGED_KVCACHE, logical_caches, page_size=512
+        )
+        kwargs["block_table"] = block_table
+        scoped_case = case.removeprefix("page512-")
+
+    if scoped_case == "other-cap":
         kwargs["softcap"] = 49.0
-    elif case == "page16":
+    elif scoped_case == "page16":
         q, k_cache, v_cache, cache_seqlens, block_table, _ = (
             make_paged_kvcache_inputs(page_size=16)
         )
         kwargs["cache_seqlens"] = cache_seqlens
         kwargs["block_table"] = block_table
-    elif case == "page512":
-        k_cache, v_cache, block_table = page_logical_caches(
-            PAGED_KVCACHE, logical_caches, page_size=512
-        )
-        kwargs["block_table"] = block_table
-    elif case == "page32":
+    elif scoped_case == "page32":
         k_cache, v_cache, block_table = page_logical_caches(
             PAGED_KVCACHE, logical_caches, page_size=32
         )
         kwargs["block_table"] = block_table
-    elif case == "other-profile":
-        kwargs["shape"] = AttnShape(
-            4, 1, 512, 8, 2, 128, torch.bfloat16, True
+    elif scoped_case == "other-profile":
+        q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+            make_paged_kvcache_inputs(
+                spec=PAGED_CHUNKED_PREFILL,
+                lengths=[113, 271],
+                page_size=16,
+            )
         )
-    elif case == "update":
+        kwargs.update(
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            shape=PAGED_CHUNKED_PREFILL,
+        )
+    elif scoped_case == "update":
         update_shape = (
             PAGED_KVCACHE.batch,
             1,
@@ -6840,9 +6887,9 @@ def test_page256_paged_kvcache_softcap_rejects_out_of_scope_calls(
         )
         kwargs["k"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
         kwargs["v"] = torch.zeros(update_shape, device=q.device, dtype=q.dtype)
-    elif case == "window":
+    elif scoped_case == "window":
         kwargs["window_size"] = (128, 0)
-    elif case == "alibi":
+    elif scoped_case == "alibi":
         kwargs["alibi_slopes"] = torch.ones(
             PAGED_KVCACHE.nheads_q, device=q.device, dtype=torch.float32
         )
