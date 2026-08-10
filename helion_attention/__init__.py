@@ -2957,11 +2957,13 @@ def flash_attn_with_kvcache(
     update, remapping, autograd, or noncausal attention.
 
     A separate read-only speculative-decoding slice accepts exactly four query
-    tokens: causal bf16 ``(1, 4, 1024, 32, 8, 128)`` with a full dense cache.
-    It also uses the generic packed runtime and supports the default or a custom
-    softmax scale, plus an optional fp32 LSE return shaped ``[1, 32, 4]``. This
-    profile does not support cache updates, partial or tensor-valued lengths,
-    rotary, remapping, autograd, or noncausal attention.
+    tokens: causal bf16 ``(1, 4, 1024, 32, 8, 128)``. Read-only Python-integer
+    ``cache_seqlens`` values from 4 through 1023 select a cache prefix through
+    the generic packed runtime; omitted and full-length calls retain their
+    existing dispatch. Both paths support the default or a custom softmax
+    scale, plus an optional fp32 LSE return shaped ``[1, 32, 4]``. This profile
+    does not support cache updates, tensor-valued lengths, rotary, remapping,
+    autograd, optional attention features, or noncausal attention.
 
     Two paged profiles are also exposed with an int32 CUDA ``cache_seqlens``
     tensor shaped ``[batch]`` and ``block_table``. Bf16
@@ -3055,10 +3057,11 @@ def flash_attn_with_kvcache(
     The paged update additionally requires a disjoint full logical block
     mapping.
     Tensor-valued lengths and left padding on dense updates or outside the
-    exact causal 1K, either-causal 4K, and causal 16K profiles, scalar partial
-    lengths outside the exact causal 1K and either-causal 4K read-only
-    profiles, non-final one-token appends outside the exact 4K profile, and
-    multi-token updates outside the exact two-token profile fail explicitly.
+    exact causal single-token 1K, either-causal 4K, and causal 16K profiles,
+    scalar partial lengths outside the exact causal single-token and four-token
+    1K and either-causal 4K read-only profiles, non-final one-token appends
+    outside the exact 4K profile, and multi-token updates outside the exact
+    two-token profile fail explicitly.
     Non-final two-token 1K updates reject rotary, and all partial updates reject
     autograd, before either cache is mutated. Partial 4K updates additionally
     reject rotary dimensions other than full-head or D64 half-head and
@@ -3263,6 +3266,7 @@ def flash_attn_with_kvcache(
     is_scalar_prefix_dense_profile = (
         is_4k_scalar_prefix_dense_profile
         or spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
+        or spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
     )
     has_dense_alibi = alibi_slopes is not None
     if has_dense_alibi:
@@ -3392,10 +3396,17 @@ def flash_attn_with_kvcache(
                     "for this read-only profile; cache_seqlens must equal the "
                     "cache length declared by shape"
                 )
-            if cache_seqlens < 1 or cache_seqlens >= spec.seqlen_k:
+            minimum_prefix_length = (
+                spec.seqlen_q if is_four_token_dense_profile else 1
+            )
+            if (
+                cache_seqlens < minimum_prefix_length
+                or cache_seqlens >= spec.seqlen_k
+            ):
                 raise ValueError(
                     "cache_seqlens must be in the inclusive range "
-                    f"[1, {spec.seqlen_k}] for this dense KV cache, got "
+                    f"[{minimum_prefix_length}, {spec.seqlen_k}] for this "
+                    "dense KV cache, got "
                     f"{cache_seqlens}"
                 )
             scalar_cache_prefix = cache_seqlens
