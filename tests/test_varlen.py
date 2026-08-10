@@ -3572,6 +3572,203 @@ def test_causal_varlen_packed_entry_points_inherit_diagnostic_return(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["unpacked", "qkvpacked", "kvpacked"],
+    ids=["unpacked", "qkv-packed", "kv-packed"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_full_causal_varlen_diagnostic_backward_matches_fp32_and_fa2(
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = VARLEN_DIAGNOSTIC
+    base_q, base_k, base_v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=2, seed=223606
+    )
+    generator = torch.Generator(device=base_q.device).manual_seed(244949)
+    grad_out = torch.randn(
+        base_q.shape,
+        device=base_q.device,
+        dtype=base_q.dtype,
+        generator=generator,
+    )
+    grad_lse = torch.randn(
+        (spec.nheads_q, base_q.shape[0]),
+        device=base_q.device,
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    def run(
+        package: object,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        api_kwargs: dict[str, object] = {
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "return_attn_probs": True,
+        }
+        if package is helion_attention:
+            api_kwargs["shape"] = spec
+
+        if entry_point == "unpacked":
+            q = base_q.detach().requires_grad_()
+            k = base_k.detach().requires_grad_()
+            v = base_v.detach().requires_grad_()
+            result = package.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                **api_kwargs,
+            )
+            grad_inputs = (q, k, v)
+        elif entry_point == "qkvpacked":
+            packed = torch.stack(
+                (base_q, base_k, base_v), dim=1
+            ).requires_grad_()
+            result = package.flash_attn_varlen_qkvpacked_func(
+                packed,
+                cu_q,
+                spec.seqlen_q,
+                **api_kwargs,
+            )
+            grad_inputs = (packed,)
+        else:
+            q = base_q.detach().requires_grad_()
+            packed = torch.stack((base_k, base_v), dim=1).requires_grad_()
+            result = package.flash_attn_varlen_kvpacked_func(
+                q,
+                packed,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                **api_kwargs,
+            )
+            grad_inputs = (q, packed)
+
+        assert isinstance(result, tuple) and len(result) == 3
+        assert all(tensor.requires_grad for tensor in result)
+        out, softmax_lse, s_dmask = result
+        raw_grads = torch.autograd.grad(
+            result,
+            grad_inputs,
+            grad_outputs=(
+                grad_out,
+                grad_lse,
+                torch.empty_like(s_dmask),
+            ),
+        )
+        if entry_point == "unpacked":
+            grads = raw_grads
+        elif entry_point == "qkvpacked":
+            grads = tuple(raw_grads[0][:, index] for index in range(3))
+        else:
+            grads = (
+                raw_grads[0],
+                raw_grads[1][:, 0],
+                raw_grads[1][:, 1],
+            )
+        return (out, softmax_lse, s_dmask), grads
+
+    got, got_grads = run(helion_attention)
+    expected_fa2, expected_fa2_grads = run(flash_attn)
+
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    q_ref = base_q.float().requires_grad_()
+    k_ref = base_k.float().requires_grad_()
+    v_ref = base_v.float().requires_grad_()
+    expected_fp32 = reference_packed(
+        q_ref,
+        k_ref,
+        v_ref,
+        lengths_q,
+        lengths_k,
+        causal=True,
+        scale=scale,
+    )
+    expected_fp32_grads = torch.autograd.grad(
+        expected_fp32, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected_fa2
+    assert out.shape == expected_out.shape == base_q.shape
+    assert out.dtype == expected_out.dtype == spec.dtype
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.nheads_q,
+        spec.batch * spec.seqlen_q,
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == spec.dtype
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        out.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+    for actual, reference_fa2, reference_fp32 in zip(
+        got_grads, expected_fa2_grads, expected_fp32_grads
+    ):
+        # The nonzero LSE gradient passed above must contribute exactly zero,
+        # just as it does in FA2; the fp32 reference differentiates only out.
+        torch.testing.assert_close(
+            actual.float(), reference_fa2.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            actual.float(), reference_fp32, atol=8e-2, rtol=2e-2
+        )
+
+
+@requires_cuda
+def test_full_causal_varlen_diagnostic_auxiliary_gradients_are_exactly_zero(
+) -> None:
+    spec = VARLEN_DIAGNOSTIC
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2, seed=282842)
+    q.requires_grad_()
+    k.requires_grad_()
+    v.requires_grad_()
+    _, softmax_lse, s_dmask = helion_attention.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        causal=True,
+        return_attn_probs=True,
+        shape=spec,
+    )
+
+    grads = torch.autograd.grad(
+        (softmax_lse, s_dmask),
+        (q, k, v),
+        grad_outputs=(torch.ones_like(softmax_lse), torch.empty_like(s_dmask)),
+    )
+
+    assert all(torch.count_nonzero(grad).item() == 0 for grad in grads)
+
+
+@requires_cuda
 def test_causal_varlen_return_attn_probs_false_retains_generated_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

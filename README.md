@@ -211,14 +211,16 @@ gradients, dropout, ALiBi, local windows, diagnostic returns, and paged calls
 remain unsupported with softcap.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
-`return_attn_probs=True` for forward-only calls with otherwise default options
-apart from `causal=True` and an optional custom `softmax_scale`. It returns
-`(out, softmax_lse, S_dmask)`, where LSE is fp32 with shape
-`[heads_q, total_q]` and `S_dmask` is an empty bf16 tensor. Fully masked causal
-rows have zero output and `+inf` LSE, matching FA2. The generated specialization
-remains the path when the option is false; diagnostic calls use the generic
-packed runtime that produces LSE directly. The varlen QKV/KV-packed adapters
-inherit this support.
+`return_attn_probs=True` with otherwise default options apart from
+`causal=True` and an optional custom `softmax_scale`. Forward calls may be
+ragged; backward is restricted to all eight query and key sequences having
+length 512. It returns `(out, softmax_lse, S_dmask)`, where LSE is fp32 with
+shape `[16, 4096]` for full-length inputs and `S_dmask` is an empty bf16 tensor.
+Only `out` contributes Q/K/V gradients; LSE and `S_dmask` gradients are ignored,
+matching FA2. Fully masked causal rows in ragged forward calls have zero output
+and `+inf` LSE. The generated specialization remains the path when the option
+is false; diagnostic calls use the generic packed runtime that produces LSE
+directly. The varlen QKV/KV-packed adapters inherit this support.
 
 Both the causal and noncausal bf16 profiles at these maxima support forward-only
 ALiBi. Pass fp32 CUDA slopes shaped `[16]` or `[8, 16]` through `alibi_slopes`;
@@ -247,16 +249,18 @@ nonempty query sequence. Both paths provide forward and Q/K/V gradients for the
 default or a custom `softmax_scale`. The QKV-packed adapter inherits
 self-attention support; the KV-packed adapter accepts the same independent
 query/key cases, including zero-length query slots paired with nonempty key
-slots. Full-length training remains CUDA-graph capturable. The full-length
-causal profile also accepts `deterministic=True` with either scale, routing the
-reshaped batch through direct math SDPA for bitwise-repeatable outputs and Q/K/V
-gradients; both packed adapters inherit this path.
+slots. Full-length causal training additionally accepts the diagnostic return
+described above when `deterministic=False`. Training without diagnostics remains
+CUDA-graph capturable. The full-length causal profile also accepts
+`deterministic=True` with either scale when diagnostics are disabled, routing
+the reshaped batch through direct math SDPA for bitwise-repeatable outputs and
+Q/K/V gradients; both packed adapters inherit these paths.
 Ragged training reads the cumulative offsets on the host for validation and
 therefore rejects graph capture. Calls that do not require gradients continue
 to use the generated varlen kernel, including ragged and full-length calls.
 Ragged noncausal batches, batches with no nonempty queries, cross-attention
 batches with any empty key slot, deterministic mode outside the exact
-full-length causal profile, paged caches, ALiBi, diagnostic returns, and
+full-length causal profile, paged caches, ALiBi, ragged diagnostic returns, and
 positive dropout remain explicitly unsupported for varlen backward.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
@@ -799,7 +803,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   dense/KV-packed calls for the three
   Llama GQA decode profiles, dense/KV-packed calls for the causal bf16 Gemma-2
   profile with `softcap=50.0`, and the causal bf16 varlen profiles
-  `(8, 512, 512, 16, 16, 64)` and `(4, 256, 256, 32, 8, 128)` described above
+  `(8, 512, 512, 16, 16, 64)` and `(4, 256, 256, 32, 8, 128)` described above;
+  varlen diagnostic backward is limited to full-length zero-dropout training
+  on the former profile with `deterministic=False`
 
 ## How the kernels are made
 

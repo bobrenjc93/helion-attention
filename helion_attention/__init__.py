@@ -31,8 +31,9 @@ generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, grad-enabled
-diagnostics on that GPT-2 profile, both full-length varlen profiles, and ragged
-causal attention use PyTorch SDPA autograd. Full-length symmetric-window
+diagnostics on that GPT-2 profile and the full-length causal varlen profile,
+both full-length varlen profiles, and ragged causal attention use PyTorch SDPA
+autograd. Full-length symmetric-window
 training on the shipped noncausal varlen profile uses the same bounded SDPA
 bridge. Deterministic zero-dropout
 BERT-base, causal GPT-2, and full-length causal varlen training use the direct
@@ -1824,11 +1825,13 @@ def flash_attn_varlen_func(
     diagnostic returns remain unsupported with softcap.
 
     The causal version of that profile also supports
-    ``return_attn_probs=True`` when no backward is needed, ``causal=True``, and
-    all options other than ``softmax_scale`` retain their defaults. It returns
-    ``(out, softmax_lse, S_dmask)`` with fp32 LSE shaped ``[nheads_q, total_q]``
-    and an empty bf16 ``S_dmask``, matching FlashAttention 2 when dropout is
-    zero.
+    ``return_attn_probs=True`` with ``causal=True`` and all options other than
+    ``softmax_scale`` retaining their defaults. Forward calls may be ragged.
+    Backward is restricted to full-length inputs, where all eight query and key
+    sequences have length 512. It returns ``(out, softmax_lse, S_dmask)`` with
+    fp32 LSE shaped ``[nheads_q, total_q]`` and an empty bf16 ``S_dmask``. In
+    backward, only ``out`` contributes Q/K/V gradients; auxiliary gradients are
+    ignored, matching FlashAttention 2 when dropout is zero.
 
     Both causal modes support zero-dropout backward when all eight query and
     key sequences have length 512. The causal profile additionally supports
@@ -1839,7 +1842,8 @@ def flash_attn_varlen_func(
     one dense BSHD call; ragged inputs use one bounded PyTorch SDPA call per
     nonempty query sequence. All-empty query batches, empty key slots in
     cross-attention, ragged noncausal (including windowed calls), graph-captured
-    ragged, paged, ALiBi, and diagnostic varlen backward remain unsupported.
+    ragged, paged, ALiBi, and ragged diagnostic varlen backward remain
+    unsupported.
     Deterministic zero-dropout backward is supported only for the full-length
     causal profile, using direct math SDPA; the noncausal and all ragged forms
     still reject it. Calls that do not need backward retain the generated packed
@@ -2044,15 +2048,19 @@ def flash_attn_varlen_func(
                 "softcap backward is not implemented; the causal varlen "
                 "softcap profile is forward-only"
             )
-        if return_attn_probs:
-            raise NotImplementedError(
-                "return_attn_probs=True is not implemented for grad-enabled "
-                "calls"
-            )
         if alibi_slopes is not None:
             raise NotImplementedError(
                 "ALiBi backward is not implemented; varlen ALiBi calls are "
                 "forward-only"
+            )
+        full_length = _has_full_varlen_token_totals(q, k, spec)
+        if return_attn_probs and (
+            f"varlen_{spec.key}" != _VARLEN_DIAGNOSTIC_KEY or not full_length
+        ):
+            raise NotImplementedError(
+                "return_attn_probs=True for grad-enabled calls is implemented "
+                "only for full-length "
+                f"{_VARLEN_DIAGNOSTIC_KEY} zero-dropout training"
             )
         if f"varlen_{spec.key}" not in _VARLEN_SDPA_BACKWARD_KEYS:
             supported = ", ".join(sorted(_VARLEN_SDPA_BACKWARD_KEYS))
@@ -2061,7 +2069,6 @@ def flash_attn_varlen_func(
                 f"{supported} with eight full-length "
                 "sequences"
             )
-        full_length = _has_full_varlen_token_totals(q, k, spec)
         if deterministic and (
             f"varlen_{spec.key}" != _VARLEN_DETERMINISTIC_BACKWARD_KEY
             or not full_length
@@ -2124,7 +2131,20 @@ def flash_attn_varlen_func(
             dense_out = dense_attention_sdpa(
                 dense_q, dense_k, dense_v, scale, spec
             )
-        return dense_out.reshape(q.shape)
+        out = dense_out.reshape(q.shape)
+        if return_attn_probs:
+            with torch.no_grad():
+                _, softmax_lse, s_dmask = _generic_varlen_diagnostic_forward(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    cu_seqlens_k,
+                    scale,
+                    spec,
+                )
+            return attention_diagnostics(out, softmax_lse, s_dmask)
+        return out
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
