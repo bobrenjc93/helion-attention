@@ -8,10 +8,11 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, BERT-base encoder diagnostics, one causal Llama-3 GQA varlen
-inference profile, ALiBi on both shipped varlen profiles, symmetric windows on
-the shipped noncausal varlen profile, and diagnostics on the shipped causal
-varlen profile use a generic Triton forward kernel. That runtime also provides
+ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
+varlen inference profile, ALiBi on both shipped varlen profiles, symmetric
+windows on the shipped noncausal varlen profile, and diagnostics on the shipped
+causal varlen profile use a generic Triton forward kernel. That runtime also
+provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes page-256 decode without softcap through the
@@ -110,6 +111,9 @@ _INT32_MAX = 2**31 - 1
 _ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
 _CAUSAL_DROPOUT_KEY = "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal"
+_GENERIC_DENSE_DIAGNOSTIC_KEYS = frozenset(
+    {_BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
+)
 _DROPOUT_SDPA_KEYS = frozenset(
     {_ENCODER_TRAINING_KEY, _BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
 )
@@ -270,7 +274,7 @@ def _supports_diagnostic_return(spec: AttnShape) -> bool:
     # Causal and non-causal are equivalent for a bottom-right single-token
     # query, and the registry maps both modes to the same checked-in kernel.
     return (
-        spec.key == _BERT_DIAGNOSTIC_KEY
+        spec.key in _GENERIC_DENSE_DIAGNOSTIC_KEYS
         or profile in _DIAGNOSTIC_DECODE_PROFILES
     ) and has_kernel(spec)
 
@@ -1439,12 +1443,12 @@ def flash_attn_func(
             ordinary dispatch; every other positive value remains unsupported.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
-        return_attn_probs: for the shipped bf16 BERT-base encoder, three Llama
-            GQA decode profiles, and the ``softcap=50.0`` Gemma-2 profile,
-            return FlashAttention's diagnostic tuple. This is available only
-            when no backward is needed and all options other than
-            ``softmax_scale`` (plus the documented causal/softcap settings)
-            retain their defaults.
+        return_attn_probs: for the shipped bf16 BERT-base encoder and causal
+            GPT-2 profile, three Llama GQA decode profiles, and the
+            ``softcap=50.0`` Gemma-2 profile, return FlashAttention's diagnostic
+            tuple. This is available only when no backward is needed and all
+            options other than ``softmax_scale`` (plus the documented
+            causal/softcap settings) retain their defaults.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -1564,10 +1568,11 @@ def flash_attn_func(
         if not _supports_diagnostic_return(spec):
             raise NotImplementedError(
                 "return_attn_probs=True is implemented only for the shipped "
-                f"{_BERT_DIAGNOSTIC_KEY} BERT-base encoder and the three "
+                f"{_BERT_DIAGNOSTIC_KEY} BERT-base encoder, the shipped "
+                f"{_CAUSAL_DROPOUT_KEY} causal GPT-2 profile, and the three "
                 "shipped batch-1, single-token bf16 Llama GQA decode profiles"
             )
-        if spec.key == _BERT_DIAGNOSTIC_KEY:
+        if spec.key in _GENERIC_DENSE_DIAGNOSTIC_KEYS:
             return _generic_dense_diagnostic_forward(q, k, v, scale, spec)
         out, softmax_lse = lookup(spec)(
             q, k, v, scale, return_softmax_lse=True
