@@ -227,6 +227,7 @@ _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE = (
 )
 _DENSE_KVCACHE_LEFT_WINDOW_PROFILE = _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
 _DENSE_KVCACHE_LEFT_WINDOW_SIZE = (511, 0)
+_DENSE_KVCACHE_LEFT_WINDOW_LENGTH = _DENSE_KVCACHE_LEFT_WINDOW_SIZE[0] + 1
 _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY = (
     "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal"
 )
@@ -2694,9 +2695,10 @@ def flash_attn_with_kvcache(
     ``window_size=(511, 0)`` for a forward-only, slope-free read of the full
     cache, with ``cache_seqlens`` omitted or supplied as the Python integer
     ``4096``. This path uses the generic packed runtime with the default or a
-    custom softmax scale. Partial or tensor-valued lengths, cache updates, LSE,
-    optional features, and autograd remain unsupported; the global window
-    continues to use the generated specialization.
+    custom softmax scale and presents only the visible 512-row cache tail to
+    the kernel. Partial or tensor-valued lengths, cache updates, LSE, optional
+    features, and autograd remain unsupported; the global window continues to
+    use the generated specialization.
     The causal 1K profile and both 4K profiles additionally accept contiguous
     CUDA int32 ``cache_seqlens`` tensors shaped ``[1]`` for read-only,
     slope-free spans.
@@ -3161,12 +3163,25 @@ def flash_attn_with_kvcache(
                 "the 4K dense KV-cache left window is forward-only and does "
                 "not support autograd"
             )
+        # Do not merely mask the prefix: zero weights still produce 0 * NaN
+        # inside the value dot product when an out-of-window cache row is NaN.
+        window_start = spec.seqlen_k - _DENSE_KVCACHE_LEFT_WINDOW_LENGTH
+        window_spec = AttnShape(
+            spec.batch,
+            spec.seqlen_q,
+            _DENSE_KVCACHE_LEFT_WINDOW_LENGTH,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+            spec.dtype,
+            spec.causal,
+        )
         return _generic_dense_forward(
             q,
-            k_cache,
-            v_cache,
+            k_cache[:, window_start:],
+            v_cache[:, window_start:],
             scale,
-            spec,
+            window_spec,
             None,
             window_size=_DENSE_KVCACHE_LEFT_WINDOW_SIZE,
         )

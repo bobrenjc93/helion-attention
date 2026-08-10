@@ -333,11 +333,11 @@ out = helion_attention.flash_attn_with_kvcache(
 ```
 
 ALiBi uses the generic packed Triton runtime and never mutates the cache;
-slope-free full-cache calls retain the checked-in generated specialization and
-slope-free prefixes retain their existing packed-prefix dispatch. Full-cache
-ALiBi retains its existing generic dense dispatch. This narrow mode does not
-support LSE, updates, tensor-selected spans, cache remapping, left padding,
-rotary, windows, softcap, or autograd.
+slope-free full-cache global-window calls retain the checked-in generated
+specialization, and slope-free prefixes retain their existing packed-prefix
+dispatch. Full-cache ALiBi retains its existing generic dense dispatch. This
+narrow mode does not support LSE, updates, tensor-selected spans, cache
+remapping, left padding, rotary, windows, softcap, or autograd.
 
 The exact causal bf16 `(1, 1, 1024, 32, 8, 128)` profile accepts a read-only
 Python integer `cache_seqlens` from 1 through 1024. It also accepts a contiguous
@@ -359,9 +359,18 @@ positions 0 through 4094, mutates that slot, and attends through the appended
 token. Both causal flags and the default or a custom `softmax_scale` are
 supported. Slope-free calls additionally support optional fp32 LSE, and updates
 optionally apply full-head or D64 half-head interleaved rotary. These calls use
-the generic packed Triton runtime. Omitting the length or passing 4096 for a
-slope-free read retains the checked-in generated dispatch, as does the existing
-final-slot append at position 4095.
+the generic packed Triton runtime. With the global `window_size=(-1, -1)`,
+omitting the length or passing 4096 for a slope-free read retains the checked-in
+generated dispatch, as does the existing final-slot append at position 4095.
+
+A forward-only, slope-free full-cache read on this exact 4K profile also accepts
+`window_size=(511, 0)` with either causal flag and the default or a custom
+`softmax_scale`. It attends only to cache rows 3584 through 4095, exposes only
+that 512-row tail to the generic packed Triton kernel, and never mutates cache
+storage. `cache_seqlens` must be omitted or supplied as the Python integer 4096.
+Partial or tensor-valued lengths, LSE, updates, ALiBi, cache remapping, left
+padding, rotary, softcap, explicit split counts, autograd, other windows, and
+other profiles remain unsupported for this local-window path.
 
 The 4K profile also accepts a contiguous CUDA int32 `cache_seqlens` tensor
 shaped `[1]` for a slope-free, read-only prefix. An optional contiguous CUDA
@@ -788,8 +797,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   profiles above, or combined with ALiBi, diagnostic returns, local windows,
   softcap, or deterministic mode
 - sliding-window attention outside finite symmetric calls on the noncausal
-  bf16 varlen self-attention profile above, including ragged windowed backward
-  and all KV-cache window calls
+  bf16 varlen self-attention profile and the exact full-cache 4K dense KV-cache
+  decode exception above, including ragged windowed backward and all other
+  KV-cache window calls
 - softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
   causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
   unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, or read-only

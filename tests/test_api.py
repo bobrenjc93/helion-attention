@@ -7362,6 +7362,63 @@ def test_kvcache_4k_left_window_matches_fa2_and_fp32_without_mutation(
     torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
 
 
+@requires_cuda
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+def test_kvcache_4k_left_window_isolates_out_of_window_nonfinite_values(
+    causal: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    manifest_spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
+    spec = AttnShape(
+        manifest_spec.batch,
+        manifest_spec.seqlen_q,
+        manifest_spec.seqlen_k,
+        manifest_spec.nheads_q,
+        manifest_spec.nheads_kv,
+        manifest_spec.head_dim,
+        manifest_spec.dtype,
+        causal,
+    )
+    q, k_cache, v_cache = make_inputs(spec, seed=20260811)
+    window_length = DENSE_KVCACHE_LEFT_WINDOW_SIZE[0] + 1
+    visible_v = v_cache[:, -window_length:].clone()
+    v_cache[:, :-window_length].fill_(float("nan"))
+    scale = 1.0 / math.sqrt(spec.head_dim)
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            causal=causal,
+            window_size=DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+            shape=spec,
+        )
+        expected_fa2 = flash_attn.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            causal=causal,
+            window_size=DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+        )
+        expected_fp32, _ = reference_single_token_prefix_attention(
+            q,
+            k_cache,
+            v_cache,
+            spec.seqlen_k,
+            spec,
+            scale,
+            leftpad=spec.seqlen_k - window_length,
+        )
+
+    assert torch.isfinite(got).all()
+    assert torch.isfinite(expected_fa2).all()
+    assert torch.isnan(v_cache[:, :-window_length]).all()
+    assert torch.equal(v_cache[:, -window_length:], visible_v)
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
 @pytest.mark.parametrize(
     "cache_seqlens",
@@ -7384,13 +7441,21 @@ def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispat
         manifest_spec.dtype,
         causal,
     )
-    q = torch.zeros(1, dtype=spec.dtype)
-    k_cache = torch.ones(1, dtype=spec.dtype)
-    v_cache = torch.full((1,), 2.0, dtype=spec.dtype)
+    q = torch.zeros(
+        spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim, dtype=spec.dtype
+    )
+    k_cache = torch.ones(
+        spec.batch,
+        spec.seqlen_k,
+        spec.nheads_kv,
+        spec.head_dim,
+        dtype=spec.dtype,
+    )
+    v_cache = torch.full_like(k_cache, 2.0)
     original_k = k_cache.clone()
     original_v = v_cache.clone()
-    windowed_out = torch.full((1,), 3.0, dtype=spec.dtype)
-    global_out = torch.full((1,), 5.0, dtype=spec.dtype)
+    windowed_out = torch.full_like(q, 3.0)
+    global_out = torch.full_like(q, 5.0)
     dispatches: list[str] = []
 
     monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
@@ -7406,9 +7471,26 @@ def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispat
         softcap: float = 0.0,
         window_size: tuple[int, int] = (-1, -1),
     ) -> torch.Tensor:
-        assert q_arg is q and k_arg is k_cache and v_arg is v_cache
+        assert q_arg is q
+        assert tuple(k_arg.shape) == tuple(v_arg.shape) == (
+            spec.batch,
+            DENSE_KVCACHE_LEFT_WINDOW_SIZE[0] + 1,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
+        assert k_arg.data_ptr() == k_cache[:, -k_arg.shape[1] :].data_ptr()
+        assert v_arg.data_ptr() == v_cache[:, -v_arg.shape[1] :].data_ptr()
         assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
-        assert spec_arg == spec
+        assert spec_arg == AttnShape(
+            spec.batch,
+            spec.seqlen_q,
+            DENSE_KVCACHE_LEFT_WINDOW_SIZE[0] + 1,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+            spec.dtype,
+            spec.causal,
+        )
         assert slopes_arg is None
         assert softcap == 0.0
         assert window_size == DENSE_KVCACHE_LEFT_WINDOW_SIZE
