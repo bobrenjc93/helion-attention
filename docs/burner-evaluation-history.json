@@ -3733,6 +3733,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:526b27c3e828bff3e89bd61a7156725191d95f62",
+      "commit": "526b27c3e828bff3e89bd61a7156725191d95f62",
+      "recordedAt": "2026-08-10T22:19:46.370Z",
+      "label": "base 526b27c",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:164",
+      "recordedAt": "2026-08-10T22:19:46.370Z",
+      "label": "PR #164",
+      "kind": "leaf",
+      "prNumber": 164,
+      "title": "Correct the sliding-window limitations inventory",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
