@@ -3373,6 +3373,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:b5b9669b0fa41003f42c68557f86ade0fb51ffc5",
+      "commit": "b5b9669b0fa41003f42c68557f86ade0fb51ffc5",
+      "recordedAt": "2026-08-10T16:20:49.796Z",
+      "label": "base b5b9669",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:148",
+      "recordedAt": "2026-08-10T16:20:49.796Z",
+      "label": "PR #148",
+      "kind": "leaf",
+      "prNumber": 148,
+      "title": "Enable ALiBi on page-512 KV-cache decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
