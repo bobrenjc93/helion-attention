@@ -212,10 +212,13 @@ both the unpacked API and the varlen QKV/KV-packed adapters accept them, with
 either the default or a custom `softmax_scale`. The causal bf16 Llama-3 profile
 above likewise accepts `[32]` or `[4, 32]` slopes through its unpacked and
 KV-packed entry points. ALiBi calls use the generic packed Triton runtime, while
-`alibi_slopes=None` retains each profile's existing dispatch. Other varlen
-profiles and paged calls made directly through the core varlen API still reject
-ALiBi explicitly; the narrow KV-cache paths described below are the only paged
-exceptions.
+`alibi_slopes=None` retains each profile's existing dispatch. Other non-paged
+varlen profiles still reject ALiBi explicitly. The one direct core paged-varlen
+exception is forward-only bf16 page-size-256 decode
+`(4, 1, 1024, 8, 2, 128)`, which accepts fp32 CUDA slopes shaped `[8]` or
+`[4, 8]`; page-size-16 calls, chunked prefill, and other paged profiles still
+reject them. The KV-cache paths described below have their own paged ALiBi
+support.
 
 Zero-dropout backward is supported for both the causal and noncausal bf16
 `(8, 512, 512, 16, 16, 64)` varlen profiles when all eight query and key
@@ -258,10 +261,13 @@ As on the non-paged path, the shape sequence dimensions are maxima and actual
 lengths come from adjacent cumulative offsets. The chunked-prefill profile
 uses bottom-right causal alignment. The decode modes are equivalent because a
 bottom-right single-token query can see the whole used cache. Page-size-256
-decode supports only the default option set apart from the causal flag and
-`softmax_scale`: gradients, dropout, sliding windows, softcap, ALiBi,
-`deterministic=True`, and diagnostic returns remain unsupported. Other page
-sizes and paged core-varlen profiles are rejected explicitly.
+decode supports the default option set plus either causal flag, a default or
+custom `softmax_scale`, and optional forward-only fp32 ALiBi slopes shaped `[8]`
+or `[4, 8]`. ALiBi uses the generic paged runtime and supports the same ragged,
+permuted logical caches. Gradients, dropout, sliding windows, softcap,
+`deterministic=True`, diagnostic returns, and combinations of ALiBi with those
+features remain unsupported. Other page sizes and paged core-varlen profiles
+are rejected explicitly.
 
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus
@@ -725,15 +731,19 @@ also raise `NotImplementedError` rather than silently doing something else:
   dropout, ALiBi, local windows, or autograd; the dense/KV-packed Gemma-2
   exception permits its diagnostic tuple described above, while the paged
   exception permits its documented LSE return
-- ALiBi slopes for varlen profiles other than the causal and noncausal bf16
-  `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
-  `(4, 256, 256, 32, 8, 128)` profile above, and for KV-cache calls outside the
-  exact read-only bf16 dense `(1, 1, 4096, 32, 8, 128)` decode profile,
-  page-size-16 profiles, and page-size-256 decode above; dense KV-cache ALiBi
-  cannot be combined with LSE, updates, partial lengths, remapping, left
-  padding, rotary, windows, softcap, or autograd; paged ALiBi cannot be combined
-  with softcap, updates, rotary, windows, or autograd, and its LSE combination
-  is limited to the exact read-only page-size-256 decode profile above
+- ALiBi slopes for non-paged varlen profiles other than the causal and
+  noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
+  `(4, 256, 256, 32, 8, 128)` profile above, for core paged-varlen calls outside
+  forward-only bf16 page-size-256 decode `(4, 1, 1024, 8, 2, 128)`, and for
+  KV-cache calls outside the exact read-only bf16 dense
+  `(1, 1, 4096, 32, 8, 128)` decode profile, page-size-16 profiles, and
+  page-size-256 decode above; core paged-varlen ALiBi cannot be combined with
+  dropout, windows, softcap, `deterministic=True`, diagnostic returns, or
+  autograd; dense KV-cache ALiBi cannot be combined with LSE, updates, partial
+  lengths, remapping, left padding, rotary, windows, softcap, or autograd; paged
+  KV-cache ALiBi cannot be combined with softcap, updates, rotary, windows, or
+  autograd, and its LSE combination is limited to the exact read-only
+  page-size-256 decode profile above
 - KV-cache mutation beyond the dense paired one-token final-slot append and
   exact two-token final-two-slot append above; the exact four-token profile is
   read-only;
