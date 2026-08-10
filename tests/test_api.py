@@ -2038,6 +2038,101 @@ def test_causal_dropout_forward_and_qkv_gradients_match_direct_sdpa(
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
 )
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_causal_gpt2_return_attn_probs_matches_fa2(
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = CAUSAL_DROPOUT
+    q, k, v = make_inputs(spec, seed=20260809)
+    declared_shape = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+    )
+
+    with torch.no_grad():
+        if entry_point == "dense":
+            got = helion_attention.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+            )
+        elif entry_point == "qkvpacked":
+            qkv = torch.stack((q, k, v), dim=2)
+            got = helion_attention.flash_attn_qkvpacked_func(
+                qkv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_qkvpacked_func(
+                qkv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+            )
+        else:
+            kv = torch.stack((k, v), dim=2)
+            got = helion_attention.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+            )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (2, 32, 1024)
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["dense", "qkvpacked", "kvpacked"],
+    ids=["dense", "qkv-packed", "kv-packed"],
+)
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_causal_zero_dropout_retains_generated_dispatch(
     entry_point: str,
@@ -2067,6 +2162,11 @@ def test_causal_zero_dropout_retains_generated_dispatch(
     monkeypatch.setattr(
         helion_attention, "dense_attention_math_sdpa", reject_sdpa
     )
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_dense_diagnostic_forward",
+        reject_sdpa,
+    )
     if entry_point == "dense":
         out = helion_attention.flash_attn_func(
             q,
@@ -2075,6 +2175,7 @@ def test_causal_zero_dropout_retains_generated_dispatch(
             dropout_p=0.0,
             causal=True,
             deterministic=deterministic,
+            return_attn_probs=False,
             shape=spec,
         )
     elif entry_point == "qkvpacked":
@@ -2083,6 +2184,7 @@ def test_causal_zero_dropout_retains_generated_dispatch(
             dropout_p=0.0,
             causal=True,
             deterministic=deterministic,
+            return_attn_probs=False,
             shape=spec,
         )
     else:
@@ -2092,11 +2194,112 @@ def test_causal_zero_dropout_retains_generated_dispatch(
             dropout_p=0.0,
             causal=True,
             deterministic=deterministic,
+            return_attn_probs=False,
             shape=spec,
         )
 
     assert out is sentinel
     assert dispatched == [spec]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("grad", "grad-enabled"),
+        ("dropout", "with dropout"),
+        ("deterministic", "deterministic=False"),
+        ("alibi", "ALiBi"),
+        ("window", "sliding-window"),
+        ("softcap", "Gemma-2"),
+        ("noncausal", "causal GPT-2 profile"),
+        ("fp16", "causal GPT-2 profile"),
+        ("other-profile", "causal GPT-2 profile"),
+    ],
+)
+def test_causal_gpt2_return_attn_probs_rejects_out_of_scope_calls(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = CAUSAL_DROPOUT
+    q, k, v = make_inputs(spec, seed=31415)
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "return_attn_probs": True,
+        "shape": spec,
+    }
+    if case == "grad":
+        q.requires_grad_()
+    elif case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "noncausal":
+        kwargs["causal"] = False
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.nheads_q,
+            spec.head_dim,
+        )
+    elif case == "fp16":
+        q, k, v = (tensor.to(torch.float16) for tensor in (q, k, v))
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.nheads_q,
+            spec.head_dim,
+        )
+    else:
+        other = AttnShape(1, 7, 7, 2, 2, 32, torch.bfloat16, True)
+        q, k, v = make_inputs(other, seed=31415)
+        kwargs["shape"] = other
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
+        raise AssertionError("out-of-scope GPT-2 diagnostic reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_func(q, k, v, **kwargs)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["qkvpacked", "kvpacked"], ids=["qkv-packed", "kv-packed"]
+)
+def test_causal_gpt2_packed_diagnostics_reject_gradients(
+    entry_point: str,
+) -> None:
+    spec = CAUSAL_DROPOUT
+    q, k, v = make_inputs(spec, seed=27182)
+
+    with pytest.raises(NotImplementedError, match="grad-enabled"):
+        if entry_point == "qkvpacked":
+            qkv = torch.stack((q, k, v), dim=2).requires_grad_()
+            helion_attention.flash_attn_qkvpacked_func(
+                qkv, causal=True, return_attn_probs=True, shape=spec
+            )
+        else:
+            kv = torch.stack((k, v), dim=2).requires_grad_()
+            helion_attention.flash_attn_kvpacked_func(
+                q, kv, causal=True, return_attn_probs=True, shape=spec
+            )
 
 
 @requires_cuda

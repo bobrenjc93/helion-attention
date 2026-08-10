@@ -82,6 +82,16 @@ remain outside this BERT-base subset. For zero-dropout training, the same
 entry points accept `deterministic=True` with either scale and call PyTorch's
 repeatable math operator directly, without changing global SDPA backend flags.
 
+The checked-in causal bf16 GPT-2 profile
+`(2, 1024, 1024, 32, 32, 64)` likewise supports `return_attn_probs=True`
+through the dense, QKV-packed, and KV-packed entry points. A no-backward,
+zero-dropout call returns `(out, softmax_lse, S_dmask)` with fp32 LSE shaped
+`[2, 32, 1024]` and an empty bf16 `S_dmask`, matching FA2. The default and
+custom `softmax_scale` are supported. Diagnostic calls use the generic packed
+runtime, while output-only calls retain the generated specialization. Gradients,
+positive dropout, noncausal mode, deterministic mode, ALiBi, local windows,
+softcap, other dtypes, and other profiles remain outside this diagnostic subset.
+
 The three checked-in batch-1 Llama GQA decode profiles (one query token and a
 1K, 4K, or 16K KV sequence) support `return_attn_probs=True` through both
 `flash_attn_func` and `flash_attn_kvpacked_func`. For calls that do not require
@@ -710,10 +720,11 @@ also raise `NotImplementedError` rather than silently doing something else:
   outside the exact decode profile above, and KV-cache rotary outside the
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
   the exact full-head interleaved two-token append
-- `return_attn_probs=True` outside the no-backward BERT-base dense/QKV-packed/
-  KV-packed calls, dense/KV-packed calls for the three Llama GQA decode
-  profiles, dense/KV-packed calls for the causal bf16 Gemma-2 profile with
-  `softcap=50.0`, and the causal bf16 varlen profile described above
+- `return_attn_probs=True` outside the no-backward BERT-base and causal bf16
+  GPT-2 dense/QKV-packed/KV-packed calls, dense/KV-packed calls for the three
+  Llama GQA decode profiles, dense/KV-packed calls for the causal bf16 Gemma-2
+  profile with `softcap=50.0`, and the causal bf16 varlen profile described
+  above
 
 ## How the kernels are made
 

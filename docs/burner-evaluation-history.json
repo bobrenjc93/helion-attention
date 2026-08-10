@@ -2533,6 +2533,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:8e1e2c16789f73c7f046f7dc33be86043f8475a6",
+      "commit": "8e1e2c16789f73c7f046f7dc33be86043f8475a6",
+      "recordedAt": "2026-08-10T02:47:17.505Z",
+      "label": "base 8e1e2c1",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 91,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:115",
+      "recordedAt": "2026-08-10T02:47:17.505Z",
+      "label": "PR #115",
+      "kind": "leaf",
+      "prNumber": 115,
+      "title": "Return diagnostics for causal GPT-2 inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 57,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
