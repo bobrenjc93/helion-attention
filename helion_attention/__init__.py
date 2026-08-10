@@ -20,11 +20,11 @@ exactly a 511-token left plus current-token causal window for the bf16 batch-1
 Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime
 also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
-varlen profile, and read-only page-256 paged decode through both the core
-varlen and KV-cache APIs. The same runtime exposes page-256/page-512 decode
-with optional ALiBi through the core varlen API. The KV-cache adapter also uses
-the generic paged runtime for ALiBi on both exposed page-16 profiles and
-page-256/page-512 decode. Read-only causal 1K and both
+varlen profile, read-only page-256 core paged decode, and read-only
+page-256/page-512 KV-cache decode. The same runtime exposes
+page-256/page-512 decode with optional ALiBi through the core varlen API. The
+KV-cache adapter also uses the generic paged runtime for ALiBi on both exposed
+page-16 profiles and page-256/page-512 decode. Read-only causal 1K and both
 causal variants of 4K dense decode likewise
 use the generic runtime for a bounded Python-int prefix. Those profiles and
 causal 16K decode also use it for read-only CUDA-tensor-selected spans, while
@@ -129,7 +129,7 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
 _CORE_PAGED_GENERATED_PAGE_SIZE = 16
 _CORE_PAGED_VARLEN_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
 _PAGED_KVCACHE_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
-_PAGE256_PAGED_KVCACHE_SOFTCAP = 50.0
+_PAGED_KVCACHE_SOFTCAP = 50.0
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
 _ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
@@ -2653,14 +2653,15 @@ def _paged_kvcache_forward(
             )
     has_softcap = softcap != 0.0
     if has_softcap and (
-        softcap != _PAGE256_PAGED_KVCACHE_SOFTCAP
+        softcap != _PAGED_KVCACHE_SOFTCAP
         or requested != _CORE_PAGED_KVCACHE_SHAPE
-        or page_size != 256
+        or page_size not in (256, 512)
     ):
         raise NotImplementedError(
             "softcap=50.0 for paged KV caches is implemented only for the "
-            "read-only bf16 page-size-256 batch=4 seqlen_q=1 seqlen_k=1024 "
-            "nheads=8 (GQA 8:2) head_dim=128 decode profile"
+            "read-only bf16 page-size-256 or page-size-512 batch=4 "
+            "seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 "
+            "decode profile"
         )
     if return_softmax_lse and requested != _CORE_PAGED_KVCACHE_SHAPE:
         raise NotImplementedError(
@@ -2960,7 +2961,7 @@ def _paged_kvcache_forward(
     ):
         # The generated paged specialization intentionally stays on the lean
         # page-16 slope-free output-only contract. Reuse the vLLM-compatible
-        # single-launch runtime for page-256/page-512 decode, page-256 softcap,
+        # single-launch runtime for page-256/page-512 decode and softcap,
         # ALiBi, or the diagnostic return it already computes.
         check_paged_varlen_tensors(
             packed_q,
@@ -3103,13 +3104,12 @@ def flash_attn_with_kvcache(
     page-size-512 caches and supports both causal modes, which are equivalent
     for single-token bottom-right decode. Page-16 slope-free output-only calls
     route through :func:`flash_attn_varlen_func`; page-256 and page-512 calls
-    use the generic paged runtime. Page-256 additionally accepts exactly
+    use the generic paged runtime and additionally accept exactly
     ``softcap=50.0`` for forward-only calls. Both profiles support ragged
     logical caches. The page-16 profiles and the page-256/page-512 decode
     profile additionally accept forward-only fp32 ALiBi slopes shaped ``[8]``
     or ``[batch, 8]`` through the generic paged runtime (``[2, 8]`` for
-    chunked prefill and ``[4, 8]`` for decode). Page-512 decode does not support
-    softcap.
+    chunked prefill and ``[4, 8]`` for decode).
     The page-16 decode profile alone accepts a paired one-token K/V update when
     every ``cache_seqlens`` value is exactly 1023. The full logical block table
     must map to in-range, disjoint physical pages. The adapter writes offset 15
@@ -3179,9 +3179,10 @@ def flash_attn_with_kvcache(
     decode profile supports the same return for page sizes 16, 256, and 512
     through the generic single-launch paged runtime; page-16 slope-free
     output-only calls retain the generated specialization. The read-only
-    page-256 and page-512 decode paths also support that LSE return with ALiBi.
-    Their causal results follow FlashAttention 2's position-shifted ALiBi LSE
-    convention, while their noncausal results retain the mathematical LSE.
+    page-256 and page-512 decode paths also support that LSE return with ALiBi
+    or softcap. Their causal ALiBi results follow FlashAttention 2's
+    position-shifted LSE convention, while their noncausal ALiBi results retain
+    the mathematical LSE.
     Cache tensors created in inference mode must also be updated in inference
     mode, and an append requires disjoint query, K-cache, and V-cache memory.
     The paged update additionally requires a disjoint full logical block
@@ -3209,10 +3210,10 @@ def flash_attn_with_kvcache(
     page-16 final-slot slice above, paged rotary, and paged autograd are
     unsupported. Paged ALiBi LSE returns are limited to read-only page-256 and
     page-512 decode; updates, other profiles, and all other page sizes remain
-    unsupported. Paged softcap is unsupported for updates,
-    page-size-16 and page-size-512 caches, other profiles, ALiBi, windows, and
-    autograd. Paged softmax LSE is unsupported for chunked prefill, other
-    profiles, and page sizes other than 16, 256, or 512.
+    unsupported. Paged softcap is unsupported for updates, page-size-16 and
+    other page sizes, other profiles, ALiBi, windows, and autograd. Paged
+    softmax LSE is unsupported for chunked prefill, other profiles, and page
+    sizes other than 16, 256, or 512.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
@@ -3305,7 +3306,7 @@ def flash_attn_with_kvcache(
         # validation after shape normalization.
         allow_alibi=True,
         allowed_softcap=(
-            _PAGE256_PAGED_KVCACHE_SOFTCAP
+            _PAGED_KVCACHE_SOFTCAP
             if block_table is not None
             else None
         ),

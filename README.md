@@ -458,8 +458,8 @@ the default `causal=False` is equivalent to `causal=True`. The page-size-16
 profiles and page-size-256/page-size-512 decode also accept forward-only fp32
 ALiBi slopes shaped `[8]` or `[batch, 8]` (`[2, 8]` for chunked prefill and
 `[4, 8]` for decode). Page-size-512 decode supports the default or a custom
-scale, ALiBi, and an optional fp32 LSE return. For example, page-size-512 ALiBi
-is called as follows:
+scale and an optional fp32 LSE return, plus either exactly `softcap=50.0` or
+ALiBi. For example, page-size-512 ALiBi is called as follows:
 
 ```python
 B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 512
@@ -507,15 +507,14 @@ For ALiBi,
 causal decode follows FA2's position-shifted diagnostic convention: each
 single-query LSE is the mathematical value plus
 `slope * (cache_seqlen - 1)`; noncausal decode is unshifted. None of these
-read-only calls mutates the cache. Read-only page-size-256 decode additionally
-accepts exactly
-`softcap=50.0`, with the default or a custom scale and with or without the LSE
-return. `softcap=0` preserves the existing dispatch, including the generated
-path for page-size-16 output-only calls. Other caps, page sizes, and profiles,
-plus page-size-512 softcap calls, ALiBi with softcap, ALiBi with LSE outside
-the exact read-only page-size-256/page-size-512 decode profile, paged updates
-outside the exact final-slot slice above, rotary, windows, and autograd are
-rejected before dispatch. LSE on chunked
+read-only calls mutates the cache. Read-only page-size-256 and page-size-512
+decode additionally accept exactly `softcap=50.0`, with the default or a
+custom scale and with or without the LSE return. `softcap=0` preserves the
+existing dispatch, including the generated path for page-size-16 output-only
+calls. Other caps, page sizes, and profiles, ALiBi with softcap, ALiBi with LSE
+outside the exact read-only page-size-256/page-size-512 decode profile, paged
+updates outside the exact final-slot slice above, rotary, windows, and autograd
+are rejected before dispatch. LSE on chunked
 prefill, non-causal chunked prefill, every other paged profile, and every page
 size other than 16, 256, or 512 are also rejected before dispatch.
 
@@ -857,9 +856,10 @@ also raise `NotImplementedError` rather than silently doing something else:
   KV-cache window calls
 - softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
   causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
-  unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, or read-only core
-  paged-varlen and KV-cache page-size-256 decode `(4, 1, 1024, 8, 2, 128)` with
-  either decode-equivalent causal flag; the supported softcap cannot be
+  unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, read-only core
+  paged-varlen page-size-256 decode, or read-only KV-cache page-size-256 or
+  page-size-512 decode `(4, 1, 1024, 8, 2, 128)` with either decode-equivalent
+  causal flag; the supported softcap cannot be
   combined with dropout, ALiBi, local windows, or autograd; the dense/KV-packed
   Gemma-2 exception permits its diagnostic tuple described above, while only
   the paged KV-cache exception permits its documented LSE return
