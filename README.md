@@ -160,17 +160,19 @@ alignment, including zero output for fully masked query rows.
 
 One deliberately unregistered varlen profile is also callable through the
 generic packed Triton runtime: causal bf16 Llama-3 GQA with maximum shape
-`(4, 256, 256, 32, 8, 128)`. It supports only calls that do not require
-backward. Device-side `cu_seqlens_q` and `cu_seqlens_k` may independently
-describe ragged query and key lengths with different packed token totals;
-shared-offset self-attention continues to support mixed empty and nonempty
-slots. The unpacked and KV-packed entry points accept the default or a custom
-`softmax_scale`. They also accept forward-only fp32 ALiBi slopes shaped `[32]`
-or `[4, 32]`; slope-free calls retain their existing generic dispatch. Dropout,
-windows, softcap, deterministic mode, diagnostic returns, paged caches, and
-backward remain unsupported, including in combination with ALiBi. Because this
-is generic fallback coverage rather than a generated specialization,
-`is_varlen_shape_supported` remains false for the profile.
+`(4, 256, 256, 32, 8, 128)`. Device-side `cu_seqlens_q` and `cu_seqlens_k` may
+independently describe ragged query and key lengths with different packed token
+totals for calls that do not need backward; shared-offset self-attention
+continues to support mixed empty and nonempty slots. Zero-dropout backward is
+supported only when all four query and key sequences have length 256. Those
+full token totals are reshaped to one dense PyTorch SDPA call, providing output
+and Q/K/V gradients through the unpacked and KV-packed entry points with the
+default or a custom `softmax_scale`. The same entry points accept forward-only
+fp32 ALiBi slopes shaped `[32]` or `[4, 32]`; slope-free inference retains its
+existing generic dispatch. Ragged training, dropout, windows, softcap,
+deterministic mode, diagnostic returns, paged caches, and ALiBi backward remain
+unsupported. Because this is fallback coverage rather than a generated
+specialization, `is_varlen_shape_supported` remains false for the profile.
 
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
 symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for
@@ -683,11 +685,12 @@ training. The encoder-training profile, BERT-base profile, and causal GPT-2
 profile use PyTorch SDPA when `0 < dropout_p < 1`.
 Default-option dense MHA, GQA, and cross-attention calls without a generated
 backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
-causal masking. Packed varlen calls remain forward-only except for the two
+causal masking. Packed varlen calls remain forward-only except for the three
 exact full-length profiles (including finite symmetric-window backward on the
-noncausal profile) and the causal ragged query/key contract described above;
-KV-cache calls remain forward-only. These unsupported FlashAttention features
-also raise `NotImplementedError` rather than silently doing something else:
+noncausal profile) and the causal `(8, 512, 512, 16, 16, 64)` ragged query/key
+contract described above; KV-cache calls remain forward-only. These unsupported
+FlashAttention features also raise `NotImplementedError` rather than silently
+doing something else:
 
 - backward for dense or varlen ALiBi, ragged noncausal varlen batches,
   batches with no nonempty queries, ragged cross-attention batches with empty

@@ -9,7 +9,7 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
-varlen inference profile, ALiBi on that profile and both shipped varlen
+varlen profile, ALiBi on that profile and both shipped varlen
 profiles, symmetric windows on the shipped noncausal varlen profile, and
 diagnostics on the shipped causal varlen profile use a generic Triton forward
 kernel. That runtime also provides
@@ -24,14 +24,15 @@ Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
-profile, grad-enabled dense calls without a generated backward, both
+profile, grad-enabled dense calls without a generated backward, supported
 full-length varlen profiles, and ragged causal attention use PyTorch SDPA
 autograd. Full-length symmetric-window training on the shipped noncausal
 varlen profile uses the same bounded SDPA bridge. Deterministic zero-dropout
-BERT-base, causal GPT-2, and full-length causal varlen training use the direct
-math operator without changing process-wide SDPA backend state. The explicit
-shape validates these paths and makes specialization introspection independent
-of fallback coverage.
+BERT-base, causal GPT-2, and full-length causal
+``(8, 512, 512, 16, 16, 64)`` varlen training use the direct math operator
+without changing process-wide SDPA backend state. The explicit shape validates
+these paths and makes specialization introspection independent of fallback
+coverage.
 """
 
 from __future__ import annotations
@@ -134,12 +135,12 @@ _CUDNN_SDPA_FAST_PATH_KEYS = frozenset(
         "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
     }
 )
-_LLAMA3_VARLEN_INFERENCE_KEY = (
+_LLAMA3_VARLEN_KEY = (
     "varlen_b4_sq256_sk256_hq32_hkv8_d128_bf16_causal"
 )
 _VARLEN_ALIBI_KEYS = frozenset(
     {
-        _LLAMA3_VARLEN_INFERENCE_KEY,
+        _LLAMA3_VARLEN_KEY,
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
@@ -152,6 +153,7 @@ _VARLEN_SOFTCAP_KEY = _VARLEN_DIAGNOSTIC_KEY
 _VARLEN_SOFTCAP = 50.0
 _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
     {
+        _LLAMA3_VARLEN_KEY,
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
@@ -1149,7 +1151,7 @@ def _generic_varlen_forward(
     softmax_scale: float,
     spec: AttnShape,
 ) -> torch.Tensor:
-    """Run the exact validated Llama-3 varlen inference profile generically."""
+    """Run the exact validated Llama-3 varlen profile generically."""
     # This intentionally is not a general missing-specialization fallback.
     # Both cumulative-length tensors remain device-resident, preserving
     # graph-capturable ragged self- and cross-attention lengths.
@@ -1678,14 +1680,18 @@ def flash_attn_varlen_func(
     slopes shaped ``[32]`` or ``[4, 32]`` under the same forward-only contract.
 
     Causal bf16 Llama-3 GQA attention with maximum shape
-    ``(4, 256, 256, 32, 8, 128)`` is also supported when no backward or
-    incompatible optional feature is requested. Its device-resident query and
-    key offsets may independently describe arbitrary ragged lengths.
+    ``(4, 256, 256, 32, 8, 128)`` is also supported. Zero-dropout backward is
+    available only when all four query and key sequences have length 256;
+    these full token totals are reshaped into one dense PyTorch SDPA call.
+    Its device-resident query and key offsets may independently describe
+    arbitrary ragged lengths for calls that do not need backward.
     Shared-offset self-attention continues to support a mix of empty and
     nonempty slots. This unregistered profile uses the generic packed Triton
     runtime and accepts the default or a custom ``softmax_scale``, with or
-    without the ALiBi slopes described above. Registered profiles retain
-    generated dispatch.
+    without the forward-only ALiBi slopes described above. Full-length
+    training accepts either scale through the unpacked and KV-packed APIs;
+    ragged training and all deterministic calls remain unsupported.
+    Registered profiles retain generated dispatch.
 
     The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
@@ -1761,13 +1767,11 @@ def flash_attn_varlen_func(
             f"({max_seqlen_q}, {max_seqlen_k})"
         )
 
-    is_llama3_varlen_inference = (
-        f"varlen_{spec.key}" == _LLAMA3_VARLEN_INFERENCE_KEY
-    )
-    if is_llama3_varlen_inference and deterministic:
+    is_llama3_varlen = f"varlen_{spec.key}" == _LLAMA3_VARLEN_KEY
+    if is_llama3_varlen and deterministic:
         raise NotImplementedError(
             "deterministic=True is not implemented for the Llama-3 varlen "
-            "inference profile"
+            "profile"
         )
 
     has_symmetric_window = window != (-1, -1)
@@ -1917,8 +1921,7 @@ def flash_attn_varlen_func(
             supported = ", ".join(sorted(_VARLEN_SDPA_BACKWARD_KEYS))
             raise NotImplementedError(
                 "varlen backward is implemented only for "
-                f"{supported} with eight full-length "
-                "sequences"
+                f"{supported} with each profile's exact full-length batch"
             )
         full_length = _has_full_varlen_token_totals(q, k, spec)
         if deterministic and (
@@ -2029,7 +2032,7 @@ def flash_attn_varlen_func(
             spec,
             alibi_slopes,
         )
-    if is_llama3_varlen_inference:
+    if is_llama3_varlen:
         return _generic_varlen_forward(
             q,
             k,

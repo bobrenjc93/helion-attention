@@ -1084,7 +1084,9 @@ def test_ragged_causal_varlen_packed_adapters_match_fp32_and_fa2(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "spec",
+    (*VARLEN_ALIBI_PROFILES, LLAMA3_VARLEN_INFERENCE),
+    ids=["causal", "noncausal", "llama3-gqa"],
 )
 def test_full_varlen_backward_matches_fp32_and_fa2(
     softmax_scale: float | None, spec: AttnShape
@@ -1123,7 +1125,14 @@ def test_full_varlen_backward_matches_fp32_and_fa2(
         if softmax_scale is None
         else softmax_scale
     )
-    fp32_gradient_atol = 8e-2 if spec.causal else 5e-2
+    is_llama3_custom_scale = (
+        spec == LLAMA3_VARLEN_INFERENCE and softmax_scale is not None
+    )
+    # GQA K/V gradients accumulate four bf16 query-head contributions.
+    fp32_gradient_atol = 1.5e-1 if is_llama3_custom_scale else 8e-2
+    if not spec.causal:
+        fp32_gradient_atol = 5e-2
+    fa2_gradient_atol = 1.5e-1 if is_llama3_custom_scale else 2e-2
     q_ref = q.float().detach().requires_grad_()
     k_ref = k.float().detach().requires_grad_()
     v_ref = v.float().detach().requires_grad_()
@@ -1172,7 +1181,10 @@ def test_full_varlen_backward_matches_fp32_and_fa2(
             actual.float(), reference, atol=fp32_gradient_atol, rtol=2e-2
         )
         torch.testing.assert_close(
-            actual.float(), reference_fa2.float(), atol=2e-2, rtol=2e-2
+            actual.float(),
+            reference_fa2.float(),
+            atol=fa2_gradient_atol,
+            rtol=2e-2,
         )
 
 
@@ -1311,15 +1323,37 @@ def test_deterministic_full_causal_varlen_training_is_repeatable_and_matches_ref
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "name",
-    ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
-    ids=["qkv-packed", "kv-packed"],
+    ("name", "spec"),
+    [
+        pytest.param(
+            "flash_attn_varlen_qkvpacked_func",
+            VARLEN_ALIBI_CAUSAL,
+            id="causal-qkv-packed",
+        ),
+        pytest.param(
+            "flash_attn_varlen_kvpacked_func",
+            VARLEN_ALIBI_CAUSAL,
+            id="causal-kv-packed",
+        ),
+        pytest.param(
+            "flash_attn_varlen_qkvpacked_func",
+            VARLEN_ALIBI_NONCAUSAL,
+            id="noncausal-qkv-packed",
+        ),
+        pytest.param(
+            "flash_attn_varlen_kvpacked_func",
+            VARLEN_ALIBI_NONCAUSAL,
+            id="noncausal-kv-packed",
+        ),
+        pytest.param(
+            "flash_attn_varlen_kvpacked_func",
+            LLAMA3_VARLEN_INFERENCE,
+            id="llama3-gqa-kv-packed",
+        ),
+    ],
 )
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
-)
-@pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
 )
 def test_full_varlen_packed_adapters_match_fp32_and_fa2(
     name: str, softmax_scale: float | None, spec: AttnShape
@@ -1340,9 +1374,15 @@ def test_full_varlen_packed_adapters_match_fp32_and_fa2(
         if softmax_scale is None
         else softmax_scale
     )
-    fp32_gradient_atol = (
-        8e-2 if spec.causal or softmax_scale is not None else 5e-2
+    is_llama3_custom_scale = (
+        spec == LLAMA3_VARLEN_INFERENCE and softmax_scale is not None
     )
+    fp32_gradient_atol = 5e-2
+    if spec.causal or softmax_scale is not None:
+        fp32_gradient_atol = 8e-2
+    if is_llama3_custom_scale:
+        fp32_gradient_atol = 1.5e-1
+    fa2_gradient_atol = 1.5e-1 if is_llama3_custom_scale else 2e-2
 
     if name == "flash_attn_varlen_qkvpacked_func":
         qkv = torch.stack((q, k, v), dim=1).requires_grad_()
@@ -1440,7 +1480,10 @@ def test_full_varlen_packed_adapters_match_fp32_and_fa2(
             actual.float(), reference, atol=fp32_gradient_atol, rtol=2e-2
         )
         torch.testing.assert_close(
-            actual.float(), reference_fa2.float(), atol=2e-2, rtol=2e-2
+            actual.float(),
+            reference_fa2.float(),
+            atol=fa2_gradient_atol,
+            rtol=2e-2,
         )
 
 
@@ -2395,7 +2438,11 @@ def test_llama3_varlen_without_alibi_retains_existing_dispatch(
 
 
 @requires_cuda
-def test_llama3_varlen_rejects_gradients_before_generic_dispatch(
+@pytest.mark.parametrize(
+    "entry_point", ["unpacked", "kvpacked"], ids=["unpacked", "kv-packed"]
+)
+def test_llama3_varlen_ragged_training_rejects_before_generic_dispatch(
+    entry_point: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = LLAMA3_VARLEN_INFERENCE
@@ -2410,18 +2457,30 @@ def test_llama3_varlen_rejects_gradients_before_generic_dispatch(
     monkeypatch.setattr(
         helion_attention, "_generic_varlen_forward", reject_generic
     )
-    with pytest.raises(NotImplementedError, match="varlen backward"):
-        helion_attention.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            spec.seqlen_q,
-            spec.seqlen_k,
-            causal=True,
-            shape=spec,
-        )
+    with pytest.raises(NotImplementedError, match="ragged varlen backward"):
+        if entry_point == "unpacked":
+            helion_attention.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens,
+                cu_seqlens,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=True,
+                shape=spec,
+            )
+        else:
+            helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=1),
+                cu_seqlens,
+                cu_seqlens,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=True,
+                shape=spec,
+            )
 
 
 @requires_cuda
