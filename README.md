@@ -859,10 +859,12 @@ also raise `NotImplementedError` rather than silently doing something else:
 - dropout outside the exact encoder-training, BERT-base, and causal GPT-2
   profiles above, or combined with ALiBi, diagnostic returns, local windows,
   softcap, or deterministic mode
-- sliding-window attention outside finite symmetric calls on the noncausal
-  bf16 varlen self-attention profile and the exact full-cache 4K dense KV-cache
-  decode exception above, including ragged windowed backward and all other
-  KV-cache window calls
+- sliding-window attention outside these exceptions: finite symmetric
+  `window_size=(radius, radius)` (`radius >= 0`) on the noncausal bf16 varlen
+  self-attention profile, exact `window_size=(127, 0)` on the causal bf16
+  varlen profile, and exact `window_size=(511, 0)` on the causal dense 2K
+  profile and the full-cache 4K KV-cache decode profile above; ragged windowed
+  backward and all other KV-cache window calls remain unsupported
 - softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
   causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
   unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, read-only core
