@@ -339,13 +339,17 @@ support LSE, updates, tensor-selected spans, cache remapping, left padding,
 rotary, windows, softcap, or autograd.
 
 The exact causal bf16 `(1, 1, 1024, 32, 8, 128)` profile accepts a read-only
-Python integer `cache_seqlens` from 1 through 1024, with the default or a custom
-`softmax_scale` and optional fp32 LSE. Partial values use the generic packed
-Triton runtime and never mutate the cache. Omitting the length or passing 1024
-retains the checked-in generated dispatch, as does the existing final-slot
-append at position 1023. Noncausal calls, tensor-valued lengths, left padding,
-cache remapping, rotary, ALiBi, windows, softcap, explicit split counts,
-autograd, and non-final updates remain unsupported for this 1K prefix mode.
+Python integer `cache_seqlens` from 1 through 1024. It also accepts a contiguous
+CUDA int32 tensor shaped `[1]`; an optional matching `cache_leftpad` selects
+`[cache_leftpad, cache_seqlens)`, with
+`0 <= cache_leftpad < cache_seqlens <= 1024`. Both forms support the default or
+a custom `softmax_scale` and optional fp32 LSE, use the generic packed Triton
+runtime for partial or tensor-selected spans, and never mutate the cache.
+Omitting the length or passing 1024 as a Python integer retains the checked-in
+generated dispatch, as does the existing final-slot append at position 1023.
+Tensor spans reject updates, cache remapping, rotary, ALiBi, windows, softcap,
+explicit split counts, autograd, and CUDA graph capture. Noncausal tensor spans
+and tensor spans on other 1K profiles remain unsupported.
 
 The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
 through 4095 for read-only prefix attention, optionally with ALiBi as described
@@ -396,11 +400,11 @@ and `cache_leftpad` changes it to `[cache_leftpad, cache_seqlens)`, with
 a custom `softmax_scale` and optional fp32 LSE. This path synchronizes once to
 check bounds recoverably, so it rejects CUDA graph capture and autograd.
 `cache_leftpad` is not supported with updates, cache remapping, rotary, paged
-caches, or profiles outside the exact 4K and causal 16K slices. Omitting the
-length or passing the full length as a Python integer retains the checked-in
-split-KV generated kernel. Those full, read-only calls also accept
-`num_splits=16`, matching the generated kernel's fixed split count. Other
-explicit split counts, profiles, tensor spans, updates, rotary calls, and
+caches, or profiles outside the exact causal 1K, either-causal 4K, and causal
+16K slices. Omitting the length or passing the full length as a Python integer
+retains the checked-in split-KV generated kernel. Those full, read-only calls
+also accept `num_splits=16`, matching the generated kernel's fixed split count.
+Other explicit split counts, profiles, tensor spans, updates, rotary calls, and
 autograd are rejected before dispatch.
 
 Two exact bf16 profiles also accept a read-only paged cache through
@@ -809,9 +813,9 @@ also raise `NotImplementedError` rather than silently doing something else:
 - KV-cache mutation beyond the dense paired one-token final-slot append, the
   exact 4K partial one-token append, and exact two-token final-two-slot append
   above; the exact four-token profile is read-only;
-  dense tensor lengths outside the exact either-causal 4K and causal 16K
-  profiles above, scalar partial caches outside the exact causal 1K and
-  either-causal 4K profiles above, `cache_leftpad` outside those tensor-span
+  dense tensor lengths outside the exact causal 1K, either-causal 4K, and
+  causal 16K profiles above, scalar partial caches outside the exact causal 1K
+  and either-causal 4K profiles above, `cache_leftpad` outside those tensor-span
   profiles or combined with updates, remapping, rotary, or autograd, paged
   profiles and page sizes other than the exact read-only page-size-16 profiles
   and page-size-256 and page-size-512 decode above, paged LSE outside the exact
