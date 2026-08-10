@@ -7660,11 +7660,17 @@ def test_kvcache_4k_partial_append_matches_fa2_and_fp32(
     [False, True],
     ids=["output", "output-lse"],
 )
+@pytest.mark.parametrize(
+    "rotary_dim",
+    [64, 128],
+    ids=["half-head", "full-head"],
+)
 def test_kvcache_4k_partial_rotary_append_matches_fa2_and_fp32(
     position: int,
     softmax_scale: float | None,
     causal: bool,
     return_softmax_lse: bool,
+    rotary_dim: int,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     manifest_spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
@@ -7693,7 +7699,9 @@ def test_kvcache_4k_partial_rotary_append_matches_fa2_and_fp32(
         dtype=spec.dtype,
         generator=generator,
     )
-    rotary_cos, rotary_sin = make_rotary_tables(spec, seed=20260816)
+    rotary_cos, rotary_sin = make_rotary_tables(
+        spec, rotary_dim=rotary_dim, seed=20260816
+    )
     rotated_q = reference_interleaved_rotary(
         q, rotary_cos, rotary_sin, position
     )
@@ -7757,6 +7765,8 @@ def test_kvcache_4k_partial_rotary_append_matches_fa2_and_fp32(
 
     assert torch.equal(q_helion, q)
     assert torch.equal(q_fa2, q)
+    assert torch.equal(rotated_q[..., rotary_dim:], q[..., rotary_dim:])
+    assert torch.equal(rotated_k[..., rotary_dim:], new_k[..., rotary_dim:])
     assert k_helion.data_ptr() == k_pointer
     assert v_helion.data_ptr() == v_pointer
     assert torch.equal(k_helion, expected_k)
@@ -7914,16 +7924,28 @@ def test_kvcache_4k_final_slot_append_retains_generated_dispatch(
     ("case", "error", "message"),
     [
         pytest.param(
-            "partial-rotary",
+            "rotary-dim-32",
             NotImplementedError,
-            "full-head interleaved",
-            id="partial-rotary",
+            "partial rotary dimensions",
+            id="rotary-dim-32",
         ),
         pytest.param(
-            "neox-rotary",
+            "rotary-dim-96",
             NotImplementedError,
-            "full-head interleaved",
-            id="neox-rotary",
+            "partial rotary dimensions",
+            id="rotary-dim-96",
+        ),
+        pytest.param(
+            "neox-half-head-rotary",
+            NotImplementedError,
+            "only interleaved rotary",
+            id="neox-half-head-rotary",
+        ),
+        pytest.param(
+            "neox-full-head-rotary",
+            NotImplementedError,
+            "only interleaved rotary",
+            id="neox-full-head-rotary",
         ),
         pytest.param(
             "tensor-length",
@@ -7979,7 +8001,9 @@ def test_kvcache_4k_partial_append_rejects_before_mutation(
     original_v = v_cache.clone()
     new_k = k_cache[:, :1].clone()
     new_v = v_cache[:, :1].clone()
-    rotary_cos, rotary_sin = make_rotary_tables(spec, seed=20260817)
+    rotary_cos, rotary_sin = make_rotary_tables(
+        spec, rotary_dim=64, seed=20260817
+    )
     kwargs: dict[str, object] = {
         "k": new_k,
         "v": new_v,
@@ -7989,13 +8013,21 @@ def test_kvcache_4k_partial_append_rejects_before_mutation(
         "causal": spec.causal,
         "shape": spec,
     }
-    if case == "partial-rotary":
-        partial_cos, partial_sin = make_rotary_tables(
-            spec, rotary_dim=64, seed=20260818
+    if case.startswith("rotary-dim-"):
+        unsupported_dim = int(case.removeprefix("rotary-dim-"))
+        unsupported_cos, unsupported_sin = make_rotary_tables(
+            spec, rotary_dim=unsupported_dim, seed=20260818
         )
-        kwargs.update(rotary_cos=partial_cos, rotary_sin=partial_sin)
-    elif case == "neox-rotary":
+        kwargs.update(rotary_cos=unsupported_cos, rotary_sin=unsupported_sin)
+    elif case == "neox-half-head-rotary":
         kwargs["rotary_interleaved"] = False
+    elif case == "neox-full-head-rotary":
+        full_cos, full_sin = make_rotary_tables(spec, seed=20260819)
+        kwargs.update(
+            rotary_cos=full_cos,
+            rotary_sin=full_sin,
+            rotary_interleaved=False,
+        )
     elif case == "tensor-length":
         kwargs["cache_seqlens"] = torch.tensor(
             [position], device=q.device, dtype=torch.int32

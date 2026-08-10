@@ -3073,6 +3073,36 @@
         "eval_5b403bea": 96,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:3491206546aedba276ad630c360d9f8d93d645e1",
+      "commit": "3491206546aedba276ad630c360d9f8d93d645e1",
+      "recordedAt": "2026-08-10T11:50:44.140Z",
+      "label": "base 3491206",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:137",
+      "recordedAt": "2026-08-10T11:50:44.140Z",
+      "label": "PR #137",
+      "kind": "leaf",
+      "prNumber": 137,
+      "title": "Allow half-head rotary on partial 4K appends",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
