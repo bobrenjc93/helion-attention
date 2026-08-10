@@ -51,6 +51,7 @@ PERSISTENT_CAUSAL_KEYS = {
     "b4_sq8192_sk8192_hq28_hkv4_d128_bf16_causal",
 }
 PERSISTENT_CAUSAL_D64_KEY = "b8_sq2048_sk2048_hq16_hkv16_d64_bf16_causal"
+TILE_PARALLEL_CAUSAL_D32_KEY = "b8_sq1024_sk1024_hq8_hkv8_d32_bf16_causal"
 SPLIT_KV_DECODE_16K_KEY = "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
 SPLIT_KV_DECODE_SPLITS = 16
 AUTOTUNE_ACCEPTANCE_REPEAT = 100
@@ -62,6 +63,8 @@ if TYPE_CHECKING:
 
 def select_dense_kernel_name(spec: "AttnShape") -> str:
     """Choose a Helion source without applying shape-specific configs broadly."""
+    if spec.key == TILE_PARALLEL_CAUSAL_D32_KEY:
+        return "causal_attention_bshd_d32_1k"
     if spec.key == PERSISTENT_CAUSAL_D64_KEY:
         return "causal_attention_bshd_d64"
     if spec.key in PERSISTENT_CAUSAL_KEYS:

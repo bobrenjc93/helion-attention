@@ -2227,6 +2227,48 @@
     },
     {
       "autotuning_provenance": {
+        "autotuning_wall_time_seconds": 0.0,
+        "configs": [
+          {
+            "config": {
+              "block_sizes": [
+                64,
+                64
+              ],
+              "indexing": [
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer",
+                "pointer"
+              ],
+              "num_stages": 3,
+              "num_warps": 4,
+              "pid_type": "flat"
+            },
+            "kernel": "causal_attention_bshd_16k"
+          }
+        ],
+        "helion_version": "1.4.0",
+        "measured_time_ms": 0.034656,
+        "selection": "fixed"
+      },
+      "backward": false,
+      "batch": 8,
+      "causal": true,
+      "description": "batch=8 seqlen_q=1024 seqlen_k=1024 nheads=8 head_dim=32 dtype=bf16 causal=True",
+      "dtype": "bf16",
+      "head_dim": 32,
+      "key": "b8_sq1024_sk1024_hq8_hkv8_d32_bf16_causal",
+      "nheads_kv": 8,
+      "nheads_q": 8,
+      "note": "small-model decoder",
+      "seqlen_k": 1024,
+      "seqlen_q": 1024,
+      "varlen": false
+    },
+    {
+      "autotuning_provenance": {
         "autotuning_wall_time_seconds": 344.092,
         "configs": [
           {
