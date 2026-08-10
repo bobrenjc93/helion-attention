@@ -115,7 +115,8 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
     {_CORE_PAGED_CHUNKED_PREFILL_SHAPE, _CORE_PAGED_KVCACHE_SHAPE}
 )
 _CORE_PAGED_GENERATED_PAGE_SIZE = 16
-_CORE_PAGED_DECODE_PAGE_SIZES = frozenset({16, 256})
+_CORE_PAGED_VARLEN_DECODE_PAGE_SIZES = frozenset({16, 256})
+_PAGED_KVCACHE_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
 _PAGE256_PAGED_KVCACHE_SOFTCAP = 50.0
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
 _INT32_MAX = 2**31 - 1
@@ -492,7 +493,7 @@ def _check_core_paged_varlen_spec(spec: AttnShape, page_size: int) -> None:
         page_size == _CORE_PAGED_GENERATED_PAGE_SIZE
         or (
             requested == _CORE_PAGED_KVCACHE_SHAPE
-            and page_size in _CORE_PAGED_DECODE_PAGE_SIZES
+            and page_size in _CORE_PAGED_VARLEN_DECODE_PAGE_SIZES
         )
     )
     if (
@@ -529,7 +530,7 @@ def _check_core_paged_kvcache_spec(spec: AttnShape, page_size: int) -> None:
         page_size == _CORE_PAGED_GENERATED_PAGE_SIZE
         or (
             requested == _CORE_PAGED_KVCACHE_SHAPE
-            and page_size in _CORE_PAGED_DECODE_PAGE_SIZES
+            and page_size in _PAGED_KVCACHE_DECODE_PAGE_SIZES
         )
     )
     if (
@@ -543,7 +544,8 @@ def _check_core_paged_kvcache_spec(spec: AttnShape, page_size: int) -> None:
             "    batch=2 seqlen_q=200 seqlen_k=320 nheads=8 (GQA 8:2) "
             "head_dim=128 causal=True page_size=16\n"
             "    batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
-            "head_dim=128 causal=True or causal=False page_size=16 or 256\n"
+            "head_dim=128 causal=True or causal=False page_size=16, 256, "
+            "or 512\n"
             f"got:\n    {spec.describe()}, page_size={page_size}"
         )
 
@@ -2378,8 +2380,8 @@ def _paged_kvcache_forward(
     if return_softmax_lse and requested != _CORE_PAGED_KVCACHE_SHAPE:
         raise NotImplementedError(
             "return_softmax_lse=True for paged KV caches is implemented only "
-            "for the bf16 page-size-16 or page-size-256 batch=4 seqlen_q=1 "
-            "seqlen_k=1024 "
+            "for the bf16 page-size-16, page-size-256, or page-size-512 "
+            "batch=4 seqlen_q=1 seqlen_k=1024 "
             "nheads=8 (GQA 8:2) head_dim=128 decode profile"
         )
     if alibi_slopes is not None:
@@ -2494,7 +2496,7 @@ def _paged_kvcache_forward(
     ):
         # The generated paged specialization intentionally stays on the lean
         # page-16 slope-free output-only contract. Reuse the vLLM-compatible
-        # single-launch runtime for page-256 decode and its softcap support,
+        # single-launch runtime for page-256/page-512 decode, page-256 softcap,
         # ALiBi, or the diagnostic return it already computes.
         check_paged_varlen_tensors(
             packed_q,
@@ -2629,15 +2631,17 @@ def flash_attn_with_kvcache(
     ``cache_seqlens`` tensor shaped ``[batch]`` and ``block_table``. Bf16
     ``(2, 200, 320, 8, 2, 128)`` accepts page-size-16 caches and supports only
     ``causal=True`` and uses bottom-right causal alignment for chunked prefill.
-    Bf16 ``(4, 1, 1024, 8, 2, 128)`` accepts page-size-16 or page-size-256
-    caches and supports both causal modes, which are equivalent for
-    single-token bottom-right decode. Page-16 slope-free output-only calls
-    route through :func:`flash_attn_varlen_func`; page-256 calls use the generic
-    paged runtime and accept exactly ``softcap=50.0`` for forward-only calls.
-    Both profiles support ragged logical caches. The page-16 profiles and the
-    page-256 decode profile additionally accept forward-only fp32 ALiBi slopes
-    shaped ``[8]`` or ``[batch, 8]`` through the generic paged runtime
-    (``[2, 8]`` for chunked prefill and ``[4, 8]`` for decode).
+    Bf16 ``(4, 1, 1024, 8, 2, 128)`` accepts page-size-16, page-size-256, or
+    page-size-512 caches and supports both causal modes, which are equivalent
+    for single-token bottom-right decode. Page-16 slope-free output-only calls
+    route through :func:`flash_attn_varlen_func`; page-256 and page-512 calls
+    use the generic paged runtime. Page-256 additionally accepts exactly
+    ``softcap=50.0`` for forward-only calls. Both profiles support ragged
+    logical caches. The page-16 profiles and the page-256 decode profile
+    additionally accept forward-only fp32 ALiBi slopes shaped ``[8]`` or
+    ``[batch, 8]`` through the generic paged runtime (``[2, 8]`` for chunked
+    prefill and ``[4, 8]`` for decode). Page-512 decode does not support ALiBi
+    or softcap.
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
@@ -2687,13 +2691,13 @@ def flash_attn_with_kvcache(
     cache slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
-    decode profile supports the same return for page sizes 16 and 256 through
-    the generic single-launch paged runtime; page-16 slope-free output-only
-    calls retain the generated specialization. The read-only page-256 decode
-    path also supports that LSE return with ALiBi. Its causal result follows
-    FlashAttention 2's position-shifted ALiBi LSE convention, while its
-    noncausal result retains the mathematical LSE. Cache tensors created in
-    inference mode must also be updated in inference mode, and an
+    decode profile supports the same return for page sizes 16, 256, and 512
+    through the generic single-launch paged runtime; page-16 slope-free
+    output-only calls retain the generated specialization. The read-only
+    page-256 decode path also supports that LSE return with ALiBi. Its causal
+    result follows FlashAttention 2's position-shifted ALiBi LSE convention,
+    while its noncausal result retains the mathematical LSE. Cache tensors
+    created in inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
     lengths and left padding on updates or outside the exact either-causal 4K
     and causal 16K profiles, scalar partial lengths outside the exact causal 1K
@@ -2715,9 +2719,9 @@ def flash_attn_with_kvcache(
     unsupported for both paged profiles. Paged ALiBi LSE returns are limited to
     read-only page-256 decode; updates, other profiles, and all other page sizes
     remain unsupported. Paged softcap is unsupported for updates,
-    page-size-16 caches, other profiles, ALiBi, windows, and autograd. Paged
-    softmax LSE is unsupported for chunked prefill, other profiles, and page
-    sizes other than 16 or 256.
+    page-size-16 and page-size-512 caches, other profiles, ALiBi, windows, and
+    autograd. Paged softmax LSE is unsupported for chunked prefill, other
+    profiles, and page sizes other than 16, 256, or 512.
     """
     if (k is None) != (v is None):
         raise ValueError("k and v must be provided together when updating the KV cache")
