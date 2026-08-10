@@ -377,9 +377,12 @@ a custom `softmax_scale` and optional fp32 LSE, use the generic packed Triton
 runtime for partial or tensor-selected spans, and never mutate the cache.
 Omitting the length or passing 1024 as a Python integer retains the checked-in
 generated dispatch, as does the existing final-slot append at position 1023.
-Tensor spans reject updates, cache remapping, rotary, ALiBi, windows, softcap,
-explicit split counts, autograd, and CUDA graph capture. Noncausal tensor spans
-and tensor spans on other 1K profiles remain unsupported.
+That append also accepts the exact CUDA int32 tensor value `[1023]`, leaves the
+length tensor unchanged, supports either scale and optional fp32 LSE, and
+retains the same generated dispatch. Other tensor values remain read-only.
+Tensor updates reject left padding, cache remapping, rotary, ALiBi, windows,
+softcap, explicit split counts, autograd, and CUDA graph capture. Noncausal
+tensor spans and tensor spans on other 1K profiles remain unsupported.
 
 The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
 through 4095 for read-only prefix attention, optionally with ALiBi as described
@@ -531,8 +534,10 @@ are rejected before dispatch. LSE on chunked
 prefill, non-causal chunked prefill, every other paged profile, and every page
 size other than 16, 256, or 512 are also rejected before dispatch.
 
-The single-token dense decode paths append one paired K/V token when a scalar
-cache length points at the final slot declared by `shape`:
+The single-token dense decode paths append one paired K/V token when a Python
+integer cache length points at the final slot declared by `shape`. The exact
+causal bf16 1K profile also accepts a CUDA int32 `[1023]` tensor for this
+update:
 
 ```python
 new_k = torch.randn(B, 1, H_KV, D, device="cuda", dtype=torch.bfloat16)
@@ -569,17 +574,18 @@ causal flag, and the exact causal 16K profile accepts its tensor prefix or
 left-padded span.
 Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`, except
 for the exact 4K non-final appends above; the exact two-token update accepts
-`0 <= cache_seqlens <= 1022`. Other multi-token updates, scalar partial lengths
-outside the exact causal single-token and four-token 1K and either-causal 4K
-read-only profiles, non-final appends outside the exact 4K one-token and 1K
-two-token profiles, and tensor lengths on every other dense profile are
-rejected explicitly. Caches created
+`0 <= cache_seqlens <= 1022`. Tensor-valued updates are limited to `[1023]` on
+the exact causal bf16 1K profile. Other multi-token updates, scalar partial
+lengths outside the exact causal single-token and four-token 1K and
+either-causal 4K read-only profiles, non-final appends outside the exact 4K
+one-token and 1K two-token profiles, and tensor lengths on every other dense
+profile are rejected explicitly. Caches created
 inside `torch.inference_mode()` must be updated while that mode remains
 enabled. For an append, `q`, `k_cache`, and `v_cache` must occupy disjoint
 memory; update `k`/`v` aliases are staged safely.
 
-The one-token final-slot append accepts paired, contiguous `rotary_cos` and
-`rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
+The Python-integer one-token final-slot append accepts paired, contiguous
+`rotary_cos` and `rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
 `seqlen_ro >= S_CACHE` and the same CUDA dtype/device as `q`. The default
 interleaved layout rotates adjacent pairs in `q` and `new_k` at position
 `cache_seqlens`; the rotated key is what the cache stores. `rotary_dim` may be
@@ -903,7 +909,8 @@ raise `NotImplementedError` rather than silently doing something else:
   exact page-16 paged final-slot append at four device lengths of 1023 above;
   the exact four-token profile is read-only;
   dense tensor lengths outside the exact causal single-token 1K, either-causal
-  4K, and causal 16K profiles above, scalar partial caches outside the exact
+  4K, and causal 16K profiles above, dense tensor updates outside the exact
+  causal 1K `[1023]` slice, scalar partial caches outside the exact
   causal single-token and four-token 1K and either-causal 4K profiles above,
   `cache_leftpad` outside those tensor-span profiles or combined with updates,
   remapping, rotary, or autograd, paged

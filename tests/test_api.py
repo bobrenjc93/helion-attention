@@ -8136,7 +8136,13 @@ def test_kvcache_1k_full_lengths_retain_generated_dispatch(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "tensor_length",
+    [False, True],
+    ids=["python-int", "cuda-int32-tensor"],
+)
 def test_kvcache_1k_final_slot_append_retains_generated_dispatch(
+    tensor_length: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
@@ -8144,6 +8150,16 @@ def test_kvcache_1k_final_slot_append_retains_generated_dispatch(
     q, k_cache, v_cache = make_inputs(spec, seed=20260821)
     new_k = k_cache[:, :1].clone()
     new_v = v_cache[:, :1].clone()
+    cache_seqlens: int | torch.Tensor = (
+        torch.tensor([position], device=q.device, dtype=torch.int32)
+        if tensor_length
+        else position
+    )
+    original_cache_seqlens = (
+        cache_seqlens.clone()
+        if isinstance(cache_seqlens, torch.Tensor)
+        else None
+    )
     marker = torch.empty_like(q)
     lookup_calls: list[AttnShape] = []
 
@@ -8171,13 +8187,288 @@ def test_kvcache_1k_final_slot_append_retains_generated_dispatch(
         v_cache,
         k=new_k,
         v=new_v,
-        cache_seqlens=position,
+        cache_seqlens=cache_seqlens,
         causal=True,
         shape=spec,
     )
 
     assert result is marker
     assert lookup_calls == [spec]
+    if isinstance(cache_seqlens, torch.Tensor):
+        assert torch.equal(cache_seqlens, original_cache_seqlens)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["output", "output-lse"],
+)
+def test_kvcache_1k_tensor_final_slot_append_matches_fa2_and_fp32(
+    softmax_scale: float | None,
+    return_softmax_lse: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, initial_k, initial_v = make_inputs(spec, seed=20260823)
+    new_k = initial_k[:, :1].clone()
+    new_v = initial_v[:, :1].clone()
+    position = spec.seqlen_k - 1
+    cache_seqlens = torch.tensor(
+        [position], device=q.device, dtype=torch.int32
+    )
+    original_cache_seqlens = cache_seqlens.clone()
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    k_helion = initial_k.clone()
+    v_helion = initial_v.clone()
+    k_pointer = k_helion.data_ptr()
+    v_pointer = v_helion.data_ptr()
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_helion,
+        v_helion,
+        k=new_k,
+        v=new_v,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_softmax_lse=return_softmax_lse,
+        shape=spec,
+    )
+
+    k_fa2 = initial_k.clone()
+    v_fa2 = initial_v.clone()
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_fa2,
+        v_fa2,
+        k=new_k,
+        v=new_v,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_softmax_lse=return_softmax_lse,
+    )
+
+    expected_k = initial_k.clone()
+    expected_v = initial_v.clone()
+    expected_k[:, -1:] = new_k
+    expected_v[:, -1:] = new_v
+    expected_out = reference_attention(q, expected_k, expected_v, spec, scale)
+    expected_lse = reference_single_token_lse(q, expected_k, spec, scale)
+
+    assert k_helion.data_ptr() == k_pointer
+    assert v_helion.data_ptr() == v_pointer
+    assert torch.equal(cache_seqlens, original_cache_seqlens)
+    assert torch.equal(k_helion, expected_k)
+    assert torch.equal(v_helion, expected_v)
+    assert torch.equal(k_helion, k_fa2)
+    assert torch.equal(v_helion, v_fa2)
+    if return_softmax_lse:
+        assert isinstance(got, tuple)
+        assert isinstance(expected_fa2, tuple)
+        out, lse = got
+        fa2_out, fa2_lse = expected_fa2
+        assert lse.shape == (spec.batch, spec.nheads_q, spec.seqlen_q)
+        assert lse.dtype == torch.float32
+        torch.testing.assert_close(lse, fa2_lse, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+    else:
+        assert isinstance(got, torch.Tensor)
+        assert isinstance(expected_fa2, torch.Tensor)
+        out = got
+        fa2_out = expected_fa2
+    torch.testing.assert_close(out, fa2_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        out.float(), expected_out, atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+def test_kvcache_1k_tensor_final_slot_append_validates_metadata_before_mutation(
+) -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260824)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    new_k = k_cache[:, :1].clone()
+    new_v = v_cache[:, :1].clone()
+    invalid_lengths: list[tuple[torch.Tensor, type[Exception], str]] = [
+        (
+            torch.tensor(
+                [[spec.seqlen_k - 1]], device=q.device, dtype=torch.int32
+            ),
+            ValueError,
+            "shape",
+        ),
+        (
+            torch.tensor(
+                [spec.seqlen_k - 1], device=q.device, dtype=torch.int64
+            ),
+            ValueError,
+            "dtype torch.int32",
+        ),
+        (
+            torch.tensor([spec.seqlen_k - 1], dtype=torch.int32),
+            ValueError,
+            "CUDA tensor",
+        ),
+        (
+            torch.tensor([0], device=q.device, dtype=torch.int32),
+            ValueError,
+            "inclusive range",
+        ),
+    ]
+
+    for cache_seqlens, error, match in invalid_lengths:
+        with pytest.raises(error, match=match):
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                k=new_k,
+                v=new_v,
+                cache_seqlens=cache_seqlens,
+                causal=True,
+                shape=spec,
+            )
+        assert torch.equal(k_cache, original_k)
+        assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("other-value", "final cache slot", id="other-value"),
+        pytest.param("rotary", "rotary embeddings", id="rotary"),
+        pytest.param("remapping", "cache_batch_idx", id="remapping"),
+        pytest.param("leftpad", "read-only", id="leftpad"),
+        pytest.param("alibi", "ALiBi", id="alibi"),
+        pytest.param("window", "sliding-window", id="window"),
+        pytest.param("softcap", "softcap", id="softcap"),
+        pytest.param("num-splits", "read-only", id="num-splits"),
+        pytest.param("autograd", "autograd", id="autograd"),
+        pytest.param("noncausal", "implemented only", id="noncausal"),
+        pytest.param("other-profile", "implemented only", id="other-profile"),
+    ],
+)
+def test_kvcache_1k_tensor_final_slot_append_rejects_out_of_scope_before_mutation(
+    case: str,
+    message: str,
+) -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260825)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    new_k = k_cache[:, :1].clone()
+    new_v = v_cache[:, :1].clone()
+    q_arg = q
+    shape_arg = spec
+    kwargs: dict[str, object] = {
+        "k": new_k,
+        "v": new_v,
+        "cache_seqlens": torch.tensor(
+            [spec.seqlen_k - 1], device=q.device, dtype=torch.int32
+        ),
+    }
+    if case == "other-value":
+        kwargs["cache_seqlens"] = torch.tensor(
+            [spec.seqlen_k - 2], device=q.device, dtype=torch.int32
+        )
+    elif case == "rotary":
+        rotary_cos, rotary_sin = make_rotary_tables(
+            spec, rotary_dim=spec.head_dim, seed=20260826
+        )
+        kwargs.update(rotary_cos=rotary_cos, rotary_sin=rotary_sin)
+    elif case == "remapping":
+        kwargs["cache_batch_idx"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
+        )
+    elif case == "leftpad":
+        kwargs["cache_leftpad"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
+        )
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.zeros(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (511, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "num-splits":
+        kwargs["num_splits"] = 16
+    elif case == "autograd":
+        q_arg = q.detach().requires_grad_()
+    elif case == "noncausal":
+        shape_arg = AttnShape(
+            spec.batch,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+            spec.dtype,
+            False,
+        )
+    elif case == "other-profile":
+        shape_arg = TWO_TOKEN_KVCACHE
+
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q_arg,
+            k_cache,
+            v_cache,
+            causal=shape_arg.causal,
+            shape=shape_arg,
+            **kwargs,  # type: ignore[arg-type]
+        )
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+def test_kvcache_1k_tensor_final_slot_append_rejects_cuda_graph_capture() -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260827)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    new_k = k_cache[:, :1].clone()
+    new_v = v_cache[:, :1].clone()
+    cache_seqlens = torch.tensor(
+        [spec.seqlen_k - 1], device=q.device, dtype=torch.int32
+    )
+
+    graph = torch.cuda.CUDAGraph()
+    capture_marker = torch.empty_like(q)
+    with pytest.raises(NotImplementedError, match="during CUDA graph capture"):
+        with torch.cuda.graph(graph):
+            capture_marker.copy_(q)
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                k=new_k,
+                v=new_v,
+                cache_seqlens=cache_seqlens,
+                causal=True,
+                shape=spec,
+            )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    torch.cuda.synchronize(q.device)
 
 
 @pytest.mark.parametrize(
@@ -11093,9 +11384,9 @@ def test_kvcache_rejects_invalid_updates_before_mutating_either_cache(
     reject(NotImplementedError, "multi-token", k=multi_k, v=multi_v)
     reject(
         NotImplementedError,
-        "tensor-valued cache_seqlens",
+        "final cache slot",
         cache_seqlens=torch.tensor(
-            [spec.seqlen_k - 1], device=q.device, dtype=torch.int32
+            [spec.seqlen_k - 2], device=q.device, dtype=torch.int32
         ),
     )
     reject(
