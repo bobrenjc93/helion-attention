@@ -2683,6 +2683,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:73b77a923ee8507027ec6b0dce18287b66654ad6",
+      "commit": "73b77a923ee8507027ec6b0dce18287b66654ad6",
+      "recordedAt": "2026-08-10T06:04:07.639Z",
+      "label": "base 73b77a9",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 94,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:123",
+      "recordedAt": "2026-08-10T06:04:07.639Z",
+      "label": "PR #123",
+      "kind": "leaf",
+      "prNumber": 123,
+      "title": "Read scalar prefixes from the 4K dense KV cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 94,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
