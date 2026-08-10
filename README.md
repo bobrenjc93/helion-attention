@@ -223,19 +223,25 @@ ALiBi, diagnostic returns, and positive dropout remain explicitly unsupported
 for varlen backward.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
-profiles when `block_table` is supplied. Both use bf16 page-size-16 caches in
-`[num_blocks, 16, heads_kv, head_dim]` layout, support ragged request lengths
-and permuted physical pages, and accept a custom `softmax_scale`:
+profiles when `block_table` is supplied. Both accept bf16 page-size-16 caches;
+the single-token decode profile additionally accepts page-size-256 caches.
+Caches use `[num_blocks, page_size, heads_kv, head_dim]` layout. All supported
+paths handle ragged request lengths and permuted physical pages and accept the
+default or a custom `softmax_scale`:
 
-| profile | causal modes | use |
-| --- | --- | --- |
-| `(2, 200, 320, 8, 2, 128)` | `True` | chunked prefill |
-| `(4, 1, 1024, 8, 2, 128)` | `True` or `False` | single-token decode |
+| profile | page sizes | causal modes | dispatch | use |
+| --- | --- | --- | --- | --- |
+| `(2, 200, 320, 8, 2, 128)` | 16 | `True` | generated | chunked prefill |
+| `(4, 1, 1024, 8, 2, 128)` | 16, 256 | `True` or `False` | generated for 16; generic paged runtime for 256 | single-token decode |
 
 As on the non-paged path, the shape sequence dimensions are maxima and actual
 lengths come from adjacent cumulative offsets. The chunked-prefill profile
 uses bottom-right causal alignment. The decode modes are equivalent because a
-bottom-right single-token query can see the whole used cache.
+bottom-right single-token query can see the whole used cache. Page-size-256
+decode supports only the default option set apart from the causal flag and
+`softmax_scale`: gradients, dropout, sliding windows, softcap, ALiBi,
+`deterministic=True`, and diagnostic returns remain unsupported. Other page
+sizes and paged core-varlen profiles are rejected explicitly.
 
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus

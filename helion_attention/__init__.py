@@ -13,8 +13,9 @@ inference profile, ALiBi on both shipped varlen profiles, symmetric windows on
 the shipped noncausal varlen profile, and diagnostics on the shipped causal
 varlen profile use a generic Triton forward kernel. That runtime also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
-varlen profile, and read-only page-256 paged decode through the core varlen and
-KV-cache APIs. The KV-cache adapter also uses the generic paged runtime for
+varlen profile, and, only through the KV-cache API, read-only page-256 paged
+decode. The same runtime exposes page-256 decode without softcap through the
+core varlen API. The KV-cache adapter also uses the generic paged runtime for
 ALiBi on both exposed page-16 profiles and page-256 decode. Read-only 4K dense
 decode likewise uses the generic runtime for ALiBi while retaining its
 generated specialization when slopes are omitted.
