@@ -81,16 +81,20 @@ requires `deterministic=False`.
 
 The checked-in noncausal bf16 BERT-base encoder profile
 `(16, 512, 512, 12, 12, 64)` supports `return_attn_probs=True` through the
-dense, QKV-packed, and KV-packed entry points. A forward-only, dropout-free
-call returns `(out, softmax_lse, S_dmask)` with fp32 LSE shaped
+dense, QKV-packed, and KV-packed entry points. A dropout-free call returns
+`(out, softmax_lse, S_dmask)` with fp32 LSE shaped
 `[16, 12, 512]` and an empty bf16 `S_dmask`, matching FA2. Diagnostic calls
-use the generic packed runtime; ordinary calls retain the generated
-specialization. The same three entry points accept `0 < dropout_p < 1` through
-PyTorch SDPA, with either the default or a custom `softmax_scale`. Causal mode,
-ALiBi, deterministic dropout, dropout diagnostics, and other dense profiles
-remain outside this BERT-base subset. For zero-dropout training, the same
-entry points accept `deterministic=True` with either scale and call PyTorch's
-repeatable math operator directly, without changing global SDPA backend flags.
+that require gradients use PyTorch SDPA for the output and Q/K/V gradients
+while retaining the generic packed runtime's LSE; as in FA2, LSE and `S_dmask`
+gradients contribute zero. No-backward diagnostic calls remain wholly on the
+generic packed runtime, and ordinary calls retain the generated specialization.
+The same three entry points accept `0 < dropout_p < 1` through PyTorch SDPA,
+with either the default or a custom `softmax_scale`. Causal mode, ALiBi,
+deterministic diagnostics, dropout diagnostics, and other dense profiles remain
+outside this BERT-base subset. For zero-dropout training without diagnostics,
+the same entry points accept `deterministic=True` with either scale and call
+PyTorch's repeatable math operator directly, without changing global SDPA
+backend flags.
 
 The checked-in causal bf16 GPT-2 profile
 `(2, 1024, 1024, 32, 32, 64)` likewise supports `return_attn_probs=True`
@@ -851,8 +855,8 @@ also raise `NotImplementedError` rather than silently doing something else:
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
   the exact full-head or D64 half-head interleaved 4K partial append or the
   exact full-head interleaved two-token append
-- `return_attn_probs=True` outside the no-backward BERT-base and the
-  backward-capable causal bf16 GPT-2 dense/QKV-packed/KV-packed calls,
+- `return_attn_probs=True` outside the backward-capable BERT-base and causal
+  bf16 GPT-2 dense/QKV-packed/KV-packed calls,
   dense/KV-packed calls for the three
   Llama GQA decode profiles, dense/KV-packed calls for the causal bf16 Gemma-2
   profile with `softcap=50.0`, and the causal bf16 varlen profiles

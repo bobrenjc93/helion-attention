@@ -2449,10 +2449,16 @@ def test_causal_gpt2_return_attn_probs_matches_fa2(
 
 
 @requires_cuda
-def test_causal_gpt2_diagnostic_inference_retains_generic_dispatch(
+@pytest.mark.parametrize(
+    ("spec", "causal"),
+    [(BERT_DIAGNOSTIC, False), (CAUSAL_DROPOUT, True)],
+    ids=["bert-base", "causal-gpt2"],
+)
+def test_dense_diagnostic_inference_retains_generic_dispatch(
+    spec: AttnShape,
+    causal: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = CAUSAL_DROPOUT
     q, k, v = make_inputs(spec, seed=212132)
     q.requires_grad_()
     sentinel = (
@@ -2496,7 +2502,7 @@ def test_causal_gpt2_diagnostic_inference_retains_generic_dispatch(
             q,
             k,
             v,
-            causal=True,
+            causal=causal,
             return_attn_probs=True,
             shape=spec,
         )
@@ -2514,12 +2520,18 @@ def test_causal_gpt2_diagnostic_inference_retains_generic_dispatch(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_causal_gpt2_diagnostic_backward_matches_fp32_and_fa2(
+@pytest.mark.parametrize(
+    ("spec", "causal"),
+    [(BERT_DIAGNOSTIC, False), (CAUSAL_DROPOUT, True)],
+    ids=["bert-base", "causal-gpt2"],
+)
+def test_dense_diagnostic_backward_matches_fp32_and_fa2(
     entry_point: str,
     softmax_scale: float | None,
+    spec: AttnShape,
+    causal: bool,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
-    spec = CAUSAL_DROPOUT
     base_q, base_k, base_v = make_inputs(spec, seed=223606)
     grad_out = make_inputs(spec, seed=244949)[0]
     generator = torch.Generator(device="cuda").manual_seed(264575)
@@ -2538,7 +2550,7 @@ def test_causal_gpt2_diagnostic_backward_matches_fp32_and_fa2(
     ]:
         api_kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
-            "causal": True,
+            "causal": causal,
             "return_attn_probs": True,
         }
         if package is helion_attention:
@@ -2635,8 +2647,14 @@ def test_causal_gpt2_diagnostic_backward_matches_fp32_and_fa2(
 
 
 @requires_cuda
-def test_causal_gpt2_diagnostic_auxiliary_gradients_are_exactly_zero() -> None:
-    spec = CAUSAL_DROPOUT
+@pytest.mark.parametrize(
+    ("spec", "causal"),
+    [(BERT_DIAGNOSTIC, False), (CAUSAL_DROPOUT, True)],
+    ids=["bert-base", "causal-gpt2"],
+)
+def test_dense_diagnostic_auxiliary_gradients_are_exactly_zero(
+    spec: AttnShape, causal: bool
+) -> None:
     q, k, v = (
         tensor.requires_grad_()
         for tensor in make_inputs(spec, seed=282842)
@@ -2645,7 +2663,7 @@ def test_causal_gpt2_diagnostic_auxiliary_gradients_are_exactly_zero() -> None:
         q,
         k,
         v,
-        causal=True,
+        causal=causal,
         return_attn_probs=True,
         shape=spec,
     )
@@ -3536,10 +3554,14 @@ def test_bert_zero_dropout_retains_generated_dispatch(
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        ("grad", "grad-enabled"),
+        ("deterministic", "deterministic=False"),
+        ("deterministic-grad", "deterministic=False"),
         ("causal", "BERT-base encoder"),
         ("alibi", "ALiBi"),
         ("dropout", "dropout"),
+        ("window", "sliding-window"),
+        ("softcap", "Gemma-2"),
+        ("fp16", "BERT-base encoder"),
         ("other-shape", "BERT-base encoder"),
     ],
 )
@@ -3554,8 +3576,10 @@ def test_bert_return_attn_probs_rejects_out_of_scope_calls(
         "return_attn_probs": True,
         "shape": spec,
     }
-    if case == "grad":
-        q.requires_grad_()
+    if case in ("deterministic", "deterministic-grad"):
+        if case == "deterministic-grad":
+            q.requires_grad_()
+        kwargs["deterministic"] = True
     elif case == "causal":
         kwargs["causal"] = True
         kwargs["shape"] = (
@@ -3570,6 +3594,18 @@ def test_bert_return_attn_probs_rejects_out_of_scope_calls(
         )
     elif case == "dropout":
         kwargs["dropout_p"] = 0.1
+    elif case == "window":
+        kwargs["window_size"] = (511, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "fp16":
+        q, k, v = (tensor.to(torch.float16) for tensor in (q, k, v))
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.nheads_q,
+            spec.head_dim,
+        )
     else:
         spec = AttnShape(1, 7, 7, 2, 2, 32, torch.bfloat16, False)
         q, k, v = make_inputs(spec, seed=31415)

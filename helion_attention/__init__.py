@@ -41,9 +41,9 @@ generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, grad-enabled
-diagnostics on that GPT-2 profile and the full-length causal varlen profile,
-both full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. Full-length symmetric-window
+diagnostics on both dense diagnostic profiles and the full-length causal
+varlen profile, both full-length varlen profiles, and ragged causal attention
+use PyTorch SDPA autograd. Full-length symmetric-window
 training on the shipped noncausal varlen profile uses the same bounded SDPA
 bridge. Deterministic zero-dropout BERT-base, causal GPT-2, and both full-length
 varlen training profiles use the direct math operator without changing
@@ -1588,11 +1588,11 @@ def flash_attn_func(
         return_attn_probs: for the shipped bf16 BERT-base encoder and causal
             GPT-2 profile, three Llama GQA decode profiles, and the
             ``softcap=50.0`` Gemma-2 profile, return FlashAttention's diagnostic
-            tuple. The zero-dropout causal GPT-2 profile also supports
-            backward through ``out``; its LSE and empty ``S_dmask`` accept
-            gradients with zero contribution, matching FlashAttention. Other
-            profiles require that no backward is needed, and all options other
-            than ``softmax_scale`` (plus the documented causal/softcap
+            tuple. The zero-dropout BERT-base and causal GPT-2 profiles also
+            support backward through ``out``; their LSE and empty ``S_dmask``
+            accept gradients with zero contribution, matching FlashAttention.
+            Other profiles require that no backward is needed, and all options
+            other than ``softmax_scale`` (plus the documented causal/softcap
             settings) retain their defaults.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
@@ -1747,7 +1747,7 @@ def flash_attn_func(
             softcap=_GEMMA2_SOFTCAP,
         )
     if return_attn_probs:
-        if needs_backward and spec.key != _CAUSAL_DROPOUT_KEY:
+        if needs_backward and spec.key not in _GENERIC_DENSE_DIAGNOSTIC_KEYS:
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented for grad-enabled "
                 "calls"
