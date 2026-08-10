@@ -340,16 +340,17 @@ It also accepts a paired two-token K/V update only at `cache_seqlens=1022`,
 filling slots 1022 and 1023 before attention. Full-head interleaved rotary
 tables optionally rotate Q and the appended K at positions 1022 and 1023.
 Causal bf16 `(1, 4, 1024, 32, 8, 128)` is strictly read-only and accepts an
-omitted or full scalar cache length with either scale. The four-token path
-never mutates cache storage. It does not support LSE, updates, partial or
-tensor-valued lengths, rotary, cache remapping, autograd, or noncausal mode;
-other query lengths remain unsupported.
+omitted or full scalar cache length with either scale and optionally returns
+fp32 LSE shaped `[1, 32, 4]`. The four-token path never mutates cache storage.
+It does not support updates, partial or tensor-valued lengths, rotary, cache
+remapping, autograd, or noncausal mode; other query lengths remain unsupported.
 
-For supported slope-free single-token dense caches, pass
+For supported slope-free single-token dense caches and the exact four-token
+profile above, pass
 `return_softmax_lse=True` to receive `(out, softmax_lse)`. The LSE is fp32 with
-shape `[batch, heads_q, 1]`, matching FlashAttention's KV-cache API. The exact
-paged decode profile below supports the same return for both the default and a
-custom `softmax_scale`.
+shape `[batch, heads_q, query_len]`, matching FlashAttention's KV-cache API.
+The exact paged decode profile below supports the same return for both the
+default and a custom `softmax_scale`.
 
 The causal bf16 dense profile `(1, 1, 16384, 32, 8, 128)` also accepts a
 contiguous CUDA int32 `cache_seqlens` tensor shaped `[1]`. Values from 1 through
