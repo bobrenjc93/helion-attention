@@ -22,8 +22,8 @@ varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes slope-free page-512 decode and page-256 decode
 with optional ALiBi but without softcap through the core varlen API. The
 KV-cache adapter also uses the generic paged runtime for ALiBi on both exposed
-page-16 profiles and page-256 decode. Read-only causal 1K and both causal
-variants of 4K dense decode likewise
+page-16 profiles and page-256/page-512 decode. Read-only causal 1K and both
+causal variants of 4K dense decode likewise
 use the generic runtime for a bounded Python-int prefix. Those profiles and
 causal 16K decode also use it for read-only CUDA-tensor-selected spans, while
 the 4K profiles support full-cache or scalar-prefix ALiBi. The same two 4K
@@ -2498,30 +2498,35 @@ def _paged_kvcache_forward(
     if alibi_slopes is not None:
         supports_alibi_page_size = (
             page_size == _CORE_PAGED_GENERATED_PAGE_SIZE
-            or (requested == _CORE_PAGED_KVCACHE_SHAPE and page_size == 256)
+            or (
+                requested == _CORE_PAGED_KVCACHE_SHAPE
+                and page_size in (256, 512)
+            )
         )
         if not supports_alibi_page_size:
             raise NotImplementedError(
                 "paged KV-cache ALiBi is implemented only with page-size-16 "
-                "caches or page-size-256 caches for the decode profile"
+                "caches or page-size-256/page-size-512 caches for the decode "
+                "profile"
             )
         if requested not in _CORE_PAGED_KVCACHE_SHAPES:
             raise NotImplementedError(
                 "paged KV-cache ALiBi is implemented only for the bf16 "
                 "page-size-16 batch=2 seqlen_q=200 seqlen_k=320 "
-                "chunked-prefill and page-size-16 or page-size-256 batch=4 "
-                "seqlen_q=1 seqlen_k=1024 decode profiles with nheads=8 "
-                "(GQA 8:2) head_dim=128"
+                "chunked-prefill and page-size-16, page-size-256, or "
+                "page-size-512 batch=4 seqlen_q=1 seqlen_k=1024 decode "
+                "profiles with nheads=8 (GQA 8:2) head_dim=128"
             )
         supports_alibi_lse = (
-            requested == _CORE_PAGED_KVCACHE_SHAPE and page_size == 256
+            requested == _CORE_PAGED_KVCACHE_SHAPE
+            and page_size in (256, 512)
         )
         if return_softmax_lse and not supports_alibi_lse:
             raise NotImplementedError(
                 "return_softmax_lse=True with paged KV-cache ALiBi is "
-                "implemented only for the read-only bf16 page-size-256 "
-                "batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
-                "head_dim=128 decode profile"
+                "implemented only for the read-only bf16 page-size-256 or "
+                "page-size-512 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 "
+                "(GQA 8:2) head_dim=128 decode profile"
             )
 
     expected_q = (
@@ -2922,11 +2927,11 @@ def flash_attn_with_kvcache(
     route through :func:`flash_attn_varlen_func`; page-256 and page-512 calls
     use the generic paged runtime. Page-256 additionally accepts exactly
     ``softcap=50.0`` for forward-only calls. Both profiles support ragged
-    logical caches. The page-16 profiles and the page-256 decode profile
-    additionally accept forward-only fp32 ALiBi slopes shaped ``[8]`` or
-    ``[batch, 8]`` through the generic paged runtime (``[2, 8]`` for chunked
-    prefill and ``[4, 8]`` for decode). Page-512 decode does not support ALiBi
-    or softcap.
+    logical caches. The page-16 profiles and the page-256/page-512 decode
+    profile additionally accept forward-only fp32 ALiBi slopes shaped ``[8]``
+    or ``[batch, 8]`` through the generic paged runtime (``[2, 8]`` for
+    chunked prefill and ``[4, 8]`` for decode). Page-512 decode does not support
+    softcap.
     The page-16 decode profile alone accepts a paired one-token K/V update when
     every ``cache_seqlens`` value is exactly 1023. The full logical block table
     must map to in-range, disjoint physical pages. The adapter writes offset 15
@@ -2996,12 +3001,13 @@ def flash_attn_with_kvcache(
     decode profile supports the same return for page sizes 16, 256, and 512
     through the generic single-launch paged runtime; page-16 slope-free
     output-only calls retain the generated specialization. The read-only
-    page-256 decode path also supports that LSE return with ALiBi. Its causal
-    result follows FlashAttention 2's position-shifted ALiBi LSE convention,
-    while its noncausal result retains the mathematical LSE. Cache tensors
-    created in inference mode must also be updated in inference mode, and an
-    append requires disjoint query, K-cache, and V-cache memory. The paged
-    update additionally requires a disjoint full logical block mapping.
+    page-256 and page-512 decode paths also support that LSE return with ALiBi.
+    Their causal results follow FlashAttention 2's position-shifted ALiBi LSE
+    convention, while their noncausal results retain the mathematical LSE.
+    Cache tensors created in inference mode must also be updated in inference
+    mode, and an append requires disjoint query, K-cache, and V-cache memory.
+    The paged update additionally requires a disjoint full logical block
+    mapping.
     Tensor-valued lengths and left padding on dense updates or outside the
     exact causal 1K, either-causal 4K, and causal 16K profiles, scalar partial
     lengths outside the exact causal 1K and either-causal 4K read-only
@@ -3020,9 +3026,9 @@ def flash_attn_with_kvcache(
     and rotates its tokens at consecutive positions. Read-only rotary calls
     and other paged profiles fail explicitly. Paged updates outside the exact
     page-16 final-slot slice above, paged rotary, and paged autograd are
-    unsupported. Paged ALiBi LSE returns are limited to
-    read-only page-256 decode; updates, other profiles, and all other page sizes
-    remain unsupported. Paged softcap is unsupported for updates,
+    unsupported. Paged ALiBi LSE returns are limited to read-only page-256 and
+    page-512 decode; updates, other profiles, and all other page sizes remain
+    unsupported. Paged softcap is unsupported for updates,
     page-size-16 and page-size-512 caches, other profiles, ALiBi, windows, and
     autograd. Paged softmax LSE is unsupported for chunked prefill, other
     profiles, and page sizes other than 16, 256, or 512.
