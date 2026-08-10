@@ -3583,6 +3583,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:8ef8e0e8ba4d6771ea9a2b418b23cffca55fec93",
+      "commit": "8ef8e0e8ba4d6771ea9a2b418b23cffca55fec93",
+      "recordedAt": "2026-08-10T19:30:43.297Z",
+      "label": "base 8ef8e0e",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:156",
+      "recordedAt": "2026-08-10T19:30:43.297Z",
+      "label": "PR #156",
+      "kind": "leaf",
+      "prNumber": 156,
+      "title": "Append two tokens before the 1K cache tail",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
