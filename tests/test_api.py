@@ -5640,7 +5640,9 @@ def test_large_page_paged_kvcache_matches_fa2_and_fp32_for_ragged_permuted_pages
 
 
 @requires_cuda
-@pytest.mark.parametrize("page_size", [16, 256], ids=["page-16", "page-256"])
+@pytest.mark.parametrize(
+    "page_size", [16, 256, 512], ids=["page-16", "page-256", "page-512"]
+)
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
@@ -5733,13 +5735,15 @@ def test_paged_kvcache_alibi_matches_fa2_and_fp32_for_ragged_permuted_pages(
 @pytest.mark.parametrize(
     "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
 )
-def test_page256_paged_kvcache_alibi_returns_fp32_lse(
+@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
+def test_large_page_paged_kvcache_alibi_returns_fp32_lse(
+    page_size: int,
     causal: bool,
     softmax_scale: float | None,
     batched_slopes: bool,
 ) -> None:
     q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
-        make_paged_kvcache_inputs(page_size=256, seed=20260809)
+        make_paged_kvcache_inputs(page_size=page_size, seed=20260809)
     )
     original_k = k_cache.clone()
     original_v = v_cache.clone()
@@ -6348,6 +6352,9 @@ def test_page256_paged_kvcache_softcap_rejects_out_of_scope_calls(
             PAGED_KVCACHE, [37, 128, 1024, 5], 256, id="decode-page-256"
         ),
         pytest.param(
+            PAGED_KVCACHE, [37, 128, 1024, 5], 512, id="decode-page-512"
+        ),
+        pytest.param(
             PAGED_CHUNKED_PREFILL,
             [113, 271],
             16,
@@ -6423,14 +6430,16 @@ def test_paged_kvcache_alibi_uses_generic_paged_runtime(
 
 @requires_cuda
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
-def test_page256_paged_kvcache_alibi_lse_uses_generic_paged_runtime(
+@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
+def test_large_page_paged_kvcache_alibi_lse_uses_generic_paged_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
     causal: bool,
 ) -> None:
     import helion_attention._paged_attention as generic_attention
 
     q, k_cache, v_cache, cache_seqlens, block_table, _ = (
-        make_paged_kvcache_inputs(page_size=256)
+        make_paged_kvcache_inputs(page_size=page_size)
     )
     original_k = k_cache.clone()
     original_v = v_cache.clone()
@@ -6503,6 +6512,9 @@ def test_page256_paged_kvcache_alibi_lse_uses_generic_paged_runtime(
             PAGED_KVCACHE, [37, 128, 1024, 5], 256, id="decode-page-256"
         ),
         pytest.param(
+            PAGED_KVCACHE, [37, 128, 1024, 5], 512, id="decode-page-512"
+        ),
+        pytest.param(
             PAGED_CHUNKED_PREFILL,
             [113, 271],
             16,
@@ -6547,7 +6559,7 @@ def test_paged_kvcache_alibi_rejects_incompatible_modes_before_dispatch(
         "alibi_slopes": slopes,
         "shape": spec,
     }
-    if spec == PAGED_KVCACHE and page_size == 256:
+    if spec == PAGED_KVCACHE and page_size in (256, 512):
         kwargs["return_softmax_lse"] = True
     if case == "update":
         update_shape = (
@@ -6642,7 +6654,9 @@ def test_paged_kvcache_alibi_lse_rejects_other_supported_profiles(
 
 
 @requires_cuda
-@pytest.mark.parametrize("page_size", [16, 256], ids=["page-16", "page-256"])
+@pytest.mark.parametrize(
+    "page_size", [16, 256, 512], ids=["page-16", "page-256", "page-512"]
+)
 def test_paged_kvcache_alibi_rejects_other_profiles_before_dispatch(
     monkeypatch: pytest.MonkeyPatch,
     page_size: int,
@@ -6760,12 +6774,6 @@ def test_paged_kvcache_alibi_rejects_malformed_slopes_before_dispatch(
             UnsupportedShapeError,
             "supports only",
             id="unsupported-page-32",
-        ),
-        pytest.param(
-            512,
-            NotImplementedError,
-            "ALiBi.*page-size-16",
-            id="page-512",
         ),
     ],
 )

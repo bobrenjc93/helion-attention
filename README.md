@@ -430,14 +430,14 @@ select a different used length. Logical pages can map to physical cache pages
 in any order. Queries use dense BSHD layout and results are returned in that
 same layout. Chunked prefill uses bottom-right causal alignment. For decode,
 the default `causal=False` is equivalent to `causal=True`. The page-size-16
-profiles and page-size-256 decode also accept forward-only fp32 ALiBi slopes
-shaped `[8]` or `[batch, 8]` (`[2, 8]` for chunked prefill and `[4, 8]` for
-decode). Page-size-512 decode supports the default or a custom scale and an
-optional fp32 LSE return, but no other optional features. For example,
-page-size-256 ALiBi is called as follows:
+profiles and page-size-256/page-size-512 decode also accept forward-only fp32
+ALiBi slopes shaped `[8]` or `[batch, 8]` (`[2, 8]` for chunked prefill and
+`[4, 8]` for decode). Page-size-512 decode supports the default or a custom
+scale, ALiBi, and an optional fp32 LSE return. For example, page-size-512 ALiBi
+is called as follows:
 
 ```python
-B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 256
+B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 512
 NUM_BLOCKS = B * (MAX_CACHE // PAGE_SIZE)
 q = torch.randn(B, 1, H_Q, D, device="cuda", dtype=torch.bfloat16)
 k_cache = torch.randn(NUM_BLOCKS, PAGE_SIZE, H_KV, D, device="cuda", dtype=torch.bfloat16)
@@ -476,8 +476,9 @@ remain read-only.
 Slope-free output-only page-size-16 calls route through their checked-in
 paged-varlen kernels. Page-size-256 and page-size-512 decode calls and all paged
 ALiBi calls use the generic single-launch paged runtime, as do slope-free LSE
-requests and the page-size-256 decode combination of ALiBi with LSE. These
-return fp32 `[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output. For ALiBi,
+requests and the page-size-256/page-size-512 decode combination of ALiBi with
+LSE. These return fp32 `[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output.
+For ALiBi,
 causal decode follows FA2's position-shifted diagnostic convention: each
 single-query LSE is the mathematical value plus
 `slope * (cache_seqlen - 1)`; noncausal decode is unshifted. None of these
@@ -486,8 +487,8 @@ accepts exactly
 `softcap=50.0`, with the default or a custom scale and with or without the LSE
 return. `softcap=0` preserves the existing dispatch, including the generated
 path for page-size-16 output-only calls. Other caps, page sizes, and profiles,
-plus all page-size-512 ALiBi and softcap calls, ALiBi with softcap, ALiBi with
-LSE outside the exact read-only page-size-256 decode profile, paged updates
+plus page-size-512 softcap calls, ALiBi with softcap, ALiBi with LSE outside
+the exact read-only page-size-256/page-size-512 decode profile, paged updates
 outside the exact final-slot slice above, rotary, windows, and autograd are
 rejected before dispatch. LSE on chunked
 prefill, non-causal chunked prefill, every other paged profile, and every page
@@ -831,13 +832,13 @@ also raise `NotImplementedError` rather than silently doing something else:
   forward-only bf16 page-size-256 decode `(4, 1, 1024, 8, 2, 128)`, and for
   KV-cache calls outside the exact read-only bf16 dense
   `(1, 1, 4096, 32, 8, 128)` decode profile, page-size-16 profiles, and
-  page-size-256 decode above; core paged-varlen ALiBi cannot be combined with
-  dropout, windows, softcap, `deterministic=True`, diagnostic returns, or
-  autograd; dense KV-cache ALiBi cannot be combined with LSE, updates, partial
-  lengths, remapping, left padding, rotary, windows, softcap, or autograd; paged
-  KV-cache ALiBi cannot be combined with softcap, updates, rotary, windows, or
-  autograd, and its LSE combination is limited to the exact read-only
-  page-size-256 decode profile above
+  page-size-256/page-size-512 decode above; core paged-varlen ALiBi cannot be
+  combined with dropout, windows, softcap, `deterministic=True`, diagnostic
+  returns, or autograd; dense KV-cache ALiBi cannot be combined with LSE,
+  updates, partial lengths, remapping, left padding, rotary, windows, softcap,
+  or autograd; paged KV-cache ALiBi cannot be combined with softcap, updates,
+  rotary, windows, or autograd, and its LSE combination is limited to the exact
+  read-only page-size-256/page-size-512 decode profile above
 - KV-cache mutation beyond the dense paired one-token final-slot append, the
   exact 4K partial one-token append, exact two-token final-two-slot append, and
   exact page-16 paged final-slot append at four device lengths of 1023 above;
