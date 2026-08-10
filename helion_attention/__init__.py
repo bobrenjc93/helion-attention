@@ -9,14 +9,13 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
-varlen inference profile, ALiBi with optional diagnostics on that profile,
-ALiBi on both
-shipped varlen profiles, symmetric windows on the shipped noncausal varlen
-profile, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. The same runtime exposes exactly a 511-token left plus
-current-token causal window for the bf16 batch-1 2K Llama GQA profile while
-its global-window call retains generated dispatch. Grad-enabled calls use a
-bounded PyTorch SDPA autograd bridge. That runtime also provides
+varlen inference profile, ALiBi with optional diagnostics on that profile and
+the shipped causal varlen profile, ALiBi on both shipped varlen profiles, and
+symmetric windows on the shipped noncausal varlen profile use a generic Triton
+forward kernel. The same runtime exposes exactly a 511-token left plus
+current-token causal window for the bf16 batch-1 2K Llama GQA profile while its
+global-window call retains generated dispatch. Grad-enabled calls use a bounded
+PyTorch SDPA autograd bridge. That runtime also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and read-only page-256 paged decode through both the core
 varlen and KV-cache APIs. The same runtime exposes slope-free page-512 decode
@@ -169,6 +168,9 @@ _VARLEN_ALIBI_KEYS = frozenset(
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _VARLEN_DIAGNOSTIC_KEYS = frozenset(
+    {_LLAMA3_VARLEN_INFERENCE_KEY, _VARLEN_DIAGNOSTIC_KEY}
+)
+_VARLEN_ALIBI_DIAGNOSTIC_KEYS = frozenset(
     {_LLAMA3_VARLEN_INFERENCE_KEY, _VARLEN_DIAGNOSTIC_KEY}
 )
 _VARLEN_SYMMETRIC_WINDOW_KEY = (
@@ -1943,12 +1945,15 @@ def flash_attn_varlen_func(
 
     The causal version of that profile also supports
     ``return_attn_probs=True`` with ``causal=True`` and all options other than
-    ``softmax_scale`` retaining their defaults. Forward calls may be ragged.
-    Backward is restricted to full-length inputs, where all eight query and key
-    sequences have length 512. It returns ``(out, softmax_lse, S_dmask)`` with
-    fp32 LSE shaped ``[nheads_q, total_q]`` and an empty bf16 ``S_dmask``. In
-    backward, only ``out`` contributes Q/K/V gradients; auxiliary gradients are
-    ignored, matching FlashAttention 2 when dropout is zero.
+    ``softmax_scale`` and optional ALiBi retaining their defaults. Forward
+    calls may be ragged, and ALiBi slopes may have shape ``[16]`` or
+    ``[8, 16]``. Slope-free backward is restricted to full-length inputs, where
+    all eight query and key sequences have length 512. It returns
+    ``(out, softmax_lse, S_dmask)`` with fp32 LSE shaped
+    ``[nheads_q, total_q]`` and an empty bf16 ``S_dmask``. In backward, only
+    ``out`` contributes Q/K/V gradients; auxiliary gradients are ignored,
+    matching FlashAttention 2 when dropout is zero. Combined ALiBi diagnostic
+    calls remain forward-only.
 
     Both causal modes support zero-dropout backward when all eight query and
     key sequences have length 512. The causal profile additionally supports
@@ -2056,10 +2061,15 @@ def flash_attn_varlen_func(
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented with block_table"
             )
-        if alibi_slopes is not None and not is_llama3_varlen_inference:
+        requested = f"varlen_{spec.key}"
+        if (
+            alibi_slopes is not None
+            and requested not in _VARLEN_ALIBI_DIAGNOSTIC_KEYS
+        ):
+            supported = ", ".join(sorted(_VARLEN_ALIBI_DIAGNOSTIC_KEYS))
             raise NotImplementedError(
                 "return_attn_probs=True with ALiBi slopes is implemented only "
-                f"for {_LLAMA3_VARLEN_INFERENCE_KEY}"
+                f"for {supported}"
             )
         if deterministic:
             raise NotImplementedError(
