@@ -56,6 +56,16 @@ Everything else matches `flash_attn.flash_attn_func`: the layout is
 `1/sqrt(head_dim)`, and `causal=True` uses FlashAttention's bottom-right causal
 mask alignment.
 
+One dense local-window profile is exposed through `flash_attn_func` and
+`flash_attn_kvpacked_func`: forward-only causal bf16 Llama GQA with exact shape
+`(1, 2048, 2048, 32, 8, 128)` accepts `window_size=(511, 0)`. Each query sees
+itself and up to 511 preceding keys, for a 512-key window, through the generic
+packed Triton runtime. Both the default and a custom `softmax_scale` are
+supported. `window_size=(-1, -1)` retains the checked-in generated
+specialization. Other windows and shapes, autograd, dropout, softcap, ALiBi,
+`deterministic=True`, and diagnostic returns remain unsupported for this local
+window.
+
 Score capping is limited to the forward-only inference profiles described
 below. The dense causal-bf16 Gemma-2 profile
 `(1, 4096, 4096, 16, 8, 256)` accepts exactly `softcap=50.0` through
@@ -123,8 +133,8 @@ the shipped causal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2 profile accept
 with either the default or a custom scale. Zero-dropout calls that do not need
 backward retain each generated specialization. Zero-dropout GPT-2 training also
 accepts `deterministic=True` with either scale through the direct math operator
-used by BERT-base. Other dropout calls, local windows, softcap outside the exact
-dense, varlen, and paged subsets described here, dense diagnostic returns
+used by BERT-base. Other dropout calls, other local windows, softcap outside the
+exact dense, varlen, and paged subsets described here, dense diagnostic returns
 outside the subsets above, and deterministic dropout still fail explicitly as
 described below.
 Unregistered calls must also fit the generic kernel's signed 32-bit Q/output

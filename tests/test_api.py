@@ -154,6 +154,10 @@ GEMMA2_SOFTCAP = AttnShape(
     1, 4096, 4096, 16, 8, 256, torch.bfloat16, True
 )
 GEMMA2_SOFTCAP_VALUE = 50.0
+LLAMA_2K_LEFT_WINDOW = AttnShape(
+    1, 2048, 2048, 32, 8, 128, torch.bfloat16, True
+)
+LLAMA_2K_LEFT_WINDOW_SIZE = (511, 0)
 
 
 def make_inputs(
@@ -359,6 +363,46 @@ def reference_attention(
         attn_mask=mask,
         scale=scale,
         enable_gqa=spec.nheads_q != spec.nheads_kv,
+    ).transpose(1, 2)
+
+
+def reference_causal_left_window_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    spec: AttnShape,
+    scale: float,
+    window_left: int,
+    *,
+    query_block: int = 128,
+) -> torch.Tensor:
+    """Compute a causal GQA left window in fp32 with bounded score tiles."""
+    group_size = spec.nheads_q // spec.nheads_kv
+    grouped_q = q.float().permute(0, 2, 1, 3).reshape(
+        spec.batch,
+        spec.nheads_kv,
+        group_size,
+        spec.seqlen_q,
+        spec.head_dim,
+    )
+    grouped_k_t = k.float().permute(0, 2, 3, 1).unsqueeze(2)
+    grouped_v = v.float().permute(0, 2, 1, 3).unsqueeze(2)
+    output = torch.empty_like(grouped_q)
+    columns = torch.arange(spec.seqlen_k, device=q.device)[None, :]
+
+    for start in range(0, spec.seqlen_q, query_block):
+        stop = min(start + query_block, spec.seqlen_q)
+        scores = torch.matmul(
+            grouped_q[..., start:stop, :], grouped_k_t
+        ) * scale
+        rows = torch.arange(start, stop, device=q.device)[:, None]
+        visible = (columns <= rows) & (columns >= rows - window_left)
+        scores.masked_fill_(~visible, float("-inf"))
+        probabilities = torch.softmax(scores, dim=-1)
+        output[..., start:stop, :] = torch.matmul(probabilities, grouped_v)
+
+    return output.reshape(
+        spec.batch, spec.nheads_q, spec.seqlen_q, spec.head_dim
     ).transpose(1, 2)
 
 
@@ -1460,6 +1504,251 @@ def test_unregistered_dense_fallback_matches_fp32_sdpa(spec: AttnShape) -> None:
     assert got.shape == q.shape
     assert got.dtype == spec.dtype
     torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_llama_2k_left_window_dense_and_kvpacked_match_fa2_and_fp32(
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA_2K_LEFT_WINDOW
+    q, k, v = make_inputs(spec, seed=20260810)
+    kv = torch.stack((k, v), dim=2)
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    with torch.no_grad():
+        dense = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            shape=spec,
+        )
+        expected_dense = flash_attn.flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+        )
+        packed = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            shape=spec,
+        )
+        expected_packed = flash_attn.flash_attn_kvpacked_func(
+            q,
+            kv,
+            softmax_scale=softmax_scale,
+            causal=True,
+            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+        )
+        expected_fp32 = reference_causal_left_window_attention(
+            q,
+            k,
+            v,
+            spec,
+            scale,
+            LLAMA_2K_LEFT_WINDOW_SIZE[0],
+        )
+
+    assert dense.shape == packed.shape == q.shape
+    assert dense.dtype == packed.dtype == torch.bfloat16
+    torch.testing.assert_close(dense, expected_dense, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(packed, expected_packed, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(dense.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(packed.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+def test_llama_2k_global_window_retains_generated_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA_2K_LEFT_WINDOW
+    q, k, v = make_inputs(spec, seed=173205)
+    kv = torch.stack((k, v), dim=2)
+    q.requires_grad_()
+    sentinel = torch.empty_like(q)
+    dispatches: list[str] = []
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+        *,
+        softcap: float = 0.0,
+        window_size: tuple[int, int] = (-1, -1),
+    ) -> torch.Tensor:
+        del q_arg, k_arg, v_arg, scale_arg
+        assert spec_arg == spec
+        assert slopes_arg is None
+        assert softcap == 0.0
+        assert window_size == LLAMA_2K_LEFT_WINDOW_SIZE
+        dispatches.append("generic-window")
+        return sentinel
+
+    def lookup_stub(spec_arg: AttnShape):
+        assert spec_arg == spec
+
+        def generated(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            del q_arg, k_arg, v_arg, scale_arg
+            dispatches.append("generated-global")
+            return sentinel
+
+        return generated
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+
+    with torch.no_grad():
+        windowed = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            shape=spec,
+        )
+        packed_windowed = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            causal=True,
+            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            shape=spec,
+        )
+        global_attention = helion_attention.flash_attn_func(
+            q, k, v, causal=True, window_size=(-1, -1), shape=spec
+        )
+        packed_global_attention = helion_attention.flash_attn_kvpacked_func(
+            q, kv, causal=True, window_size=(-1, -1), shape=spec
+        )
+
+    assert windowed is packed_windowed is sentinel
+    assert global_attention is packed_global_attention is sentinel
+    assert dispatches == [
+        "generic-window",
+        "generic-window",
+        "generated-global",
+        "generated-global",
+    ]
+
+
+@requires_cuda
+def test_llama_2k_left_window_rejects_out_of_scope_calls_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA_2K_LEFT_WINDOW
+    q, k, v = make_inputs(spec, seed=223607)
+    slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
+    other_spec = AttnShape(1, 16, 16, 32, 8, 128, torch.bfloat16, True)
+    other_q, other_k, other_v = make_inputs(other_spec, seed=244949)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope left-window call reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+
+    cases: list[
+        tuple[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            AttnShape,
+            dict[str, object],
+            str,
+        ]
+    ] = [
+        ((q, k, v), spec, {"window_size": (510, 0)}, "sliding-window"),
+        ((q, k, v), spec, {"window_size": (511.0, 0)}, "sliding-window"),
+        (
+            (other_q, other_k, other_v),
+            other_spec,
+            {"window_size": LLAMA_2K_LEFT_WINDOW_SIZE},
+            "implemented only",
+        ),
+        (
+            (q.detach().requires_grad_(), k, v),
+            spec,
+            {"window_size": LLAMA_2K_LEFT_WINDOW_SIZE},
+            "forward-only",
+        ),
+        (
+            (q, k, v),
+            spec,
+            {"window_size": LLAMA_2K_LEFT_WINDOW_SIZE, "dropout_p": 0.1},
+            "does not support dropout",
+        ),
+        (
+            (q, k, v),
+            spec,
+            {"window_size": LLAMA_2K_LEFT_WINDOW_SIZE, "softcap": 50.0},
+            "does not support softcap",
+        ),
+        (
+            (q, k, v),
+            spec,
+            {
+                "window_size": LLAMA_2K_LEFT_WINDOW_SIZE,
+                "alibi_slopes": slopes,
+            },
+            "does not support ALiBi",
+        ),
+        (
+            (q, k, v),
+            spec,
+            {"window_size": LLAMA_2K_LEFT_WINDOW_SIZE, "deterministic": True},
+            "deterministic=False",
+        ),
+        (
+            (q, k, v),
+            spec,
+            {
+                "window_size": LLAMA_2K_LEFT_WINDOW_SIZE,
+                "return_attn_probs": True,
+            },
+            "return_attn_probs=True",
+        ),
+    ]
+
+    for tensors, case_spec, kwargs, message in cases:
+        with pytest.raises(NotImplementedError, match=message):
+            helion_attention.flash_attn_func(
+                *tensors,
+                causal=True,
+                shape=case_spec,
+                **kwargs,  # type: ignore[arg-type]
+            )
+
+    kv = torch.stack((k, v), dim=2).requires_grad_()
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            causal=True,
+            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            shape=spec,
+        )
 
 
 @requires_cuda

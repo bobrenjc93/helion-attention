@@ -2983,6 +2983,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:21b0bff8026b318a004f6cc314a13e170537f8c5",
+      "commit": "21b0bff8026b318a004f6cc314a13e170537f8c5",
+      "recordedAt": "2026-08-10T10:42:49.102Z",
+      "label": "base 21b0bff",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:134",
+      "recordedAt": "2026-08-10T10:42:49.102Z",
+      "label": "PR #134",
+      "kind": "leaf",
+      "prNumber": 134,
+      "title": "Expose a 512-key left window on 2K Llama GQA",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 95,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

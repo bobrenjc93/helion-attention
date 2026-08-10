@@ -12,7 +12,10 @@ ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
 varlen inference profile, ALiBi and diagnostics on that profile, ALiBi on both
 shipped varlen profiles, symmetric windows on the shipped noncausal varlen
 profile, and diagnostics on the shipped causal varlen profile use a generic
-Triton forward kernel. That runtime also provides
+Triton forward kernel. The same runtime exposes exactly a 511-token left plus
+current-token causal window for the forward-only bf16 batch-1 2K Llama GQA
+profile while its global-window call retains generated dispatch. That runtime
+also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes page-256 decode with optional ALiBi but
@@ -116,6 +119,10 @@ _INT32_MAX = 2**31 - 1
 _ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
 _CAUSAL_DROPOUT_KEY = "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal"
+_LLAMA_2K_LEFT_WINDOW_KEY = (
+    "b1_sq2048_sk2048_hq32_hkv8_d128_bf16_causal"
+)
+_LLAMA_2K_LEFT_WINDOW_SIZE = (511, 0)
 _GENERIC_DENSE_DIAGNOSTIC_KEYS = frozenset(
     {_BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
 )
@@ -228,6 +235,7 @@ def _reject_unsupported(
     allow_return_attn_probs: bool = False,
     allow_softcap_return_attn_probs: bool = False,
     allowed_softcap: float | None = None,
+    allowed_window_size: tuple[int, int] | None = None,
 ) -> float:
     if isinstance(dropout_p, bool) or not isinstance(dropout_p, Real):
         raise TypeError("dropout_p must be a real number")
@@ -236,7 +244,14 @@ def _reject_unsupported(
         raise ValueError("dropout_p must satisfy 0.0 <= dropout_p < 1.0")
     if probability != 0.0 and not allow_dropout:
         raise NotImplementedError("dropout is not implemented; pass dropout_p=0.0")
-    if tuple(window_size) != (-1, -1):
+    requested_window = tuple(window_size)
+    has_allowed_window = (
+        allowed_window_size is not None
+        and len(requested_window) == 2
+        and all(type(bound) is int for bound in requested_window)
+        and requested_window == allowed_window_size
+    )
+    if requested_window != (-1, -1) and not has_allowed_window:
         raise NotImplementedError("sliding-window attention is not implemented")
     has_softcap = softcap != 0.0
     if has_softcap and softcap != allowed_softcap:
@@ -826,6 +841,7 @@ def _generic_dense_forward(
     alibi_slopes: torch.Tensor | None,
     *,
     softcap: float = 0.0,
+    window_size: tuple[int, int] = (-1, -1),
 ) -> torch.Tensor:
     """Adapt a validated dense batch to the generic packed Triton runtime."""
     total_q, total_k = _validate_generic_dense_layout(spec)
@@ -861,7 +877,7 @@ def _generic_dense_forward(
         dynamic_max_seqlen_k=None,
         softmax_scale=softmax_scale,
         causal=spec.causal,
-        window_size=(-1, -1),
+        window_size=window_size,
         softcap=softcap,
         alibi_slopes=alibi_slopes,
         q_descale=None,
@@ -1471,6 +1487,10 @@ def flash_attn_func(
             ``(2, 1024, 1024, 32, 32, 64)`` attention.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
+        window_size: ``(-1, -1)`` selects global attention. Exactly ``(511, 0)``
+            is additionally supported for forward-only causal bf16
+            ``(1, 2048, 2048, 32, 8, 128)`` Llama GQA attention through this
+            entry point and :func:`flash_attn_kvpacked_func`.
         softcap: exactly ``50.0`` is supported for forward-only causal bf16
             ``(1, 4096, 4096, 16, 8, 256)`` Gemma-2 attention. Zero retains
             ordinary dispatch; every other positive value remains unsupported.
@@ -1498,7 +1518,10 @@ def flash_attn_func(
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256``, all ALiBi calls, and
     the supported Gemma-2 softcap call use a generic packed Triton forward
-    kernel. The exact default-option,
+    kernel. The exact Llama GQA local-window call described above also uses that
+    runtime with either the default or a custom scale; gradients and all other
+    optional features are unsupported, and ``window_size=(-1, -1)`` retains its
+    generated specialization. The exact default-option,
     default-scale, no-backward noncausal bf16
     ``(2, 1024, 1024, 16, 16, 256)`` call uses direct PyTorch Flash SDPA on
     SM90 when eligible. The corresponding causal bf16
@@ -1519,9 +1542,10 @@ def flash_attn_func(
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """
+    window = tuple(window_size)
     dropout = _reject_unsupported(
         dropout_p,
-        window_size,
+        window,
         softcap,
         alibi_slopes,
         return_attn_probs,
@@ -1530,8 +1554,39 @@ def flash_attn_func(
         allow_return_attn_probs=True,
         allow_softcap_return_attn_probs=True,
         allowed_softcap=_GEMMA2_SOFTCAP,
+        allowed_window_size=_LLAMA_2K_LEFT_WINDOW_SIZE,
     )
     spec = normalize_shape(shape, q.dtype, causal)
+    has_left_window = window != (-1, -1)
+    if has_left_window:
+        if spec.key != _LLAMA_2K_LEFT_WINDOW_KEY:
+            raise NotImplementedError(
+                "dense sliding-window attention is implemented only for the "
+                "no-backward causal bf16 Llama GQA profile "
+                "(1, 2048, 2048, 32, 8, 128) with window_size=(511, 0); "
+                f"got {spec.describe()}"
+            )
+        if dropout != 0.0:
+            raise NotImplementedError(
+                "the Llama 2K left window does not support dropout"
+            )
+        if softcap != 0.0:
+            raise NotImplementedError(
+                "the Llama 2K left window does not support softcap"
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "the Llama 2K left window does not support ALiBi slopes"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "the Llama 2K left window requires deterministic=False"
+            )
+        if return_attn_probs:
+            raise NotImplementedError(
+                "the Llama 2K left window does not support "
+                "return_attn_probs=True"
+            )
     has_softcap = softcap != 0.0
     if has_softcap and spec.key != _GEMMA2_SOFTCAP_KEY:
         raise NotImplementedError(
@@ -1559,6 +1614,21 @@ def flash_attn_func(
     needs_backward = torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in (q, k, v)
     )
+    if has_left_window:
+        if needs_backward:
+            raise NotImplementedError(
+                "the Llama 2K left window is forward-only and does not support "
+                "autograd"
+            )
+        return _generic_dense_forward(
+            q,
+            k,
+            v,
+            scale,
+            spec,
+            None,
+            window_size=_LLAMA_2K_LEFT_WINDOW_SIZE,
+        )
     if has_softcap:
         if needs_backward:
             raise NotImplementedError(
