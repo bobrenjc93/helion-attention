@@ -2893,6 +2893,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:07ec242054a5a446b5d13080350052b8e96e6add",
+      "commit": "07ec242054a5a446b5d13080350052b8e96e6add",
+      "recordedAt": "2026-08-10T09:21:27.648Z",
+      "label": "base 07ec242",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 68,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:130",
+      "recordedAt": "2026-08-10T09:21:27.648Z",
+      "label": "PR #130",
+      "kind": "leaf",
+      "prNumber": 130,
+      "title": "Rotate partial 4K one-token appends",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 69,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
