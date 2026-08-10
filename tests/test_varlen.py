@@ -1949,7 +1949,6 @@ def test_ragged_varlen_backward_rejects_out_of_scope_calls(
         ("window_size", (1, 1), "sliding-window"),
         ("softcap", 1.0, "softcap"),
         ("alibi_slopes", "slopes", "ALiBi backward"),
-        ("return_attn_probs", True, "grad-enabled"),
     ],
 )
 @pytest.mark.parametrize(
@@ -4064,22 +4063,48 @@ def test_causal_varlen_packed_entry_points_inherit_alibi_diagnostics(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "entry_point",
-    ["unpacked", "qkvpacked", "kvpacked"],
-    ids=["unpacked", "qkv-packed", "kv-packed"],
+    ("entry_point", "ragged"),
+    [
+        ("unpacked", False),
+        ("qkvpacked", False),
+        ("kvpacked", False),
+        ("unpacked", True),
+        ("qkvpacked", True),
+    ],
+    ids=[
+        "full-unpacked",
+        "full-qkv-packed",
+        "full-kv-packed",
+        "ragged-unpacked",
+        "ragged-qkv-packed",
+    ],
 )
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_full_causal_varlen_diagnostic_backward_matches_fp32_and_fa2(
+def test_causal_varlen_diagnostic_backward_matches_fp32_and_fa2(
     entry_point: str,
+    ragged: bool,
     softmax_scale: float | None,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = VARLEN_DIAGNOSTIC
-    base_q, base_k, base_v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
-        spec, variant=2, seed=223606
-    )
+    if ragged:
+        base_q, base_k, base_v, cu_q, lengths_q = make_ragged_self_packed(
+            spec, seed=223606
+        )
+        cu_k = cu_q
+        lengths_k = lengths_q
+    else:
+        (
+            base_q,
+            base_k,
+            base_v,
+            cu_q,
+            cu_k,
+            lengths_q,
+            lengths_k,
+        ) = make_packed(spec, variant=2, seed=223606)
     generator = torch.Generator(device=base_q.device).manual_seed(244949)
     grad_out = torch.randn(
         base_q.shape,
@@ -4202,7 +4227,7 @@ def test_full_causal_varlen_diagnostic_backward_matches_fp32_and_fa2(
     assert out.dtype == expected_out.dtype == spec.dtype
     assert softmax_lse.shape == expected_lse.shape == (
         spec.nheads_q,
-        spec.batch * spec.seqlen_q,
+        base_q.shape[0],
     )
     assert softmax_lse.dtype == expected_lse.dtype == torch.float32
     assert s_dmask.shape == expected_s_dmask.shape == (0,)
@@ -4221,8 +4246,9 @@ def test_full_causal_varlen_diagnostic_backward_matches_fp32_and_fa2(
     ):
         # The nonzero LSE gradient passed above must contribute exactly zero,
         # just as it does in FA2; the fp32 reference differentiates only out.
+        fa2_atol = 5e-2 if ragged else 2e-2
         torch.testing.assert_close(
-            actual.float(), reference_fa2.float(), atol=2e-2, rtol=2e-2
+            actual.float(), reference_fa2.float(), atol=fa2_atol, rtol=2e-2
         )
         torch.testing.assert_close(
             actual.float(), reference_fp32, atol=8e-2, rtol=2e-2
@@ -4230,10 +4256,18 @@ def test_full_causal_varlen_diagnostic_backward_matches_fp32_and_fa2(
 
 
 @requires_cuda
-def test_full_causal_varlen_diagnostic_auxiliary_gradients_are_exactly_zero(
+@pytest.mark.parametrize("ragged", [False, True], ids=["full", "ragged"])
+def test_causal_varlen_diagnostic_auxiliary_gradients_are_exactly_zero(
+    ragged: bool,
 ) -> None:
     spec = VARLEN_DIAGNOSTIC
-    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2, seed=282842)
+    if ragged:
+        q, k, v, cu_q, _ = make_ragged_self_packed(spec, seed=282842)
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, *_ = make_packed(
+            spec, variant=2, seed=282842
+        )
     q.requires_grad_()
     k.requires_grad_()
     v.requires_grad_()
@@ -4257,6 +4291,51 @@ def test_full_causal_varlen_diagnostic_auxiliary_gradients_are_exactly_zero(
     )
 
     assert all(torch.count_nonzero(grad).item() == 0 for grad in grads)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("cross-offsets", "identical.*cross-attention offsets"),
+        ("empty-slots", "all eight.*nonempty"),
+    ],
+)
+def test_ragged_causal_varlen_diagnostic_backward_rejects_out_of_scope_offsets(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_DIAGNOSTIC
+    if case == "cross-offsets":
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(spec)
+    else:
+        q, k, v, cu_q, _ = make_ragged_self_packed(
+            spec, lengths=MIXED_EMPTY_SELF_LENGTHS
+        )
+        cu_k = cu_q
+    q.requires_grad_()
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported ragged diagnostics reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            return_attn_probs=True,
+            shape=spec,
+        )
 
 
 @requires_cuda
