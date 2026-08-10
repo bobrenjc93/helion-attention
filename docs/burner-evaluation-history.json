@@ -2713,6 +2713,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:118af050f978a897446a232c77a4e51e1e4dd483",
+      "commit": "118af050f978a897446a232c77a4e51e1e4dd483",
+      "recordedAt": "2026-08-10T06:29:16.521Z",
+      "label": "base 118af05",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 94,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:124",
+      "recordedAt": "2026-08-10T06:29:16.521Z",
+      "label": "PR #124",
+      "kind": "leaf",
+      "prNumber": 124,
+      "title": "Backpropagate causal GPT-2 diagnostic calls",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 94,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

@@ -34,6 +34,34 @@ class _GeneratedForwardWithFlashGradients(torch.autograd.Function):
         return None, grad_out
 
 
+class _AttentionDiagnostics(torch.autograd.Function):
+    """Expose diagnostic tensors while differentiating only the output."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        out: torch.Tensor,
+        softmax_lse: torch.Tensor,
+        s_dmask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del ctx
+        # FlashAttention exposes all three tensors as differentiable outputs,
+        # but its backward ignores grad_softmax_lse and grad_S_dmask. Cloning
+        # avoids custom-Function view restrictions while retaining that exact
+        # contract for diagnostics produced under no_grad.
+        return out.clone(), softmax_lse.clone(), s_dmask.clone()
+
+    @staticmethod
+    def backward(
+        ctx: Any,
+        grad_out: torch.Tensor,
+        grad_softmax_lse: torch.Tensor,
+        grad_s_dmask: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None]:
+        del ctx, grad_softmax_lse, grad_s_dmask
+        return grad_out, None, None
+
+
 class _Attention(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -104,3 +132,12 @@ def attention_with_flash_gradients(
     with torch.no_grad():
         generated = lookup(spec)(q, k, v, softmax_scale)
     return _GeneratedForwardWithFlashGradients.apply(generated, flash)
+
+
+def attention_diagnostics(
+    out: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    s_dmask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Attach FA2-compatible zero-gradient diagnostic outputs to ``out``."""
+    return _AttentionDiagnostics.apply(out, softmax_lse, s_dmask)

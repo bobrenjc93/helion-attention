@@ -2131,6 +2131,217 @@ def test_causal_gpt2_return_attn_probs_matches_fa2(
 
 
 @requires_cuda
+def test_causal_gpt2_diagnostic_inference_retains_generic_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = CAUSAL_DROPOUT
+    q, k, v = make_inputs(spec, seed=212132)
+    q.requires_grad_()
+    sentinel = (
+        torch.empty_like(q),
+        torch.empty(
+            spec.batch,
+            spec.nheads_q,
+            spec.seqlen_q,
+            device=q.device,
+            dtype=torch.float32,
+        ),
+        q.new_empty((0,)),
+    )
+    calls: list[tuple[float, AttnShape]] = []
+
+    def diagnostic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert q_arg is q
+        assert k_arg is k
+        assert v_arg is v
+        calls.append((scale_arg, spec_arg))
+        return sentinel
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("diagnostic inference dispatch changed")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", diagnostic
+    )
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "attention_diagnostics", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+
+    with torch.no_grad():
+        result = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            return_attn_probs=True,
+            shape=spec,
+        )
+
+    assert result is sentinel
+    assert calls == [(1.0 / math.sqrt(spec.head_dim), spec)]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["dense", "qkvpacked", "kvpacked"],
+    ids=["dense", "qkv-packed", "kv-packed"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_causal_gpt2_diagnostic_backward_matches_fp32_and_fa2(
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = CAUSAL_DROPOUT
+    base_q, base_k, base_v = make_inputs(spec, seed=223606)
+    grad_out = make_inputs(spec, seed=244949)[0]
+    generator = torch.Generator(device="cuda").manual_seed(264575)
+    grad_lse = torch.randn(
+        (spec.batch, spec.nheads_q, spec.seqlen_q),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
+    )
+
+    def run(
+        package: object,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        api_kwargs: dict[str, object] = {
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "return_attn_probs": True,
+        }
+        if package is helion_attention:
+            api_kwargs["shape"] = spec
+
+        if entry_point == "dense":
+            q = base_q.detach().requires_grad_()
+            k = base_k.detach().requires_grad_()
+            v = base_v.detach().requires_grad_()
+            result = package.flash_attn_func(q, k, v, **api_kwargs)
+            grad_inputs = (q, k, v)
+        elif entry_point == "qkvpacked":
+            packed = torch.stack(
+                (base_q, base_k, base_v), dim=2
+            ).requires_grad_()
+            result = package.flash_attn_qkvpacked_func(packed, **api_kwargs)
+            grad_inputs = (packed,)
+        else:
+            q = base_q.detach().requires_grad_()
+            packed = torch.stack((base_k, base_v), dim=2).requires_grad_()
+            result = package.flash_attn_kvpacked_func(
+                q, packed, **api_kwargs
+            )
+            grad_inputs = (q, packed)
+
+        assert isinstance(result, tuple) and len(result) == 3
+        assert all(tensor.requires_grad for tensor in result)
+        out, softmax_lse, s_dmask = result
+        raw_grads = torch.autograd.grad(
+            result,
+            grad_inputs,
+            grad_outputs=(
+                grad_out,
+                grad_lse,
+                torch.empty_like(s_dmask),
+            ),
+        )
+        if entry_point == "dense":
+            grads = raw_grads
+        elif entry_point == "qkvpacked":
+            grads = tuple(raw_grads[0][:, :, index] for index in range(3))
+        else:
+            grads = (
+                raw_grads[0],
+                raw_grads[1][:, :, 0],
+                raw_grads[1][:, :, 1],
+            )
+        return (out, softmax_lse, s_dmask), grads
+
+    got, got_grads = run(helion_attention)
+    expected_fa2, expected_fa2_grads = run(flash_attn)
+
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    q_ref = base_q.float().requires_grad_()
+    k_ref = base_k.float().requires_grad_()
+    v_ref = base_v.float().requires_grad_()
+    expected_fp32 = reference_attention(q_ref, k_ref, v_ref, spec, scale)
+    expected_fp32_grads = torch.autograd.grad(
+        expected_fp32, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+    fp32_gradient_atol = 8e-2 if softmax_scale is not None else 5e-2
+
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected_fa2
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == spec.dtype
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        out.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+    for actual, reference_fa2, reference_fp32 in zip(
+        got_grads, expected_fa2_grads, expected_fp32_grads
+    ):
+        # The nonzero LSE gradient passed above must contribute exactly zero,
+        # just as it does in FA2; the fp32 reference differentiates only out.
+        torch.testing.assert_close(
+            actual.float(), reference_fa2.float(), atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            actual.float(),
+            reference_fp32,
+            atol=fp32_gradient_atol,
+            rtol=2e-2,
+        )
+
+
+@requires_cuda
+def test_causal_gpt2_diagnostic_auxiliary_gradients_are_exactly_zero() -> None:
+    spec = CAUSAL_DROPOUT
+    q, k, v = (
+        tensor.requires_grad_()
+        for tensor in make_inputs(spec, seed=282842)
+    )
+    _, softmax_lse, s_dmask = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        return_attn_probs=True,
+        shape=spec,
+    )
+
+    grads = torch.autograd.grad(
+        (softmax_lse, s_dmask),
+        (q, k, v),
+        grad_outputs=(torch.ones_like(softmax_lse), torch.empty_like(s_dmask)),
+    )
+
+    assert all(torch.count_nonzero(grad).item() == 0 for grad in grads)
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     "entry_point",
     ["dense", "qkvpacked", "kvpacked"],
@@ -2209,9 +2420,9 @@ def test_causal_zero_dropout_retains_generated_dispatch(
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        ("grad", "grad-enabled"),
         ("dropout", "with dropout"),
         ("deterministic", "deterministic=False"),
+        ("deterministic-grad", "deterministic=False"),
         ("alibi", "ALiBi"),
         ("window", "sliding-window"),
         ("softcap", "Gemma-2"),
@@ -2232,11 +2443,11 @@ def test_causal_gpt2_return_attn_probs_rejects_out_of_scope_calls(
         "return_attn_probs": True,
         "shape": spec,
     }
-    if case == "grad":
-        q.requires_grad_()
-    elif case == "dropout":
+    if case == "dropout":
         kwargs["dropout_p"] = 0.1
-    elif case == "deterministic":
+    elif case in ("deterministic", "deterministic-grad"):
+        if case == "deterministic-grad":
+            q.requires_grad_()
         kwargs["deterministic"] = True
     elif case == "alibi":
         kwargs["alibi_slopes"] = torch.ones(
@@ -2280,30 +2491,6 @@ def test_causal_gpt2_return_attn_probs_rejects_out_of_scope_calls(
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
     with pytest.raises(NotImplementedError, match=message):
         helion_attention.flash_attn_func(q, k, v, **kwargs)
-
-
-@requires_cuda
-@pytest.mark.parametrize(
-    "entry_point", ["qkvpacked", "kvpacked"], ids=["qkv-packed", "kv-packed"]
-)
-def test_causal_gpt2_packed_diagnostics_reject_gradients(
-    entry_point: str,
-) -> None:
-    spec = CAUSAL_DROPOUT
-    q, k, v = make_inputs(spec, seed=27182)
-
-    with pytest.raises(NotImplementedError, match="grad-enabled"):
-        if entry_point == "qkvpacked":
-            qkv = torch.stack((q, k, v), dim=2).requires_grad_()
-            helion_attention.flash_attn_qkvpacked_func(
-                qkv, causal=True, return_attn_probs=True, shape=spec
-            )
-        else:
-            kv = torch.stack((k, v), dim=2).requires_grad_()
-            helion_attention.flash_attn_kvpacked_func(
-                q, kv, causal=True, return_attn_probs=True, shape=spec
-            )
-
 
 @requires_cuda
 @pytest.mark.parametrize(
