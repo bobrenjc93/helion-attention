@@ -2803,6 +2803,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:ead6cb9851313e4b619436cd80fe665465ba0762",
+      "commit": "ead6cb9851313e4b619436cd80fe665465ba0762",
+      "recordedAt": "2026-08-10T08:07:19.133Z",
+      "label": "base ead6cb9",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:127",
+      "recordedAt": "2026-08-10T08:07:19.133Z",
+      "label": "PR #127",
+      "kind": "leaf",
+      "prNumber": 127,
+      "title": "Add one 1K small-model decoder kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 99,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

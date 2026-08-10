@@ -427,7 +427,7 @@ def decode_attention_bshd_split_kv(
 def causal_attention_bshd_16k(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, sm_scale: float
 ) -> torch.Tensor:
-    """Fixed persistent causal attention for explicitly validated shapes."""
+    """Tile-parallel causal attention for explicitly validated shapes."""
     batch = q.size(0)
     m_dim = hl.specialize(q.size(1))
     nheads_q = hl.specialize(q.size(2))
@@ -438,8 +438,9 @@ def causal_attention_bshd_16k(
     out = torch.empty_like(q)
     qk_scale = sm_scale * 1.44269504088896340736
     causal_offset = n_dim - m_dim
-    # A one-CTA-per-SM persistent grid interleaves short and long causal rows
-    # instead of assigning all query tiles to only sixteen batch/head CTAs.
+    # Put the query tile in the launch grid instead of assigning every query
+    # tile to only the batch/head CTAs. Persistent configs then interleave the
+    # resulting short and long causal rows across SMs.
     for tile_b, tile_h, tile_m in hl.tile(
         [batch, nheads_q, m_dim], block_size=[1, 1, None]
     ):
@@ -511,6 +512,22 @@ causal_attention_bshd_d64 = helion.kernel(
             "pointer",
             "pointer",
         ],
+    ),
+    settings=causal_attention_bshd_16k.settings,
+)
+
+
+# This small-head 1K profile has 64 batch/head pairs. Giving each 64-row query
+# tile its own CTA exposes enough parallelism to avoid serializing sixteen tiles
+# per pair, while pointer loads outperform descriptors at D32.
+causal_attention_bshd_d32_1k = helion.kernel(
+    causal_attention_bshd_16k.fn,
+    config=helion.Config(
+        block_sizes=[64, 64],
+        num_warps=4,
+        num_stages=3,
+        pid_type="flat",
+        indexing=["pointer", "pointer", "pointer", "pointer", "pointer"],
     ),
     settings=causal_attention_bshd_16k.settings,
 )

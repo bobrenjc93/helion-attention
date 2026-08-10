@@ -525,6 +525,36 @@ def test_persistent_kernel_is_selected_only_for_validated_shapes() -> None:
     )
 
 
+def test_tile_parallel_d32_kernel_is_selected_only_for_validated_shape() -> None:
+    exact = AttnShape(
+        batch=8,
+        seqlen_q=1024,
+        seqlen_k=1024,
+        nheads_q=8,
+        nheads_kv=8,
+        head_dim=32,
+        dtype=torch.bfloat16,
+        causal=True,
+    )
+
+    assert (
+        generate.select_dense_kernel_name(exact)
+        == "causal_attention_bshd_d32_1k"
+    )
+    for candidate in (
+        replace(exact, batch=4),
+        replace(exact, seqlen_q=512, seqlen_k=512),
+        replace(exact, nheads_q=16, nheads_kv=16),
+        replace(exact, head_dim=64),
+        replace(exact, dtype=torch.float16),
+        replace(exact, causal=False),
+    ):
+        assert generate.select_dense_kernel_name(candidate) in {
+            "attention_bshd",
+            "causal_attention_bshd",
+        }
+
+
 def test_split_kv_decode_is_selected_only_for_validated_shape() -> None:
     long_decode = AttnShape(
         batch=1,

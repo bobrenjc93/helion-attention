@@ -66,6 +66,7 @@ CATALOGUE: list[ShapeRequest] = [
     ShapeRequest(8, 128, 8, 32, causal=True, label="small-model decoder"),
     ShapeRequest(8, 256, 8, 32, causal=True, label="small-model decoder"),
     ShapeRequest(8, 512, 8, 32, causal=True, label="small-model decoder"),
+    ShapeRequest(8, 1024, 8, 32, causal=True, label="small-model decoder"),
     ShapeRequest(2, 1024, 32, 64, label="GPT-2 medium style prefill"),
     ShapeRequest(2, 1024, 32, 64, causal=True, label="GPT-2 medium style, causal"),
     ShapeRequest(
