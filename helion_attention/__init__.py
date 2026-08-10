@@ -15,9 +15,10 @@ diagnostics on the shipped causal varlen profile use a generic Triton forward
 kernel. That runtime also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and, only through the KV-cache API, read-only page-256 paged
-decode. The same runtime exposes page-256 decode without softcap through the
-core varlen API. The KV-cache adapter also uses the generic paged runtime for
-ALiBi on both exposed page-16 profiles and page-256 decode. Read-only 4K dense
+decode. The same runtime exposes page-256 decode with optional ALiBi but
+without softcap through the core varlen API. The KV-cache adapter also uses the
+generic paged runtime for ALiBi on both exposed page-16 profiles and page-256
+decode. Read-only 4K dense
 decode likewise uses the generic runtime for ALiBi or a bounded Python-int
 prefix while retaining its generated specialization for a slope-free full
 cache.
@@ -505,6 +506,27 @@ def _check_core_paged_kvcache_spec(spec: AttnShape, page_size: int) -> None:
             "    batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
             "head_dim=128 causal=True or causal=False page_size=16 or 256\n"
             f"got:\n    {spec.describe()}, page_size={page_size}"
+        )
+
+
+def _check_core_paged_varlen_alibi_spec(
+    spec: AttnShape, page_size: int
+) -> None:
+    """Restrict core paged-varlen ALiBi to validated page-256 decode."""
+    requested = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    )
+    if requested != _CORE_PAGED_KVCACHE_SHAPE or page_size != 256:
+        raise NotImplementedError(
+            "core paged varlen ALiBi slopes are implemented only for the bf16 "
+            "page-size-256 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 "
+            "(GQA 8:2) head_dim=128 decode profile"
         )
 
 
@@ -1201,8 +1223,10 @@ def _generic_paged_varlen_forward(
     block_table: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
+    *,
+    alibi_slopes: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Run the validated page-256 decode profile through generic Triton."""
+    """Run validated page-256 decode, with optional ALiBi, through Triton."""
     # Page 16 has checked-in generated specializations. This helper is kept
     # deliberately narrow so other page sizes and paged profiles still fail in
     # the core varlen validator before reaching the generic vLLM runtime.
@@ -1223,7 +1247,7 @@ def _generic_paged_varlen_forward(
         causal=spec.causal,
         window_size=(-1, -1),
         softcap=0.0,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -1673,11 +1697,13 @@ def flash_attn_varlen_func(
     ``(4, 1, 1024, 8, 2, 128)`` with either causal flag. They accept caches
     shaped ``[num_blocks, 16, 2, 128]``. The decode profile additionally
     accepts page-size-256 caches through the existing generic paged runtime;
-    page-size-16 calls retain generated dispatch. Both paths derive each
-    request's used cache length from adjacent ``cu_seqlens_k`` offsets without
-    copying them to the host. Page-size-256 decode supports only forward calls
-    with the default options, apart from either causal flag and a default or
-    custom ``softmax_scale``.
+    page-size-16 calls retain generated dispatch. Page-size-256 decode also
+    accepts forward-only fp32 ALiBi slopes shaped ``[8]`` or ``[4, 8]``. Both
+    paths derive each request's used cache length from adjacent
+    ``cu_seqlens_k`` offsets without copying them to the host. Page-size-256
+    decode supports only forward calls with the default options, apart from
+    either causal flag, a default or custom ``softmax_scale``, and those
+    optional ALiBi slopes.
     The int32 CUDA cumulative-length tensors contain ``batch + 1`` offsets.
     ``shape`` uses the same forms as :func:`flash_attn_func`, but its sequence
     dimensions are the maximum query and key lengths rather than dense tensor
@@ -1749,7 +1775,7 @@ def flash_attn_varlen_func(
         softcap,
         alibi_slopes,
         return_attn_probs,
-        allow_alibi=block_table is None,
+        allow_alibi=True,
         allow_return_attn_probs=True,
         allowed_softcap=_VARLEN_SOFTCAP,
     )
@@ -1843,17 +1869,31 @@ def flash_attn_varlen_func(
                 f"{_VARLEN_DIAGNOSTIC_KEY}"
             )
 
-    if alibi_slopes is not None:
+    if alibi_slopes is not None and block_table is None:
         _check_varlen_alibi_spec(spec)
 
     if block_table is not None:
         page_size = check_paged_varlen_tensors(
             q, k, v, cu_seqlens_q, cu_seqlens_k, block_table, spec
         )
+        if alibi_slopes is not None:
+            _check_core_paged_varlen_alibi_spec(spec, page_size)
         _check_core_paged_varlen_spec(spec, page_size)
+        if alibi_slopes is not None:
+            _validate_alibi_slopes(alibi_slopes, q, spec)
+        grad_tensors = (
+            (q, k, v, alibi_slopes)
+            if alibi_slopes is not None
+            else (q, k, v)
+        )
         if torch.is_grad_enabled() and any(
-            tensor.requires_grad for tensor in (q, k, v)
+            tensor.requires_grad for tensor in grad_tensors
         ):
+            if alibi_slopes is not None:
+                raise NotImplementedError(
+                    "ALiBi backward is not implemented; core paged varlen "
+                    "ALiBi calls are forward-only"
+                )
             raise NotImplementedError(
                 "flash_attn_varlen_func with block_table is forward-only; "
                 "no paged-cache backward kernel is checked in"
@@ -1869,6 +1909,11 @@ def flash_attn_varlen_func(
         # used lengths directly on CUDA and remains safe for graph capture.
         seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
         if page_size != _CORE_PAGED_GENERATED_PAGE_SIZE:
+            generic_kwargs = (
+                {"alibi_slopes": alibi_slopes}
+                if alibi_slopes is not None
+                else {}
+            )
             return _generic_paged_varlen_forward(
                 q,
                 k,
@@ -1878,6 +1923,7 @@ def flash_attn_varlen_func(
                 block_table,
                 float(softmax_scale),
                 spec,
+                **generic_kwargs,
             )
         # For the decode profile, a bottom-right-aligned single-token query has
         # equivalent causal and non-causal results. The registry handles that
