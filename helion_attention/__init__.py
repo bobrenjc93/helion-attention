@@ -9,10 +9,10 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
-varlen inference profile, ALiBi on that profile and both shipped varlen
-profiles, symmetric windows on the shipped noncausal varlen profile, and
-diagnostics on the shipped causal varlen profile use a generic Triton forward
-kernel. That runtime also provides
+varlen inference profile, ALiBi and diagnostics on that profile, ALiBi on both
+shipped varlen profiles, symmetric windows on the shipped noncausal varlen
+profile, and diagnostics on the shipped causal varlen profile use a generic
+Triton forward kernel. That runtime also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes page-256 decode with optional ALiBi but
@@ -149,6 +149,9 @@ _VARLEN_ALIBI_KEYS = frozenset(
     }
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
+_VARLEN_DIAGNOSTIC_KEYS = frozenset(
+    {_LLAMA3_VARLEN_INFERENCE_KEY, _VARLEN_DIAGNOSTIC_KEY}
+)
 _VARLEN_SYMMETRIC_WINDOW_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 )
@@ -670,10 +673,11 @@ def _validate_varlen_self_attention_offsets(
 
 
 def _supports_varlen_diagnostic_return(spec: AttnShape) -> bool:
-    """Whether ``spec`` is the one LSE-capable core varlen profile."""
-    return (
-        f"varlen_{spec.key}" == _VARLEN_DIAGNOSTIC_KEY
-        and has_varlen_kernel(spec)
+    """Whether ``spec`` has a validated LSE-capable core varlen path."""
+    requested = f"varlen_{spec.key}"
+    return requested in _VARLEN_DIAGNOSTIC_KEYS and (
+        requested == _LLAMA3_VARLEN_INFERENCE_KEY
+        or has_varlen_kernel(spec)
     )
 
 
@@ -1724,8 +1728,10 @@ def flash_attn_varlen_func(
     Shared-offset self-attention continues to support a mix of empty and
     nonempty slots. This unregistered profile uses the generic packed Triton
     runtime and accepts the default or a custom ``softmax_scale``, with or
-    without the ALiBi slopes described above. Registered profiles retain
-    generated dispatch.
+    without the ALiBi slopes described above. Forward-only slope-free calls
+    additionally accept ``return_attn_probs=True`` and return fp32 LSE shaped
+    ``[32, total_q]`` plus an empty bf16 ``S_dmask``. Registered profiles
+    retain generated dispatch.
 
     The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
@@ -1864,9 +1870,10 @@ def flash_attn_varlen_func(
                 "return_attn_probs=True requires deterministic=False"
             )
         if not _supports_varlen_diagnostic_return(spec):
+            supported = ", ".join(sorted(_VARLEN_DIAGNOSTIC_KEYS))
             raise NotImplementedError(
                 "return_attn_probs=True is implemented only for "
-                f"{_VARLEN_DIAGNOSTIC_KEY}"
+                f"{supported}"
             )
 
     if alibi_slopes is not None and block_table is None:
