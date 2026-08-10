@@ -2653,6 +2653,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:ef16aad8b1cbdf77b03ca8a372c893c63c652fd2",
+      "commit": "ef16aad8b1cbdf77b03ca8a372c893c63c652fd2",
+      "recordedAt": "2026-08-10T04:56:26.639Z",
+      "label": "base ef16aad",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:119",
+      "recordedAt": "2026-08-10T04:56:26.639Z",
+      "label": "PR #119",
+      "kind": "leaf",
+      "prNumber": 119,
+      "title": "Add one 128-token small-decoder kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 94,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
