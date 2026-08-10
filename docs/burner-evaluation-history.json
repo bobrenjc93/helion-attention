@@ -3763,6 +3763,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:07c55d9a4d633bbb248618205e732f0095f841a0",
+      "commit": "07c55d9a4d633bbb248618205e732f0095f841a0",
+      "recordedAt": "2026-08-10T22:50:26.813Z",
+      "label": "base 07c55d9",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:165",
+      "recordedAt": "2026-08-10T22:50:26.813Z",
+      "label": "PR #165",
+      "kind": "leaf",
+      "prNumber": 165,
+      "title": "Add the 16-token small-model decoder kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
