@@ -8,16 +8,16 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, BERT-base encoder diagnostics, ALiBi on both shipped varlen
-profiles, symmetric windows on the shipped noncausal varlen profile, and
-diagnostics on the shipped causal varlen profile use a generic Triton forward
-kernel. That runtime also provides ``softcap=50.0`` for one forward-only
-Gemma-2 profile, the shipped causal varlen profile, and read-only page-256
-paged decode. Both exposed page-16 paged KV-cache profiles and page-256 decode
-use the generic paged runtime when ALiBi is supplied, without expanding the
-core paged-varlen API. Read-only 4K dense decode likewise uses the generic
-runtime for ALiBi while retaining its generated specialization when slopes are
-omitted.
+ALiBi calls, BERT-base encoder diagnostics, one causal Llama-3 GQA varlen
+inference profile, ALiBi on both shipped varlen profiles, symmetric windows on
+the shipped noncausal varlen profile, and diagnostics on the shipped causal
+varlen profile use a generic Triton forward kernel. That runtime also provides
+``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
+varlen profile, and read-only page-256 paged decode. Both exposed page-16 paged
+KV-cache profiles and page-256 decode use the generic paged runtime when ALiBi
+is supplied, without expanding the core paged-varlen API. Read-only 4K dense
+decode likewise uses the generic runtime for ALiBi while retaining its
+generated specialization when slopes are omitted.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -134,6 +134,9 @@ _VARLEN_ALIBI_KEYS = frozenset(
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _VARLEN_SYMMETRIC_WINDOW_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
+)
+_LLAMA3_VARLEN_INFERENCE_KEY = (
+    "varlen_b4_sq256_sk256_hq32_hkv8_d128_bf16_causal"
 )
 _VARLEN_SOFTCAP_KEY = _VARLEN_DIAGNOSTIC_KEY
 _VARLEN_SOFTCAP = 50.0
@@ -1121,6 +1124,54 @@ def _generic_varlen_alibi_forward(
     return packed_out
 
 
+def _generic_varlen_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    softmax_scale: float,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Run the exact validated Llama-3 varlen inference profile generically."""
+    # This intentionally is not a general missing-specialization fallback.
+    # The dispatcher requires these arguments to alias the same storage, which
+    # preserves device-resident, graph-capturable ragged lengths.
+    from ._paged_attention import packed_attention
+
+    packed_out = packed_attention(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q=spec.seqlen_q,
+        max_seqlen_k=spec.seqlen_k,
+        dynamic_max_seqlen_q=None,
+        dynamic_max_seqlen_k=None,
+        softmax_scale=softmax_scale,
+        causal=True,
+        window_size=(-1, -1),
+        softcap=0.0,
+        alibi_slopes=None,
+        q_descale=None,
+        k_descale=None,
+        v_descale=None,
+        s_aux=None,
+        q_v=None,
+        cp_world_size=1,
+        cp_rank=0,
+        cp_tot_seqused_k=None,
+        out=None,
+        return_softmax_lse=False,
+        shift_fa2_lse=False,
+        fa_version=2,
+    )
+    if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
+    return packed_out
+
+
 def _generic_varlen_symmetric_window_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1553,6 +1604,14 @@ def flash_attn_varlen_func(
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
     ``[16]`` or ``[8, 16]``.
 
+    Causal bf16 Llama-3 GQA self-attention with maximum shape
+    ``(4, 256, 256, 32, 8, 128)`` is also supported when no backward or
+    optional feature is requested. Query and key offsets must share storage;
+    their device-resident values may describe arbitrary ragged lengths,
+    including a mix of empty and nonempty slots. This unregistered profile
+    uses the generic packed Triton runtime and accepts the default or a custom
+    ``softmax_scale``. Registered profiles retain generated dispatch.
+
     The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
     Query and key cumulative offsets must be identical. Forward-only calls use
@@ -1622,6 +1681,15 @@ def flash_attn_varlen_func(
             "max_seqlen_q/max_seqlen_k must match the maximum sequence lengths "
             f"declared by shape ({spec.seqlen_q}, {spec.seqlen_k}); got "
             f"({max_seqlen_q}, {max_seqlen_k})"
+        )
+
+    is_llama3_varlen_inference = (
+        f"varlen_{spec.key}" == _LLAMA3_VARLEN_INFERENCE_KEY
+    )
+    if is_llama3_varlen_inference and deterministic:
+        raise NotImplementedError(
+            "deterministic=True is not implemented for the Llama-3 varlen "
+            "inference profile"
         )
 
     has_symmetric_window = window != (-1, -1)
@@ -1859,6 +1927,23 @@ def flash_attn_varlen_func(
             scale,
             spec,
             alibi_slopes,
+        )
+    if is_llama3_varlen_inference:
+        if q.shape[0] != k.shape[0] or (
+            cu_seqlens_q.data_ptr() != cu_seqlens_k.data_ptr()
+        ):
+            raise NotImplementedError(
+                "the Llama-3 varlen inference profile supports only "
+                "self-attention with shared cu_seqlens_q/cu_seqlens_k storage"
+            )
+        return _generic_varlen_forward(
+            q,
+            k,
+            v,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            scale,
+            spec,
         )
     # Keep ordinary slope-free calls on the generated specialization.
     kernel = lookup_varlen(spec)
