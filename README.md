@@ -317,8 +317,11 @@ out = helion_attention.flash_attn_with_kvcache(
 
 ALiBi uses the generic packed Triton runtime and never mutates the cache;
 slope-free calls retain the checked-in generated specialization. This narrow
-mode does not support LSE, updates, partial lengths, cache remapping, left
-padding, rotary, windows, softcap, or autograd.
+mode optionally returns fp32 `[1, 32, 1]` LSE with
+`return_softmax_lse=True`. Causal LSE follows FA2's position-shifted ALiBi
+convention (the mathematical value plus `slope * 4095`); noncausal LSE is
+unshifted. Updates, partial lengths, cache remapping, left padding, rotary,
+windows, softcap, and autograd remain unsupported.
 
 The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
 through 4095 for slope-free, read-only prefix attention. It also accepts paired
@@ -348,8 +351,8 @@ other query lengths remain unsupported.
 For supported slope-free single-token dense caches, pass
 `return_softmax_lse=True` to receive `(out, softmax_lse)`. The LSE is fp32 with
 shape `[batch, heads_q, 1]`, matching FlashAttention's KV-cache API. The exact
-paged decode profile below supports the same return for both the default and a
-custom `softmax_scale`.
+4K ALiBi mode above and paged decode profile below support the same return for
+both the default and a custom `softmax_scale`.
 
 The causal bf16 dense profile `(1, 1, 16384, 32, 8, 128)` also accepts a
 contiguous CUDA int32 `cache_seqlens` tensor shaped `[1]`. Values from 1 through
@@ -757,11 +760,12 @@ also raise `NotImplementedError` rather than silently doing something else:
   `(1, 1, 4096, 32, 8, 128)` decode profile, page-size-16 profiles, and
   page-size-256 decode above; core paged-varlen ALiBi cannot be combined with
   dropout, windows, softcap, `deterministic=True`, diagnostic returns, or
-  autograd; dense KV-cache ALiBi cannot be combined with LSE, updates, partial
-  lengths, remapping, left padding, rotary, windows, softcap, or autograd; paged
-  KV-cache ALiBi cannot be combined with softcap, updates, rotary, windows, or
-  autograd, and its LSE combination is limited to the exact read-only
-  page-size-256 decode profile above
+  autograd; dense KV-cache ALiBi cannot be combined with updates, partial
+  lengths, remapping, left padding, rotary, windows, softcap, or autograd, and
+  its LSE combination is limited to the exact full-cache 4K profile above;
+  paged KV-cache ALiBi cannot be combined with softcap, updates, rotary,
+  windows, or autograd, and its LSE combination is limited to the exact
+  read-only page-size-256 decode profile above
 - KV-cache mutation beyond the dense paired one-token final-slot append, the
   exact 4K partial one-token append, and exact two-token final-two-slot append
   above; the exact four-token profile is read-only;

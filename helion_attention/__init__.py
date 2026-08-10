@@ -823,7 +823,9 @@ def _generic_dense_forward(
     alibi_slopes: torch.Tensor | None,
     *,
     softcap: float = 0.0,
-) -> torch.Tensor:
+    return_softmax_lse: bool = False,
+    shift_fa2_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Adapt a validated dense batch to the generic packed Triton runtime."""
     total_q, total_k = _validate_generic_dense_layout(spec)
 
@@ -846,7 +848,7 @@ def _generic_dense_forward(
     # specialization manifest.
     from ._paged_attention import packed_attention
 
-    packed_out = packed_attention(
+    packed_result = packed_attention(
         packed_q,
         packed_k,
         packed_v,
@@ -870,15 +872,35 @@ def _generic_dense_forward(
         cp_rank=0,
         cp_tot_seqused_k=None,
         out=None,
-        return_softmax_lse=False,
-        shift_fa2_lse=False,
+        return_softmax_lse=return_softmax_lse,
+        shift_fa2_lse=shift_fa2_lse,
         fa_version=2,
     )
-    if not isinstance(packed_out, torch.Tensor):  # pragma: no cover - contract guard
-        raise RuntimeError("generic packed attention unexpectedly returned softmax LSE")
-    return packed_out.view(
-        spec.batch, spec.seqlen_q, spec.nheads_q, spec.head_dim
+    output_shape = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.nheads_q,
+        spec.head_dim,
     )
+    if not return_softmax_lse:
+        if not isinstance(  # pragma: no cover - contract guard
+            packed_result, torch.Tensor
+        ):
+            raise RuntimeError(
+                "generic packed attention unexpectedly returned softmax LSE"
+            )
+        return packed_result.view(output_shape)
+
+    if not isinstance(packed_result, tuple):  # pragma: no cover - contract guard
+        raise RuntimeError("generic packed attention did not return softmax LSE")
+    packed_out, packed_lse = packed_result
+    out = packed_out.view(output_shape)
+    softmax_lse = (
+        packed_lse.view(spec.nheads_q, spec.batch, spec.seqlen_q)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
+    return out, softmax_lse
 
 
 def _validate_dense_kvcache_index_tensor(
@@ -2542,9 +2564,12 @@ def flash_attn_with_kvcache(
     The same 4K profiles accept
     forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]`` only for the
     full cache. Those calls use the generic packed runtime; omitting slopes
-    retains the generated specialization. ALiBi cannot be combined with LSE,
-    updates, partial lengths, remapping, left padding, rotary, windows, softcap,
-    or autograd. The causal bf16 ``(1, 1, 16384, 32, 8, 128)`` profile
+    retains the generated specialization. They optionally return fp32 LSE
+    shaped ``[1, 32, 1]``; causal LSE follows FlashAttention 2's
+    position-shifted ALiBi convention, while noncausal LSE is mathematical.
+    ALiBi cannot be combined with updates, partial lengths, remapping, left
+    padding, rotary, windows, softcap, or autograd. The causal bf16
+    ``(1, 1, 16384, 32, 8, 128)`` profile
     additionally accepts a contiguous
     CUDA int32 ``cache_seqlens`` tensor shaped ``[1]`` selecting the end of a
     prefix. A matching ``cache_leftpad`` tensor selects the half-open cache span
@@ -2732,11 +2757,6 @@ def flash_attn_with_kvcache(
             raise NotImplementedError(
                 "dense KV-cache ALiBi is implemented only for read-only calls; "
                 "updates are not supported"
-            )
-        if return_softmax_lse:
-            raise NotImplementedError(
-                "return_softmax_lse=True is not implemented with dense "
-                "KV-cache ALiBi"
             )
     is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
     is_four_token_dense_profile = spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
@@ -3032,6 +3052,17 @@ def flash_attn_with_kvcache(
 
     if has_dense_alibi:
         assert alibi_slopes is not None
+        if return_softmax_lse:
+            return _generic_dense_forward(
+                q,
+                k_cache,
+                v_cache,
+                scale,
+                spec,
+                alibi_slopes,
+                return_softmax_lse=True,
+                shift_fa2_lse=spec.causal,
+            )
         return _generic_dense_forward(
             q,
             k_cache,
