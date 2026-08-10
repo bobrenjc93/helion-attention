@@ -3283,6 +3283,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:ed64cb6dd42a52ba00ed56b36cc90b3156b593c4",
+      "commit": "ed64cb6dd42a52ba00ed56b36cc90b3156b593c4",
+      "recordedAt": "2026-08-10T14:39:24.968Z",
+      "label": "base ed64cb6",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:144",
+      "recordedAt": "2026-08-10T14:39:24.968Z",
+      "label": "PR #144",
+      "kind": "leaf",
+      "prNumber": 144,
+      "title": "Expose page-512 decode through core varlen",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
