@@ -3673,6 +3673,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:fdb9f97804b40f8c83406e78a96ca9cd700e8f2d",
+      "commit": "fdb9f97804b40f8c83406e78a96ca9cd700e8f2d",
+      "recordedAt": "2026-08-10T21:31:18.158Z",
+      "label": "base fdb9f97",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:162",
+      "recordedAt": "2026-08-10T21:31:18.158Z",
+      "label": "PR #162",
+      "kind": "leaf",
+      "prNumber": 162,
+      "title": "Apply softcap 50 to page-512 KV-cache decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
