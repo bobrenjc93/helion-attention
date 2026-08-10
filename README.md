@@ -307,6 +307,16 @@ slope-free calls retain the checked-in generated specialization. This narrow
 mode does not support LSE, updates, partial lengths, cache remapping, left
 padding, rotary, windows, softcap, or autograd.
 
+The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
+through 4095 for slope-free, read-only prefix attention. Both causal flags, the
+default or a custom `softmax_scale`, and optional fp32 LSE are supported. This
+path uses the generic packed Triton runtime and does not mutate the cache.
+Omitting the length or passing 4096 retains the checked-in generated dispatch.
+Tensor-valued lengths, updates of a partial prefix, ALiBi, cache remapping, left
+padding, rotary, windows, softcap, explicit split counts, and autograd remain
+unsupported on this path; scalar prefixes on other dense profiles remain
+unsupported.
+
 Two strict speculative-decoding slices use the generic packed Triton runtime
 with a dense cache. Causal bf16 `(1, 2, 1024, 32, 8, 128)` accepts either the
 default or a custom `softmax_scale`; its read-only form requires the full cache.
@@ -418,12 +428,14 @@ cache. The exact two-token profile above similarly accepts paired K/V tensors
 shaped `[1, 2, 8, 128]` when the Python integer `cache_seqlens` is 1022, and
 mutates only the final two slots. Dense read-only calls may omit
 `cache_seqlens` or pass the full cache length, including the exact four-token
-profile above; the exact 16K profile additionally accepts its documented tensor
-prefix or left-padded span.
+profile above; the exact 4K profile additionally accepts its documented scalar
+prefix, and the exact 16K profile accepts its documented tensor prefix or
+left-padded span.
 Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`; the
 two-token update must satisfy `cache_seqlens + 2 == 1024`. Other multi-token
-updates, scalar partial lengths, and tensor lengths on every other dense
-profile are rejected explicitly. Caches created inside
+updates, scalar partial lengths outside the exact read-only 4K profile, and
+tensor lengths on every other dense profile are rejected explicitly. Caches
+created inside
 `torch.inference_mode()` must be updated while that mode remains enabled. For
 an append, `q`, `k_cache`, and `v_cache` must occupy disjoint memory; update
 `k`/`v` aliases are staged safely.
@@ -723,8 +735,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   exact two-token final-two-slot append above; the exact four-token profile is
   read-only;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
-  partial caches, `cache_leftpad` outside that profile or combined with updates,
-  remapping, rotary, or autograd, paged profiles and page sizes other than the
+  partial caches outside the exact read-only 4K profile above, `cache_leftpad`
+  outside the 16K profile or combined with updates, remapping, rotary, or
+  autograd, paged profiles and page sizes other than the
   exact read-only page-size-16 profiles and page-size-256 decode above, paged LSE
   outside the exact decode profile above, and KV-cache rotary outside the
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
