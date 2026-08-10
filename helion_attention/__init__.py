@@ -25,10 +25,11 @@ Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
-profile, grad-enabled dense calls without a generated backward, both
-full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. Full-length symmetric-window training on the shipped noncausal
-varlen profile uses the same bounded SDPA bridge. Deterministic zero-dropout
+profile, grad-enabled dense calls without a generated backward, grad-enabled
+diagnostics on that GPT-2 profile, both full-length varlen profiles, and ragged
+causal attention use PyTorch SDPA autograd. Full-length symmetric-window
+training on the shipped noncausal varlen profile uses the same bounded SDPA
+bridge. Deterministic zero-dropout
 BERT-base, causal GPT-2, and full-length causal varlen training use the direct
 math operator without changing process-wide SDPA backend state. The explicit
 shape validates these paths and makes specialization introspection independent
@@ -44,6 +45,7 @@ from numbers import Real
 import torch
 
 from ._autograd import attention_autograd
+from ._autograd import attention_diagnostics
 from ._autograd import attention_with_flash_gradients
 from ._registry import UnsupportedShapeError
 from ._registry import available_paged_shapes
@@ -1445,9 +1447,12 @@ def flash_attn_func(
         return_attn_probs: for the shipped bf16 BERT-base encoder and causal
             GPT-2 profile, three Llama GQA decode profiles, and the
             ``softcap=50.0`` Gemma-2 profile, return FlashAttention's diagnostic
-            tuple. This is available only when no backward is needed and all
-            options other than ``softmax_scale`` (plus the documented
-            causal/softcap settings) retain their defaults.
+            tuple. The zero-dropout causal GPT-2 profile also supports
+            backward through ``out``; its LSE and empty ``S_dmask`` accept
+            gradients with zero contribution, matching FlashAttention. Other
+            profiles require that no backward is needed, and all options other
+            than ``softmax_scale`` (plus the documented causal/softcap
+            settings) retain their defaults.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -1551,7 +1556,7 @@ def flash_attn_func(
             softcap=_GEMMA2_SOFTCAP,
         )
     if return_attn_probs:
-        if needs_backward:
+        if needs_backward and spec.key != _CAUSAL_DROPOUT_KEY:
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented for grad-enabled "
                 "calls"
@@ -1571,6 +1576,13 @@ def flash_attn_func(
                 f"{_CAUSAL_DROPOUT_KEY} causal GPT-2 profile, and the three "
                 "shipped batch-1, single-token bf16 Llama GQA decode profiles"
             )
+        if needs_backward:
+            out = dense_attention_sdpa(q, k, v, scale, spec)
+            with torch.no_grad():
+                _, softmax_lse, s_dmask = _generic_dense_diagnostic_forward(
+                    q, k, v, scale, spec
+                )
+            return attention_diagnostics(out, softmax_lse, s_dmask)
         if spec.key in _GENERIC_DENSE_DIAGNOSTIC_KEYS:
             return _generic_dense_diagnostic_forward(q, k, v, scale, spec)
         out, softmax_lse = lookup(spec)(
