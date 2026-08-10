@@ -5066,6 +5066,310 @@ def test_two_token_dense_kvcache_rejects_malformed_updates_before_mutation(
 @pytest.mark.parametrize(
     "causal", [True, False], ids=["causal", "default-noncausal"]
 )
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_page16_paged_kvcache_appends_final_token_and_matches_fa2_and_fp32(
+    causal: bool,
+    softmax_scale: float | None,
+) -> None:
+    q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
+        make_paged_kvcache_inputs(lengths=[1023] * PAGED_KVCACHE.batch)
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    original_lengths = cache_seqlens.clone()
+    generator = torch.Generator(device=q.device).manual_seed(20260810)
+    update_shape = (
+        PAGED_KVCACHE.batch,
+        1,
+        PAGED_KVCACHE.nheads_kv,
+        PAGED_KVCACHE.head_dim,
+    )
+    new_k = torch.randn(
+        update_shape,
+        device=q.device,
+        dtype=q.dtype,
+        generator=generator,
+    )
+    new_v = torch.randn(
+        update_shape,
+        device=q.device,
+        dtype=q.dtype,
+        generator=generator,
+    )
+    scale = (
+        1.0 / math.sqrt(PAGED_KVCACHE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    out = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=new_k,
+        v=new_v,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        shape=(4, 1, 1024, 8, 2, 128),
+    )
+    assert isinstance(out, torch.Tensor)
+
+    updated_logical_caches = [
+        (
+            torch.cat((logical_k, new_k[batch]), dim=0),
+            torch.cat((logical_v, new_v[batch]), dim=0),
+        )
+        for batch, (logical_k, logical_v) in enumerate(logical_caches)
+    ]
+    expected_fp32 = torch.stack(
+        [
+            torch.nn.functional.scaled_dot_product_attention(
+                query.float().transpose(0, 1).unsqueeze(0),
+                logical_k.float().transpose(0, 1).unsqueeze(0),
+                logical_v.float().transpose(0, 1).unsqueeze(0),
+                scale=scale,
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+            for query, (logical_k, logical_v) in zip(
+                q, updated_logical_caches
+            )
+        ]
+    )
+
+    expected_k = original_k.clone()
+    expected_v = original_v.clone()
+    for batch in range(PAGED_KVCACHE.batch):
+        physical_block = int(block_table[batch, -1])
+        expected_k[physical_block, -1].copy_(new_k[batch, 0])
+        expected_v[physical_block, -1].copy_(new_v[batch, 0])
+    assert torch.equal(k_cache, expected_k)
+    assert torch.equal(v_cache, expected_v)
+    assert torch.equal(cache_seqlens, original_lengths)
+    torch.testing.assert_close(out.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    fa2_k, fa2_v, fa2_block_table = page_logical_caches(
+        PAGED_KVCACHE, logical_caches, page_size=256
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        fa2_k,
+        fa2_v,
+        k=new_k,
+        v=new_v,
+        cache_seqlens=original_lengths,
+        block_table=fa2_block_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+    torch.testing.assert_close(out, expected_fa2, atol=2e-2, rtol=1e-2)
+
+
+@requires_cuda
+def test_page16_paged_kvcache_append_reuses_generated_reader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs(lengths=[1023] * PAGED_KVCACHE.batch)
+    )
+    update_shape = (
+        PAGED_KVCACHE.batch,
+        1,
+        PAGED_KVCACHE.nheads_kv,
+        PAGED_KVCACHE.head_dim,
+    )
+    new_k = torch.full(update_shape, 3.0, device=q.device, dtype=q.dtype)
+    new_v = torch.full(update_shape, 5.0, device=q.device, dtype=q.dtype)
+    original_lengths = cache_seqlens.clone()
+    sentinel = torch.full_like(q.flatten(0, 1), 7.0)
+    seen: dict[str, object] = {}
+
+    def fake_varlen(*args: object, **kwargs: object) -> torch.Tensor:
+        seen["args"] = args
+        seen["kwargs"] = kwargs
+        for batch in range(PAGED_KVCACHE.batch):
+            physical_block = int(block_table[batch, -1])
+            torch.testing.assert_close(
+                k_cache[physical_block, -1], new_k[batch, 0]
+            )
+            torch.testing.assert_close(
+                v_cache[physical_block, -1], new_v[batch, 0]
+            )
+        return sentinel
+
+    monkeypatch.setattr(helion_attention, "flash_attn_varlen_func", fake_varlen)
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=new_k,
+        v=new_v,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        causal=True,
+        shape=PAGED_KVCACHE,
+    )
+
+    args = seen["args"]
+    assert isinstance(args, tuple)
+    torch.testing.assert_close(
+        args[4][1:] - args[4][:-1],
+        torch.full_like(cache_seqlens, PAGED_KVCACHE.seqlen_k),
+    )
+    assert torch.equal(cache_seqlens, original_lengths)
+    torch.testing.assert_close(got.flatten(0, 1), sentinel)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("other-length", "every cache_seqlens", id="other-length"),
+        pytest.param("page-256", "read-only", id="other-page-size"),
+        pytest.param("lse", "LSE paths are read-only", id="lse"),
+        pytest.param("rotary", "rotary paths are read-only", id="rotary"),
+        pytest.param("alibi", "ALiBi paths are read-only", id="alibi"),
+        pytest.param("window", "sliding-window", id="window"),
+        pytest.param("softcap", "softcap paths are read-only", id="softcap"),
+        pytest.param("autograd", "autograd", id="autograd"),
+        pytest.param("aliased-pages", "disjoint", id="aliased-pages"),
+        pytest.param("aliased-caches", "must not overlap", id="aliased-caches"),
+        pytest.param("aliased-query", "q must not overlap", id="aliased-query"),
+    ],
+)
+def test_page16_paged_kvcache_append_rejects_out_of_scope_before_mutation(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
+        make_paged_kvcache_inputs(lengths=[1023] * PAGED_KVCACHE.batch)
+    )
+    update_shape = (
+        PAGED_KVCACHE.batch,
+        1,
+        PAGED_KVCACHE.nheads_kv,
+        PAGED_KVCACHE.head_dim,
+    )
+    new_k = torch.full(update_shape, 3.0, device=q.device, dtype=q.dtype)
+    new_v = torch.full(update_shape, 5.0, device=q.device, dtype=q.dtype)
+    kwargs: dict[str, object] = {
+        "k": new_k,
+        "v": new_v,
+        "cache_seqlens": cache_seqlens,
+        "block_table": block_table,
+        "causal": True,
+        "shape": PAGED_KVCACHE,
+    }
+    if case == "other-length":
+        cache_seqlens = cache_seqlens.clone()
+        cache_seqlens[1] = 1022
+        kwargs["cache_seqlens"] = cache_seqlens
+    elif case == "page-256":
+        k_cache, v_cache, block_table = page_logical_caches(
+            PAGED_KVCACHE, logical_caches, page_size=256
+        )
+        kwargs["block_table"] = block_table
+    elif case == "lse":
+        kwargs["return_softmax_lse"] = True
+    elif case == "rotary":
+        rotary_cos, rotary_sin = make_rotary_tables(PAGED_KVCACHE)
+        kwargs["rotary_cos"] = rotary_cos
+        kwargs["rotary_sin"] = rotary_sin
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            PAGED_KVCACHE.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = PAGED_KVCACHE_SOFTCAP_VALUE
+    elif case == "autograd":
+        q = q.detach().requires_grad_()
+    elif case == "aliased-pages":
+        block_table = block_table.clone()
+        block_table[1, -1] = block_table[0, -1]
+        kwargs["block_table"] = block_table
+    elif case == "aliased-caches":
+        v_cache = k_cache
+    elif case == "aliased-query":
+        q = k_cache.reshape(-1)[: q.numel()].view_as(q)
+
+    original_q = q.detach().clone()
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("invalid paged append reached attention dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "flash_attn_varlen_func", reject_dispatch
+    )
+    monkeypatch.setattr(generic_attention, "paged_attention", reject_dispatch)
+    with pytest.raises((NotImplementedError, ValueError), match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q, k_cache, v_cache, **kwargs
+        )
+
+    assert torch.equal(q, original_q)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+def test_page16_paged_kvcache_append_rejects_cuda_graph_capture() -> None:
+    q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+        make_paged_kvcache_inputs(lengths=[1023] * PAGED_KVCACHE.batch)
+    )
+    update_shape = (
+        PAGED_KVCACHE.batch,
+        1,
+        PAGED_KVCACHE.nheads_kv,
+        PAGED_KVCACHE.head_dim,
+    )
+    new_k = torch.full(update_shape, 3.0, device=q.device, dtype=q.dtype)
+    new_v = torch.full(update_shape, 5.0, device=q.device, dtype=q.dtype)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+
+    graph = torch.cuda.CUDAGraph()
+    capture_marker = torch.empty_like(q)
+    with pytest.raises(NotImplementedError, match="during CUDA graph capture"):
+        with torch.cuda.graph(graph):
+            capture_marker.copy_(q)
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                k=new_k,
+                v=new_v,
+                cache_seqlens=cache_seqlens,
+                block_table=block_table,
+                causal=True,
+                shape=PAGED_KVCACHE,
+            )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    torch.testing.assert_close(q + 1, q.add(1))
+    torch.cuda.synchronize(q.device)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "causal", [True, False], ids=["causal", "default-noncausal"]
+)
 def test_paged_kvcache_matches_fp32_for_ragged_permuted_pages(
     causal: bool,
 ) -> None:
