@@ -9,10 +9,10 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
-varlen inference profile, ALiBi on both shipped varlen profiles, symmetric
-windows on the shipped noncausal varlen profile, and diagnostics on the shipped
-causal varlen profile use a generic Triton forward kernel. That runtime also
-provides
+varlen inference profile, ALiBi on that profile and both shipped varlen
+profiles, symmetric windows on the shipped noncausal varlen profile, and
+diagnostics on the shipped causal varlen profile use a generic Triton forward
+kernel. That runtime also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes page-256 decode without softcap through the
@@ -134,8 +134,12 @@ _CUDNN_SDPA_FAST_PATH_KEYS = frozenset(
         "b4_sq4096_sk4096_hq32_hkv32_d128_bf16_causal",
     }
 )
+_LLAMA3_VARLEN_INFERENCE_KEY = (
+    "varlen_b4_sq256_sk256_hq32_hkv8_d128_bf16_causal"
+)
 _VARLEN_ALIBI_KEYS = frozenset(
     {
+        _LLAMA3_VARLEN_INFERENCE_KEY,
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
@@ -143,9 +147,6 @@ _VARLEN_ALIBI_KEYS = frozenset(
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _VARLEN_SYMMETRIC_WINDOW_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
-)
-_LLAMA3_VARLEN_INFERENCE_KEY = (
-    "varlen_b4_sq256_sk256_hq32_hkv8_d128_bf16_causal"
 )
 _VARLEN_SOFTCAP_KEY = _VARLEN_DIAGNOSTIC_KEY
 _VARLEN_SOFTCAP = 50.0
@@ -1677,16 +1678,18 @@ def flash_attn_varlen_func(
     dtype, and causal mode must continue to match ``shape``. Forward-only
     ALiBi is supported for both causal modes of the
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
-    ``[16]`` or ``[8, 16]``.
+    ``[16]`` or ``[8, 16]``. The causal Llama-3 profile below accepts fp32
+    slopes shaped ``[32]`` or ``[4, 32]`` under the same forward-only contract.
 
     Causal bf16 Llama-3 GQA attention with maximum shape
     ``(4, 256, 256, 32, 8, 128)`` is also supported when no backward or
-    optional feature is requested. Its device-resident query and key offsets
-    may independently describe arbitrary ragged lengths. Shared-offset
-    self-attention continues to support a mix of empty and nonempty slots.
-    This unregistered profile uses the generic packed Triton runtime and
-    accepts the default or a custom ``softmax_scale``. Registered profiles
-    retain generated dispatch.
+    incompatible optional feature is requested. Its device-resident query and
+    key offsets may independently describe arbitrary ragged lengths.
+    Shared-offset self-attention continues to support a mix of empty and
+    nonempty slots. This unregistered profile uses the generic packed Triton
+    runtime and accepts the default or a custom ``softmax_scale``, with or
+    without the ALiBi slopes described above. Registered profiles retain
+    generated dispatch.
 
     The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
