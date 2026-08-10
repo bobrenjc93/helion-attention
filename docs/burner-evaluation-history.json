@@ -2383,6 +2383,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:7acf04a800a1bb4926296416c7953bb810ea0288",
+      "commit": "7acf04a800a1bb4926296416c7953bb810ea0288",
+      "recordedAt": "2026-08-10T00:44:40.435Z",
+      "label": "base 7acf04a",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 91,
+        "eval_1afd133e": 56,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:110",
+      "recordedAt": "2026-08-10T00:44:40.435Z",
+      "label": "PR #110",
+      "kind": "leaf",
+      "prNumber": 110,
+      "title": "Honor deterministic causal varlen backward",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 57,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

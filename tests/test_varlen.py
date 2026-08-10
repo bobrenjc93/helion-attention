@@ -1150,6 +1150,139 @@ def test_full_varlen_backward_matches_fp32_and_fa2(
 @requires_cuda
 @pytest.mark.parametrize(
     "name",
+    [
+        "flash_attn_varlen_func",
+        "flash_attn_varlen_qkvpacked_func",
+        "flash_attn_varlen_kvpacked_func",
+    ],
+    ids=["unpacked", "qkv-packed", "kv-packed"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_deterministic_full_causal_varlen_training_is_repeatable_and_matches_references(
+    name: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = VARLEN_ALIBI_CAUSAL
+    base_q, base_k, base_v, cu_q, cu_k, lengths_q, lengths_k = make_packed(
+        spec, variant=2, seed=20260808
+    )
+    generator = torch.Generator(device=base_q.device).manual_seed(20260809)
+    grad_out = torch.randn(
+        base_q.shape,
+        device=base_q.device,
+        dtype=base_q.dtype,
+        generator=generator,
+    )
+
+    def run(api: object, *, pass_shape: bool) -> tuple[torch.Tensor, ...]:
+        kwargs: dict[str, object] = {
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "deterministic": True,
+        }
+        if pass_shape:
+            kwargs["shape"] = spec
+
+        if name == "flash_attn_varlen_func":
+            q = base_q.detach().requires_grad_()
+            k = base_k.detach().requires_grad_()
+            v = base_v.detach().requires_grad_()
+            out = api.flash_attn_varlen_func(  # type: ignore[attr-defined]
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                **kwargs,
+            )
+            grads = torch.autograd.grad(out, (q, k, v), grad_out)
+        elif name == "flash_attn_varlen_qkvpacked_func":
+            qkv = torch.stack((base_q, base_k, base_v), dim=1).requires_grad_()
+            out = api.flash_attn_varlen_qkvpacked_func(  # type: ignore[attr-defined]
+                qkv,
+                cu_q,
+                spec.seqlen_q,
+                **kwargs,
+            )
+            qkv_grad = torch.autograd.grad(out, qkv, grad_out)[0]
+            grads = tuple(qkv_grad[:, index] for index in range(3))
+        else:
+            q = base_q.detach().requires_grad_()
+            kv = torch.stack((base_k, base_v), dim=1).requires_grad_()
+            out = api.flash_attn_varlen_kvpacked_func(  # type: ignore[attr-defined]
+                q,
+                kv,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                **kwargs,
+            )
+            q_grad, kv_grad = torch.autograd.grad(out, (q, kv), grad_out)
+            grads = (q_grad, kv_grad[:, 0], kv_grad[:, 1])
+        return (out.detach(), *(grad.detach() for grad in grads))
+
+    first = run(helion_attention, pass_shape=True)
+    repeated = run(helion_attention, pass_shape=True)
+    assert all(
+        torch.equal(actual, again)
+        for actual, again in zip(first, repeated)
+    )
+
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    q_ref = base_q.float().requires_grad_()
+    k_ref = base_k.float().requires_grad_()
+    v_ref = base_v.float().requires_grad_()
+    expected = reference_packed(
+        q_ref,
+        k_ref,
+        v_ref,
+        lengths_q,
+        lengths_k,
+        causal=True,
+        scale=scale,
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+    expected_fa2 = run(flash_attn, pass_shape=False)
+
+    assert first[0].shape == base_q.shape
+    assert first[0].dtype == spec.dtype
+    assert first[0].is_contiguous()
+    torch.testing.assert_close(
+        first[0].float(), expected, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        first[0].float(), expected_fa2[0].float(), atol=5e-2, rtol=2e-2
+    )
+    fa2_gradient_atol = 8e-2 if softmax_scale is not None else 2e-2
+    for actual, reference, reference_fa2 in zip(
+        first[1:], expected_grads, expected_fa2[1:]
+    ):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=8e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            actual.float(),
+            reference_fa2.float(),
+            atol=fa2_gradient_atol,
+            rtol=2e-2,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "name",
     ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
     ids=["qkv-packed", "kv-packed"],
 )
@@ -1295,8 +1428,12 @@ def test_full_varlen_packed_adapters_match_fp32_and_fa2(
 @pytest.mark.parametrize(
     "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
 )
+@pytest.mark.parametrize("deterministic", [False, True])
 def test_full_varlen_no_grad_retains_generated_dispatch(
-    name: str, spec: AttnShape, monkeypatch: pytest.MonkeyPatch
+    name: str,
+    spec: AttnShape,
+    deterministic: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
     sentinel = torch.empty_like(q)
@@ -1314,6 +1451,7 @@ def test_full_varlen_no_grad_retains_generated_dispatch(
 
     monkeypatch.setattr(helion_attention, "lookup_varlen", lambda _spec: generated)
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    monkeypatch.setattr(helion_attention, "dense_attention_math_sdpa", reject_sdpa)
     monkeypatch.setattr(
         helion_attention, "_generic_varlen_forward", reject_llama3
     )
@@ -1328,6 +1466,7 @@ def test_full_varlen_no_grad_retains_generated_dispatch(
                 spec.seqlen_q,
                 spec.seqlen_k,
                 causal=spec.causal,
+                deterministic=deterministic,
                 shape=spec,
             )
         elif name == "flash_attn_varlen_qkvpacked_func":
@@ -1337,6 +1476,7 @@ def test_full_varlen_no_grad_retains_generated_dispatch(
                 cu_q,
                 spec.seqlen_q,
                 causal=spec.causal,
+                deterministic=deterministic,
                 shape=spec,
             )
         else:
@@ -1349,6 +1489,7 @@ def test_full_varlen_no_grad_retains_generated_dispatch(
                 spec.seqlen_q,
                 spec.seqlen_k,
                 causal=spec.causal,
+                deterministic=deterministic,
                 shape=spec,
             )
 
@@ -1492,11 +1633,105 @@ def test_ragged_causal_cross_attention_no_grad_retains_generated_dispatch(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "name",
+    [
+        "flash_attn_varlen_func",
+        "flash_attn_varlen_qkvpacked_func",
+        "flash_attn_varlen_kvpacked_func",
+    ],
+    ids=["unpacked", "qkv-packed", "kv-packed"],
 )
-def test_full_varlen_backward_rejects_deterministic(
-    spec: AttnShape, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("deterministic", "expected_dispatch"),
+    [(False, "ordinary"), (True, "math")],
+)
+def test_full_causal_varlen_deterministic_backward_dispatch_is_narrow(
+    name: str,
+    deterministic: bool,
+    expected_dispatch: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    spec = VARLEN_ALIBI_CAUSAL
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
+    sentinel = torch.empty(
+        spec.batch,
+        spec.seqlen_q,
+        spec.nheads_q,
+        spec.head_dim,
+        device=q.device,
+        dtype=q.dtype,
+    )
+    dispatched: list[str] = []
+
+    def bridge(name: str):
+        def run(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+            spec_arg: AttnShape,
+        ) -> torch.Tensor:
+            assert q_arg.shape == sentinel.shape
+            assert k_arg.shape == sentinel.shape
+            assert v_arg.shape == sentinel.shape
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            assert spec_arg == spec
+            dispatched.append(name)
+            return sentinel
+
+        return run
+
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_sdpa", bridge("ordinary")
+    )
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", bridge("math")
+    )
+    if name == "flash_attn_varlen_func":
+        out = helion_attention.flash_attn_varlen_func(
+            q.requires_grad_(),
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            deterministic=deterministic,
+            shape=spec,
+        )
+    elif name == "flash_attn_varlen_qkvpacked_func":
+        out = helion_attention.flash_attn_varlen_qkvpacked_func(
+            torch.stack((q, k, v), dim=1).requires_grad_(),
+            cu_q,
+            spec.seqlen_q,
+            causal=True,
+            deterministic=deterministic,
+            shape=spec,
+        )
+    else:
+        out = helion_attention.flash_attn_varlen_kvpacked_func(
+            q.requires_grad_(),
+            torch.stack((k, v), dim=1).requires_grad_(),
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            deterministic=deterministic,
+            shape=spec,
+        )
+
+    assert out.shape == q.shape
+    assert out.untyped_storage().data_ptr() == sentinel.untyped_storage().data_ptr()
+    assert dispatched == [expected_dispatch]
+
+
+@requires_cuda
+def test_full_noncausal_varlen_backward_rejects_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
     q.requires_grad_()
 
@@ -1504,6 +1739,9 @@ def test_full_varlen_backward_rejects_deterministic(
         raise AssertionError("unsupported varlen backward reached dense SDPA")
 
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", reject_sdpa
+    )
     with pytest.raises(NotImplementedError, match="deterministic=True"):
         helion_attention.flash_attn_varlen_func(
             q,
@@ -1513,9 +1751,55 @@ def test_full_varlen_backward_rejects_deterministic(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            causal=spec.causal,
+            causal=False,
             deterministic=True,
             shape=spec,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        ("dropout_p", 0.1, "dropout"),
+        ("window_size", (31, 31), "sliding-window"),
+        ("softcap", VARLEN_SOFTCAP_VALUE, "softcap backward"),
+        ("alibi_slopes", "slopes", "ALiBi backward"),
+        ("return_attn_probs", True, "deterministic=False"),
+    ],
+)
+def test_deterministic_full_causal_varlen_backward_rejects_optional_features(
+    option: str,
+    value: object,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_ALIBI_CAUSAL
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
+    q.requires_grad_()
+    if value == "slopes":
+        value = torch.ones(spec.nheads_q, device=q.device)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported deterministic call reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            deterministic=True,
+            shape=spec,
+            **{option: value},
         )
 
 
@@ -3888,6 +4172,7 @@ def test_core_varlen_paged_chunked_prefill_rejects_noncausal_mode_before_lookup(
 
 
 @requires_cuda
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize(
     ("spec", "factory"),
     [
@@ -3903,6 +4188,7 @@ def test_core_varlen_paged_rejects_gradients_before_launch(
     monkeypatch: pytest.MonkeyPatch,
     spec: AttnShape,
     factory: object,
+    deterministic: bool,
 ) -> None:
     assert callable(factory)
     q, k, v, cu_q, cu_k, block_table, *_ = factory()
@@ -3922,6 +4208,7 @@ def test_core_varlen_paged_rejects_gradients_before_launch(
             spec.seqlen_q,
             spec.seqlen_k,
             causal=True,
+            deterministic=deterministic,
             block_table=block_table,
             shape=spec,
         )
