@@ -320,6 +320,15 @@ slope-free calls retain the checked-in generated specialization. This narrow
 mode does not support LSE, updates, partial lengths, cache remapping, left
 padding, rotary, windows, softcap, or autograd.
 
+The exact causal bf16 `(1, 1, 1024, 32, 8, 128)` profile accepts a read-only
+Python integer `cache_seqlens` from 1 through 1024, with the default or a custom
+`softmax_scale` and optional fp32 LSE. Partial values use the generic packed
+Triton runtime and never mutate the cache. Omitting the length or passing 1024
+retains the checked-in generated dispatch, as does the existing final-slot
+append at position 1023. Noncausal calls, tensor-valued lengths, left padding,
+cache remapping, rotary, ALiBi, windows, softcap, explicit split counts,
+autograd, and non-final updates remain unsupported for this 1K prefix mode.
+
 The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
 through 4095 for slope-free, read-only prefix attention. It also accepts paired
 one-token K/V updates at Python-integer positions 0 through 4094, mutates that
@@ -330,8 +339,8 @@ runtime. Omitting the length or passing 4096 for a read retains the checked-in
 generated dispatch, as does the existing final-slot append at position 4095.
 Tensor-valued lengths, ALiBi, cache remapping, left padding, partial or
 GPT-NeoX rotary on a partial append, windows, softcap, explicit split counts,
-and autograd remain unsupported on this path; scalar prefixes and non-final
-appends on other dense profiles remain unsupported.
+and autograd remain unsupported on this path; scalar prefixes on other dense
+profiles and non-final appends outside this 4K profile remain unsupported.
 
 Two strict speculative-decoding slices use the generic packed Triton runtime
 with a dense cache. Causal bf16 `(1, 2, 1024, 32, 8, 128)` accepts either the
@@ -449,14 +458,15 @@ continues to use the generated specialization. The exact two-token profile
 above similarly accepts paired K/V tensors shaped `[1, 2, 8, 128]` when the
 Python integer `cache_seqlens` is 1022, and mutates only the final two slots.
 Dense read-only calls may omit `cache_seqlens` or pass the full cache length,
-including the exact four-token profile above; the exact 4K profile additionally
-accepts its documented scalar prefix, and the exact 16K profile accepts its
-tensor prefix or left-padded span.
+including the exact four-token profile above; the exact causal 1K and
+either-causal 4K profiles additionally accept their documented scalar prefixes,
+and the exact 16K profile accepts its tensor prefix or left-padded span.
 Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`, except
 for the exact 4K non-final appends above; the two-token update must satisfy
 `cache_seqlens + 2 == 1024`. Other multi-token updates, scalar partial lengths
-and non-final appends outside the exact 4K profile, and tensor lengths on every
-other dense profile are rejected explicitly. Caches created inside
+outside the exact causal 1K and either-causal 4K read-only profiles, non-final
+appends outside the exact 4K profile, and tensor lengths on every other dense
+profile are rejected explicitly. Caches created inside
 `torch.inference_mode()` must be updated while that mode remains enabled. For
 an append, `q`, `k_cache`, and `v_cache` must occupy disjoint memory; update
 `k`/`v` aliases are staged safely.
@@ -767,9 +777,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   exact 4K partial one-token append, and exact two-token final-two-slot append
   above; the exact four-token profile is read-only;
   dense tensor lengths outside the exact read-only 16K profile above, scalar
-  partial caches outside the exact 4K profile above, `cache_leftpad`
-  outside the 16K profile or combined with updates, remapping, rotary, or
-  autograd, paged profiles and page sizes other than the
+  partial caches outside the exact causal 1K and either-causal 4K profiles
+  above, `cache_leftpad` outside the 16K profile or combined with updates,
+  remapping, rotary, or autograd, paged profiles and page sizes other than the
   exact read-only page-size-16 profiles and page-size-256 decode above, paged LSE
   outside the exact decode profile above, and KV-cache rotary outside the
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
