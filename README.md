@@ -168,12 +168,16 @@ backward. Device-side `cu_seqlens_q` and `cu_seqlens_k` may independently
 describe ragged query and key lengths with different packed token totals;
 shared-offset self-attention continues to support mixed empty and nonempty
 slots. The unpacked and KV-packed entry points accept the default or a custom
-`softmax_scale`. They also accept forward-only fp32 ALiBi slopes shaped `[32]`
-or `[4, 32]`; slope-free calls retain their existing generic dispatch. Dropout,
-windows, softcap, deterministic mode, diagnostic returns, paged caches, and
-backward remain unsupported, including in combination with ALiBi. Because this
-is generic fallback coverage rather than a generated specialization,
-`is_varlen_shape_supported` remains false for the profile.
+`softmax_scale`. Slope-free calls also accept `return_attn_probs=True` and
+return `(out, softmax_lse, S_dmask)`, with fp32 LSE shaped `[32, total_q]` and
+an empty bf16 `S_dmask`, for ragged self-attention and cross-attention with
+nonempty key sequences. The KV-packed adapter inherits this support. They also
+accept forward-only fp32 ALiBi slopes shaped `[32]` or `[4, 32]`; ordinary and
+ALiBi calls retain their existing generic dispatch. Dropout, windows, softcap,
+deterministic mode, paged caches, backward, and diagnostic returns combined
+with ALiBi remain unsupported. Because this is generic fallback coverage rather
+than a generated specialization, `is_varlen_shape_supported` remains false for
+the profile.
 
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
 symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for
@@ -770,8 +774,8 @@ also raise `NotImplementedError` rather than silently doing something else:
   backward-capable causal bf16 GPT-2 dense/QKV-packed/KV-packed calls,
   dense/KV-packed calls for the three
   Llama GQA decode profiles, dense/KV-packed calls for the causal bf16 Gemma-2
-  profile with `softcap=50.0`, and the causal bf16 varlen profile described
-  above
+  profile with `softcap=50.0`, and the causal bf16 varlen profiles
+  `(8, 512, 512, 16, 16, 64)` and `(4, 256, 256, 32, 8, 128)` described above
 
 ## How the kernels are made
 
