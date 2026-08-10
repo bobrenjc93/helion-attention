@@ -201,6 +201,16 @@ Asymmetric windows, cross-attention offsets, other profiles, ragged backward,
 paged caches, ALiBi, diagnostic returns, softcap, dropout, and deterministic
 mode remain unsupported in combination with a varlen window.
 
+The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts exactly
+`window_size=(127, 0)` when all eight query and key sequences have length 512.
+This is a forward-only 128-key window (the current token plus up to 127 tokens
+to its left) through the generic packed Triton runtime, with the default or a
+custom `softmax_scale`. The unpacked and QKV/KV-packed varlen entry points all
+inherit this support. The global `(-1, -1)` call retains generated dispatch.
+Ragged offsets, other windows or profiles, gradients, diagnostics, ALiBi,
+softcap, dropout, paged caches, and deterministic mode remain unsupported for
+this causal window.
+
 This shipped causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts
 exactly `softcap=50.0` for calls that do not require backward. Dynamic ragged
 query/key lengths and the default or a custom `softmax_scale` are supported by
