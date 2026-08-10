@@ -3013,6 +3013,36 @@
         "eval_5b403bea": 95,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:a3105dca21934cc7d280ad6a4d92fcff5262ed77",
+      "commit": "a3105dca21934cc7d280ad6a4d92fcff5262ed77",
+      "recordedAt": "2026-08-10T11:06:19.420Z",
+      "label": "base a3105dc",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:135",
+      "recordedAt": "2026-08-10T11:06:19.420Z",
+      "label": "PR #135",
+      "kind": "leaf",
+      "prNumber": 135,
+      "title": "Backpropagate full-length causal varlen diagnostics",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
