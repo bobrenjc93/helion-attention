@@ -49,12 +49,13 @@ that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, grad-enabled
 diagnostics on that GPT-2 profile and the full-length causal varlen profile,
 both full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. Full-length symmetric-window
-training on the shipped noncausal varlen profile uses the same bounded SDPA
-bridge. Deterministic zero-dropout BERT-base, causal GPT-2, and both full-length
-varlen training profiles use the direct math operator without changing
-process-wide SDPA backend state. The explicit shape validates these paths and
-makes specialization introspection independent of fallback coverage.
+autograd. Full-length symmetric-window training on the shipped noncausal varlen
+profile and the exact causal left window on the shipped causal varlen profile
+use the same bounded SDPA bridge. Deterministic zero-dropout BERT-base, causal
+GPT-2, and both full-length varlen training profiles use the direct math
+operator without changing process-wide SDPA backend state. The explicit shape
+validates these paths and makes specialization introspection independent of
+fallback coverage.
 """
 
 from __future__ import annotations
@@ -2033,10 +2034,13 @@ def flash_attn_varlen_func(
 
     The causal version of that profile supports exactly
     ``window_size=(127, 0)`` when all eight query and key sequences have length
-    512. This forward-only path accepts the default or a custom
-    ``softmax_scale`` and uses the generic packed Triton runtime. Ragged
-    offsets and every other optional feature remain unsupported for this
-    window. Its global ``(-1, -1)`` call retains the generated specialization.
+    512. Forward-only calls use the generic packed Triton runtime, while
+    zero-dropout training reshapes the packed tensors to the bounded causal
+    PyTorch SDPA bridge. Both paths accept the default or a custom
+    ``softmax_scale``. Ragged offsets and every other optional feature remain
+    unsupported for this window. Its global ``(-1, -1)`` call retains the
+    generated specialization in inference and its existing SDPA dispatch in
+    backward.
 
     The causal version of that profile accepts exactly ``softcap=50.0`` for
     calls that do not need backward, with either the default or a custom
@@ -2071,7 +2075,8 @@ def flash_attn_varlen_func(
     unsupported.
     Deterministic zero-dropout backward is supported for both full-length
     profiles using direct math SDPA; all ragged and windowed forms still reject
-    it. Calls that do not need backward retain the generated packed kernel,
+    deterministic backward. Calls that do not need backward retain the
+    generated packed kernel,
     including ragged and full-length calls with the global window.
     """
     window = _validate_varlen_window_size(window_size)
@@ -2171,7 +2176,7 @@ def flash_attn_varlen_func(
         if deterministic:
             raise NotImplementedError(
                 "deterministic=True is not supported with varlen "
-                "symmetric-window attention"
+                "sliding-window attention"
             )
 
     if return_attn_probs:
@@ -2295,11 +2300,6 @@ def flash_attn_varlen_func(
         _validate_full_length_varlen_offsets(
             q, k, cu_seqlens_q, cu_seqlens_k, spec
         )
-        if needs_backward:
-            raise NotImplementedError(
-                "causal varlen left-window attention is forward-only; "
-                "gradients are not implemented"
-            )
     if has_symmetric_window:
         _validate_varlen_self_attention_offsets(
             q, k, cu_seqlens_q, cu_seqlens_k
@@ -2378,6 +2378,15 @@ def flash_attn_varlen_func(
             dense_out = dense_attention_math_sdpa(
                 dense_q, dense_k, dense_v, scale, spec
             )
+        elif has_causal_left_window:
+            dense_out = dense_attention_sdpa(
+                dense_q,
+                dense_k,
+                dense_v,
+                scale,
+                spec,
+                causal_window_left=window[0],
+            )
         elif has_symmetric_window:
             dense_out = dense_attention_sdpa(
                 dense_q,
@@ -2389,8 +2398,8 @@ def flash_attn_varlen_func(
             )
         else:
             # Preserve the existing global backward call and its dispatch
-            # signature exactly; the optional radius belongs only to the new
-            # finite-window bridge.
+            # signature exactly; window bounds belong only to the finite-window
+            # bridges.
             dense_out = dense_attention_sdpa(
                 dense_q, dense_k, dense_v, scale, spec
             )
