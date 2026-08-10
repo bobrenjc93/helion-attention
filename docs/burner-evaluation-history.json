@@ -3313,6 +3313,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:067355a9a08f193d6ab6ea2c956f174f7135fa85",
+      "commit": "067355a9a08f193d6ab6ea2c956f174f7135fa85",
+      "recordedAt": "2026-08-10T15:13:02.104Z",
+      "label": "base 067355a",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:145",
+      "recordedAt": "2026-08-10T15:13:02.104Z",
+      "label": "PR #145",
+      "kind": "leaf",
+      "prNumber": 145,
+      "title": "Append the final token to page-16 paged decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
