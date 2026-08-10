@@ -8,14 +8,15 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
-varlen inference profile, ALiBi with optional diagnostics on that profile and
-the shipped causal varlen profile, ALiBi on both shipped varlen profiles, and
-symmetric windows on the shipped noncausal varlen profile use a generic Triton
-forward kernel. The same runtime exposes exactly a 511-token left plus
-current-token causal window for the bf16 batch-1 2K Llama GQA profile while its
-global-window call retains generated dispatch. Grad-enabled calls use a bounded
-PyTorch SDPA autograd bridge. That runtime also provides
+ALiBi calls that do not need backward, BERT-base and causal GPT-2 diagnostics,
+one causal Llama-3 GQA varlen inference profile, ALiBi with optional diagnostics
+on that profile and the shipped causal varlen profile, ALiBi on both shipped
+varlen profiles, and symmetric windows on the shipped noncausal varlen profile
+use a generic Triton forward kernel. The same runtime exposes exactly a
+511-token left plus current-token causal window for the bf16 batch-1 2K Llama
+GQA profile while its global-window call retains generated dispatch.
+Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime also
+provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, and read-only page-256 paged decode through both the core
 varlen and KV-cache APIs. The same runtime exposes page-256/page-512 decode
@@ -44,8 +45,9 @@ back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, grad-enabled
 diagnostics on that GPT-2 profile and the full-length causal varlen profile,
-both full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. Full-length symmetric-window
+Q/K/V ALiBi backward on the causal 64-token Llama GQA profile, both full-length
+varlen profiles, and ragged causal attention use PyTorch SDPA autograd.
+Full-length symmetric-window
 training on the shipped noncausal varlen profile uses the same bounded SDPA
 bridge. Deterministic zero-dropout BERT-base, causal GPT-2, and both full-length
 varlen training profiles use the direct math operator without changing
@@ -76,6 +78,7 @@ from ._registry import lookup
 from ._registry import lookup_backward
 from ._registry import lookup_paged
 from ._registry import lookup_varlen
+from ._sdpa import DENSE_ALIBI_BACKWARD_KEY
 from ._sdpa import dense_attention_cudnn_default_scale
 from ._sdpa import dense_attention_flash_default_scale
 from ._sdpa import dense_attention_math_sdpa
@@ -1611,7 +1614,8 @@ def flash_attn_func(
             ``(1, 4096, 4096, 16, 8, 256)`` Gemma-2 attention. Zero retains
             ordinary dispatch; every other positive value remains unsupported.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
-            ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
+            ``[batch, nheads_q]``. Q/K/V backward is supported for causal bf16
+            ``(1, 64, 64, 32, 8, 128)``; slope gradients are not.
         return_attn_probs: for the shipped bf16 BERT-base encoder and causal
             GPT-2 profile, three Llama GQA decode profiles, and the
             ``softcap=50.0`` Gemma-2 profile, return FlashAttention's diagnostic
@@ -1632,14 +1636,15 @@ def flash_attn_func(
         ``[batch, nheads_q, seqlen_q]`` and ``S_dmask`` is an empty
         input-dtype tensor, matching FlashAttention when dropout is zero.
 
-    Unregistered fp16/bf16 shapes with ``head_dim <= 256``, all ALiBi calls, and
-    the supported Gemma-2 softcap call use a generic packed Triton forward
-    kernel. The exact Llama GQA local-window call described above also uses that
-    runtime for calls that do not need backward. Grad-enabled calls use a
-    bounded PyTorch SDPA bridge with either the default or a custom scale. All
-    other optional features are unsupported, and ``window_size=(-1, -1)``
-    retains its generated specialization. The exact default-option,
-    default-scale, no-backward noncausal bf16
+    Unregistered fp16/bf16 shapes with ``head_dim <= 256``, ALiBi calls that do
+    not need backward, and the supported Gemma-2 softcap call use a generic
+    packed Triton forward kernel. The exact Llama GQA local-window call
+    described above also uses that runtime for calls that do not need backward.
+    Grad-enabled calls use a bounded PyTorch SDPA bridge with either the default
+    or a custom scale, including Q/K/V ALiBi backward on the exact profile
+    above. All other optional features are unsupported, and
+    ``window_size=(-1, -1)`` retains its generated specialization. The exact
+    default-option, default-scale, no-backward noncausal bf16
     ``(2, 1024, 1024, 16, 16, 256)`` call uses direct PyTorch Flash SDPA on
     SM90 when eligible. The corresponding causal bf16
     ``(1, 4096, 4096, 32, 8, 128)``, ``(1, 8192, 8192, 28, 4, 128)``,
@@ -1812,12 +1817,30 @@ def flash_attn_func(
             q, k, v, scale, return_softmax_lse=True
         )
         return out, softmax_lse, q.new_empty((0,))
-    if alibi_slopes is not None and torch.is_grad_enabled() and (
-        needs_backward or alibi_slopes.requires_grad
-    ):
-        raise NotImplementedError(
-            "ALiBi backward is not implemented; ALiBi calls are forward-only"
-        )
+    if alibi_slopes is not None and torch.is_grad_enabled():
+        if alibi_slopes.requires_grad:
+            raise NotImplementedError(
+                "ALiBi backward does not implement slope gradients"
+            )
+        if needs_backward:
+            if deterministic:
+                raise NotImplementedError(
+                    "deterministic=True is not supported by the ALiBi SDPA "
+                    "autograd fallback"
+                )
+            if spec.key != DENSE_ALIBI_BACKWARD_KEY:
+                raise NotImplementedError(
+                    "ALiBi backward is implemented only for "
+                    f"{DENSE_ALIBI_BACKWARD_KEY}; got {spec.key}"
+                )
+            return dense_attention_sdpa(
+                q,
+                k,
+                v,
+                scale,
+                spec,
+                alibi_slopes=alibi_slopes,
+            )
     if dropout != 0.0:
         return dense_attention_sdpa(q, k, v, scale, spec, dropout)
     if needs_backward:

@@ -11,6 +11,9 @@ from ._shape import AttnShape
 
 _Mask = TypeVar("_Mask")
 
+DENSE_ALIBI_BACKWARD_KEY = "b1_sq64_sk64_hq32_hkv8_d128_bf16_causal"
+_DENSE_ALIBI_BIAS_ELEMENTS = 1 * 32 * 64 * 64
+
 # Unlike the public SDPA dispatcher, this composite autograd operator always
 # runs the math implementation and never consults or mutates process-wide CUDA
 # backend flags. PyTorch 2.5+, the package minimum, exposes it on every backend.
@@ -215,6 +218,46 @@ def sdpa_causal_options(
     return mask, is_causal
 
 
+def _dense_alibi_bias(
+    alibi_slopes: torch.Tensor,
+    q: torch.Tensor,
+    spec: AttnShape,
+) -> torch.Tensor:
+    """Materialize the one bounded additive bias supported for autograd."""
+    if spec.key != DENSE_ALIBI_BACKWARD_KEY:
+        raise NotImplementedError(
+            "the additive-bias ALiBi SDPA fallback is implemented only for "
+            f"{DENSE_ALIBI_BACKWARD_KEY}; got {spec.key}"
+        )
+    if alibi_slopes.requires_grad:
+        raise NotImplementedError(
+            "ALiBi backward does not implement slope gradients"
+        )
+
+    slopes = (
+        alibi_slopes.unsqueeze(0)
+        if alibi_slopes.ndim == 1
+        else alibi_slopes
+    )
+    row = torch.arange(spec.seqlen_q, device=q.device)[:, None]
+    col = torch.arange(spec.seqlen_k, device=q.device)[None, :]
+    aligned_row = row + spec.seqlen_k - spec.seqlen_q
+    distance = torch.abs(aligned_row - col)
+    causal_mask = col <= aligned_row
+
+    # PyTorch requires a floating SDPA bias to match the query dtype. Form the
+    # values from fp32 slopes first, then cast only this exact bounded tensor.
+    bias = (
+        -slopes[:, :, None, None] * distance[None, None]
+    ).to(dtype=q.dtype)
+    if bias.numel() != _DENSE_ALIBI_BIAS_ELEMENTS:  # pragma: no cover - guard
+        raise RuntimeError(
+            "the bounded ALiBi bias unexpectedly contained "
+            f"{bias.numel()} elements"
+        )
+    return bias.masked_fill_(~causal_mask[None, None], float("-inf"))
+
+
 def dense_attention_sdpa(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -223,6 +266,7 @@ def dense_attention_sdpa(
     spec: AttnShape,
     dropout_p: float = 0.0,
     *,
+    alibi_slopes: torch.Tensor | None = None,
     symmetric_window_radius: int | None = None,
     causal_window_left: int | None = None,
 ) -> torch.Tensor:
@@ -232,6 +276,7 @@ def dense_attention_sdpa(
     noncausal varlen bridge validated by the public dispatcher.
     ``causal_window_left`` is reserved for the equal-length causal Llama
     bridge with a zero-token right window.
+    ``alibi_slopes`` is reserved for the exact bounded dense ALiBi profile.
     """
     query = q.transpose(1, 2)
     key = k.transpose(1, 2)
@@ -243,6 +288,10 @@ def dense_attention_sdpa(
         and causal_window_left is not None
     ):
         raise ValueError("only one SDPA window mode may be selected")
+    if alibi_slopes is not None and (
+        symmetric_window_radius is not None or causal_window_left is not None
+    ):
+        raise ValueError("ALiBi SDPA cannot be combined with a window mode")
 
     window_mask = None
     if symmetric_window_radius is not None:
@@ -274,7 +323,23 @@ def dense_attention_sdpa(
     # FlashAttention returns the input dtype even under cross-dtype autocast.
     # SDPA is autocast-eligible, so keep its native fp16/bf16 contract explicit.
     with torch.autocast(device_type=q.device.type, enabled=False):
-        if window_mask is not None:
+        if alibi_slopes is not None:
+            if dropout_p != 0.0:
+                raise NotImplementedError(
+                    "dropout combined with ALiBi slopes is not implemented"
+                )
+            additive_bias = _dense_alibi_bias(alibi_slopes, q, spec)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=additive_bias,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=softmax_scale,
+                enable_gqa=enable_gqa,
+            )
+        elif window_mask is not None:
             if dropout_p != 0.0:
                 raise ValueError("windowed SDPA requires dropout_p=0.0")
             out = torch.nn.functional.scaled_dot_product_attention(

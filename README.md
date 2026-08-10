@@ -122,8 +122,12 @@ bottom-right causal masking. Grad-enabled calls without a generated backward
 use PyTorch SDPA autograd instead; the exact BERT-base profile above and causal
 GPT-2 profile below use its direct math operator when deterministic backward is
 requested. Dense ALiBi forward calls accept fp32 slopes shaped `[nheads]` or
-`[batch, nheads]` and always use the generic Triton path; ALiBi backward is not
-implemented. The shipped noncausal bf16
+`[batch, nheads]` and always use the generic Triton path when no backward is
+needed. The causal bf16 `(1, 64, 64, 32, 8, 128)` Llama GQA profile additionally
+supports Q/K/V backward through bounded additive-bias SDPA in the dense and
+KV-packed APIs, with `[32]` or `[1, 32]` slopes and either the default or a
+custom scale. Slope gradients, deterministic mode, and ALiBi backward on other
+profiles remain unsupported. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile retains generated forward
 values during zero-dropout training. On SM90, calls that omit `softmax_scale`
 use raw PyTorch BSHD Flash gradients, falling back to the generated backward
@@ -826,9 +830,11 @@ noncausal profile) and the causal ragged query/key contract described above;
 KV-cache calls remain forward-only. These unsupported FlashAttention features
 also raise `NotImplementedError` rather than silently doing something else:
 
-- backward for dense or varlen ALiBi, ragged noncausal varlen batches,
-  batches with no nonempty queries, ragged cross-attention batches with empty
-  key slots, graph-captured ragged batches, and KV-cache calls
+- dense ALiBi backward outside the causal bf16
+  `(1, 64, 64, 32, 8, 128)` Q/K/V subset above, ALiBi slope gradients, and
+  backward for varlen ALiBi, ragged noncausal varlen batches, batches with no
+  nonempty queries, ragged cross-attention batches with empty key slots,
+  graph-captured ragged batches, and KV-cache calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback,
   except for zero-dropout training on the exact bf16 BERT-base and causal GPT-2
   `(2, 1024, 1024, 32, 32, 64)` profiles and the exact full-length bf16 varlen
