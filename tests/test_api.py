@@ -143,6 +143,7 @@ DENSE_ALIBI_KVCACHE = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+DENSE_KVCACHE_LEFT_WINDOW_SIZE = (511, 0)
 CHUNKED_PREFILL_KEY = "b1_sq64_sk320_hq8_hkv2_d128_bf16_causal"
 GENERIC_DENSE_SPECS = [
     AttnShape(2, 23, 23, 4, 4, 32, torch.bfloat16, False),
@@ -7274,6 +7275,363 @@ def test_kvcache_1k_scalar_prefix_rejects_out_of_scope_before_dispatch(
         )
     assert torch.equal(k_cache, original_k)
     assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "cache_seqlens",
+    [None, 4096],
+    ids=["omitted-length", "full-scalar-length"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+def test_kvcache_4k_left_window_matches_fa2_and_fp32_without_mutation(
+    cache_seqlens: int | None,
+    softmax_scale: float | None,
+    causal: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    manifest_spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
+    spec = AttnShape(
+        manifest_spec.batch,
+        manifest_spec.seqlen_q,
+        manifest_spec.seqlen_k,
+        manifest_spec.nheads_q,
+        manifest_spec.nheads_kv,
+        manifest_spec.head_dim,
+        manifest_spec.dtype,
+        causal,
+    )
+    q, k_cache, v_cache = make_inputs(spec, seed=20260810)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    k_pointer = k_cache.data_ptr()
+    v_pointer = v_cache.data_ptr()
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    cache_kwargs = (
+        {} if cache_seqlens is None else {"cache_seqlens": cache_seqlens}
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+            shape=spec,
+            **cache_kwargs,
+        )
+        expected_fa2 = flash_attn.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+            **cache_kwargs,
+        )
+        expected_fp32, _ = reference_single_token_prefix_attention(
+            q,
+            k_cache,
+            v_cache,
+            spec.seqlen_k,
+            spec,
+            scale,
+            leftpad=spec.seqlen_k - DENSE_KVCACHE_LEFT_WINDOW_SIZE[0] - 1,
+        )
+
+    assert isinstance(got, torch.Tensor)
+    assert isinstance(expected_fa2, torch.Tensor)
+    assert got.shape == expected_fa2.shape == q.shape
+    assert got.dtype == expected_fa2.dtype == torch.bfloat16
+    assert k_cache.data_ptr() == k_pointer
+    assert v_cache.data_ptr() == v_pointer
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize(
+    "cache_seqlens",
+    [None, 4096],
+    ids=["omitted-length", "full-scalar-length"],
+)
+def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispatch(
+    causal: bool,
+    cache_seqlens: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
+    spec = AttnShape(
+        manifest_spec.batch,
+        manifest_spec.seqlen_q,
+        manifest_spec.seqlen_k,
+        manifest_spec.nheads_q,
+        manifest_spec.nheads_kv,
+        manifest_spec.head_dim,
+        manifest_spec.dtype,
+        causal,
+    )
+    q = torch.zeros(1, dtype=spec.dtype)
+    k_cache = torch.ones(1, dtype=spec.dtype)
+    v_cache = torch.full((1,), 2.0, dtype=spec.dtype)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    windowed_out = torch.full((1,), 3.0, dtype=spec.dtype)
+    global_out = torch.full((1,), 5.0, dtype=spec.dtype)
+    dispatches: list[str] = []
+
+    monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+        *,
+        softcap: float = 0.0,
+        window_size: tuple[int, int] = (-1, -1),
+    ) -> torch.Tensor:
+        assert q_arg is q and k_arg is k_cache and v_arg is v_cache
+        assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+        assert spec_arg == spec
+        assert slopes_arg is None
+        assert softcap == 0.0
+        assert window_size == DENSE_KVCACHE_LEFT_WINDOW_SIZE
+        dispatches.append("generic-window")
+        return windowed_out
+
+    def lookup_stub(spec_arg: AttnShape):  # noqa: ANN202
+        assert spec_arg == spec
+
+        def generated(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            assert q_arg is q and k_arg is k_cache and v_arg is v_cache
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            dispatches.append("generated-global")
+            return global_out
+
+        return generated
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    cache_kwargs = (
+        {} if cache_seqlens is None else {"cache_seqlens": cache_seqlens}
+    )
+
+    windowed = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        causal=causal,
+        window_size=DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+        shape=spec,
+        **cache_kwargs,
+    )
+    global_attention = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        causal=causal,
+        window_size=(-1, -1),
+        shape=spec,
+        **cache_kwargs,
+    )
+
+    assert windowed is windowed_out
+    assert global_attention is global_out
+    assert dispatches == ["generic-window", "generated-global"]
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+def test_kvcache_4k_left_window_rejects_out_of_scope_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
+    q = torch.zeros(1, dtype=spec.dtype)
+    k_cache = torch.ones(1, dtype=spec.dtype)
+    v_cache = torch.full((1,), 2.0, dtype=spec.dtype)
+    update = torch.full((1,), 3.0, dtype=spec.dtype)
+    slopes = torch.ones(spec.nheads_q, dtype=torch.float32)
+    other_spec = AttnShape(
+        1, 1, 1024, 32, 8, 128, torch.bfloat16, spec.causal
+    )
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("an out-of-scope 4K left window reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
+    for dispatch_name in (
+        "lookup",
+        "_paged_kvcache_forward",
+        "_tensor_length_dense_kvcache_forward",
+        "_generic_dense_forward",
+        "attention_autograd",
+    ):
+        monkeypatch.setattr(helion_attention, dispatch_name, reject_dispatch)
+
+    cases: list[tuple[torch.Tensor, AttnShape, dict[str, object], str]] = [
+        (q, spec, {"window_size": (510, 0)}, "sliding-window"),
+        (q, spec, {"window_size": (511.0, 0)}, "sliding-window"),
+        (
+            q,
+            other_spec,
+            {"window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE},
+            "implemented only",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "cache_seqlens": spec.seqlen_k - 1,
+            },
+            "full cache",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "cache_seqlens": torch.tensor([spec.seqlen_k - 1]),
+            },
+            "tensor-valued",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "cache_seqlens": torch.tensor([spec.seqlen_k]),
+            },
+            "tensor-valued",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "return_softmax_lse": True,
+            },
+            "return_softmax_lse",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "k": update,
+                "v": update,
+                "cache_seqlens": spec.seqlen_k - 1,
+            },
+            "read-only",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "alibi_slopes": slopes,
+            },
+            "does not support ALiBi",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "cache_seqlens": torch.tensor([spec.seqlen_k]),
+                "cache_leftpad": torch.tensor([0]),
+            },
+            "tensor-valued",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "softcap": 50.0,
+            },
+            "softcap",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "cache_batch_idx": torch.tensor([0]),
+            },
+            "cache_batch_idx",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "rotary_cos": q,
+                "rotary_sin": q,
+            },
+            "rotary embeddings",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "num_splits": 16,
+            },
+            "only.*16384",
+        ),
+        (
+            q,
+            spec,
+            {
+                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+                "block_table": torch.tensor([[0]], dtype=torch.int32),
+            },
+            "sliding-window",
+        ),
+        (
+            q.detach().requires_grad_(),
+            spec,
+            {"window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE},
+            "does not support autograd",
+        ),
+    ]
+
+    for query, case_spec, kwargs, message in cases:
+        original_k = k_cache.clone()
+        original_v = v_cache.clone()
+        with pytest.raises(NotImplementedError, match=message):
+            helion_attention.flash_attn_with_kvcache(
+                query,
+                k_cache,
+                v_cache,
+                causal=case_spec.causal,
+                shape=case_spec,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        assert torch.equal(k_cache, original_k)
+        assert torch.equal(v_cache, original_v)
 
 
 @requires_cuda

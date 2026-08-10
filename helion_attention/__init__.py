@@ -25,8 +25,11 @@ generic paged runtime for ALiBi on both exposed page-16 profiles and page-256
 decode. Read-only causal 1K and both causal variants of 4K dense decode likewise
 use the generic runtime for a bounded Python-int prefix. Those profiles and
 causal 16K decode also use it for read-only CUDA-tensor-selected spans, while
-the 4K profiles support full-cache or scalar-prefix ALiBi. Their
-prefix runtime handles a paired one-token K/V append before the final slot,
+the 4K profiles support full-cache or scalar-prefix ALiBi. The same two 4K
+profiles expose exactly a 511-token left plus current-token window for a
+forward-only full-cache read, while their global-window calls retain generated
+dispatch. Their prefix runtime handles a paired one-token K/V append before the
+final slot,
 including full-head or D64 half-head interleaved rotary, while full reads and
 final-slot appends retain the generated specializations.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
@@ -222,6 +225,8 @@ _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE = (
     128,
     torch.bfloat16,
 )
+_DENSE_KVCACHE_LEFT_WINDOW_PROFILE = _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
+_DENSE_KVCACHE_LEFT_WINDOW_SIZE = (511, 0)
 _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY = (
     "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal"
 )
@@ -2685,6 +2690,13 @@ def flash_attn_with_kvcache(
     interleaved rotary tables. Omitted and full Python-int slope-free reads,
     plus the existing update at position 4095, retain the generated
     specialization.
+    The same causal and noncausal 4K profiles accept exactly
+    ``window_size=(511, 0)`` for a forward-only, slope-free read of the full
+    cache, with ``cache_seqlens`` omitted or supplied as the Python integer
+    ``4096``. This path uses the generic packed runtime with the default or a
+    custom softmax scale. Partial or tensor-valued lengths, cache updates, LSE,
+    optional features, and autograd remain unsupported; the global window
+    continues to use the generated specialization.
     The causal 1K profile and both 4K profiles additionally accept contiguous
     CUDA int32 ``cache_seqlens`` tensors shaped ``[1]`` for read-only,
     slope-free spans.
@@ -2827,9 +2839,10 @@ def flash_attn_with_kvcache(
     # This flag changes only how rotary pairs are laid out, so it remains
     # irrelevant when rotary_cos/rotary_sin are absent.
 
+    window = tuple(window_size)
     _reject_unsupported(
         0.0,
-        window_size,
+        window,
         softcap,
         alibi_slopes,
         False,
@@ -2839,6 +2852,11 @@ def flash_attn_with_kvcache(
         allowed_softcap=(
             _PAGE256_PAGED_KVCACHE_SOFTCAP
             if block_table is not None
+            else None
+        ),
+        allowed_window_size=(
+            _DENSE_KVCACHE_LEFT_WINDOW_SIZE
+            if block_table is None
             else None
         ),
     )
@@ -2873,6 +2891,43 @@ def flash_attn_with_kvcache(
         spec.head_dim,
         spec.dtype,
     )
+    tensor_cache_seqlens = (
+        cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
+    )
+    has_dense_left_window = window != (-1, -1)
+    if has_dense_left_window:
+        if requested_dense_profile != _DENSE_KVCACHE_LEFT_WINDOW_PROFILE:
+            raise NotImplementedError(
+                "dense KV-cache sliding-window attention is implemented only "
+                "for read-only bf16 (1, 1, 4096, 32, 8, 128) decode with "
+                "either causal flag and window_size=(511, 0); "
+                f"got {spec.describe()}"
+            )
+        if append_kv:
+            raise NotImplementedError(
+                "the 4K dense KV-cache left window is read-only; cache updates "
+                "are not supported"
+            )
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "return_softmax_lse=True is not implemented for the 4K dense "
+                "KV-cache left window"
+            )
+        if tensor_cache_seqlens is not None or tensor_cache_leftpad is not None:
+            raise NotImplementedError(
+                "the 4K dense KV-cache left window requires a full cache with "
+                "cache_seqlens omitted or supplied as the Python integer 4096; "
+                "tensor-valued cache spans are not supported"
+            )
+        if type(cache_seqlens) is int and cache_seqlens != spec.seqlen_k:
+            raise NotImplementedError(
+                "the 4K dense KV-cache left window requires a full cache; "
+                "cache_seqlens must equal 4096"
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "the 4K dense KV-cache left window does not support ALiBi slopes"
+            )
     is_4k_scalar_prefix_dense_profile = (
         requested_dense_profile == _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
     )
@@ -2923,9 +2978,6 @@ def flash_attn_with_kvcache(
                 "return_softmax_lse is not implemented for the two-token "
                 "dense KV-cache profile"
             )
-    tensor_cache_seqlens = (
-        cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
-    )
     if tensor_cache_leftpad is not None:
         if append_kv:
             raise NotImplementedError(
@@ -3101,6 +3153,23 @@ def flash_attn_with_kvcache(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    if has_dense_left_window:
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError(
+                "the 4K dense KV-cache left window is forward-only and does "
+                "not support autograd"
+            )
+        return _generic_dense_forward(
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            spec,
+            None,
+            window_size=_DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+        )
     partial_append_needs_backward = (
         scalar_cache_append_position is not None
         and torch.is_grad_enabled()
