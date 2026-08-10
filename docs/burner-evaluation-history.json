@@ -3523,6 +3523,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:bc1b7ad9e3f4807dfbdf5ebb24058107ff4286f2",
+      "commit": "bc1b7ad9e3f4807dfbdf5ebb24058107ff4286f2",
+      "recordedAt": "2026-08-10T18:26:57.033Z",
+      "label": "base bc1b7ad",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 97,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:153",
+      "recordedAt": "2026-08-10T18:26:57.033Z",
+      "label": "PR #153",
+      "kind": "leaf",
+      "prNumber": 153,
+      "title": "Apply full-head NeoX rotary to partial 4K appends",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 98,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
