@@ -3613,6 +3613,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:5f26ae4452385e024dbd3a504ccdc575ee4cf93c",
+      "commit": "5f26ae4452385e024dbd3a504ccdc575ee4cf93c",
+      "recordedAt": "2026-08-10T20:43:56.393Z",
+      "label": "base 5f26ae4",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:160",
+      "recordedAt": "2026-08-10T20:43:56.393Z",
+      "label": "PR #160",
+      "kind": "leaf",
+      "prNumber": 160,
+      "title": "Read scalar prefixes with four-token 1K decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
