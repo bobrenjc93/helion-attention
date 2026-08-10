@@ -3253,6 +3253,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:da52bf92e9847c3b42ad283d90f1b19632a14b33",
+      "commit": "da52bf92e9847c3b42ad283d90f1b19632a14b33",
+      "recordedAt": "2026-08-10T14:18:43.190Z",
+      "label": "base da52bf9",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:143",
+      "recordedAt": "2026-08-10T14:18:43.190Z",
+      "label": "PR #143",
+      "kind": "leaf",
+      "prNumber": 143,
+      "title": "Expose a 512-key window on full 4K dense-cache decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
