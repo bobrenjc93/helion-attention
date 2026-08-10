@@ -3163,6 +3163,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:26025b0491d317b33ba6cc6de96df4a0cb19c29d",
+      "commit": "26025b0491d317b33ba6cc6de96df4a0cb19c29d",
+      "recordedAt": "2026-08-10T13:00:28.393Z",
+      "label": "base 26025b0",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:140",
+      "recordedAt": "2026-08-10T13:00:28.393Z",
+      "label": "PR #140",
+      "kind": "leaf",
+      "prNumber": 140,
+      "title": "Combine ALiBi with Llama-3 varlen diagnostics",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
