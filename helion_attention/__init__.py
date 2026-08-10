@@ -18,10 +18,10 @@ varlen profile, and, only through the KV-cache API, read-only page-256 paged
 decode. The same runtime exposes page-256 decode with optional ALiBi but
 without softcap through the core varlen API. The KV-cache adapter also uses the
 generic paged runtime for ALiBi on both exposed page-16 profiles and page-256
-decode. Read-only 4K dense
-decode likewise uses the generic runtime for ALiBi or a bounded Python-int
-prefix while retaining its generated specialization for a slope-free full
-cache.
+decode. Read-only 4K dense decode likewise uses the generic runtime for ALiBi
+or a bounded Python-int prefix. The same prefix runtime handles a paired
+one-token K/V append before the final slot, while slope-free full reads and
+final-slot appends retain the generated specialization.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -2523,10 +2523,13 @@ def flash_attn_with_kvcache(
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
     and noncausal bf16 ``(1, 1, 4096, 32, 8, 128)`` profiles additionally accept
-    Python integers from 1 through 4095 for slope-free, read-only prefixes. The
-    prefix path uses the generic packed runtime with the default or a custom
-    softmax scale and optional fp32 LSE; omitted and full Python-int lengths
-    retain the generated specialization. The same 4K profiles accept
+    Python integers from 1 through 4095 for slope-free, read-only prefixes and
+    paired one-token K/V updates at positions 0 through 4094. The prefix path
+    uses the generic packed runtime with the default or a custom softmax scale
+    and optional fp32 LSE. An update mutates its selected slot and attends
+    through that newly appended token. Omitted and full Python-int reads, plus
+    the existing update at position 4095, retain the generated specialization.
+    The same 4K profiles accept
     forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]`` only for the
     full cache. Those calls use the generic packed runtime; omitting slopes
     retains the generated specialization. ALiBi cannot be combined with LSE,
@@ -2544,8 +2547,9 @@ def flash_attn_with_kvcache(
     cannot be combined with tensor-valued cache spans, updates, rotary metadata,
     paged caches, or autograd. For the single-token dense paths, a paired ``k``
     and ``v`` update is supported when a Python integer ``cache_seqlens`` is
-    exactly one less than the declared length; the update is copied into the
-    final cache slot before attention runs. On this dense path,
+    exactly one less than the declared length. The exact 4K profiles also
+    accept positions 0 through 4094. Each update is copied into its selected
+    cache slot before attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
     decode profile supports the same return for page sizes 16 and 256 through
@@ -2557,9 +2561,10 @@ def flash_attn_with_kvcache(
     inference mode must also be updated in inference mode, and an
     append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
     lengths and left padding on updates and other dense profiles, scalar partial
-    lengths outside the exact read-only 4K profile, and multi-token updates
-    outside the exact two-token profile fail explicitly. A paired
-    ``rotary_cos``/``rotary_sin`` table may be supplied
+    lengths and non-final appends outside the exact 4K profile, and multi-token
+    updates outside the exact two-token profile fail explicitly. Partial 4K
+    updates also reject rotary and autograd before either cache is mutated. A
+    paired ``rotary_cos``/``rotary_sin`` table may be supplied
     for the one-token final-slot append: the default interleaved layout may
     cover the full head or the first 64 dimensions of a 128-dimensional head,
     while the non-interleaved GPT-NeoX layout requires full-head rotation. Both
@@ -2789,6 +2794,7 @@ def flash_attn_with_kvcache(
         )
 
     scalar_cache_prefix: int | None = None
+    scalar_cache_append_position: int | None = None
     if append_kv:
         if cache_seqlens is None:
             raise ValueError(
@@ -2806,6 +2812,17 @@ def flash_attn_with_kvcache(
                     "two cache slots; cache_seqlens + 2 must equal the cache "
                     "length declared by shape"
                 )
+        elif (
+            is_scalar_prefix_dense_profile
+            and cache_seqlens < spec.seqlen_k - 1
+        ):
+            if apply_rotary:
+                raise NotImplementedError(
+                    "rotary embeddings are not implemented for partial 4K "
+                    "KV-cache updates; rotary remains limited to the "
+                    "final-slot append"
+                )
+            scalar_cache_append_position = cache_seqlens
         elif cache_seqlens + 1 != spec.seqlen_k:
             raise NotImplementedError(
                 "only a one-token update that fills the final cache slot is "
@@ -2924,6 +2941,29 @@ def flash_attn_with_kvcache(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
+    partial_append_needs_backward = (
+        scalar_cache_append_position is not None
+        and torch.is_grad_enabled()
+        and any(
+            tensor.requires_grad
+            for tensor in (q, k_cache, v_cache, k, v)
+            if tensor is not None
+        )
+    )
+    if partial_append_needs_backward:
+        raise NotImplementedError(
+            "partial 4K KV-cache updates do not support autograd"
+        )
+    appended_cache_seqlens = (
+        torch.full(
+            (spec.batch,),
+            scalar_cache_append_position + 1,
+            device=q.device,
+            dtype=torch.int32,
+        )
+        if scalar_cache_append_position is not None
+        else None
+    )
     if tensor_cache_seqlens is not None:
         _validate_dense_kvcache_tensor_span(
             tensor_cache_seqlens,
@@ -3025,7 +3065,10 @@ def flash_attn_with_kvcache(
     # Preserve the scalar full-cache/update dispatch: those calls still resolve
     # and launch the same checked-in specialization as before.
     kernel = None
-    if not is_two_token_dense_profile:
+    if (
+        not is_two_token_dense_profile
+        and scalar_cache_append_position is None
+    ):
         kernel = lookup(spec)
         needs_backward = torch.is_grad_enabled() and any(
             tensor.requires_grad
@@ -3080,6 +3123,18 @@ def flash_attn_with_kvcache(
         update_end = cache_seqlens + update_tokens
         k_cache[:, cache_seqlens:update_end].copy_(update_k)
         v_cache[:, cache_seqlens:update_end].copy_(update_v)
+    if scalar_cache_append_position is not None:
+        assert appended_cache_seqlens is not None
+        return _tensor_length_dense_kvcache_forward(
+            q_for_attention,
+            k_cache,
+            v_cache,
+            appended_cache_seqlens,
+            None,
+            scale,
+            spec,
+            return_softmax_lse=return_softmax_lse,
+        )
     if is_two_token_dense_profile:
         return _generic_dense_forward(
             q_for_attention,

@@ -2833,6 +2833,36 @@
         "eval_5b403bea": 99,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:fcb04b1d7d7613c612258ca21e568f32df9c4562",
+      "commit": "fcb04b1d7d7613c612258ca21e568f32df9c4562",
+      "recordedAt": "2026-08-10T08:36:59.375Z",
+      "label": "base fcb04b1",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:128",
+      "recordedAt": "2026-08-10T08:36:59.375Z",
+      "label": "PR #128",
+      "kind": "leaf",
+      "prNumber": 128,
+      "title": "Append one token to a partial 4K dense cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
