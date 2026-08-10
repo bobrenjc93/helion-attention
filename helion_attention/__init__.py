@@ -45,8 +45,8 @@ that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, grad-enabled
 diagnostics on that GPT-2 profile and the full-length causal varlen profile,
 both full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. Full-length symmetric-window
-training on the shipped noncausal varlen profile uses the same bounded SDPA
+autograd. Full-length symmetric-window training and one ragged radius-127
+window on the shipped noncausal varlen profile use the same bounded SDPA
 bridge. Deterministic zero-dropout BERT-base, causal GPT-2, and both full-length
 varlen training profiles use the direct math operator without changing
 process-wide SDPA backend state. The explicit shape validates these paths and
@@ -179,6 +179,7 @@ _VARLEN_ALIBI_DIAGNOSTIC_KEYS = frozenset(
 _VARLEN_SYMMETRIC_WINDOW_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 )
+_RAGGED_VARLEN_SYMMETRIC_WINDOW_SIZE = (127, 127)
 _VARLEN_SOFTCAP_KEY = _VARLEN_DIAGNOSTIC_KEY
 _VARLEN_SOFTCAP = 50.0
 _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
@@ -894,6 +895,8 @@ def _ragged_varlen_attention_sdpa(
     lengths_k: tuple[int, ...],
     softmax_scale: float,
     spec: AttnShape,
+    *,
+    symmetric_window_radius: int | None = None,
 ) -> torch.Tensor:
     """Run each validated nonempty ragged sequence through SDPA."""
     q_sequences = torch.split(q, lengths_q)
@@ -908,11 +911,11 @@ def _ragged_varlen_attention_sdpa(
         # receive zero gradients. At least one nonempty query is guaranteed.
         if seqlen_q == 0:
             continue
-        # Preserve the established self-attention call exactly. Unequal
-        # sequences need their actual lengths in the SDPA adapter so causal
-        # masking uses FlashAttention's bottom-right alignment.
+        # Preserve the established global self-attention call exactly. Unequal
+        # sequences and finite windows need their actual lengths in the SDPA
+        # adapter so masks use FlashAttention's per-sequence coordinates.
         sequence_spec = spec
-        if seqlen_q != seqlen_k:
+        if seqlen_q != seqlen_k or symmetric_window_radius is not None:
             sequence_spec = AttnShape(
                 batch=1,
                 seqlen_q=seqlen_q,
@@ -923,15 +926,24 @@ def _ragged_varlen_attention_sdpa(
                 dtype=spec.dtype,
                 causal=spec.causal,
             )
-        outputs.append(
-            dense_attention_sdpa(
+        if symmetric_window_radius is None:
+            sequence_out = dense_attention_sdpa(
                 q_sequence.unsqueeze(0),
                 k_sequence.unsqueeze(0),
                 v_sequence.unsqueeze(0),
                 softmax_scale,
                 sequence_spec,
-            ).squeeze(0)
-        )
+            )
+        else:
+            sequence_out = dense_attention_sdpa(
+                q_sequence.unsqueeze(0),
+                k_sequence.unsqueeze(0),
+                v_sequence.unsqueeze(0),
+                softmax_scale,
+                sequence_spec,
+                symmetric_window_radius=symmetric_window_radius,
+            )
+        outputs.append(sequence_out.squeeze(0))
     return torch.cat(outputs)
 
 
@@ -1934,9 +1946,12 @@ def flash_attn_varlen_func(
     Query and key cumulative offsets must be identical. Forward-only calls use
     the generic packed Triton runtime. Zero-dropout backward is additionally
     supported when all eight sequences have length 512, by reshaping them to a
-    dense windowed PyTorch SDPA call. Both paths accept the default or a custom
-    ``softmax_scale``. The global ``(-1, -1)`` default retains its existing
-    dispatch.
+    dense windowed PyTorch SDPA call. Ragged backward is supported only for
+    ``window_size=(127, 127)`` when the same cumulative-offset storage is used
+    for Q and K, all eight sequences are nonempty, and at least one has length
+    below 512. It uses one bounded PyTorch SDPA call per sequence. All paths
+    accept the default or a custom ``softmax_scale``. The global ``(-1, -1)``
+    default retains its existing dispatch.
 
     The causal version of that profile accepts exactly ``softcap=50.0`` for
     calls that do not need backward, with either the default or a custom
@@ -1964,11 +1979,11 @@ def flash_attn_varlen_func(
     sequences and a mix of empty and nonempty query sequences, all of length
     at most 512. Self-attention with identical query/key offsets continues to
     accept mixed empty and nonempty slots. Full-length inputs are reshaped to
-    one dense BSHD call; ragged inputs use one bounded PyTorch SDPA call per
-    nonempty query sequence. All-empty query batches, empty key slots in
-    cross-attention, ragged noncausal (including windowed calls), graph-captured
-    ragged, paged, ALiBi, and ragged diagnostic varlen backward remain
-    unsupported.
+    one dense BSHD call; supported ragged inputs use one bounded PyTorch SDPA
+    call per nonempty query sequence. All-empty query batches, empty key slots
+    in cross-attention, ragged noncausal calls outside the radius-127
+    shared-offset window above, graph-captured ragged, paged, ALiBi, and ragged
+    diagnostic varlen backward remain unsupported.
     Deterministic zero-dropout backward is supported for both full-length
     profiles using direct math SDPA; all ragged and windowed forms still reject
     it. Calls that do not need backward retain the generated packed kernel,
@@ -2216,14 +2231,21 @@ def flash_attn_varlen_func(
                 "deterministic=True is implemented only for full-length "
                 f"zero-dropout training on {supported}"
             )
-        if has_symmetric_window and not full_length:
-            raise NotImplementedError(
-                "varlen sliding-window backward is implemented only when all "
-                "eight self-attention sequences have length 512; ragged "
-                "windowed calls remain forward-only"
-            )
+        ragged_symmetric_window = has_symmetric_window and not full_length
+        if ragged_symmetric_window:
+            if window != _RAGGED_VARLEN_SYMMETRIC_WINDOW_SIZE:
+                raise NotImplementedError(
+                    "ragged varlen sliding-window backward is implemented "
+                    "only with window_size=(127, 127)"
+                )
+            if cu_seqlens_q.data_ptr() != cu_seqlens_k.data_ptr():
+                raise NotImplementedError(
+                    "ragged varlen sliding-window backward requires shared "
+                    "query/key cumulative-offset storage"
+                )
         if (
             not full_length
+            and not ragged_symmetric_window
             and f"varlen_{spec.key}" != _RAGGED_VARLEN_SDPA_BACKWARD_KEY
         ):
             raise NotImplementedError(
@@ -2238,6 +2260,27 @@ def flash_attn_varlen_func(
             lengths_q, lengths_k = _ragged_varlen_attention_lengths(
                 q, k, cu_seqlens_q, cu_seqlens_k, spec
             )
+            if ragged_symmetric_window:
+                if any(length == 0 for length in lengths_q):
+                    raise NotImplementedError(
+                        "ragged varlen sliding-window backward requires all "
+                        "eight self-attention sequences to be nonempty"
+                    )
+                if not any(length < spec.seqlen_q for length in lengths_q):
+                    raise NotImplementedError(
+                        "ragged varlen sliding-window backward requires at "
+                        "least one sequence length below 512"
+                    )
+                return _ragged_varlen_attention_sdpa(
+                    q,
+                    k,
+                    v,
+                    lengths_q,
+                    lengths_k,
+                    scale,
+                    spec,
+                    symmetric_window_radius=window[0],
+                )
             return _ragged_varlen_attention_sdpa(
                 q, k, v, lengths_q, lengths_k, scale, spec
             )

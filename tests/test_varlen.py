@@ -3088,6 +3088,135 @@ def test_llama3_varlen_neighboring_shapes_remain_unsupported(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "entry_point", ["unpacked", "qkv-packed"], ids=["unpacked", "qkv-packed"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_ragged_radius_127_symmetric_window_backward_matches_fp32_and_fa2(
+    entry_point: str, softmax_scale: float | None
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = VARLEN_SYMMETRIC_WINDOW
+    q, k, v, cu_seqlens, lengths = make_ragged_self_packed(
+        spec, seed=20260810
+    )
+    generator = torch.Generator(device=q.device).manual_seed(20260811)
+    grad_out = torch.randn(
+        q.shape,
+        device=q.device,
+        dtype=q.dtype,
+        generator=generator,
+    )
+    window_size = (127, 127)
+
+    if entry_point == "unpacked":
+        q_actual = q.detach().requires_grad_()
+        k_actual = k.detach().requires_grad_()
+        v_actual = v.detach().requires_grad_()
+        got = helion_attention.flash_attn_varlen_func(
+            q_actual,
+            k_actual,
+            v_actual,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+            shape=spec,
+        )
+        got_grads = torch.autograd.grad(
+            got, (q_actual, k_actual, v_actual), grad_out
+        )
+
+        q_fa2 = q.detach().requires_grad_()
+        k_fa2 = k.detach().requires_grad_()
+        v_fa2 = v.detach().requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_varlen_func(
+            q_fa2,
+            k_fa2,
+            v_fa2,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+        )
+        expected_fa2_grads = torch.autograd.grad(
+            expected_fa2, (q_fa2, k_fa2, v_fa2), grad_out
+        )
+    else:
+        qkv_actual = torch.stack((q, k, v), dim=1).requires_grad_()
+        got = helion_attention.flash_attn_varlen_qkvpacked_func(
+            qkv_actual,
+            cu_seqlens,
+            spec.seqlen_q,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+            shape=spec,
+        )
+        got_qkv_grad = torch.autograd.grad(got, qkv_actual, grad_out)[0]
+        got_grads = tuple(got_qkv_grad[:, index] for index in range(3))
+
+        qkv_fa2 = torch.stack((q, k, v), dim=1).requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_varlen_qkvpacked_func(
+            qkv_fa2,
+            cu_seqlens,
+            spec.seqlen_q,
+            softmax_scale=softmax_scale,
+            window_size=window_size,
+        )
+        expected_fa2_qkv_grad = torch.autograd.grad(
+            expected_fa2, qkv_fa2, grad_out
+        )[0]
+        expected_fa2_grads = tuple(
+            expected_fa2_qkv_grad[:, index] for index in range(3)
+        )
+
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    q_ref = q.float().detach().requires_grad_()
+    k_ref = k.float().detach().requires_grad_()
+    v_ref = v.float().detach().requires_grad_()
+    expected = reference_packed(
+        q_ref,
+        k_ref,
+        v_ref,
+        lengths,
+        lengths,
+        causal=False,
+        scale=scale,
+        window_size=window_size,
+    )
+    expected_grads = torch.autograd.grad(
+        expected, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    assert got.is_contiguous()
+    torch.testing.assert_close(got.float(), expected, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+    for actual, reference, reference_fa2 in zip(
+        got_grads, expected_grads, expected_fa2_grads
+    ):
+        torch.testing.assert_close(
+            actual.float(), reference, atol=8e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            actual.float(), reference_fa2.float(), atol=8e-2, rtol=2e-2
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     ("radius", "softmax_scale"),
     [
         pytest.param(31, None, id="default-scale"),
@@ -3755,6 +3884,49 @@ def test_ragged_varlen_symmetric_window_rejects_backward_but_allows_no_grad(
             shape=spec,
         )
     assert out is sentinel
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("copied-offsets", "shared", id="copied-offsets"),
+        pytest.param("empty-sequence", "nonempty", id="empty-sequence"),
+        pytest.param(
+            "cross-attention",
+            "identical cu_seqlens",
+            id="cross-attention",
+        ),
+    ],
+)
+def test_ragged_radius_127_window_backward_rejects_out_of_scope_layouts(
+    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = VARLEN_SYMMETRIC_WINDOW
+    if case == "cross-attention":
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(spec)
+    else:
+        lengths = MIXED_EMPTY_SELF_LENGTHS if case == "empty-sequence" else None
+        q, k, v, cu_q, _ = make_ragged_self_packed(spec, lengths=lengths)
+        cu_k = cu_q.clone() if case == "copied-offsets" else cu_q
+    q.requires_grad_()
+
+    def reject_sdpa(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope radius-127 call reached SDPA")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_sdpa)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            window_size=(127, 127),
+            shape=spec,
+        )
 
 
 @requires_cuda
