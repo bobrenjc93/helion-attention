@@ -4513,6 +4513,15 @@ def test_page256_paged_kvcache_alibi_returns_fp32_lse(
         slopes,
         causal=causal,
     )
+    if causal:
+        slope_rows = (
+            slopes.expand(PAGED_KVCACHE.batch, -1)
+            if slopes.ndim == 1
+            else slopes
+        )
+        expected_fp32_lse += slope_rows[:, :, None] * (
+            cache_seqlens[:, None, None].float() - 1
+        )
 
     assert out.shape == q.shape
     assert lse.shape == (PAGED_KVCACHE.batch, PAGED_KVCACHE.nheads_q, 1)
@@ -4535,8 +4544,12 @@ def test_page256_paged_kvcache_alibi_returns_fp32_lse(
         softmax_scale=softmax_scale,
         causal=causal,
         alibi_slopes=slopes,
+        return_softmax_lse=True,
     )
-    torch.testing.assert_close(out, expected_fa2, atol=2e-2, rtol=1e-2)
+    assert isinstance(expected_fa2, tuple)
+    fa2_out, fa2_lse = expected_fa2
+    torch.testing.assert_close(out, fa2_out, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, fa2_lse, atol=2e-3, rtol=1e-3)
 
 
 @requires_cuda
@@ -5108,8 +5121,10 @@ def test_paged_kvcache_alibi_uses_generic_paged_runtime(
 
 
 @requires_cuda
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
 def test_page256_paged_kvcache_alibi_lse_uses_generic_paged_runtime(
     monkeypatch: pytest.MonkeyPatch,
+    causal: bool,
 ) -> None:
     import helion_attention._paged_attention as generic_attention
 
@@ -5154,7 +5169,7 @@ def test_page256_paged_kvcache_alibi_lse_uses_generic_paged_runtime(
         cache_seqlens=cache_seqlens,
         block_table=block_table,
         softmax_scale=0.19,
-        causal=False,
+        causal=causal,
         alibi_slopes=slopes,
         return_softmax_lse=True,
         shape=(4, 1, 1024, 8, 2, 128),
@@ -5166,7 +5181,7 @@ def test_page256_paged_kvcache_alibi_lse_uses_generic_paged_runtime(
     assert isinstance(kwargs, dict)
     assert kwargs["alibi_slopes"] is slopes
     assert kwargs["return_softmax_lse"] is True
-    assert kwargs["shift_fa2_lse"] is False
+    assert kwargs["shift_fa2_lse"] is causal
     torch.testing.assert_close(out.flatten(0, 1), packed_out)
     torch.testing.assert_close(
         lse,
