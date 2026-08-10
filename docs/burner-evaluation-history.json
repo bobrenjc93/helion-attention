@@ -3403,6 +3403,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:2db5fabdfbe36e8dd728e9a8fc49f8e0fa3099af",
+      "commit": "2db5fabdfbe36e8dd728e9a8fc49f8e0fa3099af",
+      "recordedAt": "2026-08-10T16:48:42.248Z",
+      "label": "base 2db5fab",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:149",
+      "recordedAt": "2026-08-10T16:48:42.248Z",
+      "label": "PR #149",
+      "kind": "leaf",
+      "prNumber": 149,
+      "title": "Expose page-256 softcap through core varlen",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 96,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
