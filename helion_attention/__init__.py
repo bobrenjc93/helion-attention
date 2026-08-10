@@ -2938,11 +2938,12 @@ def flash_attn_with_kvcache(
     additional speculative-decoding slice accepts exactly two query tokens:
     causal bf16 ``(1, 2, 1024, 32, 8, 128)`` with a full dense cache. It uses
     the generic packed runtime and supports the default or a custom softmax
-    scale. A paired two-token K/V update is accepted only at
-    ``cache_seqlens=1022`` and fills the final two slots before attention.
-    That update accepts full-head interleaved rotary tables and rotates the two
-    query/key tokens at positions 1022 and 1023. This profile does not support
-    LSE, partial read-only lengths, partial or non-interleaved rotary,
+    scale. Read-only calls optionally return fp32 LSE shaped ``[1, 32, 2]``.
+    A paired two-token K/V update is accepted only at ``cache_seqlens=1022``
+    and fills the final two slots before attention. That update accepts
+    full-head interleaved rotary tables and rotates the two query/key tokens at
+    positions 1022 and 1023. Updates do not support LSE, and this profile does
+    not support partial read-only lengths, partial or non-interleaved rotary,
     remapping, autograd, or noncausal attention.
 
     A separate read-only speculative-decoding slice accepts exactly four query
@@ -3290,10 +3291,11 @@ def flash_attn_with_kvcache(
                 "updates are not implemented"
             )
     if is_two_token_dense_profile:
-        if return_softmax_lse:
+        if return_softmax_lse and append_kv:
             raise NotImplementedError(
-                "return_softmax_lse is not implemented for the two-token "
-                "dense KV-cache profile"
+                "return_softmax_lse=True for the two-token dense KV-cache "
+                "profile is implemented only for read-only calls; updates "
+                "are not supported"
             )
     if tensor_cache_leftpad is not None:
         if append_kv:
@@ -3627,6 +3629,15 @@ def flash_attn_with_kvcache(
                 "the two-token dense KV-cache profile does not support autograd"
             )
         if not append_kv:
+            if return_softmax_lse:
+                out, softmax_lse, _ = _generic_dense_diagnostic_forward(
+                    q,
+                    k_cache,
+                    v_cache,
+                    scale,
+                    spec,
+                )
+                return out, softmax_lse
             return _generic_dense_forward(
                 q,
                 k_cache,
