@@ -393,14 +393,18 @@ path synchronizes once for recoverable bounds validation, so updates, ALiBi,
 cache remapping, rotary, windows, softcap, explicit split counts, autograd, and
 CUDA graph capture remain unsupported. Scalar prefixes and tensor spans on
 other dense profiles, plus non-final appends outside this 4K profile, remain
-unsupported except for the separately documented 1K and 16K slices.
+unsupported except for the separately documented two-token 1K update and 1K
+and 16K read slices.
 
 Two strict speculative-decoding slices use the generic packed Triton runtime
 with a dense cache. Causal bf16 `(1, 2, 1024, 32, 8, 128)` accepts either the
 default or a custom `softmax_scale`; its read-only form requires the full cache.
-It also accepts a paired two-token K/V update only at `cache_seqlens=1022`,
-filling slots 1022 and 1023 before attention. Full-head interleaved rotary
-tables optionally rotate Q and the appended K at positions 1022 and 1023.
+It also accepts a paired two-token K/V update at Python-integer
+`cache_seqlens` positions 0 through 1022. Positions 0 through 1021 mutate the
+selected slots and attend through the appended prefix with the generic packed
+runtime. The final update at position 1022 retains full-cache dispatch and
+optionally applies full-head interleaved rotary to Q and the appended K at
+positions 1022 and 1023. Non-final updates reject rotary before mutation.
 Causal bf16 `(1, 4, 1024, 32, 8, 128)` is strictly read-only and accepts an
 omitted or full scalar cache length with either scale and optionally returns
 fp32 LSE shaped `[1, 32, 4]`. The four-token path never mutates cache storage.
@@ -528,22 +532,24 @@ half-head interleaved rotary, to Q and the appended K at that position and use
 the generic packed runtime; the final-slot append continues to use the
 generated specialization. The exact
 two-token profile
-above similarly accepts paired K/V tensors shaped `[1, 2, 8, 128]` when the
-Python integer `cache_seqlens` is 1022, and mutates only the final two slots.
+above similarly accepts paired K/V tensors shaped `[1, 2, 8, 128]` at Python
+integer `cache_seqlens` positions 0 through 1022 and mutates only those two
+slots. Non-final positions attend through the appended prefix; position 1022
+retains the existing full-cache dispatch.
 Dense read-only calls may omit `cache_seqlens` or pass the full cache length,
 including the exact four-token profile above; the exact causal 1K and
 either-causal 4K profiles additionally accept their documented scalar prefixes,
 the 4K profile accepts tensor-selected spans with either causal flag, and the
 exact causal 16K profile accepts its tensor prefix or left-padded span.
 Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`, except
-for the exact 4K non-final appends above; the two-token update must satisfy
-`cache_seqlens + 2 == 1024`. Other multi-token updates, scalar partial lengths
+for the exact 4K non-final appends above; the exact two-token update accepts
+`0 <= cache_seqlens <= 1022`. Other multi-token updates, scalar partial lengths
 outside the exact causal 1K and either-causal 4K read-only profiles, non-final
-appends outside the exact 4K profile, and tensor lengths on every other dense
-profile are rejected explicitly. Caches created inside
-`torch.inference_mode()` must be updated while that mode remains enabled. For
-an append, `q`, `k_cache`, and `v_cache` must occupy disjoint memory; update
-`k`/`v` aliases are staged safely.
+appends outside the exact 4K one-token and 1K two-token profiles, and tensor
+lengths on every other dense profile are rejected explicitly. Caches created
+inside `torch.inference_mode()` must be updated while that mode remains
+enabled. For an append, `q`, `k_cache`, and `v_cache` must occupy disjoint
+memory; update `k`/`v` aliases are staged safely.
 
 The one-token final-slot append accepts paired, contiguous `rotary_cos` and
 `rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
@@ -555,9 +561,9 @@ the full head dimension, or 64 for a D128 head; the latter preserves dimensions
 split-half pair layout and is supported only for full-head rotation. Other
 partial rotary dimensions and rotary on a read-only call are rejected. The
 exact 4K non-final append accepts full-head rotation in either layout and D64
-half-head rotation in the interleaved layout. The exact two-token append remains
-full-head interleaved-only and uses consecutive positions 1022 and 1023 for its
-Q/K tokens.
+half-head rotation in the interleaved layout. The exact two-token final append
+remains full-head interleaved-only and uses consecutive positions 1022 and 1023
+for its Q/K tokens; earlier two-token appends do not support rotary.
 
 `shape` accepts:
 
@@ -856,7 +862,7 @@ also raise `NotImplementedError` rather than silently doing something else:
   rotary, windows, or autograd, and its LSE combination is limited to the exact
   read-only page-size-256/page-size-512 decode profile above
 - KV-cache mutation beyond the dense paired one-token final-slot append, the
-  exact 4K partial one-token append, exact two-token final-two-slot append, and
+  exact 4K partial one-token append, exact 1K partial two-token append, and
   exact page-16 paged final-slot append at four device lengths of 1023 above;
   the exact four-token profile is read-only;
   dense tensor lengths outside the exact causal 1K, either-causal 4K, and

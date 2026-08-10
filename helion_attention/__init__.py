@@ -31,7 +31,10 @@ forward-only full-cache read, while their global-window calls retain generated
 dispatch. Their prefix runtime handles a paired one-token K/V append before the
 final slot, including full-head interleaved or GPT-NeoX rotary and D64
 half-head interleaved rotary, while full reads and final-slot appends retain
-the generated specializations.
+the generated specializations. The same prefix runtime handles slope-free
+two-token updates before the final two slots of the causal 1K speculative
+decode profile, while its full reads and final append retain full-cache
+dispatch.
 The page-16 1K paged decode profile likewise accepts one paired final-slot
 append when every device-resident length is 1023 and its logical pages map to
 disjoint physical blocks, then retains its generated reader for attention.
@@ -1107,11 +1110,13 @@ def _tensor_length_dense_kvcache_forward(
     # (and its per-stream cuBLAS workspace).
     from ._paged_attention import packed_attention
 
-    packed_q = q.view(spec.batch, spec.nheads_q, spec.head_dim)
+    total_q = spec.batch * spec.seqlen_q
+    packed_q = q.view(total_q, spec.nheads_q, spec.head_dim)
     packed_k = k_cache.view(spec.seqlen_k, spec.nheads_kv, spec.head_dim)
     packed_v = v_cache.view(spec.seqlen_k, spec.nheads_kv, spec.head_dim)
-    cu_seqlens_q = torch.arange(
-        spec.batch + 1, device=q.device, dtype=torch.int32
+    cu_seqlens_q = (
+        torch.arange(spec.batch + 1, device=q.device, dtype=torch.int32)
+        * spec.seqlen_q
     )
     cu_seqlens_k = torch.cat(
         (
@@ -1168,7 +1173,11 @@ def _tensor_length_dense_kvcache_forward(
             "tensor-length KV-cache attention did not return requested LSE"
         )
     output, packed_lse = result
-    softmax_lse = packed_lse.transpose(0, 1).contiguous().unsqueeze(-1)
+    softmax_lse = (
+        packed_lse.view(spec.nheads_q, spec.batch, spec.seqlen_q)
+        .permute(1, 0, 2)
+        .contiguous()
+    )
     return output.reshape(output_shape), softmax_lse
 
 
@@ -2938,12 +2947,14 @@ def flash_attn_with_kvcache(
     additional speculative-decoding slice accepts exactly two query tokens:
     causal bf16 ``(1, 2, 1024, 32, 8, 128)`` with a full dense cache. It uses
     the generic packed runtime and supports the default or a custom softmax
-    scale. A paired two-token K/V update is accepted only at
-    ``cache_seqlens=1022`` and fills the final two slots before attention.
-    That update accepts full-head interleaved rotary tables and rotates the two
-    query/key tokens at positions 1022 and 1023. This profile does not support
-    LSE, partial read-only lengths, partial or non-interleaved rotary,
-    remapping, autograd, or noncausal attention.
+    scale. A paired two-token K/V update is accepted at Python-integer
+    ``cache_seqlens`` positions 0 through 1022. It fills those two slots and
+    attends through the appended prefix; the final append at position 1022
+    retains full-cache dispatch. That final update alone accepts full-head
+    interleaved rotary tables and rotates the two query/key tokens at positions
+    1022 and 1023. This profile does not support LSE, partial read-only lengths,
+    rotary on a non-final update, partial or non-interleaved rotary on the final
+    update, remapping, autograd, or noncausal attention.
 
     A separate read-only speculative-decoding slice accepts exactly four query
     tokens: causal bf16 ``(1, 4, 1024, 32, 8, 128)`` with a full dense cache.
@@ -3046,11 +3057,12 @@ def flash_attn_with_kvcache(
     Tensor-valued lengths and left padding on dense updates or outside the
     exact causal 1K, either-causal 4K, and causal 16K profiles, scalar partial
     lengths outside the exact causal 1K and either-causal 4K read-only
-    profiles, non-final appends outside the exact 4K profile, and multi-token
-    updates outside the exact two-token profile fail explicitly. Partial 4K
-    updates reject autograd, rotary dimensions other than full-head or D64
-    half-head, and non-interleaved partial-head rotary before either cache is
-    mutated. A paired
+    profiles, non-final one-token appends outside the exact 4K profile, and
+    multi-token updates outside the exact two-token profile fail explicitly.
+    Non-final two-token 1K updates reject rotary, and all partial updates reject
+    autograd, before either cache is mutated. Partial 4K updates additionally
+    reject rotary dimensions other than full-head or D64 half-head and
+    non-interleaved partial-head rotary. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied
     for the one-token final-slot append: the default interleaved layout may
     cover the full head or the first 64 dimensions of a 128-dimensional head,
@@ -3346,12 +3358,21 @@ def flash_attn_with_kvcache(
                 f"of length {spec.seqlen_k}"
             )
         if is_two_token_dense_profile:
-            if cache_seqlens + 2 != spec.seqlen_k:
-                raise NotImplementedError(
-                    "the two-token dense KV-cache update must fill the final "
-                    "two cache slots; cache_seqlens + 2 must equal the cache "
-                    "length declared by shape"
+            final_start = spec.seqlen_k - 2
+            if cache_seqlens > final_start:
+                raise ValueError(
+                    "the two-token dense KV-cache update must fit within the "
+                    "cache; cache_seqlens must be in the inclusive range "
+                    f"[0, {final_start}], got {cache_seqlens}"
                 )
+            if cache_seqlens < final_start:
+                if apply_rotary:
+                    raise NotImplementedError(
+                        "rotary embeddings are not implemented for non-final "
+                        "two-token KV-cache updates; rotary remains limited "
+                        "to the final append at cache_seqlens=1022"
+                    )
+                scalar_cache_append_position = cache_seqlens
         elif (
             is_4k_scalar_prefix_dense_profile
             and cache_seqlens < spec.seqlen_k - 1
@@ -3518,12 +3539,13 @@ def flash_attn_with_kvcache(
     )
     if partial_append_needs_backward:
         raise NotImplementedError(
-            "partial 4K KV-cache updates do not support autograd"
+            "partial dense KV-cache updates do not support autograd"
         )
     appended_cache_seqlens = (
         torch.full(
             (spec.batch,),
-            scalar_cache_append_position + 1,
+            scalar_cache_append_position
+            + (2 if is_two_token_dense_profile else 1),
             device=q.device,
             dtype=torch.int32,
         )
