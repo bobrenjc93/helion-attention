@@ -146,6 +146,18 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
+One deliberately unregistered varlen profile is also callable through the
+generic packed Triton runtime: causal bf16 Llama-3 GQA with maximum shape
+`(4, 256, 256, 32, 8, 128)`. It supports only calls that do not require
+backward, with equal packed Q/K token totals and `cu_seqlens_q` and
+`cu_seqlens_k` sharing the same storage for self-attention. Their device-side
+values may describe arbitrary ragged lengths, including mixed empty and
+nonempty slots. The unpacked and KV-packed entry points accept the default or a
+custom `softmax_scale`; dropout, windows, softcap, ALiBi, deterministic mode,
+diagnostic returns, cross-attention offsets, and paged caches remain
+unsupported. Because this is generic fallback coverage rather than a generated
+specialization, `is_varlen_shape_supported` remains false for the profile.
+
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
 symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for
 self-attention. Dynamic ragged lengths with identical query/key cumulative
@@ -424,7 +436,7 @@ helion_attention.available_paged_shapes()
 These introspection functions intentionally describe only checked-in generated
 kernels; they do not report generic fallback coverage. An unlisted compatible
 dense shape remains callable but is not specialization-accelerated. Dense shapes
-outside the fallback envelope and unlisted varlen/paged shapes raise
+outside the fallback envelope and all other unlisted varlen/paged shapes raise
 `UnsupportedShapeError`. **To accelerate an unlisted shape, please
 [file an issue](https://github.com/bobrenjc93/helion-attention/issues)** — adding
 a specialization is an autotuning run, not a runtime code change.
