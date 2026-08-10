@@ -2503,6 +2503,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:ccd288c717255cadaee3b5bf64c9b5521fbb58bf",
+      "commit": "ccd288c717255cadaee3b5bf64c9b5521fbb58bf",
+      "recordedAt": "2026-08-10T02:27:23.571Z",
+      "label": "base ccd288c",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:114",
+      "recordedAt": "2026-08-10T02:27:23.571Z",
+      "label": "PR #114",
+      "kind": "leaf",
+      "prNumber": 114,
+      "title": "Honor deterministic backward on causal GPT-2",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
