@@ -33,6 +33,9 @@ dispatch. Their prefix runtime handles a paired one-token K/V append before the
 final slot,
 including full-head or D64 half-head interleaved rotary, while full reads and
 final-slot appends retain the generated specializations.
+The page-16 1K paged decode profile likewise accepts one paired final-slot
+append when every device-resident length is 1023 and its logical pages map to
+disjoint physical blocks, then retains its generated reader for attention.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
@@ -338,6 +341,54 @@ def _contiguous_tensors_overlap(first: torch.Tensor, second: torch.Tensor) -> bo
     second_start = second.data_ptr()
     second_end = second_start + second.numel() * second.element_size()
     return first_start < second_end and second_start < first_end
+
+
+def _strided_tensor_byte_bounds(tensor: torch.Tensor) -> tuple[int, int] | None:
+    """Return a conservative byte interval containing a strided tensor."""
+    if tensor.numel() == 0:
+        return None
+    minimum_offset = tensor.storage_offset()
+    maximum_offset = minimum_offset
+    for size, stride in zip(tensor.shape, tensor.stride()):
+        extent = (size - 1) * stride
+        minimum_offset += min(0, extent)
+        maximum_offset += max(0, extent)
+    storage_start = tensor.untyped_storage().data_ptr()
+    element_size = tensor.element_size()
+    return (
+        storage_start + minimum_offset * element_size,
+        storage_start + (maximum_offset + 1) * element_size,
+    )
+
+
+def _strided_tensors_may_overlap(
+    first: torch.Tensor, second: torch.Tensor
+) -> bool:
+    """Whether two strided tensors have intersecting reachable byte ranges."""
+    if first.device != second.device:
+        return False
+    first_bounds = _strided_tensor_byte_bounds(first)
+    second_bounds = _strided_tensor_byte_bounds(second)
+    if first_bounds is None or second_bounds is None:
+        return False
+    first_start, first_end = first_bounds
+    second_start, second_end = second_bounds
+    return first_start < second_end and second_start < first_end
+
+
+def _strided_tensor_has_internal_overlap(tensor: torch.Tensor) -> bool:
+    """Conservatively detect overlapping indices in a strided tensor."""
+    covered_span = 1
+    dimensions = sorted(
+        (abs(stride), size)
+        for size, stride in zip(tensor.shape, tensor.stride())
+        if size > 1
+    )
+    for stride, size in dimensions:
+        if stride < covered_span:
+            return True
+        covered_span += (size - 1) * stride
+    return False
 
 
 def _validate_kvcache_rotary(
@@ -2356,6 +2407,8 @@ def _paged_kvcache_forward(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    k: torch.Tensor | None,
+    v: torch.Tensor | None,
     *,
     append_kv: bool,
     cache_seqlens: int | torch.Tensor | None,
@@ -2367,11 +2420,7 @@ def _paged_kvcache_forward(
     return_softmax_lse: bool,
     shape: ShapeLike,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Adapt exact read-only dense-query paged profiles to core varlen."""
-    if append_kv:
-        raise NotImplementedError(
-            "paged KV-cache updates are not implemented; paged caches are read-only"
-        )
+    """Adapt exact dense-query paged profiles to core varlen."""
     spec = normalize_shape(shape, q.dtype, causal)
     for name, cache in (("k_cache", k_cache), ("v_cache", v_cache)):
         if not isinstance(cache, torch.Tensor):
@@ -2397,6 +2446,32 @@ def _paged_kvcache_forward(
         spec.head_dim,
         spec.dtype,
     )
+    if append_kv:
+        if (
+            requested != _CORE_PAGED_KVCACHE_SHAPE
+            or page_size != _CORE_PAGED_GENERATED_PAGE_SIZE
+        ):
+            raise NotImplementedError(
+                "paged KV-cache updates are implemented only for the bf16 "
+                "page-size-16 batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 "
+                "(GQA 8:2) head_dim=128 decode profile; all other paged "
+                "profiles and page sizes are read-only"
+            )
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "return_softmax_lse=True is not implemented with paged "
+                "KV-cache updates; the paged LSE paths are read-only"
+            )
+        if alibi_slopes is not None:
+            raise NotImplementedError(
+                "paged KV-cache ALiBi paths are read-only; updates do not "
+                "support ALiBi slopes"
+            )
+        if softcap != 0.0:
+            raise NotImplementedError(
+                "paged KV-cache softcap paths are read-only; updates do not "
+                "support softcap"
+            )
     has_softcap = softcap != 0.0
     if has_softcap and (
         softcap != _PAGE256_PAGED_KVCACHE_SOFTCAP
@@ -2479,13 +2554,59 @@ def _paged_kvcache_forward(
             "cache_seqlens must be on the same CUDA device as q, k_cache, "
             "and v_cache"
         )
+    if append_kv:
+        assert k is not None and v is not None
+        expected_update = (
+            spec.batch,
+            1,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
+        for name, tensor in (("k", k), ("v", v)):
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"{name} must be a torch.Tensor")
+            if tensor.ndim == 4 and tensor.shape[1] != 1:
+                raise NotImplementedError(
+                    "paged KV-cache updates accept exactly one token; "
+                    f"{name} must contain exactly one token"
+                )
+            if tuple(tensor.shape) != expected_update:
+                raise ValueError(
+                    f"{name} has shape {tuple(tensor.shape)} but the paged "
+                    f"one-token update requires {expected_update}"
+                )
+            if tensor.dtype != spec.dtype:
+                raise ValueError(
+                    f"{name} has dtype {tensor.dtype} but shape declares "
+                    f"{spec.dtype}"
+                )
+            if not tensor.is_cuda:
+                raise ValueError(
+                    f"{name} must be a CUDA tensor, got device {tensor.device}"
+                )
+            if tensor.device != q.device:
+                raise ValueError(
+                    "q, paged K/V caches, and update k/v must be on the same "
+                    "CUDA device"
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(
+                    f"{name} must be contiguous in "
+                    "[batch, 1, nheads_kv, head_dim] layout"
+                )
+        with torch.cuda.device(q.device):
+            if torch.cuda.is_current_stream_capturing():
+                raise NotImplementedError(
+                    "paged KV-cache updates are not supported during CUDA "
+                    "graph capture"
+                )
     if alibi_slopes is not None:
         _validate_alibi_slopes(alibi_slopes, q, spec)
 
-    grad_tensors = (
-        (q, k_cache, v_cache, alibi_slopes)
-        if alibi_slopes is not None
-        else (q, k_cache, v_cache)
+    grad_tensors = tuple(
+        tensor
+        for tensor in (q, k_cache, v_cache, k, v, alibi_slopes)
+        if isinstance(tensor, torch.Tensor)
     )
     if torch.is_grad_enabled() and any(
         tensor.requires_grad for tensor in grad_tensors
@@ -2513,12 +2634,140 @@ def _paged_kvcache_forward(
         device=q.device,
         dtype=torch.int32,
     )
+    attention_cache_seqlens = (
+        torch.full(
+            (spec.batch,),
+            spec.seqlen_k,
+            device=q.device,
+            dtype=torch.int32,
+        )
+        if append_kv
+        else cache_seqlens
+    )
     cu_seqlens_k = torch.cat(
         (
             cache_seqlens.new_zeros(1),
-            cache_seqlens.cumsum(dim=0, dtype=torch.int32),
+            attention_cache_seqlens.cumsum(dim=0, dtype=torch.int32),
         )
     )
+    if append_kv:
+        assert k is not None and v is not None
+        check_paged_varlen_tensors(
+            packed_q,
+            k_cache,
+            v_cache,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            block_table,
+            spec,
+        )
+        if _strided_tensor_has_internal_overlap(k_cache) or (
+            _strided_tensor_has_internal_overlap(v_cache)
+        ):
+            raise ValueError(
+                "paged K/V caches must not have internal memory overlap when "
+                "updating"
+            )
+        if _strided_tensors_may_overlap(k_cache, v_cache):
+            raise ValueError("k_cache and v_cache must not overlap when updating")
+        if _strided_tensors_may_overlap(q, k_cache) or (
+            _strided_tensors_may_overlap(q, v_cache)
+        ):
+            raise ValueError(
+                "q must not overlap k_cache or v_cache when updating"
+            )
+        for name, metadata in (
+            ("cache_seqlens", cache_seqlens),
+            ("block_table", block_table),
+        ):
+            if _strided_tensors_may_overlap(metadata, k_cache) or (
+                _strided_tensors_may_overlap(metadata, v_cache)
+            ):
+                raise ValueError(
+                    f"{name} must not overlap k_cache or v_cache when updating"
+                )
+        if not torch.is_inference_mode_enabled() and (
+            k_cache.is_inference() or v_cache.is_inference()
+        ):
+            raise RuntimeError(
+                "KV caches created in torch.inference_mode() must be updated "
+                "while torch.inference_mode() is enabled"
+            )
+
+        required_blocks = spec.seqlen_k // page_size
+        metadata_values = torch.cat(
+            (
+                cache_seqlens.detach().reshape(-1),
+                block_table[:, :required_blocks].detach().reshape(-1),
+            )
+        ).tolist()
+        length_values = tuple(
+            int(value) for value in metadata_values[: spec.batch]
+        )
+        append_position = spec.seqlen_k - 1
+        if any(length != append_position for length in length_values):
+            raise NotImplementedError(
+                "page-size-16 paged KV-cache updates require every "
+                f"cache_seqlens value to equal {append_position}; got "
+                f"{length_values}; other lengths remain read-only"
+            )
+        physical_blocks = tuple(
+            int(value) for value in metadata_values[spec.batch :]
+        )
+        invalid_blocks = tuple(
+            block
+            for block in physical_blocks
+            if block < 0 or block >= k_cache.shape[0]
+        )
+        if invalid_blocks:
+            raise ValueError(
+                "block_table physical block indices must be in the range "
+                f"[0, {k_cache.shape[0] - 1}], got {invalid_blocks}"
+            )
+        if len(set(physical_blocks)) != len(physical_blocks):
+            raise ValueError(
+                "block_table must map the full logical caches to disjoint "
+                "physical blocks when updating; duplicate entries would "
+                "alias cache rows"
+            )
+
+        # Resolve the generated reader and prepare every temporary before the
+        # first write, so recoverable validation/allocation failures cannot
+        # leave K and V at different logical states.
+        lookup_paged(spec, page_size)
+        cache_tensors = (k_cache, v_cache)
+        update_k = (
+            k.clone()
+            if any(
+                _strided_tensors_may_overlap(k, cache)
+                for cache in cache_tensors
+            )
+            else k
+        )
+        update_v = (
+            v.clone()
+            if any(
+                _strided_tensors_may_overlap(v, cache)
+                for cache in cache_tensors
+            )
+            else v
+        )
+        final_blocks = tuple(
+            physical_blocks[(batch + 1) * required_blocks - 1]
+            for batch in range(spec.batch)
+        )
+        final_block_indices = torch.tensor(
+            final_blocks,
+            device=q.device,
+            dtype=torch.int64,
+        )
+        page_offset = append_position % page_size
+        k_cache[:, page_offset].index_copy_(
+            0, final_block_indices, update_k[:, 0]
+        )
+        v_cache[:, page_offset].index_copy_(
+            0, final_block_indices, update_v[:, 0]
+        )
     if (
         page_size != _CORE_PAGED_GENERATED_PAGE_SIZE
         or return_softmax_lse
@@ -2658,8 +2907,8 @@ def flash_attn_with_kvcache(
     profile does not support cache updates, partial or tensor-valued lengths,
     rotary, remapping, autograd, or noncausal attention.
 
-    Two read-only paged profiles are also exposed with an int32 CUDA
-    ``cache_seqlens`` tensor shaped ``[batch]`` and ``block_table``. Bf16
+    Two paged profiles are also exposed with an int32 CUDA ``cache_seqlens``
+    tensor shaped ``[batch]`` and ``block_table``. Bf16
     ``(2, 200, 320, 8, 2, 128)`` accepts page-size-16 caches and supports only
     ``causal=True`` and uses bottom-right causal alignment for chunked prefill.
     Bf16 ``(4, 1, 1024, 8, 2, 128)`` accepts page-size-16, page-size-256, or
@@ -2673,6 +2922,14 @@ def flash_attn_with_kvcache(
     ``[batch, 8]`` through the generic paged runtime (``[2, 8]`` for chunked
     prefill and ``[4, 8]`` for decode). Page-512 decode does not support ALiBi
     or softcap.
+    The page-16 decode profile alone accepts a paired one-token K/V update when
+    every ``cache_seqlens`` value is exactly 1023. The full logical block table
+    must map to in-range, disjoint physical pages. The adapter writes offset 15
+    of each row's final logical page, leaves ``cache_seqlens`` unchanged, and
+    invokes the same generated reader with an internal full-length view. This
+    update supports either causal flag and the default or a custom softmax
+    scale, but rejects LSE, rotary, ALiBi, windows, softcap, autograd, and CUDA
+    graph capture before writing either cache. Other paged calls are read-only.
 
     For dense caches, ``cache_seqlens`` may be omitted or supplied as a Python
     integer equal to the declared cache length for a read-only call. The causal
@@ -2738,12 +2995,14 @@ def flash_attn_with_kvcache(
     result follows FlashAttention 2's position-shifted ALiBi LSE convention,
     while its noncausal result retains the mathematical LSE. Cache tensors
     created in inference mode must also be updated in inference mode, and an
-    append requires disjoint query, K-cache, and V-cache memory. Tensor-valued
-    lengths and left padding on updates or outside the exact causal 1K,
-    either-causal 4K, and causal 16K profiles, scalar partial lengths outside
-    the exact causal 1K and either-causal 4K read-only profiles, non-final
-    appends outside the exact 4K profile, and multi-token updates outside the
-    exact two-token profile fail explicitly. Partial 4K updates reject
+    append requires disjoint query, K-cache, and V-cache memory. The paged
+    update additionally requires a disjoint full logical block mapping.
+    Tensor-valued lengths and left padding on dense updates or outside the
+    exact causal 1K, either-causal 4K, and causal 16K profiles, scalar partial
+    lengths outside the exact causal 1K and either-causal 4K read-only
+    profiles, non-final appends outside the exact 4K profile, and multi-token
+    updates outside the exact two-token profile fail explicitly. Partial 4K
+    updates reject
     autograd, rotary dimensions other than full-head or D64 half-head, and
     non-interleaved rotary before either cache is mutated. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied
@@ -2754,9 +3013,9 @@ def flash_attn_with_kvcache(
     non-final 4K append accepts the interleaved form with either full-head or
     D64 half-head rotation. The exact two-token append remains full-head-only
     and rotates its tokens at consecutive positions. Read-only rotary calls
-    and other paged profiles fail explicitly. Paged updates, rotary, and
-    autograd are
-    unsupported for both paged profiles. Paged ALiBi LSE returns are limited to
+    and other paged profiles fail explicitly. Paged updates outside the exact
+    page-16 final-slot slice above, paged rotary, and paged autograd are
+    unsupported. Paged ALiBi LSE returns are limited to
     read-only page-256 decode; updates, other profiles, and all other page sizes
     remain unsupported. Paged softcap is unsupported for updates,
     page-size-16 and page-size-512 caches, other profiles, ALiBi, windows, and
@@ -2870,10 +3129,17 @@ def flash_attn_with_kvcache(
             f"{_TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION} tensor-span profiles"
         )
     if block_table is not None:
+        if has_rotary_metadata:
+            raise NotImplementedError(
+                "paged KV-cache rotary paths are read-only; rotary embeddings "
+                "are not implemented for updates"
+            )
         return _paged_kvcache_forward(
             q,
             k_cache,
             v_cache,
+            k,
+            v,
             append_kv=append_kv,
             cache_seqlens=cache_seqlens,
             block_table=block_table,
