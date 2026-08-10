@@ -2743,6 +2743,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:4fc5fd909da46476dde44b95ade629fb87d8e445",
+      "commit": "4fc5fd909da46476dde44b95ade629fb87d8e445",
+      "recordedAt": "2026-08-10T07:02:49.685Z",
+      "label": "base 4fc5fd9",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 93,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:125",
+      "recordedAt": "2026-08-10T07:02:49.685Z",
+      "label": "PR #125",
+      "kind": "leaf",
+      "prNumber": 125,
+      "title": "Expose page-256 ALiBi through core varlen",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 94,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
