@@ -2473,6 +2473,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:1320a58104146fafb96e96dcf522e34f50a6d66b",
+      "commit": "1320a58104146fafb96e96dcf522e34f50a6d66b",
+      "recordedAt": "2026-08-10T02:06:30.423Z",
+      "label": "base 1320a58",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:113",
+      "recordedAt": "2026-08-10T02:06:30.423Z",
+      "label": "PR #113",
+      "kind": "leaf",
+      "prNumber": 113,
+      "title": "Expose page-256 decode through core varlen block tables",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
