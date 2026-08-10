@@ -3343,6 +3343,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:85f125779ef52733a939b0b31f9e1a2577297aa1",
+      "commit": "85f125779ef52733a939b0b31f9e1a2577297aa1",
+      "recordedAt": "2026-08-10T15:57:17.243Z",
+      "label": "base 85f1257",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 97,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:147",
+      "recordedAt": "2026-08-10T15:57:17.243Z",
+      "label": "PR #147",
+      "kind": "leaf",
+      "prNumber": 147,
+      "title": "Backpropagate the 512-key Llama window",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 97,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
