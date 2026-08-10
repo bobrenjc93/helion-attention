@@ -3553,6 +3553,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:e842f88bfe484d9dce8262e00be417ddd6c08ae5",
+      "commit": "e842f88bfe484d9dce8262e00be417ddd6c08ae5",
+      "recordedAt": "2026-08-10T19:05:59.351Z",
+      "label": "base e842f88",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 98,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:155",
+      "recordedAt": "2026-08-10T19:05:59.351Z",
+      "label": "PR #155",
+      "kind": "leaf",
+      "prNumber": 155,
+      "title": "Add one 32-token small-model decoder kernel",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
