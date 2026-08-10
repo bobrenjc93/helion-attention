@@ -1013,6 +1013,39 @@
       }
     },
     {
+      "key": "b8_sq128_sk128_hq8_hkv8_d32_bf16_causal",
+      "description": "batch=8 seqlen_q=128 seqlen_k=128 nheads=8 head_dim=32 dtype=bf16 causal=True",
+      "kind": "forward",
+      "varlen": false,
+      "paged": false,
+      "backward": false,
+      "flash_attn_api": "flash_attn_func",
+      "flash_attn_3_api": "flash_attn_func",
+      "note": "small-model decoder",
+      "implementations": {
+        "helion-attention": {
+          "us": 30.52064332739821,
+          "tflops": 2.215980550425885,
+          "max_abs_error": 0.009243965148925781
+        },
+        "flash-attn": {
+          "us": 192.12227721421937,
+          "tflops": 0.35203180485201085,
+          "max_abs_error": 0.009243965148925781
+        },
+        "sdpa-flash": {
+          "us": 196.469675738148,
+          "tflops": 0.3442421928264416,
+          "max_abs_error": 0.009243965148925781
+        },
+        "sdpa-cudnn": {
+          "us": 195.17448691034102,
+          "tflops": 0.3465266033007133,
+          "max_abs_error": 0.009243965148925781
+        }
+      }
+    },
+    {
       "key": "b8_sq2048_sk2048_hq16_hkv16_d64_bf16_causal",
       "description": "batch=8 seqlen_q=2048 seqlen_k=2048 nheads=16 head_dim=64 dtype=bf16 causal=True",
       "kind": "forward",
