@@ -2593,6 +2593,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:2d6c9d26dfdf05d4bd7bd51a2b55e66b76bfe46c",
+      "commit": "2d6c9d26dfdf05d4bd7bd51a2b55e66b76bfe46c",
+      "recordedAt": "2026-08-10T04:01:54.963Z",
+      "label": "base 2d6c9d2",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:117",
+      "recordedAt": "2026-08-10T04:01:54.963Z",
+      "label": "PR #117",
+      "kind": "leaf",
+      "prNumber": 117,
+      "title": "Enable ALiBi on the Llama-3 varlen slice",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
