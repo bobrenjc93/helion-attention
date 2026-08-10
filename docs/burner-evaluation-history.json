@@ -2563,6 +2563,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:0530b37c1e0fa9c80f89ea351575f86f965fe36a",
+      "commit": "0530b37c1e0fa9c80f89ea351575f86f965fe36a",
+      "recordedAt": "2026-08-10T03:39:52.478Z",
+      "label": "base 0530b37",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:116",
+      "recordedAt": "2026-08-10T03:39:52.478Z",
+      "label": "PR #116",
+      "kind": "leaf",
+      "prNumber": 116,
+      "title": "Use the fixed persistent source for B8 2K causal MHA",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 92,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
