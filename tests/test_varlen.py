@@ -2131,6 +2131,203 @@ def test_llama3_varlen_ragged_cross_attention_matches_fp32_and_fa2(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_llama3_varlen_alibi_matches_fp32_and_fa2(
+    batched_slopes: bool,
+    softmax_scale: float | None,
+) -> None:
+    spec = LLAMA3_VARLEN_INFERENCE
+    q, k, v, cu_q, lengths_q = make_ragged_self_packed(
+        spec, lengths=[256, 0, 73, 0], seed=20260809
+    )
+    cu_k = cu_q
+    lengths_k = lengths_q
+
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(spec.batch)], dim=0
+        )
+        if batched_slopes
+        else head_slopes
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            shape=spec,
+        )
+        expected_fp32 = reference_packed(
+            q,
+            k,
+            v,
+            lengths_q,
+            lengths_k,
+            causal=True,
+            scale=scale,
+            alibi_slopes=slopes,
+        )
+
+    assert slopes.shape == (
+        (spec.batch, spec.nheads_q) if batched_slopes else (spec.nheads_q,)
+    )
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    assert got.is_contiguous()
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    with torch.no_grad():
+        expected_fa2 = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+        )
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.29], ids=["default-scale", "custom-scale"]
+)
+def test_llama3_varlen_kvpacked_inherits_alibi_support(
+    batched_slopes: bool, softmax_scale: float | None
+) -> None:
+    spec = LLAMA3_VARLEN_INFERENCE
+    q, k, v, cu_q, cu_k, *_ = make_packed(
+        spec, variant=0, seed=271828
+    )
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(spec.batch)], dim=0
+        )
+        if batched_slopes
+        else head_slopes
+    )
+    kv = torch.stack((k, v), dim=1)
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            shape=spec,
+        )
+        expected_unpacked = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            shape=spec,
+        )
+
+    torch.testing.assert_close(got, expected_unpacked)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["unpacked", "kvpacked"], ids=["unpacked", "kv-packed"]
+)
+def test_llama3_varlen_without_alibi_retains_existing_dispatch(
+    entry_point: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = LLAMA3_VARLEN_INFERENCE
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[object, ...]] = []
+
+    def generic(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(args)
+        return sentinel
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("slope-free Llama-3 call changed dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_varlen_forward", generic)
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_alibi_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+
+    with torch.no_grad():
+        if entry_point == "unpacked":
+            got = helion_attention.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=True,
+                alibi_slopes=None,
+                shape=spec,
+            )
+        else:
+            got = helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=1),
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=True,
+                alibi_slopes=None,
+                shape=spec,
+            )
+
+    assert got is sentinel
+    assert len(calls) == 1
+
+
+@requires_cuda
 def test_llama3_varlen_rejects_gradients_before_generic_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2166,28 +2363,27 @@ def test_llama3_varlen_rejects_gradients_before_generic_dispatch(
     [
         pytest.param("dropout_p", 0.1, "dropout", id="dropout"),
         pytest.param("window_size", (7, 7), "sliding-window", id="window"),
-        pytest.param("softcap", 50.0, "implemented only", id="softcap"),
-        pytest.param("alibi_slopes", "slopes", "implemented only", id="alibi"),
+        pytest.param("softcap", 50.0, "softcap", id="softcap"),
         pytest.param(
             "deterministic", True, "deterministic=True", id="deterministic"
         ),
         pytest.param(
-            "return_attn_probs", True, "implemented only", id="diagnostics"
+            "return_attn_probs", True, "implemented", id="diagnostics"
         ),
     ],
 )
+@pytest.mark.parametrize("with_alibi", [False, True], ids=["plain", "alibi"])
 def test_llama3_varlen_rejects_optional_features_before_generic_dispatch(
     option: str,
     value: object,
     message: str,
+    with_alibi: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = LLAMA3_VARLEN_INFERENCE
     q, k, v, cu_seqlens, _ = make_ragged_self_packed(
         spec, lengths=[256, 0, 37, 11]
     )
-    if value == "slopes":
-        value = torch.ones(spec.nheads_q, device=q.device)
 
     def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
         raise AssertionError("unsupported option reached generic dispatch")
@@ -2195,6 +2391,12 @@ def test_llama3_varlen_rejects_optional_features_before_generic_dispatch(
     monkeypatch.setattr(
         helion_attention, "_generic_varlen_forward", reject_generic
     )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_alibi_forward", reject_generic
+    )
+    kwargs = {option: value}
+    if with_alibi:
+        kwargs["alibi_slopes"] = torch.ones(spec.nheads_q, device=q.device)
     with pytest.raises(NotImplementedError, match=message):
         helion_attention.flash_attn_varlen_func(
             q,
@@ -2206,12 +2408,27 @@ def test_llama3_varlen_rejects_optional_features_before_generic_dispatch(
             spec.seqlen_k,
             causal=True,
             shape=spec,
-            **{option: value},
+            **kwargs,
         )
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    ("with_alibi", "exception", "message"),
+    [
+        pytest.param(
+            False,
+            helion_attention.UnsupportedShapeError,
+            "supports only",
+            id="plain",
+        ),
+        pytest.param(True, NotImplementedError, "ALiBi slopes", id="alibi"),
+    ],
+)
 def test_llama3_varlen_rejects_paging_before_dispatch(
+    with_alibi: bool,
+    exception: type[Exception],
+    message: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = LLAMA3_VARLEN_INFERENCE
@@ -2225,7 +2442,13 @@ def test_llama3_varlen_rejects_paging_before_dispatch(
         raise AssertionError("unsupported profile reached paged dispatch")
 
     monkeypatch.setattr(helion_attention, "lookup_paged", reject_lookup)
-    with pytest.raises(helion_attention.UnsupportedShapeError, match="supports only"):
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_alibi_forward", reject_lookup
+    )
+    slopes = (
+        torch.ones(spec.nheads_q, device=q.device) if with_alibi else None
+    )
+    with pytest.raises(exception, match=message):
         helion_attention.flash_attn_varlen_func(
             q,
             k,
@@ -2235,6 +2458,7 @@ def test_llama3_varlen_rejects_paging_before_dispatch(
             spec.seqlen_q,
             spec.seqlen_k,
             causal=True,
+            alibi_slopes=slopes,
             block_table=block_table,
             shape=spec,
         )
@@ -3415,7 +3639,9 @@ def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "spec",
+    (*VARLEN_ALIBI_PROFILES, LLAMA3_VARLEN_INFERENCE),
+    ids=["causal", "noncausal", "llama3-gqa"],
 )
 @pytest.mark.parametrize(
     ("batched_slopes", "softmax_scale", "variant"),
@@ -3657,6 +3883,18 @@ def test_varlen_alibi_bypasses_generated_dispatch(
             AttnShape(8, 256, 256, 16, 16, 64, torch.bfloat16, True),
             id="other-causal-shape",
         ),
+        pytest.param(
+            AttnShape(4, 255, 255, 32, 8, 128, torch.bfloat16, True),
+            id="llama3-other-maxima",
+        ),
+        pytest.param(
+            AttnShape(4, 256, 256, 32, 8, 128, torch.bfloat16, False),
+            id="llama3-noncausal",
+        ),
+        pytest.param(
+            AttnShape(4, 256, 256, 32, 8, 128, torch.float16, True),
+            id="llama3-fp16",
+        ),
     ],
 )
 def test_varlen_alibi_rejects_other_profiles(spec: AttnShape) -> None:
@@ -3690,7 +3928,9 @@ def test_varlen_alibi_rejects_other_profiles(spec: AttnShape) -> None:
 @requires_cuda
 @pytest.mark.parametrize("gradient_source", ["q", "slopes"])
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "spec",
+    (*VARLEN_ALIBI_PROFILES, LLAMA3_VARLEN_INFERENCE),
+    ids=["causal", "noncausal", "llama3-gqa"],
 )
 def test_varlen_alibi_rejects_gradients_before_dispatch(
     gradient_source: str, spec: AttnShape, monkeypatch: pytest.MonkeyPatch
@@ -3770,10 +4010,17 @@ def test_varlen_alibi_rejects_incompatible_options(
         ("last-stride", "contiguous.*last dimension"),
     ],
 )
+@pytest.mark.parametrize(
+    "spec",
+    [VARLEN_ALIBI_NONCAUSAL, LLAMA3_VARLEN_INFERENCE],
+    ids=["mha", "llama3-gqa"],
+)
 def test_varlen_alibi_rejects_malformed_slopes_before_dispatch(
-    case: str, message: str, monkeypatch: pytest.MonkeyPatch
+    case: str,
+    message: str,
+    spec: AttnShape,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = VARLEN_ALIBI_NONCAUSAL
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
     if case == "not-tensor":
         slopes: object = [0.1] * spec.nheads_q

@@ -165,9 +165,11 @@ backward. Device-side `cu_seqlens_q` and `cu_seqlens_k` may independently
 describe ragged query and key lengths with different packed token totals;
 shared-offset self-attention continues to support mixed empty and nonempty
 slots. The unpacked and KV-packed entry points accept the default or a custom
-`softmax_scale`; dropout, windows, softcap, ALiBi, deterministic mode,
-diagnostic returns, and paged caches remain unsupported. Because this is
-generic fallback coverage rather than a generated specialization,
+`softmax_scale`. They also accept forward-only fp32 ALiBi slopes shaped `[32]`
+or `[4, 32]`; slope-free calls retain their existing generic dispatch. Dropout,
+windows, softcap, deterministic mode, diagnostic returns, paged caches, and
+backward remain unsupported, including in combination with ALiBi. Because this
+is generic fallback coverage rather than a generated specialization,
 `is_varlen_shape_supported` remains false for the profile.
 
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
@@ -204,11 +206,13 @@ inherit this support.
 Both the causal and noncausal bf16 profiles at these maxima support forward-only
 ALiBi. Pass fp32 CUDA slopes shaped `[16]` or `[8, 16]` through `alibi_slopes`;
 both the unpacked API and the varlen QKV/KV-packed adapters accept them, with
-either the default or a custom `softmax_scale`. ALiBi calls use the generic
-packed Triton runtime, while `alibi_slopes=None` retains the checked-in generated
-specialization. Other varlen profiles and paged calls made directly through the
-core varlen API still reject ALiBi explicitly; the narrow KV-cache paths
-described below are the only paged exceptions.
+either the default or a custom `softmax_scale`. The causal bf16 Llama-3 profile
+above likewise accepts `[32]` or `[4, 32]` slopes through its unpacked and
+KV-packed entry points. ALiBi calls use the generic packed Triton runtime, while
+`alibi_slopes=None` retains each profile's existing dispatch. Other varlen
+profiles and paged calls made directly through the core varlen API still reject
+ALiBi explicitly; the narrow KV-cache paths described below are the only paged
+exceptions.
 
 Zero-dropout backward is supported for both the causal and noncausal bf16
 `(8, 512, 512, 16, 16, 64)` varlen profiles when all eight query and key
@@ -703,8 +707,9 @@ also raise `NotImplementedError` rather than silently doing something else:
   exception permits its diagnostic tuple described above, while the paged
   exception permits its documented LSE return
 - ALiBi slopes for varlen profiles other than the causal and noncausal bf16
-  `(8, 512, 512, 16, 16, 64)` profiles above, and for KV-cache calls outside
-  the exact read-only bf16 dense `(1, 1, 4096, 32, 8, 128)` decode profile,
+  `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
+  `(4, 256, 256, 32, 8, 128)` profile above, and for KV-cache calls outside the
+  exact read-only bf16 dense `(1, 1, 4096, 32, 8, 128)` decode profile,
   page-size-16 profiles, and page-size-256 decode above; dense KV-cache ALiBi
   cannot be combined with LSE, updates, partial lengths, remapping, left
   padding, rotary, windows, softcap, or autograd; paged ALiBi cannot be combined
