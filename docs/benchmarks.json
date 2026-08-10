@@ -410,6 +410,39 @@
       }
     },
     {
+      "key": "b1_sq64_sk64_hq32_hkv8_d128_bf16_causal",
+      "description": "batch=1 seqlen_q=64 seqlen_k=64 nheads=32 (GQA 32:8) head_dim=128 dtype=bf16 causal=True",
+      "kind": "forward",
+      "varlen": false,
+      "paged": false,
+      "backward": false,
+      "flash_attn_api": "flash_attn_func",
+      "flash_attn_3_api": "flash_attn_func",
+      "note": "Llama-3-8B 64-token GQA prefill",
+      "implementations": {
+        "helion-attention": {
+          "us": 28.267315337881893,
+          "tflops": 1.2055874281888406,
+          "max_abs_error": 0.010526180267333984
+        },
+        "flash-attn": {
+          "us": 197.7277518935906,
+          "tflops": 0.17235172945444627,
+          "max_abs_error": 0.010526180267333984
+        },
+        "sdpa-flash": {
+          "us": 199.28502996480108,
+          "tflops": 0.17100491695748138,
+          "max_abs_error": 0.010526180267333984
+        },
+        "sdpa-cudnn": {
+          "us": 193.9318124176695,
+          "tflops": 0.17572526949113906,
+          "max_abs_error": 0.010526180267333984
+        }
+      }
+    },
+    {
       "key": "b1_sq8192_sk8192_hq28_hkv4_d128_bf16_causal",
       "description": "batch=1 seqlen_q=8192 seqlen_k=8192 nheads=28 (GQA 28:4) head_dim=128 dtype=bf16 causal=True",
       "kind": "forward",
