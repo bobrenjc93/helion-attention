@@ -27,10 +27,10 @@ profile, grad-enabled dense calls without a generated backward, both
 full-length varlen profiles, and ragged causal attention use PyTorch SDPA
 autograd. Full-length symmetric-window training on the shipped noncausal
 varlen profile uses the same bounded SDPA bridge. Deterministic zero-dropout
-BERT-base training and full-length causal varlen training use the direct math
-operator without changing process-wide SDPA backend state. The explicit shape
-validates these paths and makes specialization introspection independent of
-fallback coverage.
+BERT-base, causal GPT-2, and full-length causal varlen training use the direct
+math operator without changing process-wide SDPA backend state. The explicit
+shape validates these paths and makes specialization introspection independent
+of fallback coverage.
 """
 
 from __future__ import annotations
@@ -112,6 +112,9 @@ _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
 _CAUSAL_DROPOUT_KEY = "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal"
 _DROPOUT_SDPA_KEYS = frozenset(
     {_ENCODER_TRAINING_KEY, _BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
+)
+_DENSE_DETERMINISTIC_BACKWARD_KEYS = frozenset(
+    {_BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
 )
 _GEMMA2_SOFTCAP_KEY = "b1_sq4096_sk4096_hq16_hkv8_d256_bf16_causal"
 _GEMMA2_SOFTCAP = 50.0
@@ -1465,8 +1468,9 @@ def flash_attn_func(
     paths fall back to their generated kernels when ineligible. Grad-enabled
     calls without ALiBi or a generated backward, plus supported positive-dropout
     calls, use PyTorch SDPA autograd.
-    Deterministic zero-dropout training on the exact BERT-base profile uses
-    PyTorch's direct math SDPA operator for repeatable output and gradients.
+    Deterministic zero-dropout training on the exact BERT-base and causal GPT-2
+    profiles uses PyTorch's direct math SDPA operator for repeatable output and
+    gradients.
     Zero-dropout training on the shipped encoder profile retains generated
     forward values. Its omitted/default-scale SM90 path uses raw BSHD PyTorch
     Flash gradients, falling back to the generated backward when Flash is
@@ -1588,7 +1592,7 @@ def flash_attn_func(
                 return attention_with_flash_gradients(q, k, v, scale, spec)
             return attention_autograd(q, k, v, scale, spec)
         if deterministic:
-            if spec.key == _BERT_DIAGNOSTIC_KEY:
+            if spec.key in _DENSE_DETERMINISTIC_BACKWARD_KEYS:
                 return dense_attention_math_sdpa(q, k, v, scale, spec)
             raise NotImplementedError(
                 "deterministic=True is not supported by the PyTorch SDPA "
