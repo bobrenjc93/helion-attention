@@ -23,7 +23,8 @@ without softcap through the core varlen API. The KV-cache adapter also uses the
 generic paged runtime for ALiBi on both exposed page-16 profiles and page-256
 decode. Read-only causal 1K and both causal variants of 4K dense decode likewise
 use the generic runtime for a bounded Python-int prefix. The 4K profiles also
-use it for read-only CUDA-tensor-selected spans and full-cache ALiBi. Their
+use it for read-only CUDA-tensor-selected spans and full-cache or scalar-prefix
+ALiBi. Their
 prefix runtime handles a paired one-token K/V append before the final slot,
 including full-head or D64 half-head interleaved rotary, while full reads and
 final-slot appends retain the generated specializations.
@@ -1013,6 +1014,7 @@ def _tensor_length_dense_kvcache_forward(
     softmax_scale: float,
     spec: AttnShape,
     *,
+    alibi_slopes: torch.Tensor | None,
     return_softmax_lse: bool,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Read a device-selected cache span with one generic attention launch."""
@@ -1050,7 +1052,7 @@ def _tensor_length_dense_kvcache_forward(
         causal=spec.causal,
         window_size=(-1, -1),
         softcap=0.0,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -2646,14 +2648,16 @@ def flash_attn_with_kvcache(
     generated specialization. It does not widen the profile's existing
     final-slot-only update support. The causal and noncausal bf16
     ``(1, 1, 4096, 32, 8, 128)`` profiles likewise accept Python integers from
-    1 through 4095 for slope-free, read-only prefixes and paired one-token K/V
-    updates at positions 0 through 4094. The prefix path uses the generic
-    packed runtime with the default or a custom softmax scale and optional fp32
-    LSE. An update mutates its selected slot and attends through that newly
-    appended token. Non-final updates optionally rotate the query and appended
-    key with full-head or D64 half-head interleaved rotary tables. Omitted and
-    full Python-int reads, plus the existing update at position 4095, retain
-    the generated specialization.
+    1 through 4095 for read-only prefixes and paired one-token K/V updates at
+    positions 0 through 4094. Read-only prefixes optionally accept fp32 ALiBi
+    slopes shaped ``[32]`` or ``[1, 32]``. The prefix path uses the generic
+    packed runtime with the default or a custom softmax scale; slope-free calls
+    may additionally return fp32 LSE. An update mutates its selected slot and
+    attends through that newly appended token. Non-final updates optionally
+    rotate the query and appended key with full-head or D64 half-head
+    interleaved rotary tables. Omitted and full Python-int slope-free reads,
+    plus the existing update at position 4095, retain the generated
+    specialization.
     The same 4K profiles additionally accept contiguous CUDA int32
     ``cache_seqlens`` tensors shaped ``[1]`` for read-only, slope-free spans.
     An optional matching ``cache_leftpad`` tensor selects
@@ -2664,12 +2668,11 @@ def flash_attn_with_kvcache(
     scale, and optional fp32 LSE. They synchronize once for recoverable bounds
     validation and reject CUDA graph capture, autograd, updates, remapping,
     rotary, ALiBi, windows, softcap, and explicit split counts.
-    The same 4K profiles accept
-    forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]`` only for the
-    full cache. Those calls use the generic packed runtime; omitting slopes
-    retains the generated specialization. ALiBi cannot be combined with LSE,
-    updates, partial lengths, remapping, left padding, rotary, windows, softcap,
-    or autograd. The causal bf16 ``(1, 1, 16384, 32, 8, 128)`` profile accepts
+    The same 4K profiles accept forward-only fp32 ALiBi slopes shaped ``[32]``
+    or ``[1, 32]`` for the full cache and Python-int prefixes. Those calls use
+    the generic packed runtime. ALiBi cannot be combined with LSE, updates,
+    tensor-valued spans, remapping, left padding, rotary, windows, softcap, or
+    autograd. The causal bf16 ``(1, 1, 16384, 32, 8, 128)`` profile accepts
     the same contiguous CUDA int32 span tensors, with
     ``0 <= cache_leftpad < cache_seqlens <= 16384``. This tensor-span path
     synchronizes once for recoverable bounds validation and rejects CUDA graph
@@ -2979,12 +2982,6 @@ def flash_attn_with_kvcache(
                 )
             scalar_cache_prefix = cache_seqlens
 
-    if scalar_cache_prefix is not None and has_dense_alibi:
-        raise NotImplementedError(
-            "partial or ragged scalar-prefix dense KV caches do not support "
-            "ALiBi slopes; omit cache_seqlens or pass the full cache length"
-        )
-
     # Dispatch directly after the KV-cache-specific checks. Routing back
     # through flash_attn_func would repeat normalization and validation on
     # every latency-sensitive decode step.
@@ -3128,6 +3125,7 @@ def flash_attn_with_kvcache(
             tensor_cache_leftpad,
             scale,
             spec,
+            alibi_slopes=None,
             return_softmax_lse=return_softmax_lse,
         )
 
@@ -3153,6 +3151,7 @@ def flash_attn_with_kvcache(
             None,
             scale,
             spec,
+            alibi_slopes=alibi_slopes,
             return_softmax_lse=return_softmax_lse,
         )
 
@@ -3285,6 +3284,7 @@ def flash_attn_with_kvcache(
             None,
             scale,
             spec,
+            alibi_slopes=None,
             return_softmax_lse=return_softmax_lse,
         )
     if is_two_token_dense_profile:

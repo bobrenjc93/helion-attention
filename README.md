@@ -314,8 +314,9 @@ out = helion_attention.flash_attn_with_kvcache(
 ```
 
 The exact bf16 4K profile above also accepts forward-only fp32 ALiBi slopes
-shaped `[32]` or `[1, 32]`, with either decode-equivalent causal flag and the
-default or a custom `softmax_scale`:
+shaped `[32]` or `[1, 32]` for a full-cache read or a Python-integer prefix from
+1 through 4095, with either decode-equivalent causal flag and the default or a
+custom `softmax_scale`:
 
 ```python
 slopes = torch.linspace(0.01, 0.2, H_Q, device="cuda", dtype=torch.float32)
@@ -323,6 +324,7 @@ out = helion_attention.flash_attn_with_kvcache(
     q,
     k_cache,
     v_cache,
+    cache_seqlens=1025,
     causal=True,
     alibi_slopes=slopes,
     shape=(B, 1, S_CACHE, H_Q, H_KV, D),
@@ -330,9 +332,11 @@ out = helion_attention.flash_attn_with_kvcache(
 ```
 
 ALiBi uses the generic packed Triton runtime and never mutates the cache;
-slope-free calls retain the checked-in generated specialization. This narrow
-mode does not support LSE, updates, partial lengths, cache remapping, left
-padding, rotary, windows, softcap, or autograd.
+slope-free full-cache calls retain the checked-in generated specialization and
+slope-free prefixes retain their existing packed-prefix dispatch. Full-cache
+ALiBi retains its existing generic dense dispatch. This narrow mode does not
+support LSE, updates, tensor-selected spans, cache remapping, left padding,
+rotary, windows, softcap, or autograd.
 
 The exact causal bf16 `(1, 1, 1024, 32, 8, 128)` profile accepts a read-only
 Python integer `cache_seqlens` from 1 through 1024, with the default or a custom
@@ -344,14 +348,15 @@ cache remapping, rotary, ALiBi, windows, softcap, explicit split counts,
 autograd, and non-final updates remain unsupported for this 1K prefix mode.
 
 The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
-through 4095 for slope-free, read-only prefix attention. It also accepts paired
-one-token K/V updates at Python-integer positions 0 through 4094, mutates that
-slot, and attends through the appended token. Both causal flags, the default or
-a custom `softmax_scale`, optional fp32 LSE, and optional full-head or D64
-half-head interleaved rotary are supported for updates. These calls use the
-generic packed Triton runtime. Omitting the length or passing 4096 for a read
-retains the checked-in generated dispatch, as does the existing final-slot
-append at position 4095.
+through 4095 for read-only prefix attention, optionally with ALiBi as described
+above. It also accepts slope-free paired one-token K/V updates at Python-integer
+positions 0 through 4094, mutates that slot, and attends through the appended
+token. Both causal flags and the default or a custom `softmax_scale` are
+supported. Slope-free calls additionally support optional fp32 LSE, and updates
+optionally apply full-head or D64 half-head interleaved rotary. These calls use
+the generic packed Triton runtime. Omitting the length or passing 4096 for a
+slope-free read retains the checked-in generated dispatch, as does the existing
+final-slot append at position 4095.
 
 The 4K profile also accepts a contiguous CUDA int32 `cache_seqlens` tensor
 shaped `[1]` for a slope-free, read-only prefix. An optional contiguous CUDA
