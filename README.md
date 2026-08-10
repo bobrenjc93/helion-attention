@@ -347,10 +347,11 @@ The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
 through 4095 for slope-free, read-only prefix attention. It also accepts paired
 one-token K/V updates at Python-integer positions 0 through 4094, mutates that
 slot, and attends through the appended token. Both causal flags, the default or
-a custom `softmax_scale`, optional fp32 LSE, and optional full-head interleaved
-rotary are supported for updates. These calls use the generic packed Triton
-runtime. Omitting the length or passing 4096 for a read retains the checked-in
-generated dispatch, as does the existing final-slot append at position 4095.
+a custom `softmax_scale`, optional fp32 LSE, and optional full-head or D64
+half-head interleaved rotary are supported for updates. These calls use the
+generic packed Triton runtime. Omitting the length or passing 4096 for a read
+retains the checked-in generated dispatch, as does the existing final-slot
+append at position 4095.
 
 The 4K profile also accepts a contiguous CUDA int32 `cache_seqlens` tensor
 shaped `[1]` for a slope-free, read-only prefix. An optional contiguous CUDA
@@ -473,9 +474,10 @@ out = helion_attention.flash_attn_with_kvcache(
 The append mutates both dense caches in place and attends over the updated full
 cache. The exact bf16 4K profile additionally permits positions 0 through 4094
 and attends over the updated prefix ending at that position. Those non-final
-appends optionally apply full-head interleaved rotary to Q and the appended K
-at that position and use the generic packed runtime; the final-slot append
-continues to use the generated specialization. The exact two-token profile
+appends optionally apply full-head or D64 half-head interleaved rotary to Q and
+the appended K at that position and use the generic packed runtime; the
+final-slot append continues to use the generated specialization. The exact
+two-token profile
 above similarly accepts paired K/V tensors shaped `[1, 2, 8, 128]` when the
 Python integer `cache_seqlens` is 1022, and mutates only the final two slots.
 Dense read-only calls may omit `cache_seqlens` or pass the full cache length,
@@ -502,9 +504,9 @@ the full head dimension, or 64 for a D128 head; the latter preserves dimensions
 64 through 127 unchanged. Passing `rotary_interleaved=False` selects the GPT-NeoX
 split-half pair layout and is supported only for full-head rotation. Other
 partial rotary dimensions and rotary on a read-only call are rejected. The
-exact 4K non-final append and the exact two-token append accept only the
-full-head interleaved layout. The two-token path uses consecutive positions
-1022 and 1023 for its Q/K tokens.
+exact 4K non-final append accepts D64 half-head or full-head interleaved rotary.
+The exact two-token append remains full-head interleaved-only and uses
+consecutive positions 1022 and 1023 for its Q/K tokens.
 
 `shape` accepts:
 
@@ -806,7 +808,8 @@ also raise `NotImplementedError` rather than silently doing something else:
   and page-size-256 decode above, paged LSE outside the exact decode profile
   above, and KV-cache rotary outside the
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
-  the exact full-head interleaved 4K partial or two-token append
+  the exact full-head or D64 half-head interleaved 4K partial append or the
+  exact full-head interleaved two-token append
 - `return_attn_probs=True` outside the no-backward BERT-base and the
   backward-capable causal bf16 GPT-2 dense/QKV-packed/KV-packed calls,
   dense/KV-packed calls for the three
