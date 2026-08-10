@@ -5343,16 +5343,18 @@ def test_core_varlen_page256_softcap_matches_fa2_and_fp32_for_ragged_permuted_pa
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
+@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
 @pytest.mark.parametrize(
     "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
 )
-def test_core_varlen_page256_alibi_matches_fa2_and_fp32_for_ragged_permuted_pages(
+def test_core_varlen_large_page_alibi_matches_fa2_and_fp32_for_ragged_permuted_pages(
     causal: bool,
     softmax_scale: float | None,
+    page_size: int,
     batched_slopes: bool,
 ) -> None:
     q, k, v, cu_q, cu_k, block_table, lengths_k, request_kv = (
-        make_paged_decode(page_size=256, seed=20260809)
+        make_paged_decode(page_size=page_size, seed=20260809)
     )
     head_slopes = torch.linspace(
         0.01,
@@ -5582,13 +5584,15 @@ def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
 
 
 @requires_cuda
-def test_core_varlen_page256_alibi_uses_generic_paged_runtime(
+@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
+def test_core_varlen_large_page_alibi_uses_generic_paged_runtime(
+    page_size: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import helion_attention._paged_attention as generic_attention
 
     q, k, v, cu_q, cu_k, block_table, lengths_k, _ = make_paged_decode(
-        page_size=256
+        page_size=page_size
     )
     slopes = torch.linspace(
         0.01,
@@ -5601,7 +5605,9 @@ def test_core_varlen_page256_alibi_uses_generic_paged_runtime(
     seen: dict[str, object] = {}
 
     def reject_generated(*args: object, **kwargs: object) -> object:
-        raise AssertionError("page-256 ALiBi reached generated page-16 dispatch")
+        raise AssertionError(
+            f"page-{page_size} ALiBi reached generated page-16 dispatch"
+        )
 
     def fake_generic(*args: object, **kwargs: object) -> torch.Tensor:
         seen["args"] = args
@@ -5783,12 +5789,20 @@ def test_core_varlen_paged_rejects_unsupported_page_and_shape() -> None:
     [
         pytest.param(PAGED_DECODE, make_paged_decode, 16, id="decode-page-16"),
         pytest.param(
+            PAGED_DECODE, make_paged_decode, 128, id="decode-other-page"
+        ),
+        pytest.param(
             PAGED_CHUNKED_PREFILL,
             make_paged_chunked_prefill,
             16,
             id="chunked-prefill-page-16",
         ),
-        pytest.param(PAGED_DECODE, make_paged_decode, 512, id="decode-page-512"),
+        pytest.param(
+            PAGED_CHUNKED_PREFILL,
+            make_paged_chunked_prefill,
+            512,
+            id="chunked-prefill-page-512",
+        ),
     ],
 )
 def test_core_varlen_unsupported_paged_alibi_rejected_before_dispatch(
@@ -5839,6 +5853,7 @@ def test_core_varlen_unsupported_paged_alibi_rejected_before_dispatch(
         pytest.param(256, False, id="page-256-slope-free"),
         pytest.param(256, True, id="page-256-alibi"),
         pytest.param(512, False, id="page-512-slope-free"),
+        pytest.param(512, True, id="page-512-alibi"),
     ],
 )
 def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispatch(
@@ -5906,6 +5921,11 @@ def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispa
         pytest.param(
             "alibi", "softcap combined with ALiBi", id="alibi"
         ),
+        pytest.param(
+            "page-512-alibi",
+            "softcap combined with ALiBi",
+            id="page-512-alibi",
+        ),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param(
             "diagnostic",
@@ -5954,6 +5974,16 @@ def test_core_varlen_page256_softcap_rejects_out_of_scope_calls_before_dispatch(
         kwargs["alibi_slopes"] = torch.ones(
             spec.nheads_q, device=q.device, dtype=torch.float32
         )
+    elif case == "page-512-alibi":
+        q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
+            page_size=512
+        )
+        kwargs.update(
+            block_table=block_table,
+            alibi_slopes=torch.ones(
+                spec.nheads_q, device=q.device, dtype=torch.float32
+            ),
+        )
     elif case == "window":
         kwargs["window_size"] = (1, 1)
     elif case == "diagnostic":
@@ -5983,11 +6013,15 @@ def test_core_varlen_page256_softcap_rejects_out_of_scope_calls_before_dispatch(
 
 @requires_cuda
 @pytest.mark.parametrize("gradient_source", ["q", "slopes"])
-def test_core_varlen_page256_alibi_rejects_gradients_before_dispatch(
+@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
+def test_core_varlen_large_page_alibi_rejects_gradients_before_dispatch(
     gradient_source: str,
+    page_size: int,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=256)
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
+        page_size=page_size
+    )
     slopes = torch.ones(
         PAGED_DECODE.nheads_q, device=q.device, dtype=torch.float32
     )
@@ -5997,7 +6031,9 @@ def test_core_varlen_page256_alibi_rejects_gradients_before_dispatch(
         slopes.requires_grad_()
 
     def reject_dispatch(*args: object, **kwargs: object) -> object:
-        raise AssertionError("gradient-bearing page-256 ALiBi reached dispatch")
+        raise AssertionError(
+            f"gradient-bearing page-{page_size} ALiBi reached dispatch"
+        )
 
     monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
     monkeypatch.setattr(
