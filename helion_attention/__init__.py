@@ -9,7 +9,8 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
-varlen inference profile, ALiBi and diagnostics on that profile, ALiBi on both
+varlen inference profile, ALiBi with optional diagnostics on that profile,
+ALiBi on both
 shipped varlen profiles, symmetric windows on the shipped noncausal varlen
 profile, and diagnostics on the shipped causal varlen profile use a generic
 Triton forward kernel. The same runtime exposes exactly a 511-token left plus
@@ -1411,6 +1412,8 @@ def _generic_varlen_diagnostic_forward(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
+    *,
+    alibi_slopes: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return FA2-compatible diagnostics from the generic packed runtime."""
     # The generated specialization remains the default fast path, but it does
@@ -1432,7 +1435,7 @@ def _generic_varlen_diagnostic_forward(
         causal=True,
         window_size=(-1, -1),
         softcap=0.0,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -1443,7 +1446,10 @@ def _generic_varlen_diagnostic_forward(
         cp_tot_seqused_k=None,
         out=None,
         return_softmax_lse=True,
-        shift_fa2_lse=False,
+        # FA2's causal ALiBi kernel drops the query-position constant from
+        # its scores, which leaves the output unchanged but shifts its
+        # reported LSE. Restore that convention only for combined calls.
+        shift_fa2_lse=alibi_slopes is not None,
         fa_version=2,
     )
     if not isinstance(packed_result, tuple):  # pragma: no cover - contract guard
@@ -1822,10 +1828,10 @@ def flash_attn_varlen_func(
     Shared-offset self-attention continues to support a mix of empty and
     nonempty slots. This unregistered profile uses the generic packed Triton
     runtime and accepts the default or a custom ``softmax_scale``, with or
-    without the ALiBi slopes described above. Forward-only slope-free calls
-    additionally accept ``return_attn_probs=True`` and return fp32 LSE shaped
-    ``[32, total_q]`` plus an empty bf16 ``S_dmask``. Registered profiles
-    retain generated dispatch.
+    without the ALiBi slopes described above. Forward-only calls additionally
+    accept ``return_attn_probs=True``, including together with those slopes,
+    and return fp32 LSE shaped ``[32, total_q]`` plus an empty bf16
+    ``S_dmask``. Registered profiles retain generated dispatch.
 
     The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
@@ -1958,9 +1964,10 @@ def flash_attn_varlen_func(
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented with block_table"
             )
-        if alibi_slopes is not None:
+        if alibi_slopes is not None and not is_llama3_varlen_inference:
             raise NotImplementedError(
-                "return_attn_probs=True is not implemented with ALiBi slopes"
+                "return_attn_probs=True with ALiBi slopes is implemented only "
+                f"for {_LLAMA3_VARLEN_INFERENCE_KEY}"
             )
         if deterministic:
             raise NotImplementedError(
@@ -2189,6 +2196,17 @@ def flash_attn_varlen_func(
             spec,
         )
     if return_attn_probs:
+        if alibi_slopes is not None:
+            return _generic_varlen_diagnostic_forward(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                scale,
+                spec,
+                alibi_slopes=alibi_slopes,
+            )
         return _generic_varlen_diagnostic_forward(
             q,
             k,
