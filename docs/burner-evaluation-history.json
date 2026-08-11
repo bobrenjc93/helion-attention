@@ -4603,6 +4603,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:0e96aa202c1061a3137beab5bf7cc8c5f83cb140",
+      "commit": "0e96aa202c1061a3137beab5bf7cc8c5f83cb140",
+      "recordedAt": "2026-08-11T13:36:40.026Z",
+      "label": "base 0e96aa2",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 67,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:198",
+      "recordedAt": "2026-08-11T13:36:40.026Z",
+      "label": "PR #198",
+      "kind": "leaf",
+      "prNumber": 198,
+      "title": "Read scalar prefixes with eight-token 1K decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 68,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
