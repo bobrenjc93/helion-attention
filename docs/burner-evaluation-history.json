@@ -4138,6 +4138,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:bf6d4008daf80b2cf24ed8305805a9468a1a0edc",
+      "commit": "bf6d4008daf80b2cf24ed8305805a9468a1a0edc",
+      "recordedAt": "2026-08-11T06:04:49.259Z",
+      "label": "base bf6d400",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 68,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:180",
+      "recordedAt": "2026-08-11T06:04:49.259Z",
+      "label": "PR #180",
+      "kind": "leaf",
+      "prNumber": 180,
+      "title": "Return page-512 diagnostics through core varlen",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 69,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
