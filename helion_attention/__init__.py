@@ -24,11 +24,12 @@ retains generated dispatch. It also exposes every causal left window from the
 current token alone through the full 2K context for the bf16 batch-1 2K Llama
 GQA profile while its global-window call retains generated dispatch.
 Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime
-also provides any finite positive softcap for output-only calls on the shipped
-causal varlen profile, plus ``softcap=50.0`` for one forward-only Gemma-2
-profile, read-only page-256/page-512 core paged decode, and read-only
-page-256/page-512 KV-cache decode. The Gemma-2 and shipped causal varlen
-profiles also expose the diagnostic return with exactly that cap. The same
+also provides any finite positive softcap, with optional diagnostics, for
+forward-only calls on the shipped causal varlen profile, plus
+``softcap=50.0`` for one forward-only Gemma-2 profile, read-only
+page-256/page-512 core paged decode, and read-only page-256/page-512 KV-cache
+decode. The Gemma-2 profile exposes the diagnostic return with exactly that
+cap. The same
 runtime exposes page-256/page-512 decode with optional ALiBi through the core
 varlen API, plus the FA2 diagnostic return for slope-free
 page-16/page-256/page-512 decode and softcapped page-256/page-512 decode. The
@@ -399,7 +400,7 @@ def _reject_unsupported(
         and not has_allowed_positive_softcap
     ):
         qualifier = (
-            "as a finite positive value for the supported output-only profile"
+            "as a finite positive value for the supported forward-only profile"
             if allow_positive_softcap
             else "only as softcap=50.0 for the supported inference profiles"
         )
@@ -2311,21 +2312,20 @@ def flash_attn_varlen_func(
     backward.
 
     The causal version of that profile accepts any finite positive ``softcap``
-    for output-only calls that do not need backward, with either the default or
-    a custom ``softmax_scale``. Softcapped calls use the generic packed Triton
-    runtime. Exactly ``softcap=50.0`` may additionally request
-    ``return_attn_probs=True`` to receive fp32 LSE shaped ``[16, total_q]`` and
-    an empty bf16 ``S_dmask``. ``softcap=0`` retains the generated
-    specialization. Non-50 diagnostics, other profiles, gradients, dropout,
-    ALiBi, local windows, determinism, and paging remain unsupported for this
-    composition. Paged softcap remains unsupported except for the exact
-    page-size-256/page-size-512 decode profile described above; both page sizes
-    may combine ``softcap=50.0`` with diagnostic returns.
+    for forward-only calls that do not need backward, with either the default
+    or a custom ``softmax_scale``. Softcapped calls use the generic packed
+    Triton runtime and may additionally request ``return_attn_probs=True`` to
+    receive fp32 LSE shaped ``[16, total_q]`` and an empty bf16 ``S_dmask``.
+    ``softcap=0`` retains the generated specialization. Other profiles,
+    gradients, dropout, ALiBi, local windows, determinism, and paging remain
+    unsupported for this composition. Paged softcap remains unsupported except
+    for the exact page-size-256/page-size-512 decode profile described above;
+    both page sizes may combine ``softcap=50.0`` with diagnostic returns.
 
     The causal version of that profile also supports
     ``return_attn_probs=True`` with ``causal=True``, optional
-    ``softmax_scale``, and either optional ALiBi or the exact softcap described
-    above; ALiBi and softcap cannot be combined. Forward calls may be ragged,
+    ``softmax_scale``, and either optional ALiBi or any finite positive softcap;
+    ALiBi and softcap cannot be combined. Forward calls may be ragged,
     and ALiBi slopes may have shape ``[16]`` or ``[8, 16]``. Slope-free,
     uncapped backward is restricted to full-length inputs, where all eight
     query and key sequences have length 512. It returns
@@ -2366,9 +2366,7 @@ def flash_attn_varlen_func(
         allow_return_attn_probs=True,
         allow_softcap_return_attn_probs=True,
         allowed_softcap=_VARLEN_SOFTCAP,
-        allow_positive_softcap=(
-            not return_attn_probs and block_table is None
-        ),
+        allow_positive_softcap=block_table is None,
     )
     if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
@@ -2784,7 +2782,7 @@ def flash_attn_varlen_func(
                 cu_seqlens_k,
                 scale,
                 spec,
-                softcap=_VARLEN_SOFTCAP,
+                softcap=float(softcap),
             )
         return _generic_varlen_softcap_forward(
             q,

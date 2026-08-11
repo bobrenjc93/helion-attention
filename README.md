@@ -298,24 +298,23 @@ dropout, paged caches, deterministic mode, and CUDA graph capture remain
 unsupported for this causal window.
 
 This shipped causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts any
-finite positive `softcap` for output-only calls that do not require backward.
+finite positive `softcap` for forward-only calls that do not require backward.
 Dynamic ragged query/key lengths and the default or a custom `softmax_scale`
 are supported by the unpacked and QKV/KV-packed entry points. Softcapped calls
 use the generic packed Triton runtime and apply
-`softcap * tanh(scores / softcap)` before softmax. Exactly `softcap=50.0` may
-additionally pass `return_attn_probs=True` and receive `(out, softmax_lse,
-S_dmask)`, with fp32 LSE shaped `[16, total_q]` and an empty bf16 `S_dmask`.
-`softcap=0` retains the generated specialization. Non-50 diagnostics, other
-profiles, gradients, dropout, ALiBi, local windows, deterministic mode, and
-paging remain unsupported for this composition. Paged softcap remains
-unsupported except for the exact core page-size-256/page-size-512 decode
-profile described below; both page sizes may combine `softcap=50.0` with
-diagnostic returns.
+`softcap * tanh(scores / softcap)` before softmax. They may additionally pass
+`return_attn_probs=True` and receive `(out, softmax_lse, S_dmask)`, with fp32
+LSE shaped `[16, total_q]` and an empty bf16 `S_dmask`. `softcap=0` retains the
+generated specialization. Other profiles, gradients, dropout, ALiBi, local
+windows, deterministic mode, and paging remain unsupported for this
+composition. Paged softcap remains unsupported except for the exact core
+page-size-256/page-size-512 decode profile described below; both page sizes may
+combine `softcap=50.0` with diagnostic returns.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
 `return_attn_probs=True` with `causal=True`, an optional custom `softmax_scale`,
-and either optional fp32 ALiBi slopes shaped `[16]` or `[8, 16]` or exactly
-`softcap=50.0`; ALiBi and softcap cannot be combined. Forward calls may be
+and either optional fp32 ALiBi slopes shaped `[16]` or `[8, 16]` or any finite
+positive `softcap`; ALiBi and softcap cannot be combined. Forward calls may be
 ragged; slope-free, uncapped backward is restricted to all eight query and key
 sequences having length 512. It returns
 `(out, softmax_lse, S_dmask)`, where LSE is fp32 with shape `[16, total_q]` and
@@ -1028,11 +1027,11 @@ doing something else:
   page-size-512 decode, or read-only KV-cache page-size-256 or page-size-512
   decode `(4, 1, 1024, 8, 2, 128)` with either decode-equivalent causal flag;
   the supported softcap cannot be combined with dropout, ALiBi, local windows,
-  deterministic mode, or autograd; the dense/KV-packed Gemma-2 exception and
-  unpacked/QKV/KV-packed causal varlen exception permit their diagnostic tuples
-  only at `softcap=50.0`, as does the core paged-varlen
-  page-size-256/page-size-512 exception; the paged KV-cache exception permits
-  its documented LSE return
+  deterministic mode, or autograd; the unpacked/QKV/KV-packed causal varlen
+  exception permits its diagnostic tuple at any supported positive cap, while
+  the dense/KV-packed Gemma-2 and core paged-varlen page-size-256/page-size-512
+  exceptions permit it only at `softcap=50.0`; the paged KV-cache exception
+  permits its documented LSE return
 - ALiBi slopes for non-paged varlen profiles other than the causal and
   noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
   `(4, 256, 256, 32, 8, 128)` and `(4, 2048, 2048, 32, 8, 128)` profiles and
