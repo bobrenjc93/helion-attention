@@ -4078,6 +4078,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:26f7ffbf484935d272f54caab03197f2ae8cf81b",
+      "commit": "26f7ffbf484935d272f54caab03197f2ae8cf81b",
+      "recordedAt": "2026-08-11T05:15:04.202Z",
+      "label": "base 26f7ffb",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 68,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:178",
+      "recordedAt": "2026-08-11T05:15:04.202Z",
+      "label": "PR #178",
+      "kind": "leaf",
+      "prNumber": 178,
+      "title": "Accept positive softcaps on shipped causal varlen inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 69,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
