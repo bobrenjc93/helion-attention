@@ -85,12 +85,16 @@ The checked-in noncausal bf16 BERT-base encoder profile
 dense, QKV-packed, and KV-packed entry points. A forward-only, dropout-free
 call returns `(out, softmax_lse, S_dmask)` with fp32 LSE shaped
 `[16, 12, 512]` and an empty bf16 `S_dmask`, matching FA2. Diagnostic calls
-use the generic packed runtime; ordinary calls retain the generated
-specialization. The same three entry points accept `0 < dropout_p < 1` through
-PyTorch SDPA, with either the default or a custom `softmax_scale`. Causal mode,
-ALiBi, deterministic dropout, dropout diagnostics, and other dense profiles
-remain outside this BERT-base subset. For zero-dropout training, the same
-entry points accept `deterministic=True` with either scale and call PyTorch's
+may additionally use fp32 ALiBi slopes shaped `[12]` or `[16, 12]`, with either
+the default or a custom `softmax_scale`; this combination remains forward-only
+and requires `deterministic=False`. Diagnostic calls use the generic packed
+runtime, ALiBi-only calls retain their existing generic dispatch, and ordinary
+calls retain the generated specialization. The same three entry points accept
+`0 < dropout_p < 1` through PyTorch SDPA, with either scale. Causal mode,
+ALiBi diagnostics on other profiles, deterministic diagnostics, dropout
+diagnostics, and combinations with local windows or softcap remain outside this
+BERT-base subset. For zero-dropout training without diagnostics, the same entry
+points accept `deterministic=True` with either scale and call PyTorch's
 repeatable math operator directly, without changing global SDPA backend flags.
 
 The checked-in causal bf16 GPT-2 profile
@@ -123,7 +127,8 @@ use PyTorch SDPA autograd instead; the exact BERT-base profile above and causal
 GPT-2 profile below use its direct math operator when deterministic backward is
 requested. Dense ALiBi forward calls accept fp32 slopes shaped `[nheads]` or
 `[batch, nheads]` and always use the generic Triton path; ALiBi backward is not
-implemented. The shipped noncausal bf16
+implemented. The exact BERT-base profile above may combine those slopes with
+its forward-only diagnostic return. The shipped noncausal bf16
 `(8, 512, 512, 16, 16, 64)` encoder-training profile retains generated forward
 values during zero-dropout training. On SM90, calls that omit `softmax_scale`
 use raw PyTorch BSHD Flash gradients, falling back to the generated backward
@@ -928,7 +933,8 @@ raise `NotImplementedError` rather than silently doing something else:
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
   the exact full-head interleaved/NeoX or D64 half-head interleaved 4K partial
   append or the exact full-head interleaved two-token append
-- `return_attn_probs=True` outside the no-backward BERT-base and the
+- `return_attn_probs=True` outside the no-backward BERT-base (with optional
+  ALiBi slopes as described above) and the
   backward-capable causal bf16 GPT-2 dense/QKV-packed/KV-packed calls,
   dense/KV-packed calls for the three
   Llama GQA decode profiles, dense/KV-packed calls for the causal bf16 Gemma-2
