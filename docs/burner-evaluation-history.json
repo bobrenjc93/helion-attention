@@ -4663,6 +4663,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:940795c069572f5c7c14686049f9c27a76480a56",
+      "commit": "940795c069572f5c7c14686049f9c27a76480a56",
+      "recordedAt": "2026-08-11T14:25:57.738Z",
+      "label": "base 940795c",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:200",
+      "recordedAt": "2026-08-11T14:25:57.738Z",
+      "label": "PR #200",
+      "kind": "leaf",
+      "prNumber": 200,
+      "title": "Enable ALiBi on ragged 2K Llama-3 varlen inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
