@@ -12,10 +12,11 @@ ALiBi calls, encoder-training diagnostics, BERT-base diagnostics with optional
 ALiBi, ragged BERT-base varlen inference with optional ALiBi diagnostics,
 causal GPT-2 and global
 causal 2K Llama GQA diagnostics, two causal Llama-3 GQA varlen inference
-profiles, ALiBi with optional diagnostics on the smaller profile and the
-shipped causal varlen profile, ALiBi on both shipped varlen profiles, and
-symmetric windows on the shipped noncausal varlen profile use a generic Triton
-forward kernel. The same runtime exposes exactly a 127-token left plus
+profiles, ALiBi on both Llama-3 profiles (with optional diagnostics on the
+smaller one), ALiBi on both shipped varlen profiles (with optional diagnostics
+on the causal one), and symmetric windows on the shipped noncausal varlen
+profile use a generic Triton forward kernel. The same runtime exposes exactly a
+127-token left plus
 current-token causal window
 for the full-length shipped causal varlen profile, while its global-window call
 retains generated dispatch. It also exposes every causal left window from the
@@ -217,6 +218,7 @@ _VARLEN_ALIBI_KEYS = frozenset(
     {
         _BERT_BASE_VARLEN_INFERENCE_KEY,
         _LLAMA3_VARLEN_INFERENCE_KEY,
+        _LLAMA3_2K_VARLEN_INFERENCE_KEY,
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
@@ -2187,7 +2189,7 @@ def flash_attn_varlen_func(
     dtype, and causal mode must continue to match ``shape``. Forward-only
     ALiBi is supported for both causal modes of the
     ``(8, 512, 512, 16, 16, 64)`` bf16 profile, with fp32 slopes shaped
-    ``[16]`` or ``[8, 16]``. The causal Llama-3 profile below accepts fp32
+    ``[16]`` or ``[8, 16]``. The causal Llama-3 profiles below accept fp32
     slopes shaped ``[32]`` or ``[4, 32]`` under the same forward-only contract.
 
     Noncausal bf16 BERT-base attention with maximum shape
@@ -2226,7 +2228,10 @@ def flash_attn_varlen_func(
     maximum shape ``(4, 2048, 2048, 32, 8, 128)`` for forward-only unpacked
     and KV-packed inference. Query and key offsets may independently describe
     ragged self- or cross-attention, and either the default or a custom
-    ``softmax_scale`` is accepted. Diagnostics, ALiBi, dropout, windows,
+    ``softmax_scale`` is accepted. Calls may additionally supply forward-only
+    fp32 ALiBi slopes shaped ``[32]`` or ``[4, 32]`` through the same generic
+    packed ALiBi runtime used by the 256-token profile. Slope-free calls retain
+    their existing generic inference dispatch. Diagnostics, dropout, windows,
     softcap, deterministic mode, paging, and backward remain unsupported for
     this deliberately unregistered profile. Its dense generated specialization
     and every registered varlen specialization retain their existing dispatch.
