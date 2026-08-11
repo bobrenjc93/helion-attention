@@ -3988,6 +3988,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:173",
+      "recordedAt": "2026-08-11T02:17:02.699Z",
+      "label": "PR #173",
+      "kind": "leaf",
+      "prNumber": 173,
+      "title": "Expose ragged BERT-base varlen inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

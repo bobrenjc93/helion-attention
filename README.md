@@ -177,8 +177,19 @@ out = helion_attention.flash_attn_varlen_func(
 query and key lengths. Causal masking follows FlashAttention's bottom-right
 alignment, including zero output for fully masked query rows.
 
-One deliberately unregistered varlen profile is also callable through the
-generic packed Triton runtime: causal bf16 Llama-3 GQA with maximum shape
+Noncausal bf16 BERT-base varlen attention with maximum shape
+`(16, 512, 512, 12, 12, 64)` is callable through the generic packed Triton
+runtime when no backward is required. Device-side query and key offsets may
+independently describe ragged lengths, so the unpacked and KV-packed APIs
+support both self- and cross-attention; the QKV-packed API supports ragged
+self-attention. All three accept the default or a custom `softmax_scale`.
+Paging, dropout, ALiBi, diagnostic returns, windows, softcap, and backward
+remain explicitly unsupported. This is narrow generic fallback coverage, not
+a generated varlen specialization, so `is_varlen_shape_supported` remains
+false for this profile.
+
+A second deliberately unregistered varlen profile is callable through the
+same runtime: causal bf16 Llama-3 GQA with maximum shape
 `(4, 256, 256, 32, 8, 128)`. It supports only calls that do not require
 backward. Device-side `cu_seqlens_q` and `cu_seqlens_k` may independently
 describe ragged query and key lengths with different packed token totals;
