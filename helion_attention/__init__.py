@@ -9,12 +9,12 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base diagnostics with optional ALiBi, ragged BERT-base varlen
-inference with optional ALiBi, causal GPT-2 and global causal 2K Llama GQA
-diagnostics, one causal Llama-3 GQA varlen inference profile, ALiBi with optional
-diagnostics on that profile and the shipped causal varlen profile, ALiBi on both
-shipped varlen profiles, and symmetric windows on the shipped noncausal varlen
-profile use a generic Triton forward kernel. The same runtime exposes exactly a
-127-token left plus
+inference with optional ALiBi or slope-free diagnostics, causal GPT-2 and global
+causal 2K Llama GQA diagnostics, one causal Llama-3 GQA varlen inference
+profile, ALiBi with optional diagnostics on that profile and the shipped causal
+varlen profile, ALiBi on both shipped varlen profiles, and symmetric windows on
+the shipped noncausal varlen profile use a generic Triton forward kernel. The
+same runtime exposes exactly a 127-token left plus
 current-token causal window
 for the full-length shipped causal varlen profile, while its global-window call
 retains generated dispatch. It also exposes every causal left window from the
@@ -198,7 +198,11 @@ _VARLEN_ALIBI_KEYS = frozenset(
 )
 _VARLEN_DIAGNOSTIC_KEY = "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 _VARLEN_DIAGNOSTIC_KEYS = frozenset(
-    {_LLAMA3_VARLEN_INFERENCE_KEY, _VARLEN_DIAGNOSTIC_KEY}
+    {
+        _BERT_BASE_VARLEN_INFERENCE_KEY,
+        _LLAMA3_VARLEN_INFERENCE_KEY,
+        _VARLEN_DIAGNOSTIC_KEY,
+    }
 )
 _VARLEN_ALIBI_DIAGNOSTIC_KEYS = frozenset(
     {_LLAMA3_VARLEN_INFERENCE_KEY, _VARLEN_DIAGNOSTIC_KEY}
@@ -867,7 +871,7 @@ def _supports_varlen_diagnostic_return(spec: AttnShape) -> bool:
     """Whether ``spec`` has a validated LSE-capable core varlen path."""
     requested = f"varlen_{spec.key}"
     return requested in _VARLEN_DIAGNOSTIC_KEYS and (
-        requested == _LLAMA3_VARLEN_INFERENCE_KEY
+        requested in _GENERIC_VARLEN_INFERENCE_KEYS
         or has_varlen_kernel(spec)
     )
 
@@ -1686,7 +1690,7 @@ def _generic_varlen_diagnostic_forward(
         dynamic_max_seqlen_q=None,
         dynamic_max_seqlen_k=None,
         softmax_scale=softmax_scale,
-        causal=True,
+        causal=spec.causal,
         window_size=(-1, -1),
         softcap=softcap,
         alibi_slopes=alibi_slopes,
@@ -2116,15 +2120,18 @@ def flash_attn_varlen_func(
     independently. The unpacked and KV-packed entry points support self- or
     cross-attention, while the QKV-packed entry point supports self-attention.
     All three accept the default or a custom ``softmax_scale`` and use the
-    generic packed Triton runtime for inference. When all sixteen query and key
-    sequences have length 512, slope-free global zero-dropout calls additionally
-    support backward by reshaping the packed tensors to the dense PyTorch SDPA
-    bridge. Forward-only calls may supply fp32 ALiBi slopes shaped ``[12]`` or
-    ``[16, 12]``; slope-free calls retain their existing generic dispatch.
-    Ragged backward, paging, dropout, diagnostic returns, windows, softcap,
-    ALiBi backward, and deterministic backward remain unsupported. This is
-    generic fallback coverage, so :func:`is_varlen_shape_supported` remains
-    false for this profile.
+    generic packed Triton runtime for inference. Forward-only slope-free calls
+    additionally accept ``return_attn_probs=True`` and return fp32 LSE shaped
+    ``[12, total_q]`` plus an empty bf16 ``S_dmask``. Forward-only calls may
+    instead supply fp32 ALiBi slopes shaped ``[12]`` or ``[16, 12]``; ALiBi
+    diagnostics remain unsupported. Ordinary slope-free calls retain their
+    existing generic dispatch. When all sixteen query and key sequences have
+    length 512, slope-free global zero-dropout calls additionally support
+    backward by reshaping the packed tensors to the dense PyTorch SDPA bridge.
+    Ragged and diagnostic backward, paging, dropout, windows, softcap,
+    deterministic diagnostics and backward, and ALiBi backward remain
+    unsupported. This is generic fallback coverage, so
+    :func:`is_varlen_shape_supported` remains false for this profile.
 
     Causal bf16 Llama-3 GQA attention with maximum shape
     ``(4, 256, 256, 32, 8, 128)`` is also supported when no backward or
