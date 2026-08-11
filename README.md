@@ -183,11 +183,13 @@ Noncausal bf16 BERT-base varlen attention with maximum shape
 runtime when no backward is required. Device-side query and key offsets may
 independently describe ragged lengths, so the unpacked and KV-packed APIs
 support both self- and cross-attention; the QKV-packed API supports ragged
-self-attention. All three accept the default or a custom `softmax_scale`.
-Paging, dropout, ALiBi, diagnostic returns, windows, softcap, and backward
-remain explicitly unsupported. This is narrow generic fallback coverage, not
-a generated varlen specialization, so `is_varlen_shape_supported` remains
-false for this profile.
+self-attention. All three accept the default or a custom `softmax_scale` and
+forward-only fp32 CUDA ALiBi slopes shaped `[12]` or `[16, 12]`. ALiBi calls use
+the generic packed runtime, while `alibi_slopes=None` retains the existing
+generic inference dispatch. Paging, dropout, diagnostic returns, windows,
+softcap, and backward remain explicitly unsupported, including in combination
+with ALiBi. This is narrow generic fallback coverage, not a generated varlen
+specialization, so `is_varlen_shape_supported` remains false for this profile.
 
 A second deliberately unregistered varlen profile is callable through the
 same runtime: causal bf16 Llama-3 GQA with maximum shape
@@ -268,7 +270,9 @@ both the unpacked API and the varlen QKV/KV-packed adapters accept them, with
 either the default or a custom `softmax_scale`. On the causal profile these
 slopes may be combined with `return_attn_probs=True`. The causal bf16 Llama-3
 profile above likewise accepts `[32]` or `[4, 32]` slopes, including with its
-diagnostic return, through its unpacked and KV-packed entry points. ALiBi-only
+diagnostic return, through its unpacked and KV-packed entry points. The
+noncausal BERT-base profile accepts `[12]` or `[16, 12]` slopes through its
+unpacked and QKV/KV-packed entry points without diagnostic returns. ALiBi-only
 calls use the generic packed Triton runtime, while `alibi_slopes=None` retains
 each profile's existing dispatch. Other non-paged varlen profiles still reject
 ALiBi explicitly. The one direct core paged-varlen profile with ALiBi is
@@ -925,8 +929,9 @@ raise `NotImplementedError` rather than silently doing something else:
   only the paged KV-cache exception permits its documented LSE return
 - ALiBi slopes for non-paged varlen profiles other than the causal and
   noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
-  `(4, 256, 256, 32, 8, 128)` profile above, for core paged-varlen calls outside
-  forward-only bf16 page-size-256/page-size-512 decode
+  `(4, 256, 256, 32, 8, 128)` and noncausal bf16
+  `(16, 512, 512, 12, 12, 64)` profiles above, for core paged-varlen calls
+  outside forward-only bf16 page-size-256/page-size-512 decode
   `(4, 1, 1024, 8, 2, 128)`, and for KV-cache calls outside the exact read-only
   bf16 dense `(1, 1, 4096, 32, 8, 128)` decode profile, page-size-16 profiles, and
   page-size-256/page-size-512 decode above; core paged-varlen ALiBi cannot be
