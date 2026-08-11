@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -59,7 +60,7 @@ def _varlen_attention_kernel(
     stride_sink_b,
     stride_sink_h,
     softmax_scale,
-    softcap,
+    softcap: tl.float64,
     window_left,
     window_right,
     max_seqlen_q_value,
@@ -267,7 +268,13 @@ def _varlen_attention_kernel(
                 )
         scores *= softmax_scale
         if HAS_SOFTCAP:
-            scores = softcap * (2.0 * tl.sigmoid(2.0 * scores / softcap) - 1.0)
+            # Python softcaps span IEEE fp64. Preserve that range through the
+            # launch and use tanh directly: narrowing the cap to fp32 can
+            # underflow/overflow, while the sigmoid identity loses scores when
+            # scores / softcap is small. Attention accumulation remains fp32.
+            scores = (
+                softcap * libdevice.tanh(scores.to(tl.float64) / softcap)
+            ).to(tl.float32)
 
         score_mask = (
             valid_m[:, None]

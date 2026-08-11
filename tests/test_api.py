@@ -1886,8 +1886,16 @@ def test_llama_2k_left_window_rejects_out_of_scope_calls_before_dispatch(
 @requires_cuda
 @pytest.mark.parametrize(
     ("softcap", "softmax_scale"),
-    [(GEMMA2_NON_DIAGNOSTIC_SOFTCAP, None), (80.0, 0.37)],
-    ids=["cap-30-default-scale", "cap-80-custom-scale"],
+    [
+        (GEMMA2_NON_DIAGNOSTIC_SOFTCAP, None),
+        (80.0, 0.37),
+        (1e8, None),
+    ],
+    ids=[
+        "cap-30-default-scale",
+        "cap-80-custom-scale",
+        "large-cap-default-scale",
+    ],
 )
 def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
     softcap: float,
@@ -1950,6 +1958,48 @@ def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
     torch.testing.assert_close(packed, expected_packed, atol=2e-2, rtol=1e-2)
     torch.testing.assert_close(dense.float(), expected_fp32, atol=5e-2, rtol=2e-2)
     torch.testing.assert_close(packed.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "softcap",
+    [math.ulp(0.0), 1e-50, 1e40, sys.float_info.max],
+    ids=["min-positive", "below-fp32", "above-fp32", "max-finite"],
+)
+def test_gemma2_softcap_finite_range_boundaries_preserve_uniform_attention(
+    softcap: float,
+) -> None:
+    spec = GEMMA2_SOFTCAP
+    q = torch.zeros(
+        spec.batch,
+        spec.seqlen_q,
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    k = torch.zeros(
+        spec.batch,
+        spec.seqlen_k,
+        spec.nheads_kv,
+        spec.head_dim,
+        device=q.device,
+        dtype=spec.dtype,
+    )
+    v = torch.ones_like(k)
+
+    with torch.no_grad():
+        dense = helion_attention.flash_attn_func(
+            q, k, v, causal=True, softcap=softcap, shape=spec
+        )
+        kv = torch.stack((k, v), dim=2)
+        packed = helion_attention.flash_attn_kvpacked_func(
+            q, kv, causal=True, softcap=softcap, shape=spec
+        )
+
+    expected = torch.ones_like(q)
+    assert torch.equal(dense, expected)
+    assert torch.equal(packed, expected)
 
 
 @requires_cuda

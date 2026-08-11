@@ -70,16 +70,17 @@ window.
 
 Score capping is limited to the forward-only inference profiles described
 below. The dense causal-bf16 Gemma-2 profile
-`(1, 4096, 4096, 16, 8, 256)` accepts exactly `softcap=50.0` through
-`flash_attn_func` and `flash_attn_kvpacked_func`, with either the default or a
-custom `softmax_scale`. It uses the generic packed Triton runtime and applies
-`50 * tanh(scores / 50)` before softmax. These calls also accept
-`return_attn_probs=True` and return `(out, softmax_lse, S_dmask)`, with fp32
-LSE shaped `[1, 16, 4096]` and an empty bf16 `S_dmask`, through both entry
-points. `softcap=0` retains the usual generic dispatch for this unregistered
-shape. Other caps and profiles remain unsupported; softcap cannot be combined
-with dropout, ALiBi, local windows, or autograd, and its diagnostic return
-requires `deterministic=False`.
+`(1, 4096, 4096, 16, 8, 256)` accepts any finite positive `softcap` for
+output-only calls through `flash_attn_func` and
+`flash_attn_kvpacked_func`, with either the default or a custom
+`softmax_scale`. It uses the generic packed Triton runtime and applies
+`softcap * tanh(scores / softcap)` before softmax. Exactly `softcap=50.0`
+additionally accepts `return_attn_probs=True` and returns `(out, softmax_lse,
+S_dmask)`, with fp32 LSE shaped `[1, 16, 4096]` and an empty bf16 `S_dmask`,
+through both entry points. `softcap=0` retains the usual generic dispatch for
+this unregistered shape. Other profiles and non-50 diagnostic calls remain
+unsupported; softcap cannot be combined with dropout, ALiBi, local windows,
+or autograd, and its diagnostic return requires `deterministic=False`.
 
 The checked-in noncausal bf16 BERT-base encoder profile
 `(16, 512, 512, 12, 12, 64)` supports `return_attn_probs=True` through the
@@ -910,16 +911,18 @@ raise `NotImplementedError` rather than silently doing something else:
   zero-dropout training on eight canonical length-512 sequences, ragged
   symmetric-window backward remains unsupported, and all other KV-cache window
   calls remain unsupported
-- softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
-  causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
+- softcap except for no-backward, output-only bf16 calls with any finite
+  positive cap on causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, or
+  no-backward bf16 calls with exactly `softcap=50.0` on causal
   unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, read-only core
   paged-varlen page-size-256 or page-size-512 decode, or read-only KV-cache
   page-size-256 or page-size-512 decode `(4, 1, 1024, 8, 2, 128)` with either
   decode-equivalent causal flag; the supported softcap cannot be
   combined with dropout, ALiBi, local windows, or autograd; the dense/KV-packed
-  Gemma-2 and unpacked/QKV/KV-packed causal varlen exceptions permit their
-  diagnostic tuples described above, core paged-varlen softcap does not, and
-  only the paged KV-cache exception permits its documented LSE return
+  Gemma-2 exception permits its diagnostic tuple only at `softcap=50.0`, the
+  unpacked/QKV/KV-packed causal varlen exception permits its diagnostic tuple
+  described above, core paged-varlen softcap does not, and only the paged
+  KV-cache exception permits its documented LSE return
 - ALiBi slopes for non-paged varlen profiles other than the causal and
   noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
   `(4, 256, 256, 32, 8, 128)` profile above, for core paged-varlen calls outside
