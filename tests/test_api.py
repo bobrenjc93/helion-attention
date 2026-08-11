@@ -8084,9 +8084,6 @@ def test_dense_4k_kvcache_alibi_dispatch_is_opt_in_and_read_only(
             id="noncausal-tensor-prefix",
         ),
         pytest.param("remapping", "cache_batch_idx", id="remapping"),
-        pytest.param(
-            "leftpad", "does not support cache_leftpad", id="left-padding"
-        ),
         pytest.param("rotary", "rotary embeddings", id="rotary"),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param("softcap", "softcap.*implemented only", id="softcap"),
@@ -8130,13 +8127,6 @@ def test_dense_4k_kvcache_alibi_rejects_out_of_scope_modes_before_dispatch(
         )
     elif case == "remapping":
         kwargs["cache_batch_idx"] = torch.zeros(
-            spec.batch, device=q.device, dtype=torch.int32
-        )
-    elif case == "leftpad":
-        kwargs["cache_seqlens"] = torch.tensor(
-            [spec.seqlen_k], device=q.device, dtype=torch.int32
-        )
-        kwargs["cache_leftpad"] = torch.zeros(
             spec.batch, device=q.device, dtype=torch.int32
         )
     elif case == "rotary":
@@ -9614,7 +9604,92 @@ def test_kvcache_causal_4k_tensor_prefix_alibi_matches_fa2_and_fp32_without_muta
     assert torch.equal(v_cache, original_v)
 
 
-def test_kvcache_causal_4k_tensor_prefix_alibi_reuses_tensor_span_dispatch(
+@requires_cuda
+@pytest.mark.parametrize(
+    ("leftpad", "length"),
+    [
+        pytest.param(1024, 3073, id="middle-span"),
+        pytest.param(3072, 4096, id="tail-span"),
+    ],
+)
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+def test_kvcache_causal_4k_left_padded_tensor_span_alibi_matches_fa2_and_fp32_without_mutation(
+    leftpad: int,
+    length: int,
+    softmax_scale: float | None,
+    batched_slopes: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260824)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    cache_seqlens = torch.tensor(
+        [length], device=q.device, dtype=torch.int32
+    )
+    cache_leftpad = torch.tensor(
+        [leftpad], device=q.device, dtype=torch.int32
+    )
+    head_slopes = torch.linspace(
+        0.01,
+        0.2,
+        spec.nheads_q,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    slopes = head_slopes.unsqueeze(0) if batched_slopes else head_slopes
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        cache_leftpad=cache_leftpad,
+        softmax_scale=softmax_scale,
+        causal=True,
+        alibi_slopes=slopes,
+        shape=spec,
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        cache_leftpad=cache_leftpad,
+        softmax_scale=softmax_scale,
+        causal=True,
+        alibi_slopes=slopes,
+    )
+    expected_fp32 = reference_paged_alibi(
+        q,
+        [(k_cache[0, leftpad:length], v_cache[0, leftpad:length])],
+        spec,
+        scale,
+        slopes,
+        causal=True,
+    )
+
+    assert got.shape == expected_fa2.shape == q.shape
+    assert got.dtype == expected_fa2.dtype == q.dtype
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+def test_kvcache_causal_4k_tensor_span_alibi_reuses_existing_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
@@ -9624,10 +9699,13 @@ def test_kvcache_causal_4k_tensor_prefix_alibi_reuses_tensor_span_dispatch(
     original_k = k_cache.clone()
     original_v = v_cache.clone()
     cache_seqlens = torch.tensor([2049], dtype=torch.int32)
+    cache_leftpad = torch.tensor([1024], dtype=torch.int32)
     slopes = torch.linspace(0.01, 0.2, spec.nheads_q)
     slope_free_out = torch.full((1,), 3.0, dtype=spec.dtype)
     alibi_out = torch.full((1,), 7.0, dtype=spec.dtype)
-    tensor_span_calls: list[torch.Tensor | None] = []
+    tensor_span_calls: list[
+        tuple[torch.Tensor | None, torch.Tensor | None]
+    ] = []
 
     monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
     monkeypatch.setattr(
@@ -9653,15 +9731,14 @@ def test_kvcache_causal_4k_tensor_prefix_alibi_reuses_tensor_span_dispatch(
     ) -> torch.Tensor:
         assert q_arg is q and k_arg is k_cache and v_arg is v_cache
         assert cache_seqlens_arg is cache_seqlens
-        assert cache_leftpad_arg is None
         assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
         assert spec_arg == spec
         assert not return_softmax_lse
-        tensor_span_calls.append(alibi_slopes)
+        tensor_span_calls.append((cache_leftpad_arg, alibi_slopes))
         return slope_free_out if alibi_slopes is None else alibi_out
 
     def reject_other_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
-        raise AssertionError("a tensor prefix bypassed tensor-span dispatch")
+        raise AssertionError("a tensor span bypassed tensor-span dispatch")
 
     monkeypatch.setattr(
         helion_attention,
@@ -9690,11 +9767,38 @@ def test_kvcache_causal_4k_tensor_prefix_alibi_reuses_tensor_span_dispatch(
         alibi_slopes=slopes,
         shape=spec,
     )
+    left_padded_slope_free = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        cache_leftpad=cache_leftpad,
+        causal=True,
+        shape=spec,
+    )
+    left_padded_alibi = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        cache_leftpad=cache_leftpad,
+        causal=True,
+        alibi_slopes=slopes,
+        shape=spec,
+    )
 
     assert slope_free is slope_free_out
     assert with_alibi is alibi_out
-    assert tensor_span_calls[0] is None
-    assert tensor_span_calls[1] is slopes
+    assert left_padded_slope_free is slope_free_out
+    assert left_padded_alibi is alibi_out
+    assert len(tensor_span_calls) == 4
+    assert tensor_span_calls[0] == (None, None)
+    assert tensor_span_calls[1][0] is None
+    assert tensor_span_calls[1][1] is slopes
+    assert tensor_span_calls[2][0] is cache_leftpad
+    assert tensor_span_calls[2][1] is None
+    assert tensor_span_calls[3][0] is cache_leftpad
+    assert tensor_span_calls[3][1] is slopes
     assert torch.equal(k_cache, original_k)
     assert torch.equal(v_cache, original_v)
 
@@ -9703,7 +9807,6 @@ def test_kvcache_causal_4k_tensor_prefix_alibi_reuses_tensor_span_dispatch(
     ("case", "message"),
     [
         pytest.param("lse", "return_softmax_lse", id="lse"),
-        pytest.param("leftpad", "does not support cache_leftpad", id="leftpad"),
         pytest.param(
             "noncausal", "only for read-only causal", id="noncausal"
         ),
@@ -9722,7 +9825,7 @@ def test_kvcache_causal_4k_tensor_prefix_alibi_reuses_tensor_span_dispatch(
         ),
     ],
 )
-def test_kvcache_causal_4k_tensor_prefix_alibi_rejects_out_of_scope_before_dispatch(
+def test_kvcache_causal_4k_tensor_span_alibi_rejects_out_of_scope_before_dispatch(
     case: str,
     message: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -9734,14 +9837,13 @@ def test_kvcache_causal_4k_tensor_prefix_alibi_rejects_out_of_scope_before_dispa
     slopes = torch.ones(spec.nheads_q, dtype=torch.float32)
     kwargs: dict[str, object] = {
         "cache_seqlens": torch.tensor([2049], dtype=torch.int32),
+        "cache_leftpad": torch.tensor([1024], dtype=torch.int32),
         "causal": True,
         "alibi_slopes": slopes,
         "shape": spec,
     }
     if case == "lse":
         kwargs["return_softmax_lse"] = True
-    elif case == "leftpad":
-        kwargs["cache_leftpad"] = torch.tensor([1], dtype=torch.int32)
     elif case == "noncausal":
         kwargs["causal"] = False
         kwargs["shape"] = AttnShape(
@@ -9768,7 +9870,7 @@ def test_kvcache_causal_4k_tensor_prefix_alibi_rejects_out_of_scope_before_dispa
     original_v = v_cache.clone()
 
     def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
-        raise AssertionError("out-of-scope tensor-prefix ALiBi reached dispatch")
+        raise AssertionError("out-of-scope tensor-span ALiBi reached dispatch")
 
     monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
     monkeypatch.setattr(
@@ -12139,21 +12241,39 @@ def test_kvcache_full_length_supports_cuda_graph_capture(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    ("entry", "causal"),
+    ("entry", "causal", "use_alibi"),
     [
         pytest.param(
             CAUSAL_1K_SCALAR_PREFIX_DECODE,
             True,
+            False,
             id="causal-1k",
         ),
-        pytest.param(SCALAR_PREFIX_DECODE, False, id="noncausal-4k"),
-        pytest.param(SCALAR_PREFIX_DECODE, True, id="causal-4k"),
+        pytest.param(
+            SCALAR_PREFIX_DECODE,
+            False,
+            False,
+            id="noncausal-4k",
+        ),
+        pytest.param(
+            SCALAR_PREFIX_DECODE,
+            True,
+            False,
+            id="causal-4k",
+        ),
+        pytest.param(
+            SCALAR_PREFIX_DECODE,
+            True,
+            True,
+            id="causal-4k-alibi",
+        ),
     ],
 )
 @pytest.mark.parametrize("use_leftpad", [False, True], ids=["prefix", "leftpad"])
 def test_kvcache_tensor_span_rejects_cuda_graph_capture(
     entry: dict[str, object],
     causal: bool,
+    use_alibi: bool,
     use_leftpad: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -12179,6 +12299,11 @@ def test_kvcache_tensor_span_rejects_cuda_graph_capture(
         if use_leftpad
         else None
     )
+    alibi_slopes = (
+        torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
+        if use_alibi
+        else None
+    )
 
     def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
         raise AssertionError("captured dense tensor span reached dispatch")
@@ -12202,6 +12327,7 @@ def test_kvcache_tensor_span_rejects_cuda_graph_capture(
                 cache_seqlens=cache_seqlens,
                 cache_leftpad=cache_leftpad,
                 causal=causal,
+                alibi_slopes=alibi_slopes,
                 shape=spec,
             )
 
