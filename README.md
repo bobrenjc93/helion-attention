@@ -494,6 +494,15 @@ updates reject left padding, cache remapping, ALiBi, windows, softcap, explicit
 split counts, autograd, and CUDA graph capture. Noncausal tensor spans and
 tensor spans on other 1K profiles remain unsupported.
 
+The exact causal 1K profile also accepts forward-only fp32 ALiBi slopes shaped
+`[32]` or `[1, 32]` for a read-only full cache when `cache_seqlens` is omitted
+or supplied as the Python integer `1024`. This path uses the generic packed
+Triton runtime with the default or a custom `softmax_scale` and never mutates
+the inputs. Slope-free full-cache reads retain the checked-in generated
+specialization. ALiBi on this profile remains unsupported for scalar prefixes,
+tensor-selected spans, LSE, updates, cache remapping, rotary, windows, softcap,
+and autograd.
+
 The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
 through 4095 for read-only prefix attention, optionally with ALiBi as described
 above. It also accepts slope-free paired one-token K/V updates at Python-integer
@@ -1039,13 +1048,15 @@ doing something else:
   `(16, 512, 512, 12, 12, 64)` profiles above, for core paged-varlen calls
   outside forward-only bf16 page-size-256/page-size-512 decode
   `(4, 1, 1024, 8, 2, 128)`, and for KV-cache calls outside the exact read-only
-  bf16 dense `(1, 1, 4096, 32, 8, 128)` decode profile, page-size-16 profiles, and
+  causal bf16 dense `(1, 1, 1024, 32, 8, 128)` full-cache decode, bf16 dense
+  `(1, 1, 4096, 32, 8, 128)` decode, page-size-16 profiles, and
   page-size-256/page-size-512 decode above; core paged-varlen ALiBi cannot be
   combined with dropout, windows, softcap, `deterministic=True`, diagnostic
   returns, or autograd; dense KV-cache ALiBi cannot be combined with LSE,
-  updates, remapping, rotary, windows, softcap, or autograd, and tensor-selected
-  spans, including left-padded spans, are limited to the exact causal 4K profile
-  above;
+  updates, remapping, rotary, windows, softcap, or autograd; ALiBi on the causal
+  1K dense profile is limited to a full cache selected by an omitted length or
+  the Python integer `1024`, while tensor-selected spans, including left-padded
+  spans, are limited to the exact causal 4K profile above;
   paged KV-cache ALiBi cannot be combined with softcap, updates, rotary,
   windows, or autograd, and its LSE combination is limited to the exact
   read-only page-size-256/page-size-512 decode profile above

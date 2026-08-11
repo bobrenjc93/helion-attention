@@ -39,9 +39,9 @@ page-256/page-512 decode. Read-only causal
 1K and 16K dense decode, plus both causal modes of 4K dense decode, likewise
 use the generic runtime for a bounded Python-int prefix. Those profiles also
 use it for read-only CUDA-tensor-selected spans, while
-the 4K profiles support full-cache or scalar-prefix ALiBi. The causal 4K
-profile also supports ALiBi on tensor-selected spans, including left-padded
-spans.
+the 4K profiles support full-cache or scalar-prefix ALiBi. The causal 1K
+profile supports ALiBi only for a full-cache read, and the causal 4K profile
+also supports ALiBi on tensor-selected spans, including left-padded spans.
 The causal 1K profile also uses the prefix runtime for paired one-token scalar
 appends at positions 0 through 1022, optionally with full-head interleaved
 rotary. It accepts the exact device length 1023 for its paired final-slot
@@ -338,7 +338,7 @@ _BATCH_IDX_DENSE_KVCACHE_KEY = (
 _TENSOR_FINAL_APPEND_DENSE_KVCACHE_KEY = (
     _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
 )
-_DENSE_KVCACHE_ALIBI_PROFILE = _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
+_DENSE_KVCACHE_4K_ALIBI_PROFILE = _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
 _TENSOR_SPAN_DENSE_KVCACHE_ALIBI_KEY = (
     "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal"
 )
@@ -3497,6 +3497,13 @@ def flash_attn_with_kvcache(
     optional fp32 LSE. These partial updates optionally apply full-head
     interleaved rotary to the query and appended key. The existing final-slot
     update at position 1023 retains the generated specialization.
+    A read-only full cache for that exact causal 1K profile additionally accepts
+    forward-only fp32 ALiBi slopes shaped ``[32]`` or ``[1, 32]`` when
+    ``cache_seqlens`` is omitted or is the Python integer ``1024``. This ALiBi
+    path uses the generic packed runtime with either softmax scale and never
+    mutates the cache. It does not support scalar prefixes, tensor-valued spans,
+    LSE, updates, remapping, rotary, windows, softcap, or autograd; slope-free
+    full-cache reads retain the generated specialization.
     The same profile's read-only full-cache path accepts a contiguous CUDA
     int32 ``cache_batch_idx`` equal to ``[0]``. This identity metadata is
     validated and then ignored: the original one-row cache tensors retain
@@ -3871,11 +3878,20 @@ def flash_attn_with_kvcache(
         or spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
         or spec.key == _EIGHT_TOKEN_DENSE_KVCACHE_KEY
     )
+    is_4k_dense_alibi_profile = (
+        requested_dense_profile == _DENSE_KVCACHE_4K_ALIBI_PROFILE
+    )
+    is_1k_full_dense_alibi_profile = (
+        spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
+    )
     has_dense_alibi = alibi_slopes is not None
     if has_dense_alibi:
-        if requested_dense_profile != _DENSE_KVCACHE_ALIBI_PROFILE:
+        if not (
+            is_4k_dense_alibi_profile or is_1k_full_dense_alibi_profile
+        ):
             raise NotImplementedError(
                 "dense KV-cache ALiBi is implemented only for read-only bf16 "
+                "causal (1, 1, 1024, 32, 8, 128) full-cache decode or "
                 "(1, 1, 4096, 32, 8, 128) decode with either causal flag; "
                 f"got {spec.describe()}"
             )
@@ -3889,6 +3905,26 @@ def flash_attn_with_kvcache(
                 "return_softmax_lse=True is not implemented with dense "
                 "KV-cache ALiBi"
             )
+        if has_cache_batch_idx:
+            raise NotImplementedError(
+                "dense KV-cache ALiBi does not support cache_batch_idx remapping"
+            )
+        if is_1k_full_dense_alibi_profile:
+            if tensor_cache_seqlens is not None:
+                raise NotImplementedError(
+                    "causal 1K dense KV-cache ALiBi is implemented only for a "
+                    "full cache with cache_seqlens omitted or supplied as the "
+                    "Python integer 1024; tensor-valued spans are not supported"
+                )
+            if (
+                type(cache_seqlens) is int
+                and cache_seqlens != spec.seqlen_k
+            ):
+                raise NotImplementedError(
+                    "causal 1K dense KV-cache ALiBi is implemented only for a "
+                    "full cache with cache_seqlens omitted or supplied as the "
+                    "Python integer 1024; scalar prefixes are not supported"
+                )
     is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
     is_four_token_dense_profile = spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
     is_eight_token_dense_profile = spec.key == _EIGHT_TOKEN_DENSE_KVCACHE_KEY

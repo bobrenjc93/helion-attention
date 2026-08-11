@@ -9398,10 +9398,10 @@ def test_dense_4k_kvcache_alibi_rejects_out_of_scope_modes_before_dispatch(
     elif case == "slope-grad":
         slopes.requires_grad_()
     else:
-        spec = AttnShape(1, 1, 1024, 32, 8, 128, torch.bfloat16, True)
+        spec = AttnShape(1, 1, 1024, 32, 8, 128, torch.bfloat16, False)
         q, k_cache, v_cache = make_inputs(spec)
         slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
-        kwargs = {"causal": True, "alibi_slopes": slopes, "shape": spec}
+        kwargs = {"causal": False, "alibi_slopes": slopes, "shape": spec}
 
     original_k = k_cache.clone()
     original_v = v_cache.clone()
@@ -9477,6 +9477,260 @@ def test_dense_4k_kvcache_alibi_rejects_malformed_slopes_before_dispatch(
             alibi_slopes=slopes,  # type: ignore[arg-type]
             shape=spec,
         )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "cache_seqlens",
+    [None, 1024],
+    ids=["omitted-length", "full-python-int"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+def test_dense_1k_full_kvcache_alibi_matches_fa2_and_fp32_without_mutation(
+    cache_seqlens: int | None,
+    softmax_scale: float | None,
+    batched_slopes: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, k_cache, v_cache = make_inputs(spec, seed=20260811)
+    head_slopes = torch.linspace(
+        0.01,
+        0.2,
+        spec.nheads_q,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    slopes = head_slopes.unsqueeze(0) if batched_slopes else head_slopes
+    original_q = q.clone()
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    original_slopes = slopes.clone()
+    pointers = tuple(
+        tensor.data_ptr() for tensor in (q, k_cache, v_cache, slopes)
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=True,
+        alibi_slopes=slopes,
+        shape=spec,
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=True,
+        alibi_slopes=slopes,
+    )
+    expected_fp32 = reference_paged_alibi(
+        q,
+        [(k_cache[0], v_cache[0])],
+        spec,
+        scale,
+        slopes,
+        causal=True,
+    )
+
+    assert got.shape == expected_fa2.shape == q.shape
+    assert got.dtype == expected_fa2.dtype == q.dtype
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    assert tuple(
+        tensor.data_ptr() for tensor in (q, k_cache, v_cache, slopes)
+    ) == pointers
+    assert torch.equal(q, original_q)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    assert torch.equal(slopes, original_slopes)
+
+
+@pytest.mark.parametrize(
+    "cache_seqlens",
+    [None, 1024],
+    ids=["omitted-length", "full-python-int"],
+)
+def test_dense_1k_full_kvcache_alibi_is_opt_in_to_generic_dispatch(
+    cache_seqlens: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q = torch.zeros(1, dtype=spec.dtype)
+    k_cache = torch.ones(1, dtype=spec.dtype)
+    v_cache = torch.full((1,), 2.0, dtype=spec.dtype)
+    slopes = torch.linspace(0.01, 0.2, spec.nheads_q)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    generated_out = torch.full((1,), 3.0, dtype=spec.dtype)
+    generic_out = torch.full((1,), 7.0, dtype=spec.dtype)
+    lookup_calls: list[AttnShape] = []
+    generic_calls: list[tuple[float, AttnShape, torch.Tensor | None]] = []
+
+    monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
+    monkeypatch.setattr(
+        helion_attention, "_validate_alibi_slopes", lambda *args: None
+    )
+
+    def lookup_stub(spec_arg: AttnShape):  # noqa: ANN202
+        lookup_calls.append(spec_arg)
+        return lambda *args, **kwargs: generated_out
+
+    def generic_stub(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert q_arg is q and k_arg is k_cache and v_arg is v_cache
+        generic_calls.append((scale_arg, spec_arg, slopes_arg))
+        return generic_out
+
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic_stub)
+
+    slope_free = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        causal=True,
+        shape=spec,
+    )
+    with_alibi = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=0.19,
+        causal=True,
+        alibi_slopes=slopes,
+        shape=spec,
+    )
+
+    assert slope_free is generated_out
+    assert with_alibi is generic_out
+    assert lookup_calls == [spec]
+    assert generic_calls == [(0.19, spec, slopes)]
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("scalar-prefix", "full cache", id="scalar-prefix"),
+        pytest.param("tensor-span", "tensor-valued spans", id="tensor-span"),
+        pytest.param("lse", "return_softmax_lse", id="lse"),
+        pytest.param("update", "read-only", id="update"),
+        pytest.param("remapping", "cache_batch_idx", id="remapping"),
+        pytest.param("rotary", "rotary embeddings", id="rotary"),
+        pytest.param("window", "sliding-window", id="window"),
+        pytest.param("softcap", "softcap", id="softcap"),
+        pytest.param("q-grad", "ALiBi backward", id="query-autograd"),
+        pytest.param("slope-grad", "ALiBi backward", id="slope-autograd"),
+        pytest.param("noncausal", "full-cache decode", id="noncausal"),
+        pytest.param(
+            "other-profile",
+            "dense KV-cache ALiBi is implemented only",
+            id="other-profile",
+        ),
+    ],
+)
+def test_dense_1k_full_kvcache_alibi_rejects_every_other_mode_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q = torch.zeros(1, dtype=spec.dtype)
+    k_cache = torch.ones(1, dtype=spec.dtype)
+    v_cache = torch.full((1,), 2.0, dtype=spec.dtype)
+    slopes = torch.ones(spec.nheads_q, dtype=torch.float32)
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "alibi_slopes": slopes,
+        "shape": spec,
+    }
+    if case == "scalar-prefix":
+        kwargs["cache_seqlens"] = spec.seqlen_k - 1
+    elif case == "tensor-span":
+        kwargs["cache_seqlens"] = torch.tensor(
+            [spec.seqlen_k], dtype=torch.int32
+        )
+        kwargs["cache_leftpad"] = torch.tensor([1], dtype=torch.int32)
+    elif case == "lse":
+        kwargs["return_softmax_lse"] = True
+    elif case == "update":
+        kwargs.update(k=q, v=q, cache_seqlens=spec.seqlen_k - 1)
+    elif case == "remapping":
+        kwargs["cache_batch_idx"] = torch.zeros(1, dtype=torch.int32)
+    elif case == "rotary":
+        kwargs.update(rotary_cos=q, rotary_sin=q)
+    elif case == "window":
+        kwargs["window_size"] = DENSE_KVCACHE_LEFT_WINDOW_SIZE
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "q-grad":
+        q.requires_grad_()
+    elif case == "slope-grad":
+        slopes.requires_grad_()
+    elif case == "noncausal":
+        kwargs["causal"] = False
+        kwargs["shape"] = AttnShape(
+            1, 1, 1024, 32, 8, 128, torch.bfloat16, False
+        )
+    else:
+        kwargs["shape"] = AttnShape(
+            1, 1, 16384, 32, 8, 128, torch.bfloat16, True
+        )
+
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope 1K full-cache ALiBi reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
+    monkeypatch.setattr(
+        helion_attention, "_validate_alibi_slopes", lambda *args: None
+    )
+    for dispatch_name in (
+        "lookup",
+        "_paged_kvcache_forward",
+        "_validate_dense_kvcache_tensor_span",
+        "_tensor_length_dense_kvcache_forward",
+        "_generic_dense_forward",
+        "attention_autograd",
+    ):
+        monkeypatch.setattr(helion_attention, dispatch_name, reject_dispatch)
+
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            **kwargs,  # type: ignore[arg-type]
+        )
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
 
 
 @requires_cuda
@@ -9893,7 +10147,7 @@ def test_kvcache_1k_second_row_batch_idx_rejects_every_other_mode(
             "alibi",
             q,
             NotImplementedError,
-            "ALiBi is implemented only",
+            "does not support cache_batch_idx",
             {
                 "alibi_slopes": torch.ones(
                     spec.nheads_q, device=q.device, dtype=torch.float32
@@ -10479,7 +10733,7 @@ def test_kvcache_1k_identity_batch_idx_rejects_out_of_scope_before_dispatch(
             "alibi",
             q,
             NotImplementedError,
-            "ALiBi is implemented only",
+            "does not support cache_batch_idx",
             {
                 "alibi_slopes": torch.ones(
                     spec.nheads_q, device=q.device, dtype=torch.float32
