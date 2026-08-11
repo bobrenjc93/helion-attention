@@ -32,7 +32,8 @@ both exposed page-16 profiles and page-256/page-512 decode. Read-only causal
 runtime for a bounded Python-int prefix. Those profiles and
 causal 16K decode also use it for read-only CUDA-tensor-selected spans, while
 the 4K profiles support full-cache or scalar-prefix ALiBi. The causal 4K
-profile also supports ALiBi on tensor-selected prefixes without left padding.
+profile also supports ALiBi on tensor-selected spans, including left-padded
+spans.
 The causal 1K profile accepts the exact device length 1023 for its paired
 final-slot update and retains generated full-cache dispatch.
 The same two 4K profiles expose exactly a 511-token left plus current-token
@@ -259,7 +260,7 @@ _TENSOR_FINAL_APPEND_DENSE_KVCACHE_KEY = (
     _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
 )
 _DENSE_KVCACHE_ALIBI_PROFILE = _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
-_TENSOR_PREFIX_DENSE_KVCACHE_ALIBI_KEY = (
+_TENSOR_SPAN_DENSE_KVCACHE_ALIBI_KEY = (
     "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal"
 )
 _DIAGNOSTIC_DECODE_PROFILES = frozenset(
@@ -3263,20 +3264,21 @@ def flash_attn_with_kvcache(
     without it, the span begins at zero. Tensor spans support the profile's
     causal flag, the default or a custom softmax scale, and optional fp32 LSE
     when slope-free. The exact causal 4K profile also accepts fp32 ALiBi slopes
-    for a tensor-selected prefix when ``cache_leftpad`` is omitted; that path
-    does not support LSE. Tensor spans synchronize once for recoverable bounds
-    validation and reject CUDA graph capture, autograd, updates, remapping,
-    rotary, windows, softcap, explicit split counts, and ALiBi outside that
-    narrow causal 4K prefix path. The causal 1K profile alone also accepts the
-    exact tensor value ``[1023]`` for its paired one-token final-slot update.
+    for a tensor-selected span, including one selected with ``cache_leftpad``;
+    that path does not support LSE. Tensor spans synchronize once for
+    recoverable bounds validation and reject CUDA graph capture, autograd,
+    updates, remapping, rotary, windows, softcap, explicit split counts, and
+    ALiBi outside that narrow causal 4K span path. The causal 1K profile alone
+    also accepts the exact tensor value ``[1023]`` for its paired one-token
+    final-slot update.
     That update supports either scale and optional fp32 LSE, retains generated
     full-cache dispatch, and leaves the length tensor unchanged. Other tensor
     values and update features remain unsupported.
     The same 4K profiles accept forward-only fp32 ALiBi slopes shaped ``[32]``
     or ``[1, 32]`` for the full cache and Python-int prefixes. Those calls use
     the generic packed runtime. ALiBi cannot be combined with LSE, updates,
-    remapping, left padding, rotary, windows, softcap, or autograd. Tensor-valued
-    lengths with ALiBi are limited to the causal 4K profile. The causal bf16
+    remapping, rotary, windows, softcap, or autograd. Tensor-valued spans with
+    ALiBi are limited to the causal 4K profile. The causal bf16
     ``(1, 1, 16384, 32, 8, 128)`` profile accepts
     the same contiguous CUDA int32 span tensors, with
     ``0 <= cache_leftpad < cache_seqlens <= 16384``. This tensor-span path
@@ -3608,16 +3610,10 @@ def flash_attn_with_kvcache(
             f"dense {_TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION}"
         )
     if tensor_cache_seqlens is not None and has_dense_alibi:
-        if spec.key != _TENSOR_PREFIX_DENSE_KVCACHE_ALIBI_KEY:
+        if spec.key != _TENSOR_SPAN_DENSE_KVCACHE_ALIBI_KEY:
             raise NotImplementedError(
                 "tensor-valued dense KV-cache ALiBi is implemented only for "
-                "read-only causal bf16 (1, 1, 4096, 32, 8, 128) prefixes "
-                "without left padding"
-            )
-        if tensor_cache_leftpad is not None:
-            raise NotImplementedError(
-                "tensor-valued dense KV-cache ALiBi does not support "
-                "cache_leftpad"
+                "read-only causal bf16 (1, 1, 4096, 32, 8, 128) spans"
             )
 
     scalar_cache_prefix: int | None = None
