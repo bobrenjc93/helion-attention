@@ -333,8 +333,8 @@ both the unpacked API and the varlen QKV/KV-packed adapters accept them, with
 either the default or a custom `softmax_scale`. On the causal profile these
 slopes may be combined with `return_attn_probs=True`. Both causal bf16 Llama-3
 profiles above likewise accept `[32]` or `[4, 32]` slopes through their unpacked
-and KV-packed entry points; only the 256-token profile may combine them with a
-diagnostic return. The noncausal BERT-base profile accepts `[12]` or `[16, 12]`
+and KV-packed entry points, and both may combine them with a diagnostic return.
+The noncausal BERT-base profile accepts `[12]` or `[16, 12]`
 slopes through its unpacked and QKV/KV-packed entry points without diagnostic
 returns. ALiBi-only calls use the generic packed Triton runtime, while
 `alibi_slopes=None` retains each profile's existing dispatch. Other non-paged
@@ -1091,8 +1091,9 @@ doing something else:
   calls for the three Llama GQA decode profiles, dense/KV-packed calls for the
   causal bf16 Gemma-2 profile with `softcap=50.0`, and the causal bf16 varlen
   profiles
-  `(8, 512, 512, 16, 16, 64)`, `(4, 256, 256, 32, 8, 128)`, and slope-free
-  no-backward `(4, 2048, 2048, 32, 8, 128)` described above,
+  `(8, 512, 512, 16, 16, 64)`, `(4, 256, 256, 32, 8, 128)`, and no-backward
+  `(4, 2048, 2048, 32, 8, 128)`, each with optional ALiBi slopes as described
+  above,
   or no-backward core paged-varlen page-size-16/page-size-256/page-size-512
   decode `(4, 1, 1024, 8, 2, 128)` without ALiBi, where page size 256 or 512
   additionally permits exactly `softcap=50.0`;
