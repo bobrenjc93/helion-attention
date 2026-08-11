@@ -64,6 +64,11 @@ BERT_BASE_VARLEN_INFERENCE = AttnShape(
     dtype=torch.bfloat16,
     causal=False,
 )
+FULL_VARLEN_BACKWARD_PROFILES = (
+    *VARLEN_ALIBI_PROFILES,
+    BERT_BASE_VARLEN_INFERENCE,
+)
+FULL_VARLEN_BACKWARD_IDS = ["causal", "noncausal", "bert-base"]
 BERT_BASE_RAGGED_SELF_LENGTHS = [
     512,
     479,
@@ -1139,7 +1144,7 @@ def test_ragged_causal_varlen_packed_adapters_match_fp32_and_fa2(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "spec", FULL_VARLEN_BACKWARD_PROFILES, ids=FULL_VARLEN_BACKWARD_IDS
 )
 def test_full_varlen_backward_matches_fp32_and_fa2(
     softmax_scale: float | None, spec: AttnShape
@@ -1377,7 +1382,7 @@ def test_deterministic_full_varlen_training_is_repeatable_and_matches_references
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "spec", FULL_VARLEN_BACKWARD_PROFILES, ids=FULL_VARLEN_BACKWARD_IDS
 )
 def test_full_varlen_packed_adapters_match_fp32_and_fa2(
     name: str, softmax_scale: float | None, spec: AttnShape
@@ -2307,20 +2312,37 @@ def test_bert_base_varlen_rejects_optional_features_before_generic_dispatch(
 
 
 @requires_cuda
-def test_bert_base_varlen_without_alibi_retains_generic_inference_dispatch(
+@pytest.mark.parametrize(
+    "entry_point",
+    ["unpacked", "qkv-packed", "kv-packed"],
+    ids=["unpacked", "qkv-packed", "kv-packed"],
+)
+@pytest.mark.parametrize("full_length", [False, True], ids=["ragged", "full"])
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_bert_base_varlen_no_grad_retains_generic_inference_dispatch(
+    entry_point: str,
+    full_length: bool,
+    deterministic: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = BERT_BASE_VARLEN_INFERENCE
-    q = torch.zeros(
-        spec.batch,
+    sequence_length = spec.seqlen_q if full_length else 1
+    q = torch.empty(
+        spec.batch * sequence_length,
         spec.nheads_q,
         spec.head_dim,
         device="cuda",
         dtype=spec.dtype,
     )
-    k = torch.zeros_like(q)
-    v = torch.zeros_like(k)
-    cu_seqlens = torch.arange(spec.batch + 1, device=q.device, dtype=torch.int32)
+    k = torch.empty_like(q)
+    v = torch.empty_like(k)
+    cu_seqlens = torch.arange(
+        0,
+        (spec.batch + 1) * sequence_length,
+        sequence_length,
+        device=q.device,
+        dtype=torch.int32,
+    )
     sentinel = torch.empty_like(q)
     calls: list[tuple[object, ...]] = []
 
@@ -2339,20 +2361,49 @@ def test_bert_base_varlen_without_alibi_retains_generic_inference_dispatch(
         helion_attention, "_generic_varlen_diagnostic_forward", reject_dispatch
     )
     monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", reject_dispatch
+    )
 
     with torch.no_grad():
-        got = helion_attention.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_seqlens,
-            cu_seqlens,
-            spec.seqlen_q,
-            spec.seqlen_k,
-            causal=False,
-            alibi_slopes=None,
-            shape=spec,
-        )
+        if entry_point == "unpacked":
+            got = helion_attention.flash_attn_varlen_func(
+                q.requires_grad_(),
+                k.requires_grad_(),
+                v.requires_grad_(),
+                cu_seqlens,
+                cu_seqlens,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=False,
+                alibi_slopes=None,
+                deterministic=deterministic,
+                shape=spec,
+            )
+        elif entry_point == "qkv-packed":
+            got = helion_attention.flash_attn_varlen_qkvpacked_func(
+                torch.stack((q, k, v), dim=1).requires_grad_(),
+                cu_seqlens,
+                spec.seqlen_q,
+                causal=False,
+                alibi_slopes=None,
+                deterministic=deterministic,
+                shape=spec,
+            )
+        else:
+            got = helion_attention.flash_attn_varlen_kvpacked_func(
+                q.requires_grad_(),
+                torch.stack((k, v), dim=1).requires_grad_(),
+                cu_seqlens,
+                cu_seqlens,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                causal=False,
+                alibi_slopes=None,
+                deterministic=deterministic,
+                shape=spec,
+            )
 
     assert got is sentinel
     assert len(calls) == 1
@@ -2364,7 +2415,7 @@ def test_bert_base_varlen_without_alibi_retains_generic_inference_dispatch(
     ["unpacked", "qkv-packed", "kv-packed"],
     ids=["unpacked", "qkv-packed", "kv-packed"],
 )
-def test_bert_base_varlen_rejects_backward_before_generic_dispatch(
+def test_bert_base_varlen_rejects_ragged_backward_before_dispatch(
     entry_point: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spec = BERT_BASE_VARLEN_INFERENCE
@@ -2386,7 +2437,11 @@ def test_bert_base_varlen_rejects_backward_before_generic_dispatch(
         helion_attention, "_generic_varlen_forward", reject_dispatch
     )
     monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
-    with pytest.raises(NotImplementedError, match="varlen backward"):
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match="ragged varlen backward"):
         if entry_point == "unpacked":
             helion_attention.flash_attn_varlen_func(
                 q.requires_grad_(),
@@ -2420,6 +2475,39 @@ def test_bert_base_varlen_rejects_backward_before_generic_dispatch(
                 causal=False,
                 shape=spec,
             )
+
+
+@requires_cuda
+def test_bert_base_full_varlen_backward_rejects_determinism_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = BERT_BASE_VARLEN_INFERENCE
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
+    q.requires_grad_()
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("deterministic BERT-base backward reached dispatch")
+
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", reject_dispatch
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match="deterministic=True"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=False,
+            deterministic=True,
+            shape=spec,
+        )
 
 
 @requires_cuda

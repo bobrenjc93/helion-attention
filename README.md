@@ -197,10 +197,15 @@ support both self- and cross-attention; the QKV-packed API supports ragged
 self-attention. All three accept the default or a custom `softmax_scale` and
 forward-only fp32 CUDA ALiBi slopes shaped `[12]` or `[16, 12]`. ALiBi calls use
 the generic packed runtime, while `alibi_slopes=None` retains the existing
-generic inference dispatch. Paging, dropout, diagnostic returns, windows,
-softcap, and backward remain explicitly unsupported, including in combination
-with ALiBi. This is narrow generic fallback coverage, not a generated varlen
-specialization, so `is_varlen_shape_supported` remains false for this profile.
+generic inference dispatch for both ragged and full-length inputs. Slope-free,
+global, zero-dropout backward is additionally supported when all sixteen query
+and key sequences have length 512. That path reshapes the packed tensors to one
+dense PyTorch SDPA call and provides Q/K/V gradients through the unpacked and
+QKV/KV-packed APIs at either scale. Ragged backward, paging, dropout, diagnostic
+returns, windows, softcap, ALiBi backward, and deterministic backward remain
+explicitly unsupported. This is narrow generic fallback coverage, not a
+generated varlen specialization, so `is_varlen_shape_supported` remains false
+for this profile.
 
 A second deliberately unregistered varlen profile is callable through the
 same runtime: causal bf16 Llama-3 GQA with maximum shape
@@ -316,11 +321,14 @@ bitwise-repeatable outputs and Q/K/V gradients; both packed adapters inherit
 these paths.
 Ragged training reads the cumulative offsets on the host for validation and
 therefore rejects graph capture. Calls that do not require gradients continue
-to use the generated varlen kernel, including ragged and full-length calls.
+to use the generated varlen kernel, including ragged and full-length calls. The
+BERT-base varlen profile above likewise keeps its generic packed inference
+dispatch for both layouts.
 Ragged noncausal batches, batches with no nonempty queries, cross-attention
 batches with any empty key slot, deterministic mode outside these exact
-full-length profiles, paged caches, ALiBi, ragged diagnostic returns, and
-positive dropout remain explicitly unsupported for varlen backward.
+batch-8 full-length profiles (including on BERT-base), paged caches, ALiBi,
+ragged diagnostic returns, and positive dropout remain explicitly unsupported
+for varlen backward.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
 profiles when `block_table` is supplied. Both accept bf16 page-size-16 caches;
@@ -903,12 +911,13 @@ training. The encoder-training profile, BERT-base profile, and causal GPT-2
 profile use PyTorch SDPA when `0 < dropout_p < 1`.
 Default-option dense MHA, GQA, and cross-attention calls without a generated
 backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
-causal masking. Packed varlen calls remain forward-only except for the two
-exact full-length profiles (including finite symmetric-window backward on the
-noncausal profile and exact `(127, 0)` causal-window backward on the causal
-profile) and the causal ragged query/key contract described above; KV-cache
-calls remain forward-only. These unsupported FlashAttention features also
-raise `NotImplementedError` rather than silently doing something else:
+causal masking. Packed varlen calls remain forward-only except for full-length
+BERT-base, the two exact full-length batch-8 profiles (including finite
+symmetric-window backward on the noncausal profile and exact `(127, 0)`
+causal-window backward on the causal profile), and the causal ragged query/key
+contract described above; KV-cache calls remain forward-only. These unsupported
+FlashAttention features also raise `NotImplementedError` rather than silently
+doing something else:
 
 - backward for dense or varlen ALiBi, ragged noncausal varlen batches,
   batches with no nonempty queries, ragged cross-attention batches with empty

@@ -56,14 +56,15 @@ back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
 profile, grad-enabled dense calls without a generated backward, grad-enabled
 diagnostics on that GPT-2 profile and the full-length causal varlen profile,
-both full-length varlen profiles, and ragged causal attention use PyTorch SDPA
-autograd. Full-length symmetric-window training on the shipped noncausal varlen
-profile and the exact causal left window on the shipped causal varlen profile
-use the same bounded SDPA bridge. Deterministic zero-dropout BERT-base, causal
-GPT-2, and both full-length varlen training profiles use the direct math
-operator without changing process-wide SDPA backend state. The explicit shape
-validates these paths and makes specialization introspection independent of
-fallback coverage.
+both shipped full-length varlen profiles, full-length BERT-base varlen
+attention, and ragged causal attention use PyTorch SDPA autograd. Full-length
+symmetric-window training on the shipped noncausal varlen profile and the exact
+causal left window on the shipped causal varlen profile use the same bounded
+SDPA bridge. Deterministic zero-dropout dense BERT-base, causal GPT-2, and both
+shipped full-length varlen training profiles use the direct math operator
+without changing process-wide SDPA backend state. The explicit shape validates
+these paths and makes specialization introspection independent of fallback
+coverage.
 """
 
 from __future__ import annotations
@@ -212,6 +213,7 @@ _VARLEN_SOFTCAP_KEY = _VARLEN_DIAGNOSTIC_KEY
 _VARLEN_SOFTCAP = 50.0
 _VARLEN_SDPA_BACKWARD_KEYS = frozenset(
     {
+        _BERT_BASE_VARLEN_INFERENCE_KEY,
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
     }
@@ -2108,18 +2110,20 @@ def flash_attn_varlen_func(
     slopes shaped ``[32]`` or ``[4, 32]`` under the same forward-only contract.
 
     Noncausal bf16 BERT-base attention with maximum shape
-    ``(16, 512, 512, 12, 12, 64)`` is supported when no backward is required
-    and the unsupported features below are absent. Device-resident query and
-    key offsets may independently describe arbitrary ragged lengths. The
-    unpacked and KV-packed entry points support self- or cross-attention, while
-    the QKV-packed entry point supports self-attention. All three accept the
-    default or a custom ``softmax_scale`` and use the generic packed Triton
-    runtime. Forward-only calls may additionally supply fp32 ALiBi slopes shaped
-    ``[12]`` or ``[16, 12]``; slope-free calls retain their existing generic
-    dispatch. Backward, paging, dropout, diagnostic returns, windows, and
-    softcap remain unsupported, including in combination with ALiBi. This is
-    generic fallback coverage, so
-    :func:`is_varlen_shape_supported` remains false for this profile.
+    ``(16, 512, 512, 12, 12, 64)`` supports arbitrary ragged lengths when no
+    backward is required. Device-resident query and key offsets may vary
+    independently. The unpacked and KV-packed entry points support self- or
+    cross-attention, while the QKV-packed entry point supports self-attention.
+    All three accept the default or a custom ``softmax_scale`` and use the
+    generic packed Triton runtime for inference. When all sixteen query and key
+    sequences have length 512, slope-free global zero-dropout calls additionally
+    support backward by reshaping the packed tensors to the dense PyTorch SDPA
+    bridge. Forward-only calls may supply fp32 ALiBi slopes shaped ``[12]`` or
+    ``[16, 12]``; slope-free calls retain their existing generic dispatch.
+    Ragged backward, paging, dropout, diagnostic returns, windows, softcap,
+    ALiBi backward, and deterministic backward remain unsupported. This is
+    generic fallback coverage, so :func:`is_varlen_shape_supported` remains
+    false for this profile.
 
     Causal bf16 Llama-3 GQA attention with maximum shape
     ``(4, 256, 256, 32, 8, 128)`` is also supported when no backward or
@@ -2177,22 +2181,22 @@ def flash_attn_varlen_func(
     matching FlashAttention 2 when dropout is zero. Combined ALiBi diagnostic
     calls remain forward-only.
 
-    Both causal modes support zero-dropout backward when all eight query and
-    key sequences have length 512. The causal profile additionally supports
-    independent query and key cumulative offsets describing eight nonempty key
-    sequences and a mix of empty and nonempty query sequences, all of length
-    at most 512. Self-attention with identical query/key offsets continues to
-    accept mixed empty and nonempty slots. Full-length inputs are reshaped to
-    one dense BSHD call; ragged inputs use one bounded PyTorch SDPA call per
-    nonempty query sequence. All-empty query batches, empty key slots in
-    cross-attention, ragged noncausal (including windowed calls), graph-captured
-    ragged, paged, ALiBi, and ragged diagnostic varlen backward remain
-    unsupported.
-    Deterministic zero-dropout backward is supported for both full-length
-    profiles using direct math SDPA; all ragged and windowed forms still reject
-    deterministic backward. Calls that do not need backward retain the
-    generated packed kernel,
-    including ragged and full-length calls with the global window.
+    Both causal modes of the shipped batch-8 profile support zero-dropout
+    backward when all eight query and key sequences have length 512. The causal
+    profile additionally supports independent query and key cumulative offsets
+    describing eight nonempty key sequences and a mix of empty and nonempty
+    query sequences, all of length at most 512. Self-attention with identical
+    query/key offsets continues to accept mixed empty and nonempty slots.
+    Full-length inputs are reshaped to one dense BSHD call; ragged inputs use one
+    bounded PyTorch SDPA call per nonempty query sequence. All-empty query
+    batches, empty key slots in cross-attention, ragged noncausal (including
+    windowed calls), graph-captured ragged, paged, ALiBi, and ragged diagnostic
+    varlen backward remain unsupported. Deterministic zero-dropout backward is
+    supported for both shipped full-length profiles using direct math SDPA; the
+    BERT-base profile above and all ragged and windowed forms still reject
+    deterministic backward. Calls that do not need backward retain their
+    existing generated or generic packed dispatch, including ragged and
+    full-length calls with the global window.
     """
     window = _validate_varlen_window_size(window_size)
     # Non-default varlen windows have their narrow support checks below. Keep
@@ -2499,8 +2503,8 @@ def flash_attn_varlen_func(
             supported = ", ".join(sorted(_VARLEN_SDPA_BACKWARD_KEYS))
             raise NotImplementedError(
                 "varlen backward is implemented only for "
-                f"{supported} with eight full-length "
-                "sequences"
+                f"{supported} under their validated full-length or "
+                "causal-ragged contracts"
             )
         if deterministic and (
             f"varlen_{spec.key}" not in _VARLEN_DETERMINISTIC_BACKWARD_KEYS
