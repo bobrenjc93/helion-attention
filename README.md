@@ -255,11 +255,13 @@ specialization, `is_varlen_shape_supported` remains false for the profile.
 A third deliberately unregistered profile exposes the production-sized causal
 bf16 Llama-3 GQA maximum `(4, 2048, 2048, 32, 8, 128)` for forward-only
 inference. The unpacked and KV-packed entry points accept independently ragged
-self- or cross-attention offsets and the default or a custom `softmax_scale`.
-Calls use the same generic packed Triton runtime, while the registered dense
+self- or cross-attention offsets, the default or a custom `softmax_scale`, and
+fp32 ALiBi slopes shaped `[32]` or `[4, 32]`. ALiBi calls use the same generic
+packed Triton runtime as the 256-token profile, while slope-free calls retain
+their existing generic inference dispatch and the registered dense
 specialization at this shape retains its generated dispatch. Gradients,
-diagnostic returns, ALiBi, dropout, windows, softcap, deterministic mode, and
-paging remain unsupported, and `is_varlen_shape_supported` remains false.
+diagnostic returns, dropout, windows, softcap, deterministic mode, and paging
+remain unsupported, and `is_varlen_shape_supported` remains false.
 
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
 symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for
@@ -323,14 +325,15 @@ Both the causal and noncausal bf16 profiles at these maxima support forward-only
 ALiBi. Pass fp32 CUDA slopes shaped `[16]` or `[8, 16]` through `alibi_slopes`;
 both the unpacked API and the varlen QKV/KV-packed adapters accept them, with
 either the default or a custom `softmax_scale`. On the causal profile these
-slopes may be combined with `return_attn_probs=True`. The causal bf16 Llama-3
-profile above likewise accepts `[32]` or `[4, 32]` slopes, including with its
-diagnostic return, through its unpacked and KV-packed entry points. The
-noncausal BERT-base profile accepts `[12]` or `[16, 12]` slopes through its
-unpacked and QKV/KV-packed entry points without diagnostic returns. ALiBi-only
-calls use the generic packed Triton runtime, while `alibi_slopes=None` retains
-each profile's existing dispatch. Other non-paged varlen profiles still reject
-ALiBi explicitly. The one direct core paged-varlen profile with ALiBi is
+slopes may be combined with `return_attn_probs=True`. Both causal bf16 Llama-3
+profiles above likewise accept `[32]` or `[4, 32]` slopes through their unpacked
+and KV-packed entry points; only the 256-token profile may combine them with a
+diagnostic return. The noncausal BERT-base profile accepts `[12]` or `[16, 12]`
+slopes through its unpacked and QKV/KV-packed entry points without diagnostic
+returns. ALiBi-only calls use the generic packed Triton runtime, while
+`alibi_slopes=None` retains each profile's existing dispatch. Other non-paged
+varlen profiles still reject ALiBi explicitly. The one direct core paged-varlen
+profile with ALiBi is
 forward-only bf16 page-size-256 or page-size-512 decode
 `(4, 1, 1024, 8, 2, 128)`, which accepts fp32 CUDA slopes shaped `[8]` or
 `[4, 8]`; page-size-16 calls, chunked prefill, and other paged profiles still
@@ -1024,7 +1027,8 @@ doing something else:
   its documented LSE return
 - ALiBi slopes for non-paged varlen profiles other than the causal and
   noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
-  `(4, 256, 256, 32, 8, 128)` and noncausal bf16
+  `(4, 256, 256, 32, 8, 128)` and `(4, 2048, 2048, 32, 8, 128)` profiles and
+  noncausal bf16
   `(16, 512, 512, 12, 12, 64)` profiles above, for core paged-varlen calls
   outside forward-only bf16 page-size-256/page-size-512 decode
   `(4, 1, 1024, 8, 2, 128)`, and for KV-cache calls outside the exact read-only
