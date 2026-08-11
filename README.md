@@ -290,8 +290,8 @@ S_dmask)`, with fp32 LSE shaped `[16, total_q]` and an empty bf16 `S_dmask`.
 profiles, gradients, dropout, ALiBi, local windows, deterministic mode, and
 paging remain unsupported for this composition. Paged softcap remains
 unsupported except for the exact core page-size-256/page-size-512 decode
-profile described below; only its page-size-256 form may combine
-`softcap=50.0` with diagnostic returns.
+profile described below; both page sizes may combine `softcap=50.0` with
+diagnostic returns.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
 `return_attn_probs=True` with `causal=True`, an optional custom `softmax_scale`,
@@ -382,15 +382,14 @@ a default or custom `softmax_scale`. Both additionally accept optional
 forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]` or exactly
 `softcap=50.0`. ALiBi and softcap use the generic paged runtime
 and support the same ragged, permuted logical caches, but cannot be combined.
-Page-size-256 decode without ALiBi additionally accepts
+Page-size-256 and page-size-512 decode without ALiBi additionally accept
 `return_attn_probs=True` either uncapped or with exactly `softcap=50.0`.
-Page-size-512 decode accepts that diagnostic return only without ALiBi or
-softcap. Both return fp32 LSE shaped `[8, total_q]` and an empty bf16
+Both return fp32 LSE shaped `[8, total_q]` and an empty bf16
 `S_dmask`. `softcap=0` preserves the existing slope-free dispatch. Gradients,
 dropout, sliding windows, `deterministic=True`, diagnostic returns on other
-pages or profiles, other caps and softcap page sizes, page-size-512 softcap
-diagnostics, and combinations with ALiBi remain unsupported. Other page sizes
-and paged core-varlen profiles are rejected explicitly.
+pages or profiles, other caps and softcap page sizes, and combinations with
+ALiBi remain unsupported. Other page sizes and paged core-varlen profiles are
+rejected explicitly.
 
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus
@@ -1007,9 +1006,9 @@ doing something else:
   the supported softcap cannot be combined with dropout, ALiBi, local windows,
   deterministic mode, or autograd; the dense/KV-packed Gemma-2 exception and
   unpacked/QKV/KV-packed causal varlen exception permit their diagnostic tuples
-  only at `softcap=50.0`, as does the core paged-varlen page-size-256 exception;
-  core page-size-512 softcap does not permit diagnostics, and the paged
-  KV-cache exception permits its documented LSE return
+  only at `softcap=50.0`, as does the core paged-varlen
+  page-size-256/page-size-512 exception; the paged KV-cache exception permits
+  its documented LSE return
 - ALiBi slopes for non-paged varlen profiles other than the causal and
   noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
   `(4, 256, 256, 32, 8, 128)` and noncausal bf16
@@ -1055,8 +1054,8 @@ doing something else:
   profiles
   `(8, 512, 512, 16, 16, 64)` and `(4, 256, 256, 32, 8, 128)` described above,
   or no-backward core paged-varlen page-size-256/page-size-512 decode
-  `(4, 1, 1024, 8, 2, 128)` without ALiBi, where page-size-256 additionally
-  permits exactly `softcap=50.0` and page-size-512 remains uncapped;
+  `(4, 1, 1024, 8, 2, 128)` without ALiBi, where either page size additionally
+  permits exactly `softcap=50.0`;
   varlen diagnostic backward is limited to full-length zero-dropout training
   on the former profile with `deterministic=False`
 
