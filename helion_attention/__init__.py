@@ -3462,9 +3462,10 @@ def flash_attn_with_kvcache(
     ``cache_seqlens`` values from 8 through 1023 select a cache prefix through
     the generic packed runtime; omitted and full-length calls retain their
     existing dispatch. Both paths support the default or a custom softmax
-    scale. This profile does not support LSE, cache updates, tensor-valued
-    lengths, rotary, remapping, optional attention features, autograd, or
-    noncausal attention.
+    scale. Omitted and full-length calls additionally support an optional fp32
+    LSE return shaped ``[1, 32, 8]``; prefix calls remain output-only. This
+    profile does not support cache updates, tensor-valued lengths, rotary,
+    remapping, optional attention features, autograd, or noncausal attention.
 
     Two paged profiles are also exposed with an int32 CUDA ``cache_seqlens``
     tensor shaped ``[batch]`` and ``block_table``. Bf16
@@ -3954,10 +3955,16 @@ def flash_attn_with_kvcache(
                 "the eight-token dense KV-cache profile is read-only; cache "
                 "updates are not implemented"
             )
-        if return_softmax_lse:
+        if (
+            return_softmax_lse
+            and type(cache_seqlens) is int
+            and cache_seqlens != spec.seqlen_k
+        ):
             raise NotImplementedError(
-                "return_softmax_lse is not implemented for the eight-token "
-                "dense KV-cache profile"
+                "return_softmax_lse is implemented for the eight-token dense "
+                "KV-cache profile only when cache_seqlens is omitted or is "
+                "the full Python integer cache length 1024; prefix LSE is not "
+                "implemented"
             )
     if is_four_token_dense_profile:
         if append_kv:
@@ -4395,6 +4402,15 @@ def flash_attn_with_kvcache(
             raise NotImplementedError(
                 "the eight-token dense KV-cache profile does not support autograd"
             )
+        if return_softmax_lse:
+            out, softmax_lse, _ = _generic_dense_diagnostic_forward(
+                q,
+                k_cache,
+                v_cache,
+                scale,
+                spec,
+            )
+            return out, softmax_lse
         return _generic_dense_forward(
             q,
             k_cache,
