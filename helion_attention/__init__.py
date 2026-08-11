@@ -3393,12 +3393,13 @@ def flash_attn_with_kvcache(
     autograd, optional attention features, or noncausal attention.
 
     One further read-only slice accepts exactly eight query tokens: causal bf16
-    ``(1, 8, 1024, 32, 8, 128)`` with the full dense cache. It uses the generic
-    packed runtime with the default or a custom softmax scale. The cache length
-    must be omitted or supplied as the Python integer ``1024``. This profile
-    does not support LSE, cache updates, partial or tensor-valued lengths,
-    rotary, remapping, optional attention features, autograd, or noncausal
-    attention.
+    ``(1, 8, 1024, 32, 8, 128)``. Read-only Python-integer
+    ``cache_seqlens`` values from 8 through 1023 select a cache prefix through
+    the generic packed runtime; omitted and full-length calls retain their
+    existing dispatch. Both paths support the default or a custom softmax
+    scale. This profile does not support LSE, cache updates, tensor-valued
+    lengths, rotary, remapping, optional attention features, autograd, or
+    noncausal attention.
 
     Two paged profiles are also exposed with an int32 CUDA ``cache_seqlens``
     tensor shaped ``[batch]`` and ``block_table``. Bf16
@@ -3523,8 +3524,7 @@ def flash_attn_with_kvcache(
     tensor spans outside the exact causal single-token 1K, either-causal 4K,
     and causal 16K profiles,
     scalar partial lengths outside the exact causal single-token 1K and 16K,
-    four-token 1K, and either-causal 4K read-only profiles, lengths other than
-    omitted or full on the exact eight-token 1K read-only profile, non-final
+    four- and eight-token 1K, and either-causal 4K read-only profiles, non-final
     one-token appends outside the exact causal 1K and either-causal 4K profiles,
     and multi-token updates outside the exact two-token profile fail explicitly.
     Non-final one-token 1K updates accept only full-head interleaved rotary,
@@ -3785,6 +3785,7 @@ def flash_attn_with_kvcache(
         or spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
         or spec.key == _CAUSAL_16K_DENSE_KVCACHE_KEY
         or spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
+        or spec.key == _EIGHT_TOKEN_DENSE_KVCACHE_KEY
     )
     has_dense_alibi = alibi_slopes is not None
     if has_dense_alibi:
@@ -3937,7 +3938,9 @@ def flash_attn_with_kvcache(
                     "cache length declared by shape"
                 )
             minimum_prefix_length = (
-                spec.seqlen_q if is_four_token_dense_profile else 1
+                spec.seqlen_q
+                if is_four_token_dense_profile or is_eight_token_dense_profile
+                else 1
             )
             if (
                 cache_seqlens < minimum_prefix_length
