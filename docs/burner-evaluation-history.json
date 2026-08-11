@@ -4258,6 +4258,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:adb2fdf14e04a6ef234ee664f416b2146eba056f",
+      "commit": "adb2fdf14e04a6ef234ee664f416b2146eba056f",
+      "recordedAt": "2026-08-11T07:36:22.939Z",
+      "label": "base adb2fdf",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:184",
+      "recordedAt": "2026-08-11T07:36:22.939Z",
+      "label": "PR #184",
+      "kind": "leaf",
+      "prNumber": 184,
+      "title": "Return LSE for the full-cache 4K left window",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
