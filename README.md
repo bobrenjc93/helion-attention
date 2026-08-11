@@ -321,16 +321,18 @@ Zero-dropout backward is supported for both the causal and noncausal bf16
 `(8, 512, 512, 16, 16, 64)` varlen profiles when all eight query and key
 sequences have length 512 (so their valid cumulative offsets are
 `[0, 512, ..., 4096]`). The causal profile additionally supports independent
-query and key cumulative offsets describing eight nonempty key sequences and a
-mix of empty and nonempty query slots, with at least one nonempty query and all
-lengths at most 512. Causal self-attention also accepts identical query and key
-offsets containing both empty and nonempty slots. Full-length inputs are viewed
-as one dense batch; ragged causal inputs use one bounded PyTorch SDPA call per
-nonempty query sequence. Both paths provide forward and Q/K/V gradients for the
-default or a custom `softmax_scale`. The QKV-packed adapter inherits
-self-attention support; the KV-packed adapter accepts the same independent
-query/key cases, including zero-length query slots paired with nonempty key
-slots. Full-length causal training additionally accepts the diagnostic return
+query and key cumulative offsets describing a mix of empty and nonempty query
+or key slots, with at least one nonempty query and all lengths at most 512.
+Causal self-attention also accepts identical query and key offsets containing
+both empty and nonempty slots. Full-length inputs are viewed as one dense batch;
+ragged causal inputs use one bounded PyTorch SDPA call per nonempty query
+sequence with keys. A nonempty query slot with empty K/V instead returns exact
+zero rows through a differentiable branch, with zero Q/K/V gradients matching
+FA2. Both paths support the default or a custom `softmax_scale`. The QKV-packed
+adapter inherits self-attention support; the KV-packed adapter accepts the same
+independent query/key cases, including either zero-length query slots paired
+with nonempty keys or nonempty query slots paired with empty K/V. Full-length
+causal training additionally accepts the diagnostic return
 described above when `deterministic=False`. Training without diagnostics remains
 CUDA-graph capturable. Both full-length profiles also accept
 `deterministic=True` with either scale when diagnostics and local windows are
@@ -342,11 +344,10 @@ therefore rejects graph capture. Calls that do not require gradients continue
 to use the generated varlen kernel, including ragged and full-length calls. The
 BERT-base varlen profile above likewise keeps its generic packed inference
 dispatch for both layouts.
-Ragged noncausal batches, batches with no nonempty queries, cross-attention
-batches with any empty key slot, deterministic mode outside the exact
-full-length BERT-base and batch-8 profiles described above, paged caches, ALiBi,
-ragged diagnostic returns, and positive dropout remain explicitly unsupported
-for varlen backward.
+Ragged noncausal batches, batches with no nonempty queries, deterministic mode
+outside the exact full-length BERT-base and batch-8 profiles described above,
+paged caches, ALiBi, ragged diagnostic returns, and positive dropout remain
+explicitly unsupported for varlen backward.
 
 The core `flash_attn_varlen_func` exposes exactly two forward-only paged
 profiles when `block_table` is supplied. Both accept bf16 page-size-16 caches;
@@ -953,13 +954,14 @@ causal masking. Packed varlen calls remain forward-only except for full-length
 BERT-base, the two exact full-length batch-8 profiles (including finite
 symmetric-window backward on the noncausal profile and exact `(127, 0)`
 causal-window backward on the causal profile), and the causal ragged query/key
-contract described above; KV-cache calls remain forward-only. These unsupported
+contract described above, including empty-key requests through the unpacked and
+KV-packed APIs; KV-cache calls remain forward-only. These unsupported
 FlashAttention features also raise `NotImplementedError` rather than silently
 doing something else:
 
 - backward for dense or varlen ALiBi, ragged noncausal varlen batches,
-  batches with no nonempty queries, ragged cross-attention batches with empty
-  key slots, graph-captured ragged batches, and KV-cache calls
+  batches with no nonempty queries, graph-captured ragged batches, and KV-cache
+  calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback,
   except for zero-dropout training on the exact bf16 BERT-base and causal GPT-2
   `(2, 1024, 1024, 32, 32, 64)` dense profiles, the global causal bf16 Llama
