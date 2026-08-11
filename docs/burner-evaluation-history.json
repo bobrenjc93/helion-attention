@@ -4468,6 +4468,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6c35583249362e5c0821f426923f877744693574",
+      "commit": "6c35583249362e5c0821f426923f877744693574",
+      "recordedAt": "2026-08-11T11:36:42.367Z",
+      "label": "base 6c35583",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:193",
+      "recordedAt": "2026-08-11T11:36:42.367Z",
+      "label": "PR #193",
+      "kind": "leaf",
+      "prNumber": 193,
+      "title": "Accept an identity cache selector on one-row 1K decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 98,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
