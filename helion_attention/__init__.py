@@ -42,6 +42,9 @@ appends at positions 0 through 1022, optionally with full-head interleaved
 rotary. It accepts the exact device length 1023 for its paired final-slot
 update, optionally applies full-head interleaved rotary, and retains generated
 full-cache dispatch.
+Its read-only full-cache path accepts an explicit CUDA int32 identity
+``cache_batch_idx=[0]`` while passing the original cache tensors directly to
+the same generated specialization.
 The same two 4K profiles expose exactly a 511-token left plus current-token
 window for a forward-only full-cache read, while their global-window calls
 retain generated dispatch. Their prefix runtime handles a paired one-token K/V
@@ -292,6 +295,9 @@ _DENSE_KVCACHE_LEFT_WINDOW_SIZE = (511, 0)
 _DENSE_KVCACHE_LEFT_WINDOW_LENGTH = _DENSE_KVCACHE_LEFT_WINDOW_SIZE[0] + 1
 _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY = (
     "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal"
+)
+_IDENTITY_BATCH_IDX_DENSE_KVCACHE_KEY = (
+    _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
 )
 _TENSOR_FINAL_APPEND_DENSE_KVCACHE_KEY = (
     _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
@@ -1158,6 +1164,40 @@ def _validate_dense_kvcache_index_tensor(
         raise ValueError(f"{name} must use torch.strided layout")
     if not tensor.is_contiguous():
         raise ValueError(f"{name} must be contiguous")
+
+
+def _validate_identity_dense_kvcache_batch_idx(
+    cache_batch_idx: torch.Tensor,
+    *,
+    device: torch.device,
+    spec: AttnShape,
+) -> None:
+    """Validate the one identity selector accepted by full 1K decode."""
+    if not isinstance(cache_batch_idx, torch.Tensor):
+        raise TypeError("cache_batch_idx must be a torch.Tensor or None")
+    _validate_dense_kvcache_index_tensor(
+        cache_batch_idx,
+        "cache_batch_idx",
+        device=device,
+        spec=spec,
+    )
+
+    # A recoverable identity check requires one deliberate device-to-host
+    # synchronization. Reject capture before the implicit sync so graph
+    # construction fails cleanly. The cache itself is never selected, copied,
+    # or staged: successful validation falls through to generated dispatch
+    # with the caller's original cache tensors.
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise NotImplementedError(
+                "cache_batch_idx is not supported during CUDA graph capture"
+            )
+        selected_row = int(cache_batch_idx.detach().item())
+    if selected_row != 0:
+        raise NotImplementedError(
+            "only the identity cache_batch_idx=[0] is implemented for the "
+            "one-row dense KV cache"
+        )
 
 
 def _validate_dense_kvcache_tensor_span(
@@ -3363,6 +3403,12 @@ def flash_attn_with_kvcache(
     optional fp32 LSE. These partial updates optionally apply full-head
     interleaved rotary to the query and appended key. The existing final-slot
     update at position 1023 retains the generated specialization.
+    The same profile's read-only full-cache path accepts a contiguous CUDA
+    int32 ``cache_batch_idx`` equal to ``[0]``. This identity metadata is
+    validated and then ignored: the original one-row cache tensors retain
+    generated dispatch without selection or staging. It supports either
+    softmax scale and optional fp32 LSE, but rejects partial lengths, cache
+    updates, optional attention features, autograd, and CUDA graph capture.
     The causal and noncausal bf16
     ``(1, 1, 4096, 32, 8, 128)`` profiles likewise accept Python integers from
     1 through 4095 for read-only prefixes and paired one-token K/V updates at
@@ -3485,8 +3531,15 @@ def flash_attn_with_kvcache(
     if (rotary_cos is None) != (rotary_sin is None):
         raise ValueError("rotary_cos and rotary_sin must be provided together")
     apply_rotary = rotary_cos is not None
-    if cache_batch_idx is not None:
-        raise NotImplementedError("cache_batch_idx is not implemented")
+    has_cache_batch_idx = cache_batch_idx is not None
+    if has_cache_batch_idx and append_kv:
+        raise NotImplementedError(
+            "cache_batch_idx is implemented only for read-only KV-cache calls"
+        )
+    if has_cache_batch_idx and block_table is not None:
+        raise NotImplementedError(
+            "cache_batch_idx is implemented only for a dense KV cache"
+        )
     tensor_cache_leftpad = (
         cache_leftpad if isinstance(cache_leftpad, torch.Tensor) else None
     )
@@ -3623,6 +3676,37 @@ def flash_attn_with_kvcache(
     tensor_cache_seqlens = (
         cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
     )
+    if has_cache_batch_idx:
+        if spec.key != _IDENTITY_BATCH_IDX_DENSE_KVCACHE_KEY:
+            raise NotImplementedError(
+                "cache_batch_idx is implemented only as the identity [0] for "
+                "read-only causal bf16 (1, 1, 1024, 32, 8, 128) with a "
+                "one-row full cache"
+            )
+        if not (
+            cache_seqlens is None
+            or (
+                type(cache_seqlens) is int
+                and cache_seqlens == spec.seqlen_k
+            )
+        ):
+            raise NotImplementedError(
+                "cache_batch_idx requires a full cache with cache_seqlens "
+                "omitted or supplied as the Python integer 1024"
+            )
+        if tensor_cache_leftpad is not None:
+            raise NotImplementedError(
+                "cache_batch_idx does not support cache_leftpad"
+            )
+        if (
+            k_cache.ndim == 4
+            and v_cache.ndim == 4
+            and (k_cache.shape[0] != 1 or v_cache.shape[0] != 1)
+        ):
+            raise NotImplementedError(
+                "cache_batch_idx is implemented only for a one-row dense KV "
+                "cache; larger cache batches are not supported"
+            )
     is_tensor_final_slot_append = (
         append_kv
         and tensor_cache_seqlens is not None
@@ -3826,6 +3910,17 @@ def flash_attn_with_kvcache(
     check_tensors(q, k_cache, v_cache, spec)
     if k_cache.device != q.device or v_cache.device != q.device:
         raise ValueError("q, k_cache, and v_cache must be on the same CUDA device")
+    if has_cache_batch_idx:
+        assert cache_batch_idx is not None
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError("cache_batch_idx does not support autograd")
+        _validate_identity_dense_kvcache_batch_idx(
+            cache_batch_idx,
+            device=q.device,
+            spec=spec,
+        )
     tensor_cache_append_position: int | None = None
     if is_tensor_final_slot_append:
         assert tensor_cache_seqlens is not None
