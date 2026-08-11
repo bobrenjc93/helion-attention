@@ -3193,6 +3193,107 @@ def test_llama3_2k_varlen_diagnostics_match_fa2(
         pytest.param(True, 0.37, id="batch-head-custom-scale"),
     ],
 )
+def test_llama3_2k_varlen_alibi_diagnostics_match_fa2(
+    attention: str,
+    batched_slopes: bool,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    if attention == "self":
+        q, k, v, cu_q, _ = make_ragged_self_packed(
+            spec, lengths=[2048, 257, 31, 0], seed=20260811
+        )
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec,
+            lengths_q=[2048, 257, 31, 7],
+            lengths_k=[31, 2048, 17, 511],
+            seed=20260811,
+        )
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(spec.batch)], dim=0
+        )
+        if batched_slopes
+        else head_slopes
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+        )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    assert isinstance(expected, tuple) and len(expected) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert slopes.shape == (
+        (spec.batch, spec.nheads_q) if batched_slopes else (spec.nheads_q,)
+    )
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.nheads_q,
+        q.shape[0],
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    finite_lse = torch.isfinite(expected_lse)
+    assert torch.equal(torch.isfinite(softmax_lse), finite_lse)
+    torch.testing.assert_close(
+        softmax_lse[finite_lse],
+        expected_lse[finite_lse],
+        atol=2e-3,
+        rtol=1e-5,
+    )
+    assert torch.equal(softmax_lse[~finite_lse], expected_lse[~finite_lse])
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
+)
+@pytest.mark.parametrize(
+    ("batched_slopes", "softmax_scale"),
+    [
+        pytest.param(False, None, id="head-default-scale"),
+        pytest.param(True, None, id="batch-head-default-scale"),
+        pytest.param(False, 0.37, id="head-custom-scale"),
+        pytest.param(True, 0.37, id="batch-head-custom-scale"),
+    ],
+)
 def test_llama3_2k_varlen_alibi_matches_fp32_and_fa2(
     attention: str,
     batched_slopes: bool,
@@ -3399,6 +3500,92 @@ def test_llama3_2k_varlen_kvpacked_inherits_alibi_support(
         )
 
     torch.testing.assert_close(got, unpacked)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.29], ids=["default-scale", "custom-scale"]
+)
+def test_llama3_2k_varlen_kvpacked_inherits_alibi_diagnostics(
+    batched_slopes: bool, softmax_scale: float | None
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+        spec,
+        lengths_q=[128, 31, 7, 1],
+        lengths_k=[17, 256, 9, 63],
+        seed=271828,
+    )
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(spec.batch)], dim=0
+        )
+        if batched_slopes
+        else head_slopes
+    )
+    kv = torch.stack((k, v), dim=1)
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+        )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    assert isinstance(expected, tuple) and len(expected) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert slopes.shape == (
+        (spec.batch, spec.nheads_q) if batched_slopes else (spec.nheads_q,)
+    )
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.nheads_q,
+        q.shape[0],
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    finite_lse = torch.isfinite(expected_lse)
+    assert torch.equal(torch.isfinite(softmax_lse), finite_lse)
+    torch.testing.assert_close(
+        softmax_lse[finite_lse],
+        expected_lse[finite_lse],
+        atol=2e-3,
+        rtol=1e-5,
+    )
+    assert torch.equal(softmax_lse[~finite_lse], expected_lse[~finite_lse])
 
 
 @requires_cuda
@@ -3628,8 +3815,10 @@ def test_llama3_2k_varlen_rejects_optional_features_before_dispatch(
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        pytest.param("gradient", "grad-enabled", id="gradient"),
-        pytest.param("alibi", "ALiBi slopes", id="alibi"),
+        pytest.param("q-gradient", "ALiBi backward", id="q-gradient"),
+        pytest.param(
+            "slope-gradient", "ALiBi backward", id="slope-gradient"
+        ),
         pytest.param("dropout", "dropout", id="dropout"),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param("softcap", "softcap", id="softcap"),
@@ -3639,7 +3828,7 @@ def test_llama3_2k_varlen_rejects_optional_features_before_dispatch(
         pytest.param("paging", "block_table", id="paging"),
     ],
 )
-def test_llama3_2k_varlen_diagnostics_reject_incompatible_features(
+def test_llama3_2k_varlen_alibi_diagnostics_reject_incompatible_features(
     case: str,
     message: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -3653,13 +3842,16 @@ def test_llama3_2k_varlen_diagnostics_reject_incompatible_features(
     )
     kwargs: dict[str, object] = {
         "causal": True,
+        "alibi_slopes": torch.ones(spec.nheads_q, device=q.device),
         "return_attn_probs": True,
         "shape": spec,
     }
-    if case == "gradient":
+    if case == "q-gradient":
         q.requires_grad_()
-    elif case == "alibi":
-        kwargs["alibi_slopes"] = torch.ones(spec.nheads_q, device=q.device)
+    elif case == "slope-gradient":
+        slopes = kwargs["alibi_slopes"]
+        assert isinstance(slopes, torch.Tensor)
+        slopes.requires_grad_()
     elif case == "dropout":
         kwargs["dropout_p"] = 0.1
     elif case == "window":
@@ -3780,7 +3972,7 @@ def test_llama3_2k_varlen_rejects_paging_before_dispatch(
     ],
 )
 @pytest.mark.parametrize(
-    "feature", ["plain", "alibi", "diagnostics"]
+    "feature", ["plain", "alibi", "diagnostics", "combined"]
 )
 def test_llama3_2k_varlen_neighboring_profiles_remain_unsupported(
     spec: AttnShape,
@@ -3812,7 +4004,7 @@ def test_llama3_2k_varlen_neighboring_profiles_remain_unsupported(
     )
     slopes = (
         torch.ones(spec.nheads_q, device=q.device)
-        if feature == "alibi"
+        if feature in ("alibi", "combined")
         else None
     )
     exception = (
@@ -3832,7 +4024,7 @@ def test_llama3_2k_varlen_neighboring_profiles_remain_unsupported(
             spec.seqlen_k,
             causal=spec.causal,
             alibi_slopes=slopes,
-            return_attn_probs=feature == "diagnostics",
+            return_attn_probs=feature in ("diagnostics", "combined"),
             shape=spec,
         )
 
@@ -4444,6 +4636,7 @@ def test_llama3_varlen_kvpacked_inherits_alibi_support(
     [
         pytest.param(BERT_BASE_VARLEN_INFERENCE, id="bert-base"),
         pytest.param(LLAMA3_VARLEN_INFERENCE, id="llama3-gqa"),
+        pytest.param(LLAMA3_2K_VARLEN_INFERENCE, id="llama3-2k-gqa"),
         pytest.param(VARLEN_DIAGNOSTIC, id="shipped-causal"),
     ],
 )
@@ -7885,6 +8078,11 @@ def test_varlen_alibi_rejects_incompatible_options(
         pytest.param(LLAMA3_VARLEN_INFERENCE, False, id="llama3-alibi"),
         pytest.param(
             LLAMA3_VARLEN_INFERENCE, True, id="llama3-alibi-diagnostics"
+        ),
+        pytest.param(
+            LLAMA3_2K_VARLEN_INFERENCE,
+            True,
+            id="llama3-2k-alibi-diagnostics",
         ),
     ],
 )
