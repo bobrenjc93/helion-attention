@@ -3883,6 +3883,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:7b832fe66c0ebcebf1a5316d4ea40fb7a0039e4c",
+      "commit": "7b832fe66c0ebcebf1a5316d4ea40fb7a0039e4c",
+      "recordedAt": "2026-08-11T00:36:54.068Z",
+      "label": "base 7b832fe",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:169",
+      "recordedAt": "2026-08-11T00:36:54.068Z",
+      "label": "PR #169",
+      "kind": "leaf",
+      "prNumber": 169,
+      "title": "Return softcap diagnostics on shipped causal varlen",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
