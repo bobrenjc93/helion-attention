@@ -30,6 +30,8 @@ use the generic runtime for a bounded Python-int prefix. Those profiles and
 causal 16K decode also use it for read-only CUDA-tensor-selected spans, while
 the 4K profiles support full-cache or scalar-prefix ALiBi. The causal 4K
 profile also supports ALiBi on tensor-selected prefixes without left padding.
+The causal 1K profile accepts the exact device length 1023 for its paired
+final-slot update and retains generated full-cache dispatch.
 The same two 4K profiles expose exactly a 511-token left plus current-token
 window for a forward-only full-cache read, while their global-window calls
 retain generated dispatch. Their prefix runtime handles a paired one-token K/V
@@ -248,6 +250,9 @@ _DENSE_KVCACHE_LEFT_WINDOW_SIZE = (511, 0)
 _DENSE_KVCACHE_LEFT_WINDOW_LENGTH = _DENSE_KVCACHE_LEFT_WINDOW_SIZE[0] + 1
 _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY = (
     "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal"
+)
+_TENSOR_FINAL_APPEND_DENSE_KVCACHE_KEY = (
+    _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
 )
 _DENSE_KVCACHE_ALIBI_PROFILE = _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
 _TENSOR_PREFIX_DENSE_KVCACHE_ALIBI_KEY = (
@@ -1090,8 +1095,8 @@ def _validate_dense_kvcache_tensor_span(
     *,
     device: torch.device,
     spec: AttnShape,
-) -> None:
-    """Validate the one supported device-resident dense-cache span."""
+) -> int:
+    """Validate and return one supported device-resident dense-cache end."""
     _validate_dense_kvcache_index_tensor(
         cache_seqlens,
         "cache_seqlens",
@@ -1132,13 +1137,14 @@ def _validate_dense_kvcache_tensor_span(
                 f"0 <= cache_leftpad < cache_seqlens <= {spec.seqlen_k}, "
                 f"got cache_leftpad={leftpad} and cache_seqlens={length}"
             )
-        return
+        return length
 
     if length < 1 or length > spec.seqlen_k:
         raise ValueError(
             "cache_seqlens values must be in the inclusive range "
             f"[1, {spec.seqlen_k}], got {length}"
         )
+    return length
 
 
 def _tensor_length_dense_kvcache_forward(
@@ -3172,7 +3178,11 @@ def flash_attn_with_kvcache(
     does not support LSE. Tensor spans synchronize once for recoverable bounds
     validation and reject CUDA graph capture, autograd, updates, remapping,
     rotary, windows, softcap, explicit split counts, and ALiBi outside that
-    narrow causal 4K prefix path.
+    narrow causal 4K prefix path. The causal 1K profile alone also accepts the
+    exact tensor value ``[1023]`` for its paired one-token final-slot update.
+    That update supports either scale and optional fp32 LSE, retains generated
+    full-cache dispatch, and leaves the length tensor unchanged. Other tensor
+    values and update features remain unsupported.
     The same 4K profiles accept forward-only fp32 ALiBi slopes shaped ``[32]``
     or ``[1, 32]`` for the full cache and Python-int prefixes. Those calls use
     the generic packed runtime. ALiBi cannot be combined with LSE, updates,
@@ -3204,8 +3214,10 @@ def flash_attn_with_kvcache(
     mode, and an append requires disjoint query, K-cache, and V-cache memory.
     The paged update additionally requires a disjoint full logical block
     mapping.
-    Tensor-valued lengths and left padding on dense updates or outside the
-    exact causal single-token 1K, either-causal 4K, and causal 16K profiles,
+    Tensor-valued lengths on dense updates outside the exact causal
+    single-token 1K final-slot update, left padding on all dense updates, or
+    tensor spans outside the exact causal single-token 1K, either-causal 4K,
+    and causal 16K profiles,
     scalar partial lengths outside the exact causal single-token and four-token
     1K and either-causal 4K read-only profiles, non-final one-token appends
     outside the exact 4K profile, and multi-token updates outside the exact
@@ -3215,10 +3227,11 @@ def flash_attn_with_kvcache(
     reject rotary dimensions other than full-head or D64 half-head and
     non-interleaved partial-head rotary. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied
-    for the one-token final-slot append: the default interleaved layout may
-    cover the full head or the first 64 dimensions of a 128-dimensional head,
-    while the non-interleaved GPT-NeoX layout requires full-head rotation. Both
-    layouts rotate ``q`` and the appended ``k`` at ``cache_seqlens``. A
+    for the Python-integer one-token final-slot append: the default interleaved
+    layout may cover the full head or the first 64 dimensions of a
+    128-dimensional head, while the non-interleaved GPT-NeoX layout requires
+    full-head rotation. Both layouts rotate ``q`` and the appended ``k`` at
+    ``cache_seqlens``. A
     non-final 4K append accepts full-head rotation in either layout and D64
     half-head rotation in the interleaved layout. The exact two-token append
     remains full-head interleaved-only and rotates its tokens at consecutive
@@ -3374,6 +3387,11 @@ def flash_attn_with_kvcache(
     tensor_cache_seqlens = (
         cache_seqlens if isinstance(cache_seqlens, torch.Tensor) else None
     )
+    is_tensor_final_slot_append = (
+        append_kv
+        and tensor_cache_seqlens is not None
+        and spec.key == _TENSOR_FINAL_APPEND_DENSE_KVCACHE_KEY
+    )
     has_dense_left_window = window != (-1, -1)
     if has_dense_left_window:
         if requested_dense_profile != _DENSE_KVCACHE_LEFT_WINDOW_PROFILE:
@@ -3474,10 +3492,18 @@ def flash_attn_with_kvcache(
                 f"{_TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION} tensor-span profiles"
             )
     if tensor_cache_seqlens is not None and append_kv:
-        raise NotImplementedError(
-            "tensor-valued cache_seqlens are supported only for read-only KV "
-            "cache calls; updates require a Python int"
-        )
+        if not is_tensor_final_slot_append:
+            raise NotImplementedError(
+                "tensor-valued cache_seqlens updates are implemented only for "
+                "causal bf16 (1, 1, 1024, 32, 8, 128) with the final cache "
+                "slot selected; other profiles are supported only for read-only "
+                "tensor spans"
+            )
+        if apply_rotary:
+            raise NotImplementedError(
+                "the tensor-valued final-slot KV-cache update does not support "
+                "rotary embeddings"
+            )
     if cache_seqlens is not None and type(cache_seqlens) is not int:
         if tensor_cache_seqlens is None:
             raise TypeError(
@@ -3507,7 +3533,7 @@ def flash_attn_with_kvcache(
 
     scalar_cache_prefix: int | None = None
     scalar_cache_append_position: int | None = None
-    if append_kv:
+    if append_kv and tensor_cache_seqlens is None:
         if cache_seqlens is None:
             raise ValueError(
                 "cache_seqlens must be a Python int when updating the KV cache"
@@ -3573,6 +3599,29 @@ def flash_attn_with_kvcache(
     check_tensors(q, k_cache, v_cache, spec)
     if k_cache.device != q.device or v_cache.device != q.device:
         raise ValueError("q, k_cache, and v_cache must be on the same CUDA device")
+    tensor_cache_append_position: int | None = None
+    if is_tensor_final_slot_append:
+        assert tensor_cache_seqlens is not None
+        tensor_length = _validate_dense_kvcache_tensor_span(
+            tensor_cache_seqlens,
+            None,
+            device=q.device,
+            spec=spec,
+        )
+        expected_position = spec.seqlen_k - 1
+        if tensor_length != expected_position:
+            raise NotImplementedError(
+                "tensor-valued cache_seqlens updates are implemented only for "
+                f"the final cache slot at {expected_position}; other tensor "
+                "values are supported only for read-only KV-cache calls"
+            )
+        if _contiguous_tensors_overlap(
+            tensor_cache_seqlens, k_cache
+        ) or _contiguous_tensors_overlap(tensor_cache_seqlens, v_cache):
+            raise ValueError(
+                "cache_seqlens must not overlap k_cache or v_cache when updating"
+            )
+        tensor_cache_append_position = tensor_length
     if has_dense_alibi:
         assert alibi_slopes is not None
         _validate_alibi_slopes(alibi_slopes, q, spec)
@@ -3654,6 +3703,13 @@ def flash_attn_with_kvcache(
                 rotary_interleaved=rotary_interleaved,
                 full_head_interleaved_only=is_two_token_dense_profile,
             )
+        if is_tensor_final_slot_append and torch.is_grad_enabled() and any(
+            tensor.requires_grad
+            for tensor in (q, k_cache, v_cache, k, v)
+        ):
+            raise NotImplementedError(
+                "tensor-valued KV-cache updates do not support autograd"
+            )
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(spec.head_dim)
     scale = float(softmax_scale)
@@ -3719,7 +3775,7 @@ def flash_attn_with_kvcache(
         if scalar_cache_append_position is not None
         else None
     )
-    if tensor_cache_seqlens is not None:
+    if tensor_cache_seqlens is not None and not append_kv:
         _validate_dense_kvcache_tensor_span(
             tensor_cache_seqlens,
             tensor_cache_leftpad,
@@ -3853,15 +3909,20 @@ def flash_attn_with_kvcache(
     if append_kv:
         assert k is not None and v is not None and cache_seqlens is not None
         update_tokens = 2 if is_two_token_dense_profile else 1
+        if tensor_cache_append_position is not None:
+            cache_append_position = tensor_cache_append_position
+        else:
+            assert type(cache_seqlens) is int
+            cache_append_position = cache_seqlens
         cache_tensors = (k_cache, v_cache)
         if apply_rotary:
             assert rotary_cos is not None and rotary_sin is not None
             if is_two_token_dense_profile:
                 update_k = _apply_consecutive_interleaved_rotary(
-                    k, rotary_cos, rotary_sin, cache_seqlens
+                    k, rotary_cos, rotary_sin, cache_append_position
                 )
                 q_for_attention = _apply_consecutive_interleaved_rotary(
-                    q, rotary_cos, rotary_sin, cache_seqlens
+                    q, rotary_cos, rotary_sin, cache_append_position
                 )
             else:
                 apply_rotary_fn = (
@@ -3870,10 +3931,10 @@ def flash_attn_with_kvcache(
                     else _apply_neox_rotary
                 )
                 update_k = apply_rotary_fn(
-                    k, rotary_cos, rotary_sin, cache_seqlens
+                    k, rotary_cos, rotary_sin, cache_append_position
                 )
                 q_for_attention = apply_rotary_fn(
-                    q, rotary_cos, rotary_sin, cache_seqlens
+                    q, rotary_cos, rotary_sin, cache_append_position
                 )
         else:
             update_k = (
@@ -3886,9 +3947,9 @@ def flash_attn_with_kvcache(
             if any(_contiguous_tensors_overlap(v, cache) for cache in cache_tensors)
             else v
         )
-        update_end = cache_seqlens + update_tokens
-        k_cache[:, cache_seqlens:update_end].copy_(update_k)
-        v_cache[:, cache_seqlens:update_end].copy_(update_v)
+        update_end = cache_append_position + update_tokens
+        k_cache[:, cache_append_position:update_end].copy_(update_k)
+        v_cache[:, cache_append_position:update_end].copy_(update_v)
     if scalar_cache_append_position is not None:
         assert appended_cache_seqlens is not None
         return _tensor_length_dense_kvcache_forward(
