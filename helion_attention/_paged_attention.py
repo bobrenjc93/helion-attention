@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import math
+import struct
+
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 @triton.jit
@@ -59,7 +63,9 @@ def _varlen_attention_kernel(
     stride_sink_b,
     stride_sink_h,
     softmax_scale,
-    softcap,
+    softcap_high,
+    softcap_low,
+    softcap_exponent,
     window_left,
     window_right,
     max_seqlen_q_value,
@@ -81,6 +87,7 @@ def _varlen_attention_kernel(
     HAS_SINK: tl.constexpr,
     HAS_CP_TOTAL: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
+    EXTREME_SOFTCAP: tl.constexpr,
     STORE_LSE: tl.constexpr,
     SHIFT_FA2_LSE: tl.constexpr,
     HAS_DYNAMIC_MAX_Q: tl.constexpr,
@@ -267,7 +274,38 @@ def _varlen_attention_kernel(
                 )
         scores *= softmax_scale
         if HAS_SOFTCAP:
-            scores = softcap * (2.0 * tl.sigmoid(2.0 * scores / softcap) - 1.0)
+            if EXTREME_SOFTCAP:
+                # Two fp32 mantissa words plus an int exponent survive the
+                # scalar binder on Triton 3.0-3.3 and reconstruct the cap
+                # without a graph-unsafe host-to-device copy.
+                mantissa = softcap_high.to(tl.float64) + softcap_low.to(
+                    tl.float64
+                )
+                softcap = libdevice.ldexp(mantissa, softcap_exponent)
+                scores_fp64 = scores.to(tl.float64)
+                ratio = scores_fp64 / softcap
+                capped_scores = softcap * libdevice.tanh(ratio)
+                # Below 2^-27, tanh(ratio) differs from ratio by less than
+                # fp64 roundoff. Selecting the identity limit also prevents a
+                # subnormal ratio from erasing a finite score.
+                scores = tl.where(
+                    tl.abs(ratio) < 7.450580596923828e-09,
+                    scores_fp64,
+                    capped_scores,
+                ).to(tl.float32)
+            else:
+                # Ordinary fp32 caps retain the latency-sensitive path while
+                # direct tanh avoids cancellation for large representable caps.
+                ratio = scores / softcap_high
+                capped_scores = softcap_high * libdevice.tanh(ratio)
+                # The tanh correction below 2^-12 is smaller than fp32
+                # roundoff. Use its identity limit so fp32 flush-to-zero cannot
+                # collapse distinct finite logits.
+                scores = tl.where(
+                    tl.abs(ratio) < 0.000244140625,
+                    scores,
+                    capped_scores,
+                )
 
         score_mask = (
             valid_m[:, None]
@@ -383,6 +421,27 @@ def _head_metadata_strides(
     raise ValueError("head metadata must be scalar, [heads], or [batch, heads]")
 
 
+_FP32_MIN_NORMAL = float.fromhex("0x1.0p-126")
+# Above this cap, even a unit logit produces a subnormal fp32 ratio. NVIDIA's
+# fp32 flush-to-zero behavior can then turn distinct logits into equal scores.
+_FP32_MAX_STABLE_SOFTCAP = float.fromhex("0x1.0p+126")
+
+
+def _as_float32(value: float) -> float:
+    """Round a Python float exactly as Triton's legacy scalar binder does."""
+    return struct.unpack("=f", struct.pack("=f", value))[0]
+
+
+def _softcap_kernel_args(softcap: float) -> tuple[float, float, int, bool]:
+    """Encode a softcap in capture-safe scalar kernel arguments."""
+    if _FP32_MIN_NORMAL <= softcap <= _FP32_MAX_STABLE_SOFTCAP:
+        return softcap, 0.0, 0, False
+    mantissa, exponent = math.frexp(softcap)
+    high = _as_float32(mantissa)
+    low = _as_float32(mantissa - high)
+    return high, low, exponent, True
+
+
 def _attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -480,6 +539,12 @@ def _attention(
         if dynamic_max_seqlen_k is None
         else dynamic_max_seqlen_k
     )
+    has_softcap = softcap > 0.0
+    softcap_high, softcap_low, softcap_exponent, extreme_softcap = (
+        _softcap_kernel_args(softcap)
+        if has_softcap
+        else (0.0, 0.0, 0, False)
+    )
 
     if paged:
         k_strides = k.stride()
@@ -536,7 +601,9 @@ def _attention(
             skb,
             skh,
             softmax_scale,
-            softcap,
+            softcap_high,
+            softcap_low,
+            softcap_exponent,
             window_size[0],
             window_size[1],
             max_seqlen_q,
@@ -557,7 +624,8 @@ def _attention(
             HAS_ALIBI=alibi_slopes is not None,
             HAS_SINK=s_aux is not None,
             HAS_CP_TOTAL=cp_tot_seqused_k is not None,
-            HAS_SOFTCAP=softcap > 0.0,
+            HAS_SOFTCAP=has_softcap,
+            EXTREME_SOFTCAP=extreme_softcap,
             STORE_LSE=return_softmax_lse,
             SHIFT_FA2_LSE=shift_fa2_lse,
             HAS_DYNAMIC_MAX_Q=dynamic_max_seqlen_q is not None,

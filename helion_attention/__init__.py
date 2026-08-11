@@ -20,13 +20,13 @@ retains generated dispatch. It also exposes every causal left window from the
 current token alone through the full 2K context for the bf16 batch-1 2K Llama
 GQA profile while its global-window call retains generated dispatch.
 Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime
-also provides
-``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
-varlen profile, read-only page-256/page-512 core paged decode, and read-only
+also provides any finite positive softcap for output-only calls on the shipped
+causal varlen profile, plus ``softcap=50.0`` for one forward-only Gemma-2
+profile, read-only page-256/page-512 core paged decode, and read-only
 page-256/page-512 KV-cache decode. The Gemma-2 and shipped causal varlen
-profiles also expose the diagnostic return with that cap. The same runtime
-exposes page-256/page-512 decode with optional ALiBi through the core varlen
-API, plus the FA2 diagnostic return for slope-free page-256 decode. The
+profiles also expose the diagnostic return with exactly that cap. The same
+runtime exposes page-256/page-512 decode with optional ALiBi through the core
+varlen API, plus the FA2 diagnostic return for slope-free page-256 decode. The
 KV-cache adapter also uses the generic paged runtime for ALiBi on
 both exposed page-16 profiles and page-256/page-512 decode. Read-only causal
 1K and 16K dense decode, plus both causal modes of 4K dense decode, likewise
@@ -300,6 +300,7 @@ def _reject_unsupported(
     allow_return_attn_probs: bool = False,
     allow_softcap_return_attn_probs: bool = False,
     allowed_softcap: float | None = None,
+    allow_positive_softcap: bool = False,
     allowed_window_size: tuple[int, int] | None = None,
 ) -> float:
     if isinstance(dropout_p, bool) or not isinstance(dropout_p, Real):
@@ -319,11 +320,24 @@ def _reject_unsupported(
     if requested_window != (-1, -1) and not has_allowed_window:
         raise NotImplementedError("sliding-window attention is not implemented")
     has_softcap = softcap != 0.0
-    if has_softcap and softcap != allowed_softcap:
-        raise NotImplementedError(
-            "softcap is implemented only as softcap=50.0 for the supported "
-            "inference profiles"
+    has_allowed_positive_softcap = (
+        allow_positive_softcap
+        and not isinstance(softcap, bool)
+        and isinstance(softcap, Real)
+        and math.isfinite(float(softcap))
+        and float(softcap) > 0.0
+    )
+    if (
+        has_softcap
+        and softcap != allowed_softcap
+        and not has_allowed_positive_softcap
+    ):
+        qualifier = (
+            "as a finite positive value for the supported output-only profile"
+            if allow_positive_softcap
+            else "only as softcap=50.0 for the supported inference profiles"
         )
+        raise NotImplementedError(f"softcap is implemented {qualifier}")
     if alibi_slopes is not None and not allow_alibi:
         raise NotImplementedError("ALiBi slopes are not implemented")
     if probability != 0.0 and alibi_slopes is not None:
@@ -1594,6 +1608,8 @@ def _generic_varlen_softcap_forward(
     cu_seqlens_k: torch.Tensor,
     softmax_scale: float,
     spec: AttnShape,
+    *,
+    softcap: float,
 ) -> torch.Tensor:
     """Run the validated varlen softcap profile through generic Triton."""
     # Keep the Triton dependency lazy for callers that only inspect the
@@ -1613,7 +1629,7 @@ def _generic_varlen_softcap_forward(
         softmax_scale=softmax_scale,
         causal=True,
         window_size=(-1, -1),
-        softcap=_VARLEN_SOFTCAP,
+        softcap=softcap,
         alibi_slopes=None,
         q_descale=None,
         k_descale=None,
@@ -2127,15 +2143,16 @@ def flash_attn_varlen_func(
     generated specialization in inference and its existing SDPA dispatch in
     backward.
 
-    The causal version of that profile accepts exactly ``softcap=50.0`` for
-    calls that do not need backward, with either the default or a custom
-    ``softmax_scale``. Softcapped calls use the generic packed Triton runtime;
-    they may additionally request ``return_attn_probs=True`` to receive fp32
-    LSE shaped ``[16, total_q]`` and an empty bf16 ``S_dmask``. ``softcap=0``
-    retains the generated specialization. Other caps and profiles, gradients,
-    dropout, ALiBi, local windows, determinism, and paging remain unsupported
-    for this composition. Paged softcap remains unsupported except for the
-    exact page-size-256/page-size-512 decode profile described above, without
+    The causal version of that profile accepts any finite positive ``softcap``
+    for output-only calls that do not need backward, with either the default or
+    a custom ``softmax_scale``. Softcapped calls use the generic packed Triton
+    runtime. Exactly ``softcap=50.0`` may additionally request
+    ``return_attn_probs=True`` to receive fp32 LSE shaped ``[16, total_q]`` and
+    an empty bf16 ``S_dmask``. ``softcap=0`` retains the generated
+    specialization. Non-50 diagnostics, other profiles, gradients, dropout,
+    ALiBi, local windows, determinism, and paging remain unsupported for this
+    composition. Paged softcap remains unsupported except for the exact
+    page-size-256/page-size-512 decode profile described above, without
     diagnostic returns.
 
     The causal version of that profile also supports
@@ -2182,6 +2199,9 @@ def flash_attn_varlen_func(
         allow_return_attn_probs=True,
         allow_softcap_return_attn_probs=True,
         allowed_softcap=_VARLEN_SOFTCAP,
+        allow_positive_softcap=(
+            not return_attn_probs and block_table is None
+        ),
     )
     if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
         raise TypeError("max_seqlen_q and max_seqlen_k must be Python integers")
@@ -2194,9 +2214,19 @@ def flash_attn_varlen_func(
         and f"varlen_{spec.key}" != _VARLEN_SOFTCAP_KEY
     ):
         raise NotImplementedError(
-            "softcap=50.0 is implemented only for the no-backward causal "
+            "positive softcap is implemented only for the no-backward causal "
             "varlen bf16 profile (8, 512, 512, 16, 16, 64); "
             f"got {spec.describe()}"
+        )
+    if (
+        has_softcap
+        and block_table is None
+        and f"varlen_{spec.key}" == _VARLEN_SOFTCAP_KEY
+        and deterministic
+    ):
+        raise NotImplementedError(
+            "deterministic=True is not implemented with causal varlen "
+            "softcap; pass deterministic=False"
         )
     if max_seqlen_q != spec.seqlen_q or max_seqlen_k != spec.seqlen_k:
         raise ValueError(
@@ -2592,6 +2622,7 @@ def flash_attn_varlen_func(
             cu_seqlens_k,
             scale,
             spec,
+            softcap=float(softcap),
         )
     if return_attn_probs:
         if alibi_slopes is not None:
