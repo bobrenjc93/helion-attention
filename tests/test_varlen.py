@@ -1250,7 +1250,7 @@ def test_full_varlen_backward_matches_fp32_and_fa2(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "spec", FULL_VARLEN_BACKWARD_PROFILES, ids=FULL_VARLEN_BACKWARD_IDS
 )
 def test_deterministic_full_varlen_training_is_repeatable_and_matches_references(
     name: str,
@@ -1748,7 +1748,7 @@ def test_ragged_causal_cross_attention_no_grad_retains_generated_dispatch(
     [(False, "ordinary"), (True, "math")],
 )
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "spec", FULL_VARLEN_BACKWARD_PROFILES, ids=FULL_VARLEN_BACKWARD_IDS
 )
 def test_full_varlen_deterministic_backward_dispatch_is_narrow(
     name: str,
@@ -1877,7 +1877,7 @@ def test_deterministic_varlen_backward_rejects_other_profile_before_dispatch(
     ],
 )
 @pytest.mark.parametrize(
-    "spec", VARLEN_ALIBI_PROFILES, ids=["causal", "noncausal"]
+    "spec", FULL_VARLEN_BACKWARD_PROFILES, ids=FULL_VARLEN_BACKWARD_IDS
 )
 def test_deterministic_full_varlen_backward_rejects_optional_features(
     option: str,
@@ -2645,8 +2645,18 @@ def test_bert_base_varlen_no_grad_retains_generic_inference_dispatch(
     ["unpacked", "qkv-packed", "kv-packed"],
     ids=["unpacked", "qkv-packed", "kv-packed"],
 )
+@pytest.mark.parametrize(
+    ("deterministic", "message"),
+    [
+        pytest.param(False, "ragged varlen backward", id="ordinary"),
+        pytest.param(True, "deterministic=True", id="deterministic"),
+    ],
+)
 def test_bert_base_varlen_rejects_ragged_backward_before_dispatch(
-    entry_point: str, monkeypatch: pytest.MonkeyPatch
+    entry_point: str,
+    deterministic: bool,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = BERT_BASE_VARLEN_INFERENCE
     q = torch.zeros(
@@ -2671,7 +2681,7 @@ def test_bert_base_varlen_rejects_ragged_backward_before_dispatch(
     monkeypatch.setattr(
         helion_attention, "dense_attention_math_sdpa", reject_dispatch
     )
-    with pytest.raises(NotImplementedError, match="ragged varlen backward"):
+    with pytest.raises(NotImplementedError, match=message):
         if entry_point == "unpacked":
             helion_attention.flash_attn_varlen_func(
                 q.requires_grad_(),
@@ -2682,6 +2692,7 @@ def test_bert_base_varlen_rejects_ragged_backward_before_dispatch(
                 spec.seqlen_q,
                 spec.seqlen_k,
                 causal=False,
+                deterministic=deterministic,
                 shape=spec,
             )
         elif entry_point == "qkv-packed":
@@ -2691,6 +2702,7 @@ def test_bert_base_varlen_rejects_ragged_backward_before_dispatch(
                 cu_seqlens,
                 spec.seqlen_q,
                 causal=False,
+                deterministic=deterministic,
                 shape=spec,
             )
         else:
@@ -2703,41 +2715,9 @@ def test_bert_base_varlen_rejects_ragged_backward_before_dispatch(
                 spec.seqlen_q,
                 spec.seqlen_k,
                 causal=False,
+                deterministic=deterministic,
                 shape=spec,
             )
-
-
-@requires_cuda
-def test_bert_base_full_varlen_backward_rejects_determinism_before_dispatch(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec = BERT_BASE_VARLEN_INFERENCE
-    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=2)
-    q.requires_grad_()
-
-    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
-        raise AssertionError("deterministic BERT-base backward reached dispatch")
-
-    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
-    monkeypatch.setattr(
-        helion_attention, "dense_attention_math_sdpa", reject_dispatch
-    )
-    monkeypatch.setattr(
-        helion_attention, "_generic_varlen_forward", reject_dispatch
-    )
-    with pytest.raises(NotImplementedError, match="deterministic=True"):
-        helion_attention.flash_attn_varlen_func(
-            q,
-            k,
-            v,
-            cu_q,
-            cu_k,
-            spec.seqlen_q,
-            spec.seqlen_k,
-            causal=False,
-            deterministic=True,
-            shape=spec,
-        )
 
 
 @requires_cuda
