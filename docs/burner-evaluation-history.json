@@ -4003,6 +4003,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:8918984499858b1e5a9df7867a3a0d82eeac14e3",
+      "commit": "8918984499858b1e5a9df7867a3a0d82eeac14e3",
+      "recordedAt": "2026-08-11T02:40:03.974Z",
+      "label": "base 8918984",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:174",
+      "recordedAt": "2026-08-11T02:40:03.974Z",
+      "label": "PR #174",
+      "kind": "leaf",
+      "prNumber": 174,
+      "title": "Generalize the 2K Llama causal left window",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
