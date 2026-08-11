@@ -4633,6 +4633,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:f2d0c6164b545b97c4de9d5ec27dc4e77f5af640",
+      "commit": "f2d0c6164b545b97c4de9d5ec27dc4e77f5af640",
+      "recordedAt": "2026-08-11T13:58:54.151Z",
+      "label": "base f2d0c61",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:199",
+      "recordedAt": "2026-08-11T13:58:54.151Z",
+      "label": "PR #199",
+      "kind": "leaf",
+      "prNumber": 199,
+      "title": "Return page-16 diagnostics through core varlen",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
