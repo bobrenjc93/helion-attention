@@ -602,9 +602,10 @@ same layout. Chunked prefill uses bottom-right causal alignment. For decode,
 the default `causal=False` is equivalent to `causal=True`. The page-size-16
 profiles and page-size-256/page-size-512 decode also accept forward-only fp32
 ALiBi slopes shaped `[8]` or `[batch, 8]` (`[2, 8]` for chunked prefill and
-`[4, 8]` for decode). Page-size-512 decode supports the default or a custom
-scale and an optional fp32 LSE return, plus either exactly `softcap=50.0` or
-ALiBi. For example, page-size-512 ALiBi is called as follows:
+`[4, 8]` for decode). Read-only noncausal page-size-16 decode may combine ALiBi
+with an optional fp32 LSE return. Page-size-512 decode supports the default or
+a custom scale and an optional fp32 LSE return, plus either exactly
+`softcap=50.0` or ALiBi. For example, page-size-512 ALiBi is called as follows:
 
 ```python
 B, MAX_CACHE, H_Q, H_KV, D, PAGE_SIZE = 4, 1024, 8, 2, 128, 512
@@ -646,22 +647,21 @@ remain read-only.
 Slope-free output-only page-size-16 calls route through their checked-in
 paged-varlen kernels. Page-size-256 and page-size-512 decode calls and all paged
 ALiBi calls use the generic single-launch paged runtime, as do slope-free LSE
-requests and the page-size-256/page-size-512 decode combination of ALiBi with
-LSE. These return fp32 `[4, 8, 1]` LSE alongside the `[4, 1, 8, 128]` output.
-For ALiBi,
-causal decode follows FA2's position-shifted diagnostic convention: each
-single-query LSE is the mathematical value plus
-`slope * (cache_seqlen - 1)`; noncausal decode is unshifted. None of these
-read-only calls mutates the cache. Read-only page-size-256 and page-size-512
-decode additionally accept exactly `softcap=50.0`, with the default or a
-custom scale and with or without the LSE return. `softcap=0` preserves the
+requests, noncausal page-size-16 ALiBi with LSE, and either-causal
+page-size-256/page-size-512 ALiBi with LSE. These return fp32 `[4, 8, 1]` LSE
+alongside the `[4, 1, 8, 128]` output. For ALiBi, large-page causal decode
+follows FA2's position-shifted diagnostic convention: each single-query LSE is
+the mathematical value plus `slope * (cache_seqlen - 1)`; supported noncausal
+decode is unshifted. None of these read-only calls mutates the cache. Read-only
+page-size-256 and page-size-512 decode additionally accept exactly
+`softcap=50.0`, with the default or a custom scale and with or without the LSE
+return. `softcap=0` preserves the
 existing dispatch, including the generated path for page-size-16 output-only
-calls. Other caps, page sizes, and profiles, ALiBi with softcap, ALiBi with LSE
-outside the exact read-only page-size-256/page-size-512 decode profile, paged
-updates outside the exact final-slot slice above, rotary, windows, and autograd
-are rejected before dispatch. LSE on chunked
-prefill, non-causal chunked prefill, every other paged profile, and every page
-size other than 16, 256, or 512 are also rejected before dispatch.
+calls. Other caps, page sizes, and profiles, ALiBi with softcap, causal
+page-size-16 ALiBi with LSE, paged updates outside the exact final-slot slice
+above, rotary, windows, and autograd are rejected before dispatch. LSE on
+chunked prefill, non-causal chunked prefill, every other paged profile, and
+every page size other than 16, 256, or 512 are also rejected before dispatch.
 
 The single-token dense decode paths append one paired K/V token when a Python
 integer cache length points at the final slot declared by `shape`. The exact
@@ -1058,8 +1058,9 @@ doing something else:
   the Python integer `1024`, while tensor-selected spans, including left-padded
   spans, are limited to the exact causal 4K profile above;
   paged KV-cache ALiBi cannot be combined with softcap, updates, rotary,
-  windows, or autograd, and its LSE combination is limited to the exact
-  read-only page-size-256/page-size-512 decode profile above
+  windows, or autograd, and its LSE combination is limited to exact read-only
+  noncausal page-size-16 or either-causal page-size-256/page-size-512 decode
+  above
 - KV-cache mutation beyond the dense paired one-token final-slot append, the
   exact causal 1K and either-causal 4K partial one-token appends, exact 1K
   partial two-token append, and exact page-16 paged final-slot append at four

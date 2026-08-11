@@ -4903,6 +4903,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:a61fea29e6bb3ffdae7852de7f7d87bf3665621a",
+      "commit": "a61fea29e6bb3ffdae7852de7f7d87bf3665621a",
+      "recordedAt": "2026-08-11T18:20:10.936Z",
+      "label": "base a61fea2",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:208",
+      "recordedAt": "2026-08-11T18:20:10.936Z",
+      "label": "PR #208",
+      "kind": "leaf",
+      "prNumber": 208,
+      "title": "Return noncausal ALiBi LSE on page-16 decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
