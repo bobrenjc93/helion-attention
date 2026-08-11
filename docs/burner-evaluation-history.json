@@ -4873,6 +4873,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:748648c5e60818592ef5a78a55926e2b0ffde784",
+      "commit": "748648c5e60818592ef5a78a55926e2b0ffde784",
+      "recordedAt": "2026-08-11T17:53:36.410Z",
+      "label": "base 748648c",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:207",
+      "recordedAt": "2026-08-11T17:53:36.410Z",
+      "label": "PR #207",
+      "kind": "leaf",
+      "prNumber": 207,
+      "title": "Apply ALiBi only to full 1K dense-cache reads",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
