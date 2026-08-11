@@ -234,18 +234,19 @@ noncanonical offsets, other windows or profiles, diagnostics, ALiBi, softcap,
 dropout, paged caches, deterministic mode, and CUDA graph capture remain
 unsupported for this causal window.
 
-This shipped causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts
-exactly `softcap=50.0` for calls that do not require backward. Dynamic ragged
-query/key lengths and the default or a custom `softmax_scale` are supported by
-the unpacked and QKV/KV-packed entry points. Softcapped calls use the generic
-packed Triton runtime and apply `50 * tanh(scores / 50)` before softmax. They
-may additionally pass `return_attn_probs=True` and receive `(out, softmax_lse,
+This shipped causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts any
+finite positive `softcap` for output-only calls that do not require backward.
+Dynamic ragged query/key lengths and the default or a custom `softmax_scale`
+are supported by the unpacked and QKV/KV-packed entry points. Softcapped calls
+use the generic packed Triton runtime and apply
+`softcap * tanh(scores / softcap)` before softmax. Exactly `softcap=50.0` may
+additionally pass `return_attn_probs=True` and receive `(out, softmax_lse,
 S_dmask)`, with fp32 LSE shaped `[16, total_q]` and an empty bf16 `S_dmask`.
-`softcap=0` retains the generated specialization. Other caps and profiles,
-gradients, dropout, ALiBi, local windows, deterministic mode, and paging remain
-unsupported for this diagnostic composition. Paged softcap remains unsupported
-except for the exact core page-size-256/page-size-512 decode profile described
-below, without diagnostic returns.
+`softcap=0` retains the generated specialization. Non-50 diagnostics, other
+profiles, gradients, dropout, ALiBi, local windows, deterministic mode, and
+paging remain unsupported for this composition. Paged softcap remains
+unsupported except for the exact core page-size-256/page-size-512 decode
+profile described below, without diagnostic returns.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
 `return_attn_probs=True` with `causal=True`, an optional custom `softmax_scale`,
@@ -917,16 +918,18 @@ raise `NotImplementedError` rather than silently doing something else:
   zero-dropout training on eight canonical length-512 sequences, ragged
   symmetric-window backward remains unsupported, and all other KV-cache window
   calls remain unsupported
-- softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
-  causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
-  unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, read-only core
-  paged-varlen page-size-256 or page-size-512 decode, or read-only KV-cache
-  page-size-256 or page-size-512 decode `(4, 1, 1024, 8, 2, 128)` with either
-  decode-equivalent causal flag; the supported softcap cannot be
-  combined with dropout, ALiBi, local windows, or autograd; the dense/KV-packed
-  Gemma-2 and unpacked/QKV/KV-packed causal varlen exceptions permit their
-  diagnostic tuples described above, core paged-varlen softcap does not, and
-  only the paged KV-cache exception permits its documented LSE return
+- softcap except for no-backward, output-only bf16 calls with any finite
+  positive cap on causal unpacked/QKV/KV-packed varlen
+  `(8, 512, 512, 16, 16, 64)`, or no-backward bf16 calls with exactly
+  `softcap=50.0` on causal dense/KV-packed
+  `(1, 4096, 4096, 16, 8, 256)`, read-only core paged-varlen page-size-256 or
+  page-size-512 decode, or read-only KV-cache page-size-256 or page-size-512
+  decode `(4, 1, 1024, 8, 2, 128)` with either decode-equivalent causal flag;
+  the supported softcap cannot be combined with dropout, ALiBi, local windows,
+  deterministic mode, or autograd; the dense/KV-packed Gemma-2 exception and
+  unpacked/QKV/KV-packed causal varlen exception permit their diagnostic tuples
+  only at `softcap=50.0`, core paged-varlen softcap does not, and only the paged
+  KV-cache exception permits its documented LSE return
 - ALiBi slopes for non-paged varlen profiles other than the causal and
   noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
   `(4, 256, 256, 32, 8, 128)` and noncausal bf16
