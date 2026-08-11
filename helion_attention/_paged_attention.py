@@ -282,13 +282,30 @@ def _varlen_attention_kernel(
                     tl.float64
                 )
                 softcap = libdevice.ldexp(mantissa, softcap_exponent)
-                scores = (
-                    softcap * libdevice.tanh(scores.to(tl.float64) / softcap)
+                scores_fp64 = scores.to(tl.float64)
+                ratio = scores_fp64 / softcap
+                capped_scores = softcap * libdevice.tanh(ratio)
+                # Below 2^-27, tanh(ratio) differs from ratio by less than
+                # fp64 roundoff. Selecting the identity limit also prevents a
+                # subnormal ratio from erasing a finite score.
+                scores = tl.where(
+                    tl.abs(ratio) < 7.450580596923828e-09,
+                    scores_fp64,
+                    capped_scores,
                 ).to(tl.float32)
             else:
                 # Ordinary fp32 caps retain the latency-sensitive path while
                 # direct tanh avoids cancellation for large representable caps.
-                scores = softcap_high * libdevice.tanh(scores / softcap_high)
+                ratio = scores / softcap_high
+                capped_scores = softcap_high * libdevice.tanh(ratio)
+                # The tanh correction below 2^-12 is smaller than fp32
+                # roundoff. Use its identity limit so fp32 flush-to-zero cannot
+                # collapse distinct finite logits.
+                scores = tl.where(
+                    tl.abs(ratio) < 0.000244140625,
+                    scores,
+                    capped_scores,
+                )
 
         score_mask = (
             valid_m[:, None]
@@ -405,7 +422,9 @@ def _head_metadata_strides(
 
 
 _FP32_MIN_NORMAL = float.fromhex("0x1.0p-126")
-_FP32_MAX = float.fromhex("0x1.fffffep+127")
+# Above this cap, even a unit logit produces a subnormal fp32 ratio. NVIDIA's
+# fp32 flush-to-zero behavior can then turn distinct logits into equal scores.
+_FP32_MAX_STABLE_SOFTCAP = float.fromhex("0x1.0p+126")
 
 
 def _as_float32(value: float) -> float:
@@ -415,7 +434,7 @@ def _as_float32(value: float) -> float:
 
 def _softcap_kernel_args(softcap: float) -> tuple[float, float, int, bool]:
     """Encode a softcap in capture-safe scalar kernel arguments."""
-    if _FP32_MIN_NORMAL <= softcap <= _FP32_MAX:
+    if _FP32_MIN_NORMAL <= softcap <= _FP32_MAX_STABLE_SOFTCAP:
         return softcap, 0.0, 0, False
     mantissa, exponent = math.frexp(softcap)
     high = _as_float32(mantissa)

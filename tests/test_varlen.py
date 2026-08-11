@@ -5596,6 +5596,67 @@ def test_causal_varlen_softcap_finite_range_boundaries_preserve_attention(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "softcap",
+    [
+        float.fromhex("0x1.0p+125"),
+        float.fromhex("0x1.0p+126"),
+        float.fromhex("0x1.fffffep+127"),
+        sys.float_info.max,
+    ],
+    ids=["fp32-large", "fp32-fast-limit", "fp32-max", "fp64-max"],
+)
+@pytest.mark.parametrize(
+    "logit", [1.0, 0.5, 0.015625], ids=["one", "half", "one-over-64"]
+)
+def test_causal_varlen_large_softcap_preserves_multi_key_logits(
+    softcap: float,
+    logit: float,
+) -> None:
+    spec = VARLEN_SOFTCAP
+    lengths_q = [1] * spec.batch
+    lengths_k = [2] * spec.batch
+    q = torch.zeros(
+        sum(lengths_q),
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    k = torch.zeros(
+        sum(lengths_k),
+        spec.nheads_kv,
+        spec.head_dim,
+        device=q.device,
+        dtype=spec.dtype,
+    )
+    v = torch.zeros_like(k)
+    q[:, :, 0] = 1.0
+    k[1::2, :, 0] = logit
+    v[1::2] = 1.0
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            _cumulative(lengths_q, q.device),
+            _cumulative(lengths_k, q.device),
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=1.0,
+            causal=True,
+            softcap=softcap,
+            shape=spec,
+        )
+
+    expected_weight = torch.softmax(
+        torch.tensor([0.0, logit], dtype=torch.float32), dim=0
+    )[1].item()
+    assert torch.equal(got, torch.full_like(got, expected_weight))
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
 )
 @pytest.mark.parametrize(
