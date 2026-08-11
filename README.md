@@ -252,6 +252,15 @@ Dropout, windows, softcap, deterministic mode, paged caches, and backward remain
 unsupported. Because this is generic fallback coverage rather than a generated
 specialization, `is_varlen_shape_supported` remains false for the profile.
 
+A third deliberately unregistered profile exposes the production-sized causal
+bf16 Llama-3 GQA maximum `(4, 2048, 2048, 32, 8, 128)` for forward-only
+inference. The unpacked and KV-packed entry points accept independently ragged
+self- or cross-attention offsets and the default or a custom `softmax_scale`.
+Calls use the same generic packed Triton runtime, while the registered dense
+specialization at this shape retains its generated dispatch. Gradients,
+diagnostic returns, ALiBi, dropout, windows, softcap, deterministic mode, and
+paging remain unsupported, and `is_varlen_shape_supported` remains false.
+
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
 symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for
 self-attention. Dynamic ragged lengths with identical query/key cumulative
