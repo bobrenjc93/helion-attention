@@ -3958,6 +3958,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:8aaa5b38544a376ac404e7b95bc463a7dc5d4cd8",
+      "commit": "8aaa5b38544a376ac404e7b95bc463a7dc5d4cd8",
+      "recordedAt": "2026-08-11T01:53:28.984Z",
+      "label": "base 8aaa5b3",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:172",
+      "recordedAt": "2026-08-11T01:53:28.984Z",
+      "label": "PR #172",
+      "kind": "leaf",
+      "prNumber": 172,
+      "title": "Apply ALiBi to left-padded causal 4K cache spans",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
