@@ -9120,6 +9120,188 @@ def test_kvcache_1k_tensor_final_slot_append_matches_fa2_and_fp32(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["output", "output-lse"],
+)
+def test_kvcache_1k_tensor_final_slot_rotary_append_matches_fa2_and_fp32(
+    softmax_scale: float | None,
+    return_softmax_lse: bool,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, initial_k, initial_v = make_inputs(spec, seed=20260833)
+    new_k = initial_k[:, :1].clone()
+    new_v = initial_v[:, :1].clone()
+    rotary_cos, rotary_sin = make_rotary_tables(
+        spec, rotary_dim=spec.head_dim, seed=20260834
+    )
+    position = spec.seqlen_k - 1
+    cache_seqlens = torch.tensor(
+        [position], device=q.device, dtype=torch.int32
+    )
+    original_cache_seqlens = cache_seqlens.clone()
+    rotated_q = reference_interleaved_rotary(
+        q, rotary_cos, rotary_sin, position
+    )
+    rotated_k = reference_interleaved_rotary(
+        new_k, rotary_cos, rotary_sin, position
+    )
+    expected_k = initial_k.clone()
+    expected_v = initial_v.clone()
+    expected_k[:, -1:] = rotated_k
+    expected_v[:, -1:] = new_v
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    q_helion = q.clone()
+    k_helion = initial_k.clone()
+    v_helion = initial_v.clone()
+    got = helion_attention.flash_attn_with_kvcache(
+        q_helion,
+        k_helion,
+        v_helion,
+        k=new_k,
+        v=new_v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_softmax_lse=return_softmax_lse,
+        shape=spec,
+    )
+
+    q_fa2 = q.clone()
+    k_fa2 = initial_k.clone()
+    v_fa2 = initial_v.clone()
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q_fa2,
+        k_fa2,
+        v_fa2,
+        k=new_k,
+        v=new_v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=cache_seqlens,
+        softmax_scale=softmax_scale,
+        causal=True,
+        return_softmax_lse=return_softmax_lse,
+    )
+    expected_out = reference_attention(
+        rotated_q, expected_k, expected_v, spec, scale
+    )
+    expected_lse = reference_single_token_lse(
+        rotated_q, expected_k, spec, scale
+    )
+
+    assert torch.equal(q_helion, q)
+    assert torch.equal(q_fa2, q)
+    assert torch.equal(cache_seqlens, original_cache_seqlens)
+    assert torch.equal(k_helion, expected_k)
+    assert torch.equal(v_helion, expected_v)
+    assert torch.equal(k_helion, k_fa2)
+    assert torch.equal(v_helion, v_fa2)
+    if return_softmax_lse:
+        assert isinstance(got, tuple)
+        assert isinstance(expected_fa2, tuple)
+        out, lse = got
+        fa2_out, fa2_lse = expected_fa2
+        assert lse.shape == (spec.batch, spec.nheads_q, spec.seqlen_q)
+        assert lse.dtype == torch.float32
+        torch.testing.assert_close(lse, fa2_lse, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
+    else:
+        assert isinstance(got, torch.Tensor)
+        assert isinstance(expected_fa2, torch.Tensor)
+        out = got
+        fa2_out = expected_fa2
+    torch.testing.assert_close(out, fa2_out, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        out.float(), expected_out, atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+def test_kvcache_1k_tensor_final_slot_rotary_retains_generated_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    position = spec.seqlen_k - 1
+    q, k_cache, v_cache = make_inputs(spec, seed=20260835)
+    new_k = k_cache[:, :1].clone()
+    new_v = v_cache[:, :1].clone()
+    rotary_cos, rotary_sin = make_rotary_tables(
+        spec, rotary_dim=spec.head_dim, seed=20260836
+    )
+    rotated_q = reference_interleaved_rotary(
+        q, rotary_cos, rotary_sin, position
+    )
+    rotated_k = reference_interleaved_rotary(
+        new_k, rotary_cos, rotary_sin, position
+    )
+    cache_seqlens = torch.tensor(
+        [position], device=q.device, dtype=torch.int32
+    )
+    original_cache_seqlens = cache_seqlens.clone()
+    marker = torch.empty_like(q)
+    lookup_calls: list[AttnShape] = []
+
+    def lookup_stub(spec_arg: AttnShape):  # noqa: ANN202
+        lookup_calls.append(spec_arg)
+
+        def kernel(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            assert torch.equal(q_arg, rotated_q)
+            assert k_arg is k_cache
+            assert v_arg is v_cache
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            assert torch.equal(k_cache[:, -1:], rotated_k)
+            assert torch.equal(v_cache[:, -1:], new_v)
+            return marker
+
+        return kernel
+
+    def reject_prefix(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("a final-slot rotary append reached prefix dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    monkeypatch.setattr(
+        helion_attention, "_tensor_length_dense_kvcache_forward", reject_prefix
+    )
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k=new_k,
+        v=new_v,
+        rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin,
+        cache_seqlens=cache_seqlens,
+        causal=True,
+        shape=spec,
+    )
+
+    assert result is marker
+    assert lookup_calls == [spec]
+    assert torch.equal(cache_seqlens, original_cache_seqlens)
+
+
+@requires_cuda
 def test_kvcache_1k_tensor_final_slot_append_validates_metadata_before_mutation(
 ) -> None:
     spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
@@ -9176,13 +9358,22 @@ def test_kvcache_1k_tensor_final_slot_append_validates_metadata_before_mutation(
     ("case", "message"),
     [
         pytest.param("other-value", "final cache slot", id="other-value"),
-        pytest.param("rotary", "rotary embeddings", id="rotary"),
+        pytest.param(
+            "half-head-rotary",
+            "full-head interleaved rotary embeddings",
+            id="half-head-rotary",
+        ),
+        pytest.param(
+            "neox-rotary",
+            "full-head interleaved rotary embeddings",
+            id="neox-rotary",
+        ),
         pytest.param("remapping", "cache_batch_idx", id="remapping"),
         pytest.param("leftpad", "read-only", id="leftpad"),
         pytest.param("alibi", "ALiBi", id="alibi"),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param("softcap", "softcap", id="softcap"),
-        pytest.param("num-splits", "read-only", id="num-splits"),
+        pytest.param("num-splits", "rotary embeddings", id="num-splits"),
         pytest.param("autograd", "autograd", id="autograd"),
         pytest.param("noncausal", "implemented only", id="noncausal"),
         pytest.param("other-profile", "implemented only", id="other-profile"),
@@ -9207,15 +9398,21 @@ def test_kvcache_1k_tensor_final_slot_append_rejects_out_of_scope_before_mutatio
             [spec.seqlen_k - 1], device=q.device, dtype=torch.int32
         ),
     }
+    rotary_cos, rotary_sin = make_rotary_tables(
+        spec, rotary_dim=spec.head_dim, seed=20260826
+    )
+    kwargs.update(rotary_cos=rotary_cos, rotary_sin=rotary_sin)
     if case == "other-value":
         kwargs["cache_seqlens"] = torch.tensor(
             [spec.seqlen_k - 2], device=q.device, dtype=torch.int32
         )
-    elif case == "rotary":
-        rotary_cos, rotary_sin = make_rotary_tables(
-            spec, rotary_dim=spec.head_dim, seed=20260826
+    elif case == "half-head-rotary":
+        half_cos, half_sin = make_rotary_tables(
+            spec, rotary_dim=spec.head_dim // 2, seed=20260837
         )
-        kwargs.update(rotary_cos=rotary_cos, rotary_sin=rotary_sin)
+        kwargs.update(rotary_cos=half_cos, rotary_sin=half_sin)
+    elif case == "neox-rotary":
+        kwargs["rotary_interleaved"] = False
     elif case == "remapping":
         kwargs["cache_batch_idx"] = torch.zeros(
             spec.batch, device=q.device, dtype=torch.int32
@@ -9274,6 +9471,9 @@ def test_kvcache_1k_tensor_final_slot_append_rejects_cuda_graph_capture() -> Non
     cache_seqlens = torch.tensor(
         [spec.seqlen_k - 1], device=q.device, dtype=torch.int32
     )
+    rotary_cos, rotary_sin = make_rotary_tables(
+        spec, rotary_dim=spec.head_dim, seed=20260838
+    )
 
     graph = torch.cuda.CUDAGraph()
     capture_marker = torch.empty_like(q)
@@ -9286,6 +9486,8 @@ def test_kvcache_1k_tensor_final_slot_append_rejects_cuda_graph_capture() -> Non
                 v_cache,
                 k=new_k,
                 v=new_v,
+                rotary_cos=rotary_cos,
+                rotary_sin=rotary_sin,
                 cache_seqlens=cache_seqlens,
                 causal=True,
                 shape=spec,

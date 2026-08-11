@@ -38,7 +38,8 @@ profile also supports ALiBi on tensor-selected spans, including left-padded
 spans.
 The causal 1K profile also uses the prefix runtime for paired one-token scalar
 appends at positions 0 through 1022. It accepts the exact device length 1023
-for its paired final-slot update and retains generated full-cache dispatch.
+for its paired final-slot update, optionally applies full-head interleaved
+rotary, and retains generated full-cache dispatch.
 The same two 4K profiles expose exactly a 511-token left plus current-token
 window for a forward-only full-cache read, while their global-window calls
 retain generated dispatch. Their prefix runtime handles a paired one-token K/V
@@ -3379,15 +3380,17 @@ def flash_attn_with_kvcache(
     causal flag, the default or a custom softmax scale, and optional fp32 LSE
     when slope-free. The exact causal 4K profile also accepts fp32 ALiBi slopes
     for a tensor-selected span, including one selected with ``cache_leftpad``;
-    that path does not support LSE. Tensor spans synchronize once for
+    that path does not support LSE. Read-only tensor spans synchronize once for
     recoverable bounds validation and reject CUDA graph capture, autograd,
     updates, remapping, rotary, windows, softcap, explicit split counts, and
     ALiBi outside that narrow causal 4K span path. The causal 1K profile alone
     also accepts the exact tensor value ``[1023]`` for its paired one-token
     final-slot update.
     That update supports either scale and optional fp32 LSE, retains generated
-    full-cache dispatch, and leaves the length tensor unchanged. Other tensor
-    values and update features remain unsupported.
+    full-cache dispatch, optionally applies full-head interleaved rotary to the
+    query and appended key, and leaves the length tensor unchanged. Other
+    tensor values and update features, including half-head and non-interleaved
+    rotary, remain unsupported.
     The same 4K profiles accept forward-only fp32 ALiBi slopes shaped ``[32]``
     or ``[1, 32]`` for the full cache and Python-int prefixes. Those calls use
     the generic packed runtime. ALiBi cannot be combined with LSE, updates,
@@ -3432,12 +3435,13 @@ def flash_attn_with_kvcache(
     updates reject autograd, before either cache is mutated. Partial 4K updates
     additionally reject rotary dimensions other than full-head or D64 half-head
     and non-interleaved partial-head rotary. A paired
-    ``rotary_cos``/``rotary_sin`` table may be supplied
-    for the Python-integer one-token final-slot append: the default interleaved
-    layout may cover the full head or the first 64 dimensions of a
-    128-dimensional head, while the non-interleaved GPT-NeoX layout requires
-    full-head rotation. Both layouts rotate ``q`` and the appended ``k`` at
-    ``cache_seqlens``. A
+    ``rotary_cos``/``rotary_sin`` table may be supplied for the Python-integer
+    one-token final-slot append: the default interleaved layout may cover the
+    full head or the first 64 dimensions of a 128-dimensional head, while the
+    non-interleaved GPT-NeoX layout requires full-head rotation. The exact
+    tensor-selected causal 1K final-slot append accepts only the full-head
+    interleaved layout. Both layouts rotate ``q`` and the appended ``k`` at
+    ``cache_seqlens`` where supported. A
     non-final 4K append accepts full-head rotation in either layout and D64
     half-head rotation in the interleaved layout. The exact two-token append
     remains full-head interleaved-only and rotates its tokens at consecutive
@@ -3712,11 +3716,6 @@ def flash_attn_with_kvcache(
                 "slot selected; other profiles are supported only for read-only "
                 "tensor spans"
             )
-        if apply_rotary:
-            raise NotImplementedError(
-                "the tensor-valued final-slot KV-cache update does not support "
-                "rotary embeddings"
-            )
     if cache_seqlens is not None and type(cache_seqlens) is not int:
         if tensor_cache_seqlens is None:
             raise TypeError(
@@ -3918,7 +3917,9 @@ def flash_attn_with_kvcache(
                 q,
                 spec,
                 rotary_interleaved=rotary_interleaved,
-                full_head_interleaved_only=is_two_token_dense_profile,
+                full_head_interleaved_only=(
+                    is_two_token_dense_profile or is_tensor_final_slot_append
+                ),
             )
         if is_tensor_final_slot_append and torch.is_grad_enabled() and any(
             tensor.requires_grad
