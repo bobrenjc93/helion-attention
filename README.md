@@ -560,14 +560,16 @@ does not support updates, tensor-valued lengths, rotary, cache remapping,
 optional attention features, autograd, or noncausal mode. Causal bf16
 `(1, 8, 1024, 32, 8, 128)` is likewise read-only and accepts an omitted length
 or a Python integer `cache_seqlens` from 8 through 1024 with either scale and
-an output-only return. Partial prefixes use the same generic packed runtime as
-the four-token path; omitted and full-length calls retain their existing
-dispatch. Tensor-valued lengths, LSE, updates, rotary, remapping, optional
+an output-only return. Omitted and full Python-integer lengths additionally
+accept `return_softmax_lse=True` and return fp32 LSE shaped `[1, 32, 8]`.
+Partial prefixes use the same generic packed runtime as the four-token path and
+remain output-only; omitted and full-length output-only calls retain their
+existing dispatch. Tensor-valued lengths, updates, rotary, remapping, optional
 attention features, autograd, and noncausal mode remain unsupported. Other
 multi-token query lengths remain unsupported.
 
-For supported slope-free single-token dense caches and the exact four-token
-profile above, pass
+For supported slope-free single-token dense caches and the exact four-token and
+full-cache eight-token profiles above, pass
 `return_softmax_lse=True` to receive `(out, softmax_lse)`. The LSE is fp32 with
 shape `[batch, heads_q, query_len]`, matching FlashAttention's KV-cache API.
 The exact paged decode profile below supports the same return for both the
