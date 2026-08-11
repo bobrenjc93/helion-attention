@@ -311,11 +311,13 @@ a default or custom `softmax_scale`. Both additionally accept optional
 forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]` or exactly
 `softcap=50.0`. ALiBi and softcap use the generic paged runtime
 and support the same ragged, permuted logical caches, but cannot be combined.
-`softcap=0` preserves the existing slope-free dispatch. Gradients, dropout,
-sliding windows, `deterministic=True`, diagnostic returns, other caps and
-softcap page sizes, and combinations of ALiBi or softcap with those features
-remain unsupported. Other page sizes and paged core-varlen profiles are
-rejected explicitly.
+Page-size-256 decode without ALiBi or softcap additionally accepts
+`return_attn_probs=True`, returning fp32 LSE shaped `[8, total_q]` and an empty
+bf16 `S_dmask`. `softcap=0` preserves the existing slope-free dispatch.
+Gradients, dropout, sliding windows, `deterministic=True`, diagnostic returns
+on other pages or profiles, other caps and softcap page sizes, and combinations
+of ALiBi or softcap with those features remain unsupported. Other page sizes
+and paged core-varlen profiles are rejected explicitly.
 
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus
@@ -931,7 +933,9 @@ raise `NotImplementedError` rather than silently doing something else:
   dense/KV-packed calls for the three
   Llama GQA decode profiles, dense/KV-packed calls for the causal bf16 Gemma-2
   profile with `softcap=50.0`, and the causal bf16 varlen profiles
-  `(8, 512, 512, 16, 16, 64)` and `(4, 256, 256, 32, 8, 128)` described above;
+  `(8, 512, 512, 16, 16, 64)` and `(4, 256, 256, 32, 8, 128)` described above,
+  or no-backward core paged-varlen page-size-256 decode
+  `(4, 1, 1024, 8, 2, 128)` without ALiBi or softcap;
   varlen diagnostic backward is limited to full-length zero-dropout training
   on the former profile with `deterministic=False`
 
