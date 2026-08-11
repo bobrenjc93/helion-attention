@@ -62,11 +62,22 @@ One dense local-window profile is exposed through `flash_attn_func` and
 integer `0 <= left < 2048`. Each query sees itself and up to `left` preceding
 keys. Calls that do not need backward use the generic packed Triton runtime;
 grad-enabled calls use a bounded PyTorch SDPA autograd bridge for Q/K/V
-gradients. Both the default and a custom `softmax_scale` are supported.
-`window_size=(-1, -1)` retains the checked-in generated specialization when no
-backward is needed. Other bounds and shapes, dropout, softcap, ALiBi,
+gradients. Both the default and a custom `softmax_scale` are supported. An
+ordinary output-only `window_size=(-1, -1)` call retains the checked-in
+generated specialization. Other bounds and shapes, dropout, softcap, ALiBi,
 `deterministic=True`, and diagnostic returns remain unsupported for this local
 window.
+
+The global call for that same causal bf16 Llama GQA profile additionally
+supports `return_attn_probs=True` through `flash_attn_func` and
+`flash_attn_kvpacked_func`. For calls that do not require backward, exact shape
+`(1, 2048, 2048, 32, 8, 128)` returns `(out, softmax_lse, S_dmask)` with fp32
+LSE shaped `[1, 32, 2048]` and an empty bf16 `S_dmask`, matching FA2 at the
+default or a custom `softmax_scale`. This diagnostic path requires
+`causal=True`, `window_size=(-1, -1)`, `dropout_p=0.0`, `softcap=0.0`, no ALiBi,
+and `deterministic=False`; finite left-window calls remain output-only.
+Diagnostics use the generic packed Triton runtime, while ordinary no-backward
+global calls retain generated dispatch.
 
 Score capping is limited to the forward-only inference profiles described
 below. The dense causal-bf16 Gemma-2 profile
@@ -965,9 +976,12 @@ raise `NotImplementedError` rather than silently doing something else:
 - `return_attn_probs=True` outside the no-backward BERT-base (with optional
   ALiBi slopes as described above) and the
   backward-capable causal bf16 GPT-2 dense/QKV-packed/KV-packed calls,
-  dense/KV-packed calls for the three
-  Llama GQA decode profiles, dense/KV-packed calls for the causal bf16 Gemma-2
-  profile with `softcap=50.0`, and the causal bf16 varlen profiles
+  no-backward global causal bf16 `flash_attn_func`/`flash_attn_kvpacked_func`
+  calls for `(1, 2048, 2048, 32, 8, 128)` with `dropout_p=0.0`, `softcap=0.0`,
+  no ALiBi, `deterministic=False`, and `window_size=(-1, -1)`, dense/KV-packed
+  calls for the three Llama GQA decode profiles, dense/KV-packed calls for the
+  causal bf16 Gemma-2 profile with `softcap=50.0`, and the causal bf16 varlen
+  profiles
   `(8, 512, 512, 16, 16, 64)` and `(4, 256, 256, 32, 8, 128)` described above,
   or no-backward core paged-varlen page-size-256 decode
   `(4, 1, 1024, 8, 2, 128)` without ALiBi or softcap;
