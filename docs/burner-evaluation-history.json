@@ -4378,6 +4378,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:99eee7289c8da01a94a74344fa20343e6f633ca5",
+      "commit": "99eee7289c8da01a94a74344fa20343e6f633ca5",
+      "recordedAt": "2026-08-11T10:04:39.170Z",
+      "label": "base 99eee72",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:190",
+      "recordedAt": "2026-08-11T10:04:39.170Z",
+      "label": "PR #190",
+      "kind": "leaf",
+      "prNumber": 190,
+      "title": "Rotate partial 1K scalar cache appends",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 97,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

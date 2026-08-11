@@ -38,9 +38,10 @@ the 4K profiles support full-cache or scalar-prefix ALiBi. The causal 4K
 profile also supports ALiBi on tensor-selected spans, including left-padded
 spans.
 The causal 1K profile also uses the prefix runtime for paired one-token scalar
-appends at positions 0 through 1022. It accepts the exact device length 1023
-for its paired final-slot update, optionally applies full-head interleaved
-rotary, and retains generated full-cache dispatch.
+appends at positions 0 through 1022, optionally with full-head interleaved
+rotary. It accepts the exact device length 1023 for its paired final-slot
+update, optionally applies full-head interleaved rotary, and retains generated
+full-cache dispatch.
 The same two 4K profiles expose exactly a 511-token left plus current-token
 window for a forward-only full-cache read, while their global-window calls
 retain generated dispatch. Their prefix runtime handles a paired one-token K/V
@@ -3352,8 +3353,9 @@ def flash_attn_with_kvcache(
     generated specialization. Paired one-token K/V updates at Python-integer
     positions 0 through 1022 mutate the selected slot and attend through the
     appended prefix using the same generic runtime, with either scale and
-    optional fp32 LSE. These partial updates reject rotary. The existing
-    final-slot update at position 1023 retains the generated specialization.
+    optional fp32 LSE. These partial updates optionally apply full-head
+    interleaved rotary to the query and appended key. The existing final-slot
+    update at position 1023 retains the generated specialization.
     The causal and noncausal bf16
     ``(1, 1, 4096, 32, 8, 128)`` profiles likewise accept Python integers from
     1 through 4095 for read-only prefixes and paired one-token K/V updates at
@@ -3439,10 +3441,11 @@ def flash_attn_with_kvcache(
     four-token 1K, and either-causal 4K read-only profiles, non-final one-token
     appends outside the exact causal 1K and either-causal 4K profiles, and
     multi-token updates outside the exact two-token profile fail explicitly.
-    Non-final one- and two-token 1K updates reject rotary, and all partial
-    updates reject autograd, before either cache is mutated. Partial 4K updates
-    additionally reject rotary dimensions other than full-head or D64 half-head
-    and non-interleaved partial-head rotary. A paired
+    Non-final one-token 1K updates accept only full-head interleaved rotary,
+    non-final two-token 1K updates reject rotary, and all partial updates reject
+    autograd, before either cache is mutated. Partial 4K updates additionally
+    reject rotary dimensions other than full-head or D64 half-head and
+    non-interleaved partial-head rotary. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied for the Python-integer
     one-token final-slot append: the default interleaved layout may cover the
     full head or the first 64 dimensions of a 128-dimensional head, while the
@@ -3780,13 +3783,6 @@ def flash_attn_with_kvcache(
             )
             and cache_seqlens < spec.seqlen_k - 1
         ):
-            if is_1k_partial_append_dense_profile and apply_rotary:
-                raise NotImplementedError(
-                    "rotary embeddings are not implemented for non-final "
-                    "causal bf16 (1, 1, 1024, 32, 8, 128) KV-cache "
-                    "updates; rotary remains limited to the final cache slot "
-                    "at cache_seqlens=1023"
-                )
             scalar_cache_append_position = cache_seqlens
         elif cache_seqlens + 1 != spec.seqlen_k:
             raise NotImplementedError(
@@ -3926,7 +3922,12 @@ def flash_attn_with_kvcache(
                 spec,
                 rotary_interleaved=rotary_interleaved,
                 full_head_interleaved_only=(
-                    is_two_token_dense_profile or is_tensor_final_slot_append
+                    is_two_token_dense_profile
+                    or is_tensor_final_slot_append
+                    or (
+                        is_1k_partial_append_dense_profile
+                        and scalar_cache_append_position is not None
+                    )
                 ),
             )
         if is_tensor_final_slot_append and torch.is_grad_enabled() and any(
