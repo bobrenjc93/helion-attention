@@ -4408,6 +4408,36 @@
         "eval_5b403bea": 97,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:63f7e36109bbe186ab3fafe00d1709870713b67e",
+      "commit": "63f7e36109bbe186ab3fafe00d1709870713b67e",
+      "recordedAt": "2026-08-11T10:35:13.744Z",
+      "label": "base 63f7e36",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:191",
+      "recordedAt": "2026-08-11T10:35:13.744Z",
+      "label": "PR #191",
+      "kind": "leaf",
+      "prNumber": 191,
+      "title": "Honor deterministic 2K Llama GQA backward",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
