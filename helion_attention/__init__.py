@@ -8,8 +8,9 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, BERT-base diagnostics with optional ALiBi, ragged BERT-base varlen
-inference with optional ALiBi diagnostics, causal GPT-2 and global
+ALiBi calls, encoder-training diagnostics, BERT-base diagnostics with optional
+ALiBi, ragged BERT-base varlen inference with optional ALiBi diagnostics,
+causal GPT-2 and global
 causal 2K Llama GQA diagnostics, one causal Llama-3 GQA varlen inference
 profile, ALiBi with optional diagnostics on that profile and the shipped causal
 varlen profile, ALiBi on both shipped varlen profiles, and symmetric windows on
@@ -162,6 +163,7 @@ _LLAMA_2K_LEFT_WINDOW_KEY = (
 _LLAMA_2K_LEFT_WINDOW_UPPER_BOUND = 2048
 _GENERIC_DENSE_DIAGNOSTIC_KEYS = frozenset(
     {
+        _ENCODER_TRAINING_KEY,
         _BERT_DIAGNOSTIC_KEY,
         _CAUSAL_DROPOUT_KEY,
         _LLAMA_2K_LEFT_WINDOW_KEY,
@@ -1841,18 +1843,18 @@ def flash_attn_func(
             ordinary dispatch; every other positive value remains unsupported.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
-        return_attn_probs: for the shipped bf16 BERT-base encoder, causal GPT-2
-            profile, global causal 2K Llama GQA profile, three Llama GQA decode
-            profiles, and the ``softcap=50.0`` Gemma-2 profile, return
-            FlashAttention's diagnostic tuple. BERT-base diagnostics may
-            additionally use forward-only ALiBi slopes. The zero-dropout
-            causal GPT-2 profile also supports backward through ``out``; its
-            LSE and empty ``S_dmask`` accept gradients with zero contribution,
-            matching FlashAttention. Other profiles require that no backward
-            is needed, and all options other than ``softmax_scale`` (plus the
-            documented BERT ALiBi and causal/softcap settings) retain their
-            defaults. The 2K Llama diagnostic is global-only; its existing
-            finite left-window calls remain output-only.
+        return_attn_probs: for the shipped bf16 encoder-training and BERT-base
+            encoders, causal GPT-2 profile, global causal 2K Llama GQA profile,
+            three Llama GQA decode profiles, and the ``softcap=50.0`` Gemma-2
+            profile, return FlashAttention's diagnostic tuple. BERT-base
+            diagnostics may additionally use forward-only ALiBi slopes. The
+            zero-dropout causal GPT-2 profile also supports backward through
+            ``out``; its LSE and empty ``S_dmask`` accept gradients with zero
+            contribution, matching FlashAttention. Other profiles require that
+            no backward is needed, and all options other than ``softmax_scale``
+            (plus the documented BERT ALiBi and causal/softcap settings) retain
+            their defaults. The 2K Llama diagnostic is global-only; its
+            existing finite left-window calls remain output-only.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -2038,6 +2040,7 @@ def flash_attn_func(
         if not _supports_diagnostic_return(spec):
             raise NotImplementedError(
                 "return_attn_probs=True is implemented only for the shipped "
+                f"{_ENCODER_TRAINING_KEY} encoder-training profile, the shipped "
                 f"{_BERT_DIAGNOSTIC_KEY} BERT-base encoder, the shipped "
                 f"{_CAUSAL_DROPOUT_KEY} causal GPT-2 profile, the shipped "
                 f"{_LLAMA_2K_LEFT_WINDOW_KEY} global Llama GQA profile, and "

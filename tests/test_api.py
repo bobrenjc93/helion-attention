@@ -928,6 +928,117 @@ def test_encoder_no_grad_retains_generated_dispatch(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["dense", "qkvpacked", "kvpacked"],
+    ids=["dense", "qkv-packed", "kv-packed"],
+)
+def test_encoder_return_attn_probs_rejects_backward(
+    entry_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = ENCODER_TRAINING
+    q, k, v = make_inputs(spec, seed=31415)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("encoder diagnostic backward reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
+    )
+    if entry_point == "dense":
+        q.requires_grad_()
+        entry = helion_attention.flash_attn_func
+        inputs = (q, k, v)
+    elif entry_point == "qkvpacked":
+        qkv = torch.stack((q, k, v), dim=2).requires_grad_()
+        entry = helion_attention.flash_attn_qkvpacked_func
+        inputs = (qkv,)
+    else:
+        q.requires_grad_()
+        kv = torch.stack((k, v), dim=2)
+        entry = helion_attention.flash_attn_kvpacked_func
+        inputs = (q, kv)
+
+    with pytest.raises(NotImplementedError, match="grad-enabled"):
+        entry(*inputs, return_attn_probs=True, shape=spec)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("dropout", "with dropout"),
+        ("causal", "encoder-training profile"),
+        ("deterministic", "deterministic=False"),
+        ("alibi", "with ALiBi slopes"),
+        ("window", "Llama GQA profile"),
+        ("softcap", "Gemma-2 profile"),
+        ("fp16", "encoder-training profile"),
+        ("other-profile", "encoder-training profile"),
+    ],
+)
+def test_encoder_return_attn_probs_rejects_optional_features(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = ENCODER_TRAINING
+    q, k, v = make_inputs(spec, seed=27182)
+    kwargs: dict[str, object] = {
+        "return_attn_probs": True,
+        "shape": spec,
+    }
+    if case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "causal":
+        kwargs["causal"] = True
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "fp16":
+        q, k, v = (tensor.to(torch.float16) for tensor in (q, k, v))
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
+    else:
+        spec = AttnShape(1, 7, 7, 2, 2, 32, torch.bfloat16, False)
+        q, k, v = make_inputs(spec, seed=27182)
+        kwargs["shape"] = spec
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
+        raise AssertionError("out-of-scope encoder diagnostic reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_func(q, k, v, **kwargs)
+
+
+@requires_cuda
 @pytest.mark.parametrize("entry_point", ["dense", "qkvpacked", "kvpacked"])
 def test_encoder_training_forward_and_gradients_match_fa2(
     entry_point: str,
@@ -3951,6 +4062,11 @@ def test_unequal_causal_mask_includes_bottom_right_boundary() -> None:
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "spec",
+    [ENCODER_TRAINING, BERT_DIAGNOSTIC],
+    ids=["encoder-training", "bert-base"],
+)
+@pytest.mark.parametrize(
     "entry_point",
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
@@ -3958,13 +4074,16 @@ def test_unequal_causal_mask_includes_bottom_right_boundary() -> None:
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_bert_return_attn_probs_matches_fa2(
+def test_encoder_profiles_return_attn_probs_matches_fa2(
+    spec: AttnShape,
     entry_point: str,
     softmax_scale: float | None,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
-    spec = BERT_DIAGNOSTIC
-    q, k, v = make_inputs(spec, seed=20260808)
+    q, k, v = (
+        tensor.requires_grad_()
+        for tensor in make_inputs(spec, seed=20260808)
+    )
     declared_shape = (
         spec.batch,
         spec.seqlen_q,
@@ -4025,11 +4144,18 @@ def test_bert_return_attn_probs_matches_fa2(
     expected_out, expected_lse, expected_s_dmask = expected
     assert out.shape == expected_out.shape == q.shape
     assert out.dtype == expected_out.dtype == torch.bfloat16
-    assert softmax_lse.shape == expected_lse.shape == (16, 12, 512)
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.batch,
+        spec.nheads_q,
+        spec.seqlen_q,
+    )
     assert softmax_lse.dtype == expected_lse.dtype == torch.float32
     assert s_dmask.shape == expected_s_dmask.shape == (0,)
     assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
     assert s_dmask.device == expected_s_dmask.device == q.device
+    assert not out.requires_grad
+    assert not softmax_lse.requires_grad
+    assert not s_dmask.requires_grad
     torch.testing.assert_close(
         out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
     )
