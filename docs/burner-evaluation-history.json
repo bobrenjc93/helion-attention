@@ -4033,6 +4033,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:175",
+      "recordedAt": "2026-08-11T03:42:16.065Z",
+      "label": "PR #175",
+      "kind": "leaf",
+      "prNumber": 175,
+      "title": "Accept positive softcaps on the Gemma-2 profile",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
