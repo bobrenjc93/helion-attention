@@ -11,11 +11,11 @@ direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, encoder-training diagnostics, BERT-base diagnostics with optional
 ALiBi, ragged BERT-base varlen inference with optional ALiBi diagnostics,
 causal GPT-2 and global
-causal 2K Llama GQA diagnostics, one causal Llama-3 GQA varlen inference
-profile, ALiBi with optional diagnostics on that profile and the shipped causal
-varlen profile, ALiBi on both shipped varlen profiles, and symmetric windows on
-the shipped noncausal varlen profile use a generic Triton forward kernel. The
-same runtime exposes exactly a 127-token left plus
+causal 2K Llama GQA diagnostics, two causal Llama-3 GQA varlen inference
+profiles, ALiBi with optional diagnostics on the smaller profile and the
+shipped causal varlen profile, ALiBi on both shipped varlen profiles, and
+symmetric windows on the shipped noncausal varlen profile use a generic Triton
+forward kernel. The same runtime exposes exactly a 127-token left plus
 current-token causal window
 for the full-length shipped causal varlen profile, while its global-window call
 retains generated dispatch. It also exposes every causal left window from the
@@ -196,11 +196,21 @@ _CUDNN_SDPA_FAST_PATH_KEYS = frozenset(
 _LLAMA3_VARLEN_INFERENCE_KEY = (
     "varlen_b4_sq256_sk256_hq32_hkv8_d128_bf16_causal"
 )
+_LLAMA3_2K_VARLEN_INFERENCE_KEY = (
+    "varlen_b4_sq2048_sk2048_hq32_hkv8_d128_bf16_causal"
+)
+_LLAMA3_VARLEN_INFERENCE_KEYS = frozenset(
+    {_LLAMA3_VARLEN_INFERENCE_KEY, _LLAMA3_2K_VARLEN_INFERENCE_KEY}
+)
 _BERT_BASE_VARLEN_INFERENCE_KEY = (
     "varlen_b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
 )
 _GENERIC_VARLEN_INFERENCE_KEYS = frozenset(
-    {_LLAMA3_VARLEN_INFERENCE_KEY, _BERT_BASE_VARLEN_INFERENCE_KEY}
+    {
+        _LLAMA3_VARLEN_INFERENCE_KEY,
+        _LLAMA3_2K_VARLEN_INFERENCE_KEY,
+        _BERT_BASE_VARLEN_INFERENCE_KEY,
+    }
 )
 _VARLEN_ALIBI_KEYS = frozenset(
     {
@@ -2210,6 +2220,15 @@ def flash_attn_varlen_func(
     and return fp32 LSE shaped ``[32, total_q]`` plus an empty bf16
     ``S_dmask``. Registered profiles retain generated dispatch.
 
+    The same generic runtime exposes causal bf16 Llama-3 GQA attention with
+    maximum shape ``(4, 2048, 2048, 32, 8, 128)`` for forward-only unpacked
+    and KV-packed inference. Query and key offsets may independently describe
+    ragged self- or cross-attention, and either the default or a custom
+    ``softmax_scale`` is accepted. Diagnostics, ALiBi, dropout, windows,
+    softcap, deterministic mode, paging, and backward remain unsupported for
+    this deliberately unregistered profile. Its dense generated specialization
+    and every registered varlen specialization retain their existing dispatch.
+
     The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.
     Query and key cumulative offsets must be identical. Forward-only calls use
@@ -2319,10 +2338,10 @@ def flash_attn_varlen_func(
             "max_seqlen_q/max_seqlen_k must match the maximum sequence lengths "
             f"declared by shape ({spec.seqlen_q}, {spec.seqlen_k}); got "
             f"({max_seqlen_q}, {max_seqlen_k})"
-        )
+    )
 
     requested_varlen = f"varlen_{spec.key}"
-    is_llama3_varlen_inference = requested_varlen == _LLAMA3_VARLEN_INFERENCE_KEY
+    is_llama3_varlen_inference = requested_varlen in _LLAMA3_VARLEN_INFERENCE_KEYS
     is_generic_varlen_inference = (
         requested_varlen in _GENERIC_VARLEN_INFERENCE_KEYS
     )

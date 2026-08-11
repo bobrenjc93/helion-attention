@@ -4573,6 +4573,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:21bff2a68af9790521fc06441c5cabe81f341c46",
+      "commit": "21bff2a68af9790521fc06441c5cabe81f341c46",
+      "recordedAt": "2026-08-11T13:15:04.203Z",
+      "label": "base 21bff2a",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 66,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:197",
+      "recordedAt": "2026-08-11T13:15:04.203Z",
+      "label": "PR #197",
+      "kind": "leaf",
+      "prNumber": 197,
+      "title": "Expose ragged 2K Llama-3 varlen inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 67,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

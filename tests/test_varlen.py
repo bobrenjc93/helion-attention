@@ -54,6 +54,16 @@ LLAMA3_VARLEN_INFERENCE = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+LLAMA3_2K_VARLEN_INFERENCE = AttnShape(
+    batch=4,
+    seqlen_q=2048,
+    seqlen_k=2048,
+    nheads_q=32,
+    nheads_kv=8,
+    head_dim=128,
+    dtype=torch.bfloat16,
+    causal=True,
+)
 BERT_BASE_VARLEN_INFERENCE = AttnShape(
     batch=16,
     seqlen_q=512,
@@ -2950,6 +2960,372 @@ def test_bert_base_varlen_neighboring_shapes_remain_unsupported(
 
     def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
         raise AssertionError("neighboring shape reached BERT-base dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_generic
+    )
+    with pytest.raises(helion_attention.UnsupportedShapeError):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=spec.causal,
+            shape=spec,
+        )
+
+
+def test_llama3_2k_varlen_fallback_does_not_change_registration() -> None:
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+
+    assert helion_attention.is_shape_supported(
+        spec, dtype=spec.dtype, causal=spec.causal
+    )
+    assert not helion_attention.is_varlen_shape_supported(
+        spec, dtype=spec.dtype, causal=spec.causal
+    )
+    assert f"varlen_{spec.key}" not in VARLEN_IDS
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_llama3_2k_varlen_unpacked_matches_fp32_and_fa2(
+    attention: str, softmax_scale: float | None
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    if attention == "self":
+        q, k, v, cu_q, lengths_q = make_ragged_self_packed(
+            spec, lengths=[2048, 257, 31, 0], seed=20260811
+        )
+        cu_k = cu_q
+        lengths_k = lengths_q
+    else:
+        q, k, v, cu_q, cu_k, lengths_q, lengths_k = make_ragged_cross_packed(
+            spec,
+            lengths_q=[2048, 257, 31, 7],
+            lengths_k=[31, 2048, 17, 511],
+            seed=20260811,
+        )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            shape=spec,
+        )
+        expected_fp32 = reference_packed(
+            q,
+            k,
+            v,
+            lengths_q,
+            lengths_k,
+            causal=True,
+            scale=scale,
+        )
+        expected_fa2 = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+
+    assert max(lengths_q) == max(lengths_k) == 2048
+    assert got.shape == q.shape
+    assert got.dtype == torch.bfloat16
+    assert got.is_contiguous()
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.29], ids=["default-scale", "custom-scale"]
+)
+def test_llama3_2k_varlen_kvpacked_inherits_support(
+    attention: str, softmax_scale: float | None
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    if attention == "self":
+        q, k, v, cu_q, _ = make_ragged_self_packed(
+            spec, lengths=[2048, 257, 31, 0], seed=271828
+        )
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec,
+            lengths_q=[2048, 257, 31, 7],
+            lengths_k=[31, 2048, 17, 511],
+            seed=271828,
+        )
+    kv = torch.stack((k, v), dim=1)
+
+    with torch.no_grad():
+        unpacked = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            shape=spec,
+        )
+        got = helion_attention.flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            shape=spec,
+        )
+        expected_fa2 = flash_attn.flash_attn_varlen_kvpacked_func(
+            q,
+            kv,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+        )
+
+    torch.testing.assert_close(got, unpacked)
+    torch.testing.assert_close(
+        got.float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+
+
+@requires_cuda
+def test_llama3_2k_varlen_routes_only_through_generic_inference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    q, k, v, cu_seqlens, _ = make_ragged_self_packed(
+        spec, lengths=[1, 1, 1, 1]
+    )
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[object, ...]] = []
+
+    def generic(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(args)
+        return sentinel
+
+    def reject_generated(*args: object, **kwargs: object) -> object:
+        raise AssertionError("2K varlen inference reached generated dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_varlen_forward", generic)
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_generated)
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            shape=spec,
+        )
+
+    assert got is sentinel
+    assert len(calls) == 1
+
+
+@requires_cuda
+def test_llama3_2k_varlen_rejects_gradients_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    q, k, v, cu_seqlens, _ = make_ragged_self_packed(
+        spec, lengths=[1, 1, 1, 1]
+    )
+    q.requires_grad_()
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("2K varlen gradient reached generic dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match="varlen backward"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            shape=spec,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("option", "value", "message"),
+    [
+        pytest.param("dropout_p", 0.1, "dropout", id="dropout"),
+        pytest.param("window_size", (7, 7), "sliding-window", id="window"),
+        pytest.param("softcap", 50.0, "softcap", id="softcap"),
+        pytest.param("alibi_slopes", "slopes", "implemented only", id="alibi"),
+        pytest.param(
+            "deterministic", True, "deterministic=True", id="deterministic"
+        ),
+        pytest.param(
+            "return_attn_probs", True, "implemented only", id="diagnostics"
+        ),
+    ],
+)
+def test_llama3_2k_varlen_rejects_optional_features_before_dispatch(
+    option: str,
+    value: object,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    q, k, v, cu_seqlens, _ = make_ragged_self_packed(
+        spec, lengths=[1, 1, 1, 1]
+    )
+    if value == "slopes":
+        value = torch.ones(spec.nheads_q, device=q.device)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("unsupported 2K varlen option reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_dispatch
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_alibi_forward", reject_dispatch
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            shape=spec,
+            **{option: value},
+        )
+
+
+@requires_cuda
+def test_llama3_2k_varlen_rejects_paging_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    q = torch.zeros(4, 32, 128, device="cuda", dtype=spec.dtype)
+    k = torch.zeros(1, 16, 8, 128, device=q.device, dtype=spec.dtype)
+    v = torch.zeros_like(k)
+    cu_seqlens = torch.arange(5, device=q.device, dtype=torch.int32)
+    block_table = torch.zeros(4, 128, device=q.device, dtype=torch.int32)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("2K varlen paging reached attention dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_dispatch
+    )
+    with pytest.raises(helion_attention.UnsupportedShapeError, match="supports only"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            block_table=block_table,
+            shape=spec,
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "spec",
+    [
+        pytest.param(
+            AttnShape(4, 2047, 2047, 32, 8, 128, torch.bfloat16, True),
+            id="other-maxima",
+        ),
+        pytest.param(
+            AttnShape(4, 2048, 2047, 32, 8, 128, torch.bfloat16, True),
+            id="unequal-maxima",
+        ),
+        pytest.param(
+            AttnShape(4, 2048, 2048, 32, 8, 128, torch.bfloat16, False),
+            id="noncausal",
+        ),
+        pytest.param(
+            AttnShape(4, 2048, 2048, 32, 8, 128, torch.float16, True),
+            id="fp16",
+        ),
+    ],
+)
+def test_llama3_2k_varlen_neighboring_profiles_remain_unsupported(
+    spec: AttnShape, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    q = torch.zeros(
+        spec.batch, spec.nheads_q, spec.head_dim, device="cuda", dtype=spec.dtype
+    )
+    k = torch.zeros(
+        spec.batch, spec.nheads_kv, spec.head_dim, device=q.device, dtype=spec.dtype
+    )
+    v = torch.zeros_like(k)
+    cu_seqlens = torch.arange(
+        spec.batch + 1, device=q.device, dtype=torch.int32
+    )
+
+    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("neighboring profile reached 2K varlen dispatch")
 
     monkeypatch.setattr(
         helion_attention, "_generic_varlen_forward", reject_generic
