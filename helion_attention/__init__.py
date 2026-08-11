@@ -64,11 +64,11 @@ both shipped full-length varlen profiles, full-length BERT-base varlen
 attention, and ragged causal attention use PyTorch SDPA autograd. Full-length
 symmetric-window training on the shipped noncausal varlen profile and the exact
 causal left window on the shipped causal varlen profile use the same bounded
-SDPA bridge. Deterministic zero-dropout dense BERT-base, causal GPT-2, both
-shipped full-length varlen training profiles, and full-length BERT-base varlen
-training use the direct math operator without changing process-wide SDPA
-backend state. The explicit shape validates these paths and makes
-specialization introspection independent of fallback coverage.
+SDPA bridge. Deterministic zero-dropout dense BERT-base, causal GPT-2, causal
+2K Llama GQA, both shipped full-length varlen training profiles, and
+full-length BERT-base varlen training use the direct math operator without
+changing process-wide SDPA backend state. The explicit shape validates these
+paths and makes specialization introspection independent of fallback coverage.
 """
 
 from __future__ import annotations
@@ -167,7 +167,11 @@ _DROPOUT_SDPA_KEYS = frozenset(
     {_ENCODER_TRAINING_KEY, _BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
 )
 _DENSE_DETERMINISTIC_BACKWARD_KEYS = frozenset(
-    {_BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
+    {
+        _BERT_DIAGNOSTIC_KEY,
+        _CAUSAL_DROPOUT_KEY,
+        _LLAMA_2K_LEFT_WINDOW_KEY,
+    }
 )
 _GEMMA2_SOFTCAP_KEY = "b1_sq4096_sk4096_hq16_hkv8_d256_bf16_causal"
 _GEMMA2_SOFTCAP = 50.0
@@ -1830,9 +1834,9 @@ def flash_attn_func(
     paths fall back to their generated kernels when ineligible. Grad-enabled
     calls without ALiBi or a generated backward, plus supported positive-dropout
     calls, use PyTorch SDPA autograd.
-    Deterministic zero-dropout training on the exact BERT-base and causal GPT-2
-    profiles uses PyTorch's direct math SDPA operator for repeatable output and
-    gradients.
+    Deterministic zero-dropout training on the exact BERT-base, causal GPT-2,
+    and global causal 2K Llama GQA profiles uses PyTorch's direct math SDPA
+    operator for repeatable output and gradients.
     Zero-dropout training on the shipped encoder profile retains generated
     forward values. Its omitted/default-scale SM90 path uses raw BSHD PyTorch
     Flash gradients, falling back to the generated backward when Flash is
