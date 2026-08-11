@@ -54,6 +54,12 @@ CAUSAL_DROPOUT_KEY = "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal"
 CAUSAL_DROPOUT = spec_from_manifest_entry(
     next(entry for entry in SHAPES if entry["key"] == CAUSAL_DROPOUT_KEY)
 )
+NONCAUSAL_DROPOUT_KEY = (
+    "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_noncausal"
+)
+NONCAUSAL_DROPOUT = spec_from_manifest_entry(
+    next(entry for entry in SHAPES if entry["key"] == NONCAUSAL_DROPOUT_KEY)
+)
 FLASH_FAST_PATH_KEY = "b2_sq1024_sk1024_hq16_hkv16_d256_bf16_noncausal"
 CUDNN_GQA_FAST_PATH_KEY = "b1_sq4096_sk4096_hq32_hkv8_d128_bf16_causal"
 CUDNN_QWEN_FAST_PATH_KEY = "b1_sq8192_sk8192_hq28_hkv4_d128_bf16_causal"
@@ -3045,6 +3051,89 @@ def test_causal_dropout_forward_and_qkv_gradients_match_direct_sdpa(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "dropout_p", [0.1, 0.35], ids=["p10", "p35"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.137], ids=["default-scale", "custom-scale"]
+)
+@pytest.mark.parametrize(
+    "entry_point",
+    ["dense", "qkvpacked", "kvpacked"],
+    ids=["dense", "qkv-packed", "kv-packed"],
+)
+def test_noncausal_gpt2_dropout_forward_and_gradients_match_direct_sdpa(
+    entry_point: str,
+    dropout_p: float,
+    softmax_scale: float | None,
+) -> None:
+    spec = NONCAUSAL_DROPOUT
+    q, k, v = make_inputs(spec, seed=611804)
+    grad_out = make_inputs(spec, seed=173205)[0]
+
+    if entry_point == "dense":
+        q.requires_grad_()
+        k.requires_grad_()
+        v.requires_grad_()
+        torch.cuda.manual_seed_all(20260811)
+        got = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            shape=spec,
+        )
+        q_ref, k_ref, v_ref = q, k, v
+        grad_inputs = (q, k, v)
+    elif entry_point == "qkvpacked":
+        qkv = torch.stack((q, k, v), dim=2).requires_grad_()
+        torch.cuda.manual_seed_all(20260811)
+        got = helion_attention.flash_attn_qkvpacked_func(
+            qkv,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            shape=spec,
+        )
+        q_ref, k_ref, v_ref = (
+            qkv[:, :, index].contiguous() for index in range(3)
+        )
+        grad_inputs = (qkv,)
+    else:
+        q.requires_grad_()
+        kv = torch.stack((k, v), dim=2).requires_grad_()
+        torch.cuda.manual_seed_all(20260811)
+        got = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            shape=spec,
+        )
+        q_ref = q
+        k_ref, v_ref = (
+            kv[:, :, index].contiguous() for index in range(2)
+        )
+        grad_inputs = (q, kv)
+
+    torch.cuda.manual_seed_all(20260811)
+    expected = torch.nn.functional.scaled_dot_product_attention(
+        q_ref.transpose(1, 2),
+        k_ref.transpose(1, 2),
+        v_ref.transpose(1, 2),
+        dropout_p=dropout_p,
+        scale=softmax_scale,
+    ).transpose(1, 2).contiguous()
+
+    got_grads = torch.autograd.grad(got, grad_inputs, grad_out)
+    expected_grads = torch.autograd.grad(expected, grad_inputs, grad_out)
+
+    torch.testing.assert_close(got, expected, atol=0.0, rtol=0.0)
+    for actual, reference in zip(got_grads, expected_grads):
+        torch.testing.assert_close(actual, reference, atol=2e-3, rtol=1e-2)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "entry_point",
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
@@ -3356,12 +3445,17 @@ def test_causal_gpt2_diagnostic_auxiliary_gradients_are_exactly_zero() -> None:
     ids=["dense", "qkv-packed", "kv-packed"],
 )
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_causal_zero_dropout_retains_generated_dispatch(
+@pytest.mark.parametrize(
+    "spec",
+    [CAUSAL_DROPOUT, NONCAUSAL_DROPOUT],
+    ids=["causal", "noncausal"],
+)
+def test_gpt2_zero_dropout_retains_generated_dispatch(
     entry_point: str,
     deterministic: bool,
+    spec: AttnShape,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = CAUSAL_DROPOUT
     q, k, v = make_inputs(spec, seed=778899)
     sentinel = torch.empty_like(q)
     dispatched: list[AttnShape] = []
@@ -3395,7 +3489,7 @@ def test_causal_zero_dropout_retains_generated_dispatch(
             k,
             v,
             dropout_p=0.0,
-            causal=True,
+            causal=spec.causal,
             deterministic=deterministic,
             return_attn_probs=False,
             shape=spec,
@@ -3404,7 +3498,7 @@ def test_causal_zero_dropout_retains_generated_dispatch(
         out = helion_attention.flash_attn_qkvpacked_func(
             torch.stack((q, k, v), dim=2),
             dropout_p=0.0,
-            causal=True,
+            causal=spec.causal,
             deterministic=deterministic,
             return_attn_probs=False,
             shape=spec,
@@ -3414,7 +3508,7 @@ def test_causal_zero_dropout_retains_generated_dispatch(
             q,
             torch.stack((k, v), dim=2),
             dropout_p=0.0,
-            causal=True,
+            causal=spec.causal,
             deterministic=deterministic,
             return_attn_probs=False,
             shape=spec,
@@ -4938,7 +5032,8 @@ def test_dense_dropout_rejects_out_of_scope_calls_before_dispatch(
     ("case", "message"),
     [
         ("other-shape", "only for the shipped dense profiles"),
-        ("noncausal", "only for the shipped dense profiles"),
+        ("neighbor-batch", "only for the shipped dense profiles"),
+        ("neighbor-seqlen", "only for the shipped dense profiles"),
         ("fp16", "only for the shipped dense profiles"),
         ("deterministic", "deterministic=True"),
         ("alibi", "dropout combined with ALiBi"),
@@ -4947,32 +5042,40 @@ def test_dense_dropout_rejects_out_of_scope_calls_before_dispatch(
         ("return-probs", "return_attn_probs=True"),
     ],
 )
-def test_causal_dropout_rejects_out_of_scope_calls_before_dispatch(
+@pytest.mark.parametrize(
+    "dropout_spec",
+    [CAUSAL_DROPOUT, NONCAUSAL_DROPOUT],
+    ids=["causal", "noncausal"],
+)
+def test_gpt2_dropout_rejects_out_of_scope_calls_before_dispatch(
     case: str,
     message: str,
+    dropout_spec: AttnShape,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     q = torch.zeros(1, 1, 1, 1, dtype=torch.bfloat16)
     kwargs: dict[str, object] = {
         "dropout_p": 0.25,
-        "causal": True,
+        "causal": dropout_spec.causal,
         "shape": (
-            CAUSAL_DROPOUT.batch,
-            CAUSAL_DROPOUT.seqlen_q,
-            CAUSAL_DROPOUT.nheads_q,
-            CAUSAL_DROPOUT.head_dim,
+            dropout_spec.batch,
+            dropout_spec.seqlen_q,
+            dropout_spec.nheads_q,
+            dropout_spec.head_dim,
         ),
     }
     if case == "other-shape":
         kwargs["shape"] = (1, 1, 1, 1)
-    elif case == "noncausal":
-        kwargs["causal"] = False
+    elif case == "neighbor-batch":
+        kwargs["shape"] = (1, 1024, 1024, 32, 32, 64)
+    elif case == "neighbor-seqlen":
+        kwargs["shape"] = (2, 1023, 1023, 32, 32, 64)
     elif case == "fp16":
         q = q.to(torch.float16)
     elif case == "deterministic":
         kwargs["deterministic"] = True
     elif case == "alibi":
-        kwargs["alibi_slopes"] = torch.ones(CAUSAL_DROPOUT.nheads_q)
+        kwargs["alibi_slopes"] = torch.ones(dropout_spec.nheads_q)
     elif case == "window":
         kwargs["window_size"] = (128, 0)
     elif case == "softcap":
@@ -4981,7 +5084,7 @@ def test_causal_dropout_rejects_out_of_scope_calls_before_dispatch(
         kwargs["return_attn_probs"] = True
 
     def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
-        raise AssertionError("out-of-scope causal dropout call reached dispatch")
+        raise AssertionError("out-of-scope GPT-2 dropout call reached dispatch")
 
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
     monkeypatch.setattr(helion_attention, "attention_autograd", reject_dispatch)

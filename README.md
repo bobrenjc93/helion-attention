@@ -136,9 +136,9 @@ the output and Q/K/V gradients while retaining the generic packed runtime's LSE;
 as in FA2, LSE and `S_dmask` gradients contribute zero. The default and custom
 `softmax_scale` are supported. No-backward diagnostic dispatch remains wholly
 on the generic packed runtime, while output-only calls retain the generated
-specialization. Positive dropout, noncausal mode, deterministic mode, ALiBi,
-local windows, softcap, other dtypes, and other profiles remain outside this
-diagnostic subset.
+specialization. Positive-dropout diagnostics, noncausal diagnostics,
+deterministic mode, ALiBi, local windows, softcap, other dtypes, and other
+profiles remain outside this diagnostic subset.
 
 The three checked-in batch-1 Llama GQA decode profiles (one query token and a
 1K, 4K, or 16K KV sequence) support `return_attn_probs=True` through both
@@ -166,13 +166,15 @@ values during zero-dropout training. On SM90, calls that omit `softmax_scale`
 use raw PyTorch BSHD Flash gradients, falling back to the generated backward
 when Flash is unavailable. Explicit-scale, non-SM90, and deterministic calls
 retain the generated backward. This profile, the BERT-base profile above, and
-the shipped causal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2 profile accept
-`0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and KV-packed APIs,
-with either the default or a custom scale. Zero-dropout calls that do not need
-backward retain each generated specialization. Zero-dropout GPT-2 training also
-accepts `deterministic=True` with either scale through the direct math operator
-used by BERT-base. The exact global causal 2K Llama GQA profile above provides
-the same deterministic training contract through its dense and KV-packed APIs.
+both shipped causal and noncausal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2
+profiles accept `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and
+KV-packed APIs, with either the default or a custom scale. Zero-dropout calls
+that do not need backward retain each generated specialization. Zero-dropout
+causal GPT-2 training also accepts `deterministic=True` with either scale
+through the direct math operator used by BERT-base; the noncausal profile's
+deterministic training remains unsupported. The exact global causal 2K Llama
+GQA profile above provides the same deterministic training contract through
+its dense and KV-packed APIs.
 Other dropout calls, other local windows, softcap outside the exact dense,
 varlen, and paged subsets described here, dense diagnostic returns outside the
 subsets above, and deterministic dropout still fail explicitly as described
@@ -977,8 +979,8 @@ global causal bf16 `(1, 2048, 2048, 32, 8, 128)` Llama GQA profiles use the
 direct math SDPA operator for deterministic zero-dropout training. The Llama
 profile supports either scale through the dense and KV-packed APIs only; local
 windows and optional features remain excluded. The encoder-training profile,
-BERT-base profile, and causal GPT-2 profile use PyTorch SDPA when
-`0 < dropout_p < 1`.
+BERT-base profile, and causal and noncausal GPT-2 profiles use PyTorch SDPA
+when `0 < dropout_p < 1`.
 Default-option dense MHA, GQA, and cross-attention calls without a generated
 backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
 causal masking. Packed varlen calls remain forward-only except for full-length
@@ -1000,9 +1002,9 @@ doing something else:
   full-length global slope-free bf16 BERT-base varlen
   `(16, 512, 512, 12, 12, 64)` profile, and the exact full-length bf16 varlen
   `(8, 512, 512, 16, 16, 64)` profiles in either causal mode
-- dropout outside the exact encoder-training, BERT-base, and causal GPT-2
-  profiles above, or combined with ALiBi, diagnostic returns, local windows,
-  softcap, or deterministic mode
+- dropout outside the exact encoder-training, BERT-base, and causal or
+  noncausal GPT-2 profiles above, or combined with ALiBi, diagnostic returns,
+  local windows, softcap, or deterministic mode
 - sliding-window attention outside these exceptions: finite symmetric
   `window_size=(radius, radius)` (`radius >= 0`) on the noncausal bf16 varlen
   self-attention profile, exact `window_size=(127, 0)` on the causal bf16
