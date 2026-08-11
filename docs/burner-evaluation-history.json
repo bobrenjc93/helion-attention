@@ -4168,6 +4168,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:9e475d7ddf98c18b4c7400c1d37d0b040fd6eb1b",
+      "commit": "9e475d7ddf98c18b4c7400c1d37d0b040fd6eb1b",
+      "recordedAt": "2026-08-11T06:29:46.661Z",
+      "label": "base 9e475d7",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:181",
+      "recordedAt": "2026-08-11T06:29:46.661Z",
+      "label": "PR #181",
+      "kind": "leaf",
+      "prNumber": 181,
+      "title": "Backpropagate full-length BERT-base varlen attention",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
