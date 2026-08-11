@@ -204,11 +204,13 @@ retain the existing generic inference dispatch for both ragged and full-length
 inputs. Slope-free, global, zero-dropout backward is additionally supported when
 all sixteen query and key sequences have length 512. That path reshapes the
 packed tensors to one dense PyTorch SDPA call and provides Q/K/V gradients
-through the unpacked and QKV/KV-packed APIs at either scale. Ragged and
-diagnostic backward, paging, dropout, windows, softcap, ALiBi diagnostics and
-backward, and deterministic diagnostics and backward remain explicitly
-unsupported. This is narrow generic fallback coverage, not a generated varlen
-specialization, so `is_varlen_shape_supported` remains false for this profile.
+through the unpacked and QKV/KV-packed APIs at either scale. With
+`deterministic=True`, that exact full-length path uses direct math SDPA for
+bitwise-repeatable outputs and Q/K/V gradients. Ragged and diagnostic backward,
+paging, dropout, windows, softcap, ALiBi diagnostics and backward, deterministic
+diagnostics, and deterministic ragged backward remain explicitly unsupported.
+This is narrow generic fallback coverage, not a generated varlen specialization,
+so `is_varlen_shape_supported` remains false for this profile.
 
 A second deliberately unregistered varlen profile is callable through the
 same runtime: causal bf16 Llama-3 GQA with maximum shape
@@ -328,8 +330,8 @@ to use the generated varlen kernel, including ragged and full-length calls. The
 BERT-base varlen profile above likewise keeps its generic packed inference
 dispatch for both layouts.
 Ragged noncausal batches, batches with no nonempty queries, cross-attention
-batches with any empty key slot, deterministic mode outside these exact
-batch-8 full-length profiles (including on BERT-base), paged caches, ALiBi,
+batches with any empty key slot, deterministic mode outside the exact
+full-length BERT-base and batch-8 profiles described above, paged caches, ALiBi,
 ragged diagnostic returns, and positive dropout remain explicitly unsupported
 for varlen backward.
 
@@ -933,8 +935,10 @@ doing something else:
   key slots, graph-captured ragged batches, and KV-cache calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback,
   except for zero-dropout training on the exact bf16 BERT-base and causal GPT-2
-  `(2, 1024, 1024, 32, 32, 64)` profiles and the exact full-length bf16 varlen
-  `(8, 512, 512, 16, 16, 64)` profiles in either causal mode
+  `(2, 1024, 1024, 32, 32, 64)` dense profiles, the exact full-length global
+  slope-free bf16 BERT-base varlen `(16, 512, 512, 12, 12, 64)` profile, and the
+  exact full-length bf16 varlen `(8, 512, 512, 16, 16, 64)` profiles in either
+  causal mode
 - dropout outside the exact encoder-training, BERT-base, and causal GPT-2
   profiles above, or combined with ALiBi, diagnostic returns, local windows,
   softcap, or deterministic mode
