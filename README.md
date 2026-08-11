@@ -438,18 +438,19 @@ a custom `softmax_scale` and optional fp32 LSE, use the generic packed Triton
 runtime for partial or tensor-selected spans, and never mutate the cache. A
 paired one-token K/V update at a Python-integer position from 0 through 1022
 mutates that slot and attends through the appended prefix with the same scale
-and LSE options. These partial appends do not support rotary. Omitting the
-length or passing 1024 as a Python integer retains the checked-in generated
-dispatch, as does the existing final-slot append at position 1023. That append
-also accepts the exact CUDA int32 tensor value `[1023]`, leaves the length
-tensor unchanged, supports either scale and optional fp32 LSE, and retains the
-same generated dispatch. This tensor-selected update optionally applies
-full-head interleaved rotary to Q and the appended K at position 1023;
-half-head interleaved and GPT-NeoX rotary remain unsupported. Other tensor
-values remain read-only. Tensor updates reject left padding, cache remapping,
-ALiBi, windows, softcap, explicit split counts, autograd, and CUDA graph
-capture. Noncausal tensor spans and tensor spans on other 1K profiles remain
-unsupported.
+and LSE options. These partial appends optionally apply full-head interleaved
+rotary to Q and the appended K. Other rotary dimensions and GPT-NeoX rotary
+remain unsupported on this partial path. Omitting the length or passing 1024
+as a Python integer retains the checked-in generated dispatch, as does the
+existing final-slot append at position 1023. That append also accepts the exact
+CUDA int32 tensor value `[1023]`, leaves the length tensor unchanged, supports
+either scale and optional fp32 LSE, and retains the same generated dispatch.
+This tensor-selected update optionally applies full-head interleaved rotary to
+Q and the appended K at position 1023; half-head interleaved and GPT-NeoX
+rotary remain unsupported. Other tensor values remain read-only. Tensor
+updates reject left padding, cache remapping, ALiBi, windows, softcap, explicit
+split counts, autograd, and CUDA graph capture. Noncausal tensor spans and
+tensor spans on other 1K profiles remain unsupported.
 
 The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
 through 4095 for read-only prefix attention, optionally with ALiBi as described
@@ -629,11 +630,11 @@ The append mutates both dense caches in place and attends over the updated full
 cache. The exact causal bf16 1K profile additionally permits Python-integer
 positions 0 through 1022, while the exact bf16 4K profile permits positions 0
 through 4094; both attend over the updated prefix ending at that position. The
-1K partial appends reject rotary. The 4K non-final appends optionally apply
-full-head interleaved or GPT-NeoX rotary, or D64 half-head interleaved rotary,
-to Q and the appended K at that position. Both use the generic packed runtime;
-the final-slot append continues to use the generated specialization. The exact
-two-token profile
+1K partial appends optionally apply full-head interleaved rotary. The 4K
+non-final appends optionally apply full-head interleaved or GPT-NeoX rotary, or
+D64 half-head interleaved rotary, to Q and the appended K at that position.
+Both use the generic packed runtime; the final-slot append continues to use the
+generated specialization. The exact two-token profile
 above similarly accepts paired K/V tensors shaped `[1, 2, 8, 128]` at Python
 integer `cache_seqlens` positions 0 through 1022 and mutates only those two
 slots. Non-final positions attend through the appended prefix; position 1022
@@ -660,8 +661,10 @@ memory; update `k`/`v` aliases are staged safely.
 A Python-integer one-token final-slot append accepts paired, contiguous
 `rotary_cos` and `rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
 `seqlen_ro >= S_CACHE` and the same CUDA dtype/device as `q`. The exact causal
-bf16 1K append selected by the CUDA int32 tensor value `[1023]` accepts the same
-metadata only for full-head rotation with the default interleaved layout. The
+bf16 1K partial append accepts the same metadata only for full-head rotation
+with the default interleaved layout. The exact causal bf16 1K append selected
+by the CUDA int32 tensor value `[1023]` accepts the same metadata only for
+full-head rotation with the default interleaved layout. The
 interleaved layout rotates adjacent pairs in `q` and `new_k` at position
 `cache_seqlens`; the rotated key is what the cache stores. For Python-integer
 one-token appends, `rotary_dim` may be the full head dimension, or 64 for a D128
