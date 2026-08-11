@@ -4963,6 +4963,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:06aca46a244f3445d4b936464294ba56376905e3",
+      "commit": "06aca46a244f3445d4b936464294ba56376905e3",
+      "recordedAt": "2026-08-11T19:16:02.539Z",
+      "label": "base 06aca46",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:210",
+      "recordedAt": "2026-08-11T19:16:02.539Z",
+      "label": "PR #210",
+      "kind": "leaf",
+      "prNumber": 210,
+      "title": "Combine ALiBi with ragged 2K Llama-3 diagnostics",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
