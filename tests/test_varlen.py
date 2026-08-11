@@ -2093,8 +2093,16 @@ def test_varlen_matches_fp32_sdpa_with_dynamic_token_totals(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
-    attention: str, entry_point: str, softmax_scale: float | None
+@pytest.mark.parametrize(
+    "alibi_layout",
+    [None, "heads", "batch-heads"],
+    ids=["slope-free", "head-slopes", "batch-head-slopes"],
+)
+def test_bert_base_varlen_ragged_attention_with_optional_alibi_matches_fp32_and_fa2(
+    attention: str,
+    entry_point: str,
+    softmax_scale: float | None,
+    alibi_layout: str | None,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = BERT_BASE_VARLEN_INFERENCE
@@ -2120,6 +2128,15 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
         if softmax_scale is None
         else softmax_scale
     )
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    if alibi_layout is None:
+        slopes = None
+    elif alibi_layout == "heads":
+        slopes = head_slopes
+    else:
+        slopes = torch.stack(
+            [head_slopes.roll(batch) for batch in range(spec.batch)], dim=0
+        )
 
     with torch.no_grad():
         if entry_point == "unpacked":
@@ -2133,6 +2150,7 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
                 spec.seqlen_k,
                 softmax_scale=softmax_scale,
                 causal=False,
+                alibi_slopes=slopes,
                 shape=spec,
             )
             expected_fa2 = flash_attn.flash_attn_varlen_func(
@@ -2145,6 +2163,7 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
                 spec.seqlen_k,
                 softmax_scale=softmax_scale,
                 causal=False,
+                alibi_slopes=slopes,
             )
         elif entry_point == "qkv-packed":
             qkv = torch.stack((q, k, v), dim=1)
@@ -2154,6 +2173,7 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
                 spec.seqlen_q,
                 softmax_scale=softmax_scale,
                 causal=False,
+                alibi_slopes=slopes,
                 shape=spec,
             )
             expected_fa2 = flash_attn.flash_attn_varlen_qkvpacked_func(
@@ -2162,6 +2182,7 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
                 spec.seqlen_q,
                 softmax_scale=softmax_scale,
                 causal=False,
+                alibi_slopes=slopes,
             )
         else:
             kv = torch.stack((k, v), dim=1)
@@ -2174,6 +2195,7 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
                 spec.seqlen_k,
                 softmax_scale=softmax_scale,
                 causal=False,
+                alibi_slopes=slopes,
                 shape=spec,
             )
             expected_fa2 = flash_attn.flash_attn_varlen_kvpacked_func(
@@ -2185,6 +2207,7 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
                 spec.seqlen_k,
                 softmax_scale=softmax_scale,
                 causal=False,
+                alibi_slopes=slopes,
             )
         expected_fp32 = reference_packed(
             q,
@@ -2194,6 +2217,7 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
             lengths_k,
             causal=False,
             scale=scale,
+            alibi_slopes=slopes,
         )
 
     assert not helion_attention.is_varlen_shape_supported(
@@ -2202,6 +2226,12 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
     if attention == "cross":
         assert cu_q.data_ptr() != cu_k.data_ptr()
         assert q.shape[0] != k.shape[0]
+    if slopes is not None:
+        assert slopes.shape == (
+            (spec.batch, spec.nheads_q)
+            if alibi_layout == "batch-heads"
+            else (spec.nheads_q,)
+        )
     torch.testing.assert_close(
         got.float(), expected_fp32, atol=5e-2, rtol=2e-2
     )
@@ -2219,7 +2249,6 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
             "window_size", (7, 7), "sliding-window", id="window"
         ),
         pytest.param("softcap", 50.0, "softcap", id="softcap"),
-        pytest.param("alibi_slopes", "slopes", "ALiBi slopes", id="alibi"),
         pytest.param(
             "return_attn_probs",
             True,
@@ -2228,10 +2257,12 @@ def test_bert_base_varlen_ragged_attention_matches_fp32_and_fa2(
         ),
     ],
 )
+@pytest.mark.parametrize("with_alibi", [False, True], ids=["plain", "alibi"])
 def test_bert_base_varlen_rejects_optional_features_before_generic_dispatch(
     option: str,
     value: object,
     message: str,
+    with_alibi: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = BERT_BASE_VARLEN_INFERENCE
@@ -2245,16 +2276,19 @@ def test_bert_base_varlen_rejects_optional_features_before_generic_dispatch(
     k = torch.zeros_like(q)
     v = torch.zeros_like(k)
     cu_seqlens = torch.arange(spec.batch + 1, device=q.device, dtype=torch.int32)
-    if value == "slopes":
-        value = torch.ones(spec.nheads_q, device=q.device)
-
     def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
         raise AssertionError("unsupported BERT-base option reached dispatch")
 
     monkeypatch.setattr(
         helion_attention, "_generic_varlen_forward", reject_dispatch
     )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_alibi_forward", reject_dispatch
+    )
     monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    kwargs = {option: value}
+    if with_alibi:
+        kwargs["alibi_slopes"] = torch.ones(spec.nheads_q, device=q.device)
     with pytest.raises(NotImplementedError, match=message):
         helion_attention.flash_attn_varlen_func(
             q,
@@ -2266,8 +2300,60 @@ def test_bert_base_varlen_rejects_optional_features_before_generic_dispatch(
             spec.seqlen_k,
             causal=False,
             shape=spec,
-            **{option: value},
+            **kwargs,
         )
+
+
+@requires_cuda
+def test_bert_base_varlen_without_alibi_retains_generic_inference_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = BERT_BASE_VARLEN_INFERENCE
+    q = torch.zeros(
+        spec.batch,
+        spec.nheads_q,
+        spec.head_dim,
+        device="cuda",
+        dtype=spec.dtype,
+    )
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(k)
+    cu_seqlens = torch.arange(spec.batch + 1, device=q.device, dtype=torch.int32)
+    sentinel = torch.empty_like(q)
+    calls: list[tuple[object, ...]] = []
+
+    def generic(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(args)
+        return sentinel
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("slope-free BERT-base call changed dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_varlen_forward", generic)
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_alibi_forward", reject_dispatch
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens,
+            cu_seqlens,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=False,
+            alibi_slopes=None,
+            shape=spec,
+        )
+
+    assert got is sentinel
+    assert len(calls) == 1
 
 
 @requires_cuda
@@ -2335,7 +2421,22 @@ def test_bert_base_varlen_rejects_backward_before_generic_dispatch(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    ("with_alibi", "exception", "message"),
+    [
+        pytest.param(
+            False,
+            helion_attention.UnsupportedShapeError,
+            "block_table currently supports",
+            id="plain",
+        ),
+        pytest.param(True, NotImplementedError, "ALiBi", id="alibi"),
+    ],
+)
 def test_bert_base_varlen_rejects_paging_before_dispatch(
+    with_alibi: bool,
+    exception: type[Exception],
+    message: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     spec = BERT_BASE_VARLEN_INFERENCE
@@ -2365,9 +2466,10 @@ def test_bert_base_varlen_rejects_paging_before_dispatch(
     monkeypatch.setattr(
         helion_attention, "_generic_paged_varlen_forward", reject_dispatch
     )
-    with pytest.raises(
-        helion_attention.UnsupportedShapeError, match="block_table currently supports"
-    ):
+    slopes = (
+        torch.ones(spec.nheads_q, device=q.device) if with_alibi else None
+    )
+    with pytest.raises(exception, match=message):
         helion_attention.flash_attn_varlen_func(
             q,
             k,
@@ -2377,6 +2479,7 @@ def test_bert_base_varlen_rejects_paging_before_dispatch(
             spec.seqlen_q,
             spec.seqlen_k,
             causal=False,
+            alibi_slopes=slopes,
             block_table=block_table,
             shape=spec,
         )
@@ -6125,6 +6228,18 @@ def test_varlen_alibi_bypasses_generated_dispatch(
             AttnShape(4, 256, 256, 32, 8, 128, torch.float16, True),
             id="llama3-fp16",
         ),
+        pytest.param(
+            AttnShape(16, 511, 511, 12, 12, 64, torch.bfloat16, False),
+            id="bert-other-maxima",
+        ),
+        pytest.param(
+            AttnShape(16, 512, 512, 12, 12, 64, torch.bfloat16, True),
+            id="bert-causal",
+        ),
+        pytest.param(
+            AttnShape(16, 512, 512, 12, 12, 64, torch.float16, False),
+            id="bert-fp16",
+        ),
     ],
 )
 def test_varlen_alibi_rejects_other_profiles(
@@ -6162,8 +6277,8 @@ def test_varlen_alibi_rejects_other_profiles(
 @pytest.mark.parametrize("gradient_source", ["q", "slopes"])
 @pytest.mark.parametrize(
     "spec",
-    (*VARLEN_ALIBI_PROFILES, LLAMA3_VARLEN_INFERENCE),
-    ids=["causal", "noncausal", "llama3-gqa"],
+    (*VARLEN_ALIBI_PROFILES, LLAMA3_VARLEN_INFERENCE, BERT_BASE_VARLEN_INFERENCE),
+    ids=["causal", "noncausal", "llama3-gqa", "bert-base"],
 )
 def test_varlen_alibi_rejects_gradients_before_dispatch(
     gradient_source: str, spec: AttnShape, monkeypatch: pytest.MonkeyPatch

@@ -9,11 +9,12 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base diagnostics with optional ALiBi, ragged BERT-base varlen
-inference, causal GPT-2 diagnostics, one causal Llama-3 GQA varlen inference
-profile, ALiBi with optional diagnostics on that profile and the shipped causal
-varlen profile, ALiBi on both shipped varlen profiles, and symmetric windows on
-the shipped noncausal varlen profile use a generic Triton forward kernel. The
-same runtime exposes exactly a 127-token left plus current-token causal window
+inference with optional ALiBi, causal GPT-2 diagnostics, one causal Llama-3 GQA
+varlen inference profile, ALiBi with optional diagnostics on that profile and
+the shipped causal varlen profile, ALiBi on both shipped varlen profiles, and
+symmetric windows on the shipped noncausal varlen profile use a generic Triton
+forward kernel. The same runtime exposes exactly a 127-token left plus
+current-token causal window
 for the full-length shipped causal varlen profile, while its global-window call
 retains generated dispatch. It also exposes every causal left window from the
 current token alone through the full 2K context for the bf16 batch-1 2K Llama
@@ -182,6 +183,7 @@ _GENERIC_VARLEN_INFERENCE_KEYS = frozenset(
 )
 _VARLEN_ALIBI_KEYS = frozenset(
     {
+        _BERT_BASE_VARLEN_INFERENCE_KEY,
         _LLAMA3_VARLEN_INFERENCE_KEY,
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal",
         "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal",
@@ -2087,8 +2089,11 @@ def flash_attn_varlen_func(
     unpacked and KV-packed entry points support self- or cross-attention, while
     the QKV-packed entry point supports self-attention. All three accept the
     default or a custom ``softmax_scale`` and use the generic packed Triton
-    runtime. Backward, paging, dropout, ALiBi, diagnostic returns, windows, and
-    softcap remain unsupported. This is generic fallback coverage, so
+    runtime. Forward-only calls may additionally supply fp32 ALiBi slopes shaped
+    ``[12]`` or ``[16, 12]``; slope-free calls retain their existing generic
+    dispatch. Backward, paging, dropout, diagnostic returns, windows, and
+    softcap remain unsupported, including in combination with ALiBi. This is
+    generic fallback coverage, so
     :func:`is_varlen_shape_supported` remains false for this profile.
 
     Causal bf16 Llama-3 GQA attention with maximum shape
