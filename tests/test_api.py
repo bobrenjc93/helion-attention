@@ -2003,6 +2003,35 @@ def test_gemma2_softcap_finite_range_boundaries_preserve_uniform_attention(
 
 
 @requires_cuda
+def test_gemma2_softcap_supports_cuda_graph_capture() -> None:
+    spec = GEMMA2_SOFTCAP
+    q, k, v = make_inputs(spec, seed=271828)
+
+    def run() -> torch.Tensor:
+        result = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            softcap=GEMMA2_SOFTCAP_VALUE,
+            shape=spec,
+        )
+        assert isinstance(result, torch.Tensor)
+        return result
+
+    with torch.no_grad():
+        expected = run().clone()
+        torch.cuda.synchronize(q.device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+        graph.replay()
+        torch.cuda.synchronize(q.device)
+
+    torch.testing.assert_close(captured, expected)
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     "softcap",
     [0.0, GEMMA2_NON_DIAGNOSTIC_SOFTCAP, GEMMA2_SOFTCAP_VALUE],

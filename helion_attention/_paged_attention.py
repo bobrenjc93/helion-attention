@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import struct
+
 import torch
 import triton
 import triton.language as tl
@@ -60,7 +63,9 @@ def _varlen_attention_kernel(
     stride_sink_b,
     stride_sink_h,
     softmax_scale,
-    softcap_ptr,
+    softcap_high,
+    softcap_low,
+    softcap_exponent,
     window_left,
     window_right,
     max_seqlen_q_value,
@@ -82,6 +87,7 @@ def _varlen_attention_kernel(
     HAS_SINK: tl.constexpr,
     HAS_CP_TOTAL: tl.constexpr,
     HAS_SOFTCAP: tl.constexpr,
+    EXTREME_SOFTCAP: tl.constexpr,
     STORE_LSE: tl.constexpr,
     SHIFT_FA2_LSE: tl.constexpr,
     HAS_DYNAMIC_MAX_Q: tl.constexpr,
@@ -268,14 +274,21 @@ def _varlen_attention_kernel(
                 )
         scores *= softmax_scale
         if HAS_SOFTCAP:
-            # Load from device storage because Triton 3.0-3.3 narrow Python
-            # float kernel arguments to fp32 even with an fp64 annotation.
-            softcap = tl.load(softcap_ptr)
-            # Use tanh directly: the sigmoid identity loses scores when
-            # scores / softcap is small. Attention accumulation remains fp32.
-            scores = (
-                softcap * libdevice.tanh(scores.to(tl.float64) / softcap)
-            ).to(tl.float32)
+            if EXTREME_SOFTCAP:
+                # Two fp32 mantissa words plus an int exponent survive the
+                # scalar binder on Triton 3.0-3.3 and reconstruct the cap
+                # without a graph-unsafe host-to-device copy.
+                mantissa = softcap_high.to(tl.float64) + softcap_low.to(
+                    tl.float64
+                )
+                softcap = libdevice.ldexp(mantissa, softcap_exponent)
+                scores = (
+                    softcap * libdevice.tanh(scores.to(tl.float64) / softcap)
+                ).to(tl.float32)
+            else:
+                # Ordinary fp32 caps retain the latency-sensitive path while
+                # direct tanh avoids cancellation for large representable caps.
+                scores = softcap_high * libdevice.tanh(scores / softcap_high)
 
         score_mask = (
             valid_m[:, None]
@@ -391,9 +404,23 @@ def _head_metadata_strides(
     raise ValueError("head metadata must be scalar, [heads], or [batch, heads]")
 
 
-def _softcap_device_value(softcap: float, device: torch.device) -> torch.Tensor:
-    """Transport a Python softcap without Triton scalar-argument narrowing."""
-    return torch.tensor(softcap, device=device, dtype=torch.float64)
+_FP32_MIN_NORMAL = float.fromhex("0x1.0p-126")
+_FP32_MAX = float.fromhex("0x1.fffffep+127")
+
+
+def _as_float32(value: float) -> float:
+    """Round a Python float exactly as Triton's legacy scalar binder does."""
+    return struct.unpack("=f", struct.pack("=f", value))[0]
+
+
+def _softcap_kernel_args(softcap: float) -> tuple[float, float, int, bool]:
+    """Encode a softcap in capture-safe scalar kernel arguments."""
+    if _FP32_MIN_NORMAL <= softcap <= _FP32_MAX:
+        return softcap, 0.0, 0, False
+    mantissa, exponent = math.frexp(softcap)
+    high = _as_float32(mantissa)
+    low = _as_float32(mantissa - high)
+    return high, low, exponent, True
 
 
 def _attention(
@@ -494,10 +521,10 @@ def _attention(
         else dynamic_max_seqlen_k
     )
     has_softcap = softcap > 0.0
-    # HAS_SOFTCAP makes the pointer unused for ordinary attention. Reusing q
-    # there avoids a device allocation and preserves its existing launch path.
-    softcap_arg = (
-        _softcap_device_value(softcap, q.device) if has_softcap else q
+    softcap_high, softcap_low, softcap_exponent, extreme_softcap = (
+        _softcap_kernel_args(softcap)
+        if has_softcap
+        else (0.0, 0.0, 0, False)
     )
 
     if paged:
@@ -555,7 +582,9 @@ def _attention(
             skb,
             skh,
             softmax_scale,
-            softcap_arg,
+            softcap_high,
+            softcap_low,
+            softcap_exponent,
             window_size[0],
             window_size[1],
             max_seqlen_q,
@@ -577,6 +606,7 @@ def _attention(
             HAS_SINK=s_aux is not None,
             HAS_CP_TOTAL=cp_tot_seqused_k is not None,
             HAS_SOFTCAP=has_softcap,
+            EXTREME_SOFTCAP=extreme_softcap,
             STORE_LSE=return_softmax_lse,
             SHIFT_FA2_LSE=shift_fa2_lse,
             HAS_DYNAMIC_MAX_Q=dynamic_max_seqlen_q is not None,
