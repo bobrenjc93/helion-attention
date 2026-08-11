@@ -155,8 +155,8 @@ Dense calls do not need a checked-in specialization. Contiguous CUDA fp16 and
 bf16 MHA/GQA inputs with `head_dim <= 256` use the generic Triton forward when
 their exact shape is absent, including unequal query/key lengths and
 bottom-right causal masking. Grad-enabled calls without a generated backward
-use PyTorch SDPA autograd instead; the exact BERT-base profile above, causal
-GPT-2 profile below, and global causal bf16
+use PyTorch SDPA autograd instead; the exact BERT-base profile above, both
+GPT-2 profiles below, and global causal bf16
 `(1, 2048, 2048, 32, 8, 128)` Llama GQA profile use its direct math operator
 when deterministic backward is requested. Dense ALiBi forward calls accept
 fp32 slopes shaped `[nheads]` or `[batch, nheads]` and always use the generic
@@ -172,11 +172,10 @@ both shipped causal and noncausal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2
 profiles accept `0 < dropout_p < 1` through SDPA in the dense, QKV-packed, and
 KV-packed APIs, with either the default or a custom scale. Zero-dropout calls
 that do not need backward retain each generated specialization. Zero-dropout
-causal GPT-2 training also accepts `deterministic=True` with either scale
-through the direct math operator used by BERT-base; the noncausal profile's
-deterministic training remains unsupported. The exact global causal 2K Llama
-GQA profile above provides the same deterministic training contract through
-its dense and KV-packed APIs.
+causal and noncausal GPT-2 training also accepts `deterministic=True` with
+either scale through the direct math operator used by BERT-base. The exact
+global causal 2K Llama GQA profile above provides the same deterministic
+training contract through its dense and KV-packed APIs.
 Other dropout calls, other local windows, softcap outside the exact dense,
 varlen, and paged subsets described here, dense diagnostic returns outside the
 subsets above, and deterministic dropout still fail explicitly as described
@@ -979,13 +978,14 @@ The non-causal bf16 `(batch=8, seqlen=512, nheads=16, head_dim=64)` shape keeps
 its generated forward during zero-dropout training. Omitted-scale SM90 calls
 use raw PyTorch BSHD Flash gradients with a generated-backward fallback;
 custom-scale, non-SM90, and deterministic calls retain the checked-in generated
-backward. The BERT-base, causal bf16 `(2, 1024, 1024, 32, 32, 64)` GPT-2, and
-global causal bf16 `(1, 2048, 2048, 32, 8, 128)` Llama GQA profiles use the
-direct math SDPA operator for deterministic zero-dropout training. The Llama
-profile supports either scale through the dense and KV-packed APIs only; local
-windows and optional features remain excluded. The encoder-training profile,
-BERT-base profile, and causal and noncausal GPT-2 profiles use PyTorch SDPA
-when `0 < dropout_p < 1`.
+backward. The BERT-base, causal and noncausal bf16
+`(2, 1024, 1024, 32, 32, 64)` GPT-2, and global causal bf16
+`(1, 2048, 2048, 32, 8, 128)` Llama GQA profiles use the direct math SDPA
+operator for deterministic zero-dropout training. The Llama profile supports
+either scale through the dense and KV-packed APIs only; local windows and
+optional features remain excluded. The encoder-training profile, BERT-base
+profile, and causal and noncausal GPT-2 profiles use PyTorch SDPA when
+`0 < dropout_p < 1`.
 Default-option dense MHA, GQA, and cross-attention calls without a generated
 backward also use PyTorch SDPA autograd, including fp16/bf16 and bottom-right
 causal masking. Packed varlen calls remain forward-only except for full-length
@@ -1001,10 +1001,10 @@ doing something else:
   batches with no nonempty queries, graph-captured ragged batches, and KV-cache
   calls
 - `deterministic=True` when using the dense or varlen SDPA autograd fallback,
-  except for zero-dropout training on the exact bf16 BERT-base and causal GPT-2
-  `(2, 1024, 1024, 32, 32, 64)` dense profiles, the global causal bf16 Llama
-  GQA `(1, 2048, 2048, 32, 8, 128)` dense/KV-packed profile, the exact
-  full-length global slope-free bf16 BERT-base varlen
+  except for zero-dropout training on the exact bf16 BERT-base and causal and
+  noncausal GPT-2 `(2, 1024, 1024, 32, 32, 64)` dense profiles, the global
+  causal bf16 Llama GQA `(1, 2048, 2048, 32, 8, 128)` dense/KV-packed profile,
+  the exact full-length global slope-free bf16 BERT-base varlen
   `(16, 512, 512, 12, 12, 64)` profile, and the exact full-length bf16 varlen
   `(8, 512, 512, 16, 16, 64)` profiles in either causal mode
 - dropout outside the exact encoder-training, BERT-base, and causal or

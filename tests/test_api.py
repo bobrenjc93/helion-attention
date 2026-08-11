@@ -3826,8 +3826,8 @@ def test_bert_dropout_packed_forward_and_gradients_match_direct_sdpa(
 )
 @pytest.mark.parametrize(
     "spec",
-    [BERT_DIAGNOSTIC, CAUSAL_DROPOUT],
-    ids=["bert-base", "causal-gpt2"],
+    [BERT_DIAGNOSTIC, CAUSAL_DROPOUT, NONCAUSAL_DROPOUT],
+    ids=["bert-base", "causal-gpt2", "noncausal-gpt2"],
 )
 def test_dense_deterministic_training_is_repeatable_and_matches_fp32(
     entry_point: str,
@@ -3920,8 +3920,8 @@ def test_dense_deterministic_training_is_repeatable_and_matches_fp32(
 )
 @pytest.mark.parametrize(
     "spec",
-    [BERT_DIAGNOSTIC, CAUSAL_DROPOUT],
-    ids=["bert-base", "causal-gpt2"],
+    [BERT_DIAGNOSTIC, CAUSAL_DROPOUT, NONCAUSAL_DROPOUT],
+    ids=["bert-base", "causal-gpt2", "noncausal-gpt2"],
 )
 def test_dense_deterministic_training_dispatch_is_narrow(
     deterministic: bool,
