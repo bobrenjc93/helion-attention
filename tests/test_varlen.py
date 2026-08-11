@@ -43,7 +43,7 @@ VARLEN_CAUSAL_LEFT_WINDOW = VARLEN_ALIBI_CAUSAL
 VARLEN_CAUSAL_LEFT_WINDOW_SIZE = (127, 0)
 VARLEN_SOFTCAP = VARLEN_ALIBI_CAUSAL
 VARLEN_SOFTCAP_VALUE = 50.0
-VARLEN_NON_DIAGNOSTIC_SOFTCAP = 30.0
+VARLEN_NON_50_SOFTCAP = 30.0
 LLAMA3_VARLEN_INFERENCE = AttnShape(
     batch=4,
     seqlen_q=256,
@@ -533,8 +533,12 @@ def reference_softcap_packed_diagnostics(
             col = torch.arange(seqlen_k, device=q.device)[None, :]
             keep = col <= row + seqlen_k - seqlen_q
             scores.masked_fill_(~keep[None], float("-inf"))
-        softmax_lse[:, q_start : q_start + seqlen_q] = torch.logsumexp(
-            scores, dim=-1
+        lse = torch.logsumexp(scores, dim=-1)
+        # FA2 reports +inf, rather than the mathematical -inf, for query rows
+        # that have no visible keys. Match that diagnostic convention while
+        # retaining a direct fp32 calculation for every nonempty row.
+        softmax_lse[:, q_start : q_start + seqlen_q] = torch.where(
+            torch.isneginf(lse), torch.full_like(lse, float("inf")), lse
         )
         probabilities = torch.softmax(scores, dim=-1)
         # Bottom-right alignment can leave leading query rows with no keys.
@@ -6705,7 +6709,6 @@ def test_causal_varlen_return_attn_probs_false_retains_generated_dispatch(
         ("deterministic", "deterministic=False"),
         ("dropout", "dropout"),
         ("window", "sliding-window"),
-        ("softcap", "softcap"),
         ("other-shape", "causal"),
     ],
 )
@@ -6732,8 +6735,6 @@ def test_causal_varlen_return_attn_probs_rejects_out_of_scope_calls(
         kwargs["dropout_p"] = 0.1
     elif case == "window":
         kwargs["window_size"] = (128, 0)
-    elif case == "softcap":
-        kwargs["softcap"] = 1.0
     else:
         spec = AttnShape(8, 256, 256, 16, 16, 64, torch.bfloat16, True)
         kwargs["shape"] = spec
@@ -6766,7 +6767,7 @@ def test_causal_varlen_return_attn_probs_rejects_out_of_scope_calls(
     ("softcap", "softmax_scale"),
     [
         pytest.param(
-            VARLEN_NON_DIAGNOSTIC_SOFTCAP,
+            VARLEN_NON_50_SOFTCAP,
             None,
             id="cap-30-default-scale",
         ),
@@ -6958,19 +6959,38 @@ def test_causal_varlen_large_softcap_preserves_multi_key_logits(
     "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
 )
 @pytest.mark.parametrize(
-    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+    ("softcap", "softmax_scale"),
+    [
+        pytest.param(
+            VARLEN_SOFTCAP_VALUE,
+            None,
+            id="cap-50-default-scale",
+        ),
+        pytest.param(
+            VARLEN_SOFTCAP_VALUE,
+            0.37,
+            id="cap-50-custom-scale",
+        ),
+        pytest.param(
+            VARLEN_NON_50_SOFTCAP,
+            None,
+            id="cap-30-default-scale",
+        ),
+        pytest.param(80.0, 0.37, id="cap-80-custom-scale"),
+    ],
 )
-def test_causal_varlen_softcap_diagnostics_match_fa2(
+def test_causal_varlen_softcap_diagnostics_match_fa2_and_fp32(
     attention: str,
+    softcap: float,
     softmax_scale: float | None,
 ) -> None:
-    flash_attn = pytest.importorskip("flash_attn")
     spec = VARLEN_SOFTCAP
     if attention == "self":
-        q, k, v, cu_q, _ = make_ragged_self_packed(
+        q, k, v, cu_q, lengths_q = make_ragged_self_packed(
             spec, seed=20260810
         )
         cu_k = cu_q
+        lengths_k = lengths_q
     else:
         q, k, v, cu_q, cu_k, lengths_q, lengths_k = (
             make_ragged_cross_packed(spec, seed=20260810)
@@ -6983,6 +7003,11 @@ def test_causal_varlen_softcap_diagnostics_match_fa2(
     # approximation.
     q.mul_(4.0)
     k.mul_(4.0)
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
     with torch.no_grad():
         got = helion_attention.flash_attn_varlen_func(
             q,
@@ -6994,10 +7019,44 @@ def test_causal_varlen_softcap_diagnostics_match_fa2(
             spec.seqlen_k,
             softmax_scale=softmax_scale,
             causal=True,
-            softcap=VARLEN_SOFTCAP_VALUE,
+            softcap=softcap,
             return_attn_probs=True,
             shape=spec,
         )
+        expected_fp32_out, expected_fp32_lse = (
+            reference_softcap_packed_diagnostics(
+                q,
+                k,
+                v,
+                lengths_q,
+                lengths_k,
+                causal=True,
+                scale=scale,
+                softcap=softcap,
+            )
+        )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    out, softmax_lse, s_dmask = got
+    assert out.shape == q.shape
+    assert out.dtype == torch.bfloat16
+    assert softmax_lse.shape == (spec.nheads_q, q.shape[0])
+    assert softmax_lse.dtype == torch.float32
+    assert s_dmask.shape == (0,)
+    assert s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_fp32_out, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_fp32_lse, atol=5e-2, rtol=2e-3
+    )
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    with torch.no_grad():
         expected = flash_attn.flash_attn_varlen_func(
             q,
             k,
@@ -7008,24 +7067,19 @@ def test_causal_varlen_softcap_diagnostics_match_fa2(
             spec.seqlen_k,
             softmax_scale=softmax_scale,
             causal=True,
-            softcap=VARLEN_SOFTCAP_VALUE,
+            softcap=softcap,
             return_attn_probs=True,
         )
 
-    assert isinstance(got, tuple) and len(got) == 3
     assert isinstance(expected, tuple) and len(expected) == 3
-    out, softmax_lse, s_dmask = got
     expected_out, expected_lse, expected_s_dmask = expected
-    assert out.shape == expected_out.shape == q.shape
-    assert out.dtype == expected_out.dtype == torch.bfloat16
-    assert softmax_lse.shape == expected_lse.shape == (
-        spec.nheads_q,
-        q.shape[0],
-    )
-    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
-    assert s_dmask.shape == expected_s_dmask.shape == (0,)
-    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
-    assert s_dmask.device == expected_s_dmask.device == q.device
+    assert expected_out.shape == out.shape
+    assert expected_out.dtype == out.dtype
+    assert expected_lse.shape == softmax_lse.shape
+    assert expected_lse.dtype == softmax_lse.dtype
+    assert expected_s_dmask.shape == s_dmask.shape
+    assert expected_s_dmask.dtype == s_dmask.dtype
+    assert expected_s_dmask.device == s_dmask.device
     torch.testing.assert_close(
         out.float(), expected_out.float(), atol=1e-2, rtol=1e-2
     )
@@ -7050,7 +7104,7 @@ def test_causal_varlen_softcap_diagnostics_match_fa2(
     ("softcap", "softmax_scale"),
     [
         pytest.param(
-            VARLEN_NON_DIAGNOSTIC_SOFTCAP,
+            VARLEN_NON_50_SOFTCAP,
             None,
             id="cap-30-default-scale",
         ),
@@ -7116,8 +7170,26 @@ def test_varlen_packed_entry_points_inherit_softcap_support(
     ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
     ids=["qkv-packed", "kv-packed"],
 )
+@pytest.mark.parametrize(
+    ("softcap", "softmax_scale"),
+    [
+        pytest.param(
+            VARLEN_SOFTCAP_VALUE,
+            0.37,
+            id="cap-50-custom-scale",
+        ),
+        pytest.param(
+            VARLEN_NON_50_SOFTCAP,
+            None,
+            id="cap-30-default-scale",
+        ),
+        pytest.param(80.0, 0.37, id="cap-80-custom-scale"),
+    ],
+)
 def test_varlen_packed_entry_points_inherit_softcap_diagnostics(
     name: str,
+    softcap: float,
+    softmax_scale: float | None,
 ) -> None:
     spec = VARLEN_SOFTCAP
     if name == "flash_attn_varlen_qkvpacked_func":
@@ -7137,9 +7209,9 @@ def test_varlen_packed_entry_points_inherit_softcap_diagnostics(
             cu_k,
             spec.seqlen_q,
             spec.seqlen_k,
-            softmax_scale=0.37,
+            softmax_scale=softmax_scale,
             causal=True,
-            softcap=VARLEN_SOFTCAP_VALUE,
+            softcap=softcap,
             return_attn_probs=True,
             shape=spec,
         )
@@ -7148,9 +7220,9 @@ def test_varlen_packed_entry_points_inherit_softcap_diagnostics(
                 torch.stack((q, k, v), dim=1),
                 cu_q,
                 spec.seqlen_q,
-                softmax_scale=0.37,
+                softmax_scale=softmax_scale,
                 causal=True,
-                softcap=VARLEN_SOFTCAP_VALUE,
+                softcap=softcap,
                 return_attn_probs=True,
                 shape=spec,
             )
@@ -7162,9 +7234,9 @@ def test_varlen_packed_entry_points_inherit_softcap_diagnostics(
                 cu_k,
                 spec.seqlen_q,
                 spec.seqlen_k,
-                softmax_scale=0.37,
+                softmax_scale=softmax_scale,
                 causal=True,
-                softcap=VARLEN_SOFTCAP_VALUE,
+                softcap=softcap,
                 return_attn_probs=True,
                 shape=spec,
             )
@@ -7176,7 +7248,8 @@ def test_varlen_packed_entry_points_inherit_softcap_diagnostics(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "features", ["softcap", "diagnostics", "combined"]
+    "features",
+    ["softcap", "diagnostics", "combined-cap-50", "combined-non-50"],
 )
 def test_varlen_softcap_and_diagnostic_dispatch_stays_separate(
     features: str,
@@ -7211,10 +7284,12 @@ def test_varlen_softcap_and_diagnostic_dispatch_stays_separate(
 
     kwargs: dict[str, object] = {}
     if features == "softcap":
-        kwargs["softcap"] = VARLEN_NON_DIAGNOSTIC_SOFTCAP
-    elif features == "combined":
+        kwargs["softcap"] = VARLEN_NON_50_SOFTCAP
+    elif features == "combined-cap-50":
         kwargs["softcap"] = VARLEN_SOFTCAP_VALUE
-    if features in ("diagnostics", "combined"):
+    elif features == "combined-non-50":
+        kwargs["softcap"] = VARLEN_NON_50_SOFTCAP
+    if features != "softcap":
         kwargs["return_attn_probs"] = True
     with torch.no_grad():
         got = helion_attention.flash_attn_varlen_func(
@@ -7236,16 +7311,10 @@ def test_varlen_softcap_and_diagnostic_dispatch_stays_separate(
     dispatch, args, dispatch_kwargs = calls[0]
     assert dispatch == expected_dispatch
     assert len(args) == 7
-    expected_kwargs = {
-        "softcap": (
-            VARLEN_NON_DIAGNOSTIC_SOFTCAP
-            if features == "softcap"
-            else VARLEN_SOFTCAP_VALUE
-        )
-    }
-    assert dispatch_kwargs == (
-        {} if features == "diagnostics" else expected_kwargs
+    expected_kwargs = (
+        {} if features == "diagnostics" else {"softcap": kwargs["softcap"]}
     )
+    assert dispatch_kwargs == expected_kwargs
 
 
 @requires_cuda
@@ -7273,7 +7342,7 @@ def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0, seed=223607)
     kwargs: dict[str, object] = {
         "causal": True,
-        "softcap": VARLEN_NON_DIAGNOSTIC_SOFTCAP,
+        "softcap": VARLEN_NON_50_SOFTCAP,
         "shape": spec,
     }
     if case == "negative-cap":
@@ -7333,7 +7402,9 @@ def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        ("other-cap", "only as softcap=50.0"),
+        ("negative-cap", "finite positive"),
+        ("nonfinite-cap", "finite positive"),
+        ("nan-cap", "finite positive"),
         ("noncausal", "only.*causal varlen"),
         ("other-shape", "only.*causal varlen"),
         ("fp16", "only.*causal varlen"),
@@ -7342,7 +7413,7 @@ def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
         ("alibi", "softcap combined with ALiBi"),
         ("window", "sliding-window"),
         ("deterministic", "deterministic=False"),
-        ("paging", "block_table"),
+        ("paging", "only as softcap=50.0"),
     ],
 )
 def test_varlen_softcap_diagnostics_reject_out_of_scope_calls_before_dispatch(
@@ -7354,12 +7425,16 @@ def test_varlen_softcap_diagnostics_reject_out_of_scope_calls_before_dispatch(
     q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0, seed=244949)
     kwargs: dict[str, object] = {
         "causal": True,
-        "softcap": VARLEN_SOFTCAP_VALUE,
+        "softcap": VARLEN_NON_50_SOFTCAP,
         "return_attn_probs": True,
         "shape": spec,
     }
-    if case == "other-cap":
-        kwargs["softcap"] = 49.0
+    if case == "negative-cap":
+        kwargs["softcap"] = -1.0
+    elif case == "nonfinite-cap":
+        kwargs["softcap"] = float("inf")
+    elif case == "nan-cap":
+        kwargs["softcap"] = float("nan")
     elif case == "noncausal":
         spec = VARLEN_ALIBI_NONCAUSAL
         kwargs.update(causal=False, shape=spec)
