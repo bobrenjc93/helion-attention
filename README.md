@@ -426,12 +426,15 @@ CUDA int32 tensor shaped `[1]`; an optional matching `cache_leftpad` selects
 `[cache_leftpad, cache_seqlens)`, with
 `0 <= cache_leftpad < cache_seqlens <= 1024`. Both forms support the default or
 a custom `softmax_scale` and optional fp32 LSE, use the generic packed Triton
-runtime for partial or tensor-selected spans, and never mutate the cache.
-Omitting the length or passing 1024 as a Python integer retains the checked-in
-generated dispatch, as does the existing final-slot append at position 1023.
-That append also accepts the exact CUDA int32 tensor value `[1023]`, leaves the
-length tensor unchanged, supports either scale and optional fp32 LSE, and
-retains the same generated dispatch. Other tensor values remain read-only.
+runtime for partial or tensor-selected spans, and never mutate the cache. A
+paired one-token K/V update at a Python-integer position from 0 through 1022
+mutates that slot and attends through the appended prefix with the same scale
+and LSE options. These partial appends do not support rotary. Omitting the
+length or passing 1024 as a Python integer retains the checked-in generated
+dispatch, as does the existing final-slot append at position 1023. That append
+also accepts the exact CUDA int32 tensor value `[1023]`, leaves the length
+tensor unchanged, supports either scale and optional fp32 LSE, and retains the
+same generated dispatch. Other tensor values remain read-only.
 Tensor updates reject left padding, cache remapping, rotary, ALiBi, windows,
 softcap, explicit split counts, autograd, and CUDA graph capture. Noncausal
 tensor spans and tensor spans on other 1K profiles remain unsupported.
@@ -470,9 +473,9 @@ recoverable bounds validation. Updates, cache remapping, rotary, windows,
 softcap, explicit split counts, autograd, and CUDA graph capture remain
 unsupported. Tensor-selected ALiBi with noncausal attention or on other dense
 profiles also remains unsupported. Scalar prefixes and tensor
-spans on other dense profiles, plus non-final appends outside this 4K profile,
-remain unsupported except for the separately documented two-token 1K update
-and 1K and 16K read slices.
+spans on other dense profiles, plus non-final appends outside this 4K profile
+and the causal single-token 1K profile, remain unsupported except for the
+separately documented two-token 1K update and 1K and 16K read slices.
 
 Two strict speculative-decoding slices use the generic packed Triton runtime
 with a dense cache. Causal bf16 `(1, 2, 1024, 32, 8, 128)` accepts either the
@@ -610,12 +613,13 @@ out = helion_attention.flash_attn_with_kvcache(
 ```
 
 The append mutates both dense caches in place and attends over the updated full
-cache. The exact bf16 4K profile additionally permits positions 0 through 4094
-and attends over the updated prefix ending at that position. Those non-final
-appends optionally apply full-head interleaved or GPT-NeoX rotary, or D64
-half-head interleaved rotary, to Q and the appended K at that position and use
-the generic packed runtime; the final-slot append continues to use the
-generated specialization. The exact
+cache. The exact causal bf16 1K profile additionally permits Python-integer
+positions 0 through 1022, while the exact bf16 4K profile permits positions 0
+through 4094; both attend over the updated prefix ending at that position. The
+1K partial appends reject rotary. The 4K non-final appends optionally apply
+full-head interleaved or GPT-NeoX rotary, or D64 half-head interleaved rotary,
+to Q and the appended K at that position. Both use the generic packed runtime;
+the final-slot append continues to use the generated specialization. The exact
 two-token profile
 above similarly accepts paired K/V tensors shaped `[1, 2, 8, 128]` at Python
 integer `cache_seqlens` positions 0 through 1022 and mutates only those two
@@ -628,13 +632,14 @@ documented scalar prefixes. The exact causal single-token 1K and 16K profiles
 and the 4K profile with either causal flag accept their documented
 tensor-selected prefixes or left-padded spans.
 Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`, except
-for the exact 4K non-final appends above; the exact two-token update accepts
-`0 <= cache_seqlens <= 1022`. Tensor-valued updates are limited to `[1023]` on
-the exact causal bf16 1K profile. Other multi-token updates, scalar partial
-lengths outside the exact causal single-token 1K and 16K, four-token 1K, and
-either-causal 4K read-only profiles, non-final appends outside the exact 4K
-one-token and 1K two-token profiles, and tensor lengths on every other dense
-profile are rejected explicitly. Caches created
+for the exact causal 1K and either-causal 4K non-final appends above; the exact
+two-token update accepts `0 <= cache_seqlens <= 1022`. Tensor-valued updates are
+limited to `[1023]` on the exact causal bf16 1K profile. Other multi-token
+updates, scalar partial lengths outside the exact causal single-token 1K and
+16K, four-token 1K, and either-causal 4K read-only profiles, non-final appends
+outside the exact causal 1K and either-causal 4K one-token and 1K two-token
+profiles, and tensor lengths on every other dense profile are rejected
+explicitly. Caches created
 inside `torch.inference_mode()` must be updated while that mode remains
 enabled. For an append, `q`, `k_cache`, and `v_cache` must occupy disjoint
 memory; update `k`/`v` aliases are staged safely.
@@ -967,8 +972,9 @@ doing something else:
   windows, or autograd, and its LSE combination is limited to the exact
   read-only page-size-256/page-size-512 decode profile above
 - KV-cache mutation beyond the dense paired one-token final-slot append, the
-  exact 4K partial one-token append, exact 1K partial two-token append, and
-  exact page-16 paged final-slot append at four device lengths of 1023 above;
+  exact causal 1K and either-causal 4K partial one-token appends, exact 1K
+  partial two-token append, and exact page-16 paged final-slot append at four
+  device lengths of 1023 above;
   the exact four-token profile is read-only;
   dense tensor lengths outside the exact causal single-token 1K, either-causal
   4K, and causal 16K profiles above, dense tensor updates outside the exact
