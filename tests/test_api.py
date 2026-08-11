@@ -5440,6 +5440,82 @@ def test_two_token_dense_kvcache_matches_fa2(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "length", [2, 512, 1023], ids=["boundary", "middle", "tail"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.37],
+    ids=["default-scale", "custom-scale"],
+)
+def test_two_token_dense_kvcache_scalar_prefix_matches_fa2_and_fp32_without_mutation(
+    length: int,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = TWO_TOKEN_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec, seed=20260822)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    k_pointer = k_cache.data_ptr()
+    v_pointer = v_cache.data_ptr()
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=length,
+        softmax_scale=softmax_scale,
+        causal=True,
+        shape=spec,
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=length,
+        softmax_scale=softmax_scale,
+        causal=True,
+    )
+    prefix_spec = AttnShape(
+        spec.batch,
+        spec.seqlen_q,
+        length,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+        spec.causal,
+    )
+    expected_fp32 = reference_attention(
+        q,
+        k_cache[:, :length],
+        v_cache[:, :length],
+        prefix_spec,
+        scale,
+    )
+
+    assert isinstance(got, torch.Tensor)
+    assert isinstance(expected_fa2, torch.Tensor)
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        got.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+    assert (got.float() - expected_fp32).abs().mean().item() < 1e-3
+    assert k_cache.data_ptr() == k_pointer
+    assert v_cache.data_ptr() == v_pointer
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "softmax_scale",
     [None, 0.37],
     ids=["default-scale", "custom-scale"],
@@ -5711,6 +5787,68 @@ def test_two_token_dense_kvcache_full_paths_retain_generic_dispatch(
     assert calls == [spec]
 
 
+def test_two_token_dense_kvcache_scalar_prefix_uses_prefix_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = TWO_TOKEN_KVCACHE
+    q = torch.zeros(1, dtype=spec.dtype)
+    k_cache = torch.ones(1, dtype=spec.dtype)
+    v_cache = torch.full((1,), 2.0, dtype=spec.dtype)
+    marker = torch.empty_like(q)
+    calls: list[int] = []
+
+    monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
+
+    def prefix(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        cache_seqlens_arg: torch.Tensor,
+        cache_leftpad: torch.Tensor | None,
+        scale: float,
+        spec_arg: AttnShape,
+        *,
+        alibi_slopes: torch.Tensor | None,
+        return_softmax_lse: bool,
+    ) -> torch.Tensor:
+        assert query is q
+        assert key is k_cache
+        assert value is v_cache
+        assert cache_seqlens_arg.dtype == torch.int32
+        assert cache_seqlens_arg.device == q.device
+        assert cache_leftpad is None
+        assert scale == 0.37
+        assert spec_arg is spec
+        assert alibi_slopes is None
+        assert not return_softmax_lse
+        calls.append(int(cache_seqlens_arg.item()))
+        return marker
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("a two-token scalar read reached full dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_tensor_length_dense_kvcache_forward", prefix
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=512,
+        softmax_scale=0.37,
+        causal=True,
+        shape=spec,
+    )
+
+    assert result is marker
+    assert calls == [512]
+
+
 @requires_cuda
 def test_two_token_dense_kvcache_partial_append_uses_prefix_dispatch(
     monkeypatch: pytest.MonkeyPatch,
@@ -5906,18 +6044,28 @@ def test_single_token_kvcache_retains_generated_dispatch(
 @pytest.mark.parametrize(
     ("case", "error", "message"),
     [
-        ("lse", NotImplementedError, "return_softmax_lse"),
+        ("lse-read", NotImplementedError, "return_softmax_lse"),
         ("past-end-update", ValueError, "inclusive range"),
-        ("partial-scalar", NotImplementedError, "partial or ragged"),
-        ("tensor-length", NotImplementedError, "only for read-only"),
-        ("rotary", NotImplementedError, "non-final two-token"),
+        ("below-minimum-read", ValueError, "inclusive range.*2, 1024"),
+        ("zero-read", ValueError, "inclusive range.*2, 1024"),
+        ("past-end-read", ValueError, "inclusive range.*2, 1024"),
+        (
+            "tensor-length-read",
+            NotImplementedError,
+            "tensor-valued cache_seqlens",
+        ),
+        ("rotary-read", NotImplementedError, "rotary embeddings"),
         ("remapping", NotImplementedError, "cache_batch_idx"),
-        ("leftpad", NotImplementedError, "only for read-only"),
+        (
+            "leftpad",
+            NotImplementedError,
+            "requires tensor-valued cache_seqlens",
+        ),
         ("window", NotImplementedError, "sliding-window"),
         ("alibi", NotImplementedError, "ALiBi is implemented only"),
-        ("num-splits", NotImplementedError, "read-only"),
+        ("num-splits", NotImplementedError, "only.*16384"),
         ("softcap", NotImplementedError, "softcap"),
-        ("autograd-update", NotImplementedError, "autograd"),
+        ("autograd-read", NotImplementedError, "autograd"),
         ("noncausal", NotImplementedError, "multi-token dense queries only"),
         ("other-shape", NotImplementedError, "multi-token dense queries only"),
     ],
@@ -5934,99 +6082,57 @@ def test_two_token_dense_kvcache_rejects_out_of_scope_calls_before_dispatch(
     original_v = v_cache.clone()
     new_k = k_cache[:, :2].clone()
     new_v = v_cache[:, :2].clone()
-    kwargs: dict[str, object] = {"causal": True, "shape": spec}
     partial_position = spec.seqlen_k // 2
+    kwargs: dict[str, object] = {
+        "cache_seqlens": partial_position,
+        "causal": True,
+        "shape": spec,
+    }
 
-    if case == "lse":
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
-            return_softmax_lse=True,
-        )
+    if case == "lse-read":
+        kwargs["return_softmax_lse"] = True
     elif case == "past-end-update":
         kwargs.update(
             k=new_k,
             v=new_v,
             cache_seqlens=spec.seqlen_k - 1,
         )
-    elif case == "partial-scalar":
-        kwargs["cache_seqlens"] = spec.seqlen_k - 1
-    elif case == "tensor-length":
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=torch.tensor(
-                [partial_position], device=q.device, dtype=torch.int32
-            ),
+    elif case == "below-minimum-read":
+        kwargs["cache_seqlens"] = spec.seqlen_q - 1
+    elif case == "zero-read":
+        kwargs["cache_seqlens"] = 0
+    elif case == "past-end-read":
+        kwargs["cache_seqlens"] = spec.seqlen_k + 1
+    elif case == "tensor-length-read":
+        kwargs["cache_seqlens"] = torch.tensor(
+            [partial_position], device=q.device, dtype=torch.int32
         )
-    elif case == "rotary":
+    elif case == "rotary-read":
         rotary_cos, rotary_sin = make_rotary_tables(spec, seed=20260821)
         kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
         )
     elif case == "remapping":
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
-            cache_batch_idx=torch.zeros(
-                spec.batch, device=q.device, dtype=torch.int32
-            ),
+        kwargs["cache_batch_idx"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
         )
     elif case == "leftpad":
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
-            cache_leftpad=torch.zeros(
-                spec.batch, device=q.device, dtype=torch.int32
-            ),
+        kwargs["cache_leftpad"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
         )
     elif case == "window":
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
-            window_size=(511, 0),
-        )
+        kwargs["window_size"] = (511, 0)
     elif case == "alibi":
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
-            alibi_slopes=torch.ones(spec.nheads_q, device=q.device),
-        )
+        kwargs["alibi_slopes"] = torch.ones(spec.nheads_q, device=q.device)
     elif case == "num-splits":
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
-            num_splits=16,
-        )
+        kwargs["num_splits"] = 16
     elif case == "softcap":
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
-            softcap=50.0,
-        )
-    elif case == "autograd-update":
+        kwargs["softcap"] = 50.0
+    elif case == "autograd-read":
         q.requires_grad_()
-        kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
-        )
     elif case == "noncausal":
         kwargs.update(
-            k=new_k,
-            v=new_v,
-            cache_seqlens=partial_position,
             causal=False,
             shape=(
                 spec.batch,
@@ -6040,9 +6146,6 @@ def test_two_token_dense_kvcache_rejects_out_of_scope_calls_before_dispatch(
     elif case == "other-shape":
         q = torch.cat((q, q[:, :1]), dim=1)
         kwargs.update(
-            k=torch.cat((new_k, new_k[:, :1]), dim=1),
-            v=torch.cat((new_v, new_v[:, :1]), dim=1),
-            cache_seqlens=spec.seqlen_k - 3,
             shape=(
                 spec.batch,
                 spec.seqlen_q + 1,

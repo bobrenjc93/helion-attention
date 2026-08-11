@@ -45,9 +45,9 @@ retain generated dispatch. Their prefix runtime handles a paired one-token K/V
 append before the final slot, including full-head interleaved or GPT-NeoX
 rotary and D64 half-head interleaved rotary, while full reads and final-slot
 appends retain the generated specializations. The same prefix runtime handles
-slope-free two-token updates before the final two slots of the causal 1K
-speculative decode profile, while its full reads and final append retain
-full-cache dispatch.
+slope-free two-token scalar-prefix reads, plus updates before the final two
+slots of the causal 1K speculative decode profile, while its full reads and
+final append retain full-cache dispatch.
 The page-16 1K paged decode profile likewise accepts one paired final-slot
 append when every device-resident length is 1023 and its logical pages map to
 disjoint physical blocks, then retains its generated reader for attention.
@@ -3284,16 +3284,19 @@ def flash_attn_with_kvcache(
     required and describes ``q`` plus the cache:
     ``(batch, query_len, cache_len, nheads_q, nheads_kv, head_dim)``. One
     additional speculative-decoding slice accepts exactly two query tokens:
-    causal bf16 ``(1, 2, 1024, 32, 8, 128)`` with a full dense cache. It uses
-    the generic packed runtime and supports the default or a custom softmax
-    scale. A paired two-token K/V update is accepted at Python-integer
-    ``cache_seqlens`` positions 0 through 1022. It fills those two slots and
-    attends through the appended prefix; the final append at position 1022
-    retains full-cache dispatch. That final update alone accepts full-head
-    interleaved rotary tables and rotates the two query/key tokens at positions
-    1022 and 1023. This profile does not support LSE, partial read-only lengths,
-    rotary on a non-final update, partial or non-interleaved rotary on the final
-    update, remapping, autograd, or noncausal attention.
+    causal bf16 ``(1, 2, 1024, 32, 8, 128)``. Read-only Python-integer
+    ``cache_seqlens`` values from 2 through 1023 select a dense cache prefix
+    through the generic packed runtime; omitted and full-length reads retain
+    their existing full-cache dispatch. Both paths support the default or a
+    custom softmax scale. A paired two-token K/V update is accepted at
+    Python-integer ``cache_seqlens`` positions 0 through 1022. It fills those
+    two slots and attends through the appended prefix; the final append at
+    position 1022 retains full-cache dispatch. That final update alone accepts
+    full-head interleaved rotary tables and rotates the two query/key tokens at
+    positions 1022 and 1023. This profile does not support LSE, tensor-valued
+    lengths, read-only rotary, rotary on a non-final update, partial or
+    non-interleaved rotary on the final update, remapping, autograd, optional
+    attention features, or noncausal attention.
 
     A separate read-only speculative-decoding slice accepts exactly four query
     tokens: causal bf16 ``(1, 4, 1024, 32, 8, 128)``. Read-only Python-integer
@@ -3418,9 +3421,10 @@ def flash_attn_with_kvcache(
     tensor spans outside the exact causal single-token 1K, either-causal 4K,
     and causal 16K profiles,
     scalar partial lengths outside the exact causal single-token 1K and 16K,
-    four-token 1K, and either-causal 4K read-only profiles, non-final one-token
-    appends outside the exact causal 1K and either-causal 4K profiles, and
-    multi-token updates outside the exact two-token profile fail explicitly.
+    two-token and four-token 1K, and either-causal 4K read-only profiles,
+    non-final one-token appends outside the exact causal 1K and either-causal
+    4K profiles, and multi-token updates outside the exact two-token profile
+    fail explicitly.
     Non-final one- and two-token 1K updates reject rotary, and all partial
     updates reject autograd, before either cache is mutated. Partial 4K updates
     additionally reject rotary dimensions other than full-head or D64 half-head
@@ -3634,11 +3638,14 @@ def flash_attn_with_kvcache(
     is_1k_partial_append_dense_profile = (
         spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
     )
+    is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
+    is_four_token_dense_profile = spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
     is_scalar_prefix_dense_profile = (
         is_4k_scalar_prefix_dense_profile
         or spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
         or spec.key == _CAUSAL_16K_DENSE_KVCACHE_KEY
-        or spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
+        or is_two_token_dense_profile
+        or is_four_token_dense_profile
     )
     has_dense_alibi = alibi_slopes is not None
     if has_dense_alibi:
@@ -3658,8 +3665,6 @@ def flash_attn_with_kvcache(
                 "return_softmax_lse=True is not implemented with dense "
                 "KV-cache ALiBi"
             )
-    is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
-    is_four_token_dense_profile = spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
     if (
         not spec.is_decode
         and not is_two_token_dense_profile
@@ -3789,7 +3794,9 @@ def flash_attn_with_kvcache(
                     "cache length declared by shape"
                 )
             minimum_prefix_length = (
-                spec.seqlen_q if is_four_token_dense_profile else 1
+                spec.seqlen_q
+                if is_two_token_dense_profile or is_four_token_dense_profile
+                else 1
             )
             if (
                 cache_seqlens < minimum_prefix_length
