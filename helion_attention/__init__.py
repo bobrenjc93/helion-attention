@@ -29,8 +29,8 @@ page-256/page-512 KV-cache decode. The Gemma-2 and shipped causal varlen
 profiles also expose the diagnostic return with exactly that cap. The same
 runtime exposes page-256/page-512 decode with optional ALiBi through the core
 varlen API, plus the FA2 diagnostic return for slope-free page-256/page-512
-decode and softcapped page-256 decode. The KV-cache adapter also uses the
-generic paged runtime for ALiBi on both exposed page-16 profiles and
+decode and softcapped page-256/page-512 decode. The KV-cache adapter also uses
+the generic paged runtime for ALiBi on both exposed page-16 profiles and
 page-256/page-512 decode. Read-only causal
 1K and 16K dense decode, plus both causal modes of 4K dense decode, likewise
 use the generic runtime for a bounded Python-int prefix. Those profiles also
@@ -149,7 +149,7 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
 _CORE_PAGED_GENERATED_PAGE_SIZE = 16
 _CORE_PAGED_VARLEN_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
 _CORE_PAGED_VARLEN_DIAGNOSTIC_PAGE_SIZES = frozenset({256, 512})
-_CORE_PAGED_VARLEN_SOFTCAP_DIAGNOSTIC_PAGE_SIZE = 256
+_CORE_PAGED_VARLEN_SOFTCAP_DIAGNOSTIC_PAGE_SIZES = frozenset({256, 512})
 _PAGED_KVCACHE_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
 _PAGED_KVCACHE_SOFTCAP = 50.0
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
@@ -2156,11 +2156,10 @@ def flash_attn_varlen_func(
     paged runtime; page-size-16 calls retain generated dispatch. Page-size-256
     and page-size-512 decode also accept either forward-only fp32 ALiBi slopes
     shaped ``[8]`` or ``[4, 8]``, or exactly ``softcap=50.0``. ALiBi and
-    softcap cannot be combined. Page-size-256 decode without ALiBi additionally
-    accepts ``return_attn_probs=True`` either uncapped or with exactly
-    ``softcap=50.0``. Page-size-512 decode accepts that diagnostic return only
-    without ALiBi or softcap. Both return fp32 LSE shaped ``[8, total_q]`` plus
-    an empty bf16 ``S_dmask``. All paths
+    softcap cannot be combined. Page-size-256 and page-size-512 decode without
+    ALiBi additionally accept ``return_attn_probs=True`` either uncapped or
+    with exactly ``softcap=50.0``. Both return fp32 LSE shaped ``[8, total_q]``
+    plus an empty bf16 ``S_dmask``. All paths
     derive each request's used cache length from adjacent ``cu_seqlens_k``
     offsets without copying them to the host. Large-page decode supports only
     forward calls with the default options, apart from either causal flag, a
@@ -2239,8 +2238,8 @@ def flash_attn_varlen_func(
     specialization. Non-50 diagnostics, other profiles, gradients, dropout,
     ALiBi, local windows, determinism, and paging remain unsupported for this
     composition. Paged softcap remains unsupported except for the exact
-    page-size-256/page-size-512 decode profile described above; only its
-    page-size-256 form may combine ``softcap=50.0`` with diagnostic returns.
+    page-size-256/page-size-512 decode profile described above; both page sizes
+    may combine ``softcap=50.0`` with diagnostic returns.
 
     The causal version of that profile also supports
     ``return_attn_probs=True`` with ``causal=True``, optional
@@ -2449,11 +2448,11 @@ def flash_attn_varlen_func(
         if (
             return_attn_probs
             and has_softcap
-            and page_size != _CORE_PAGED_VARLEN_SOFTCAP_DIAGNOSTIC_PAGE_SIZE
+            and page_size not in _CORE_PAGED_VARLEN_SOFTCAP_DIAGNOSTIC_PAGE_SIZES
         ):
             raise NotImplementedError(
                 "return_attn_probs=True with softcap and block_table is "
-                "implemented only for page-size-256 decode"
+                "implemented only for page-size-256 or page-size-512 decode"
             )
         if (
             return_attn_probs

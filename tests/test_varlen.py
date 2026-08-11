@@ -7416,11 +7416,12 @@ def test_core_varlen_large_page_softcap_matches_fa2_and_fp32_for_ragged_permuted
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_core_varlen_page_256_softcap_diagnostics_match_fa2_and_fp32_for_ragged_permuted_pages(
-    causal: bool, softmax_scale: float | None
+@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
+def test_core_varlen_large_page_softcap_diagnostics_match_fa2_and_fp32_for_ragged_permuted_pages(
+    causal: bool, softmax_scale: float | None, page_size: int
 ) -> None:
     q, k, v, cu_q, cu_k, block_table, lengths_k, request_kv = (
-        make_paged_decode(page_size=256, seed=20260811)
+        make_paged_decode(page_size=page_size, seed=20260811)
     )
     # Exercise the nonlinear part of the cap in both physical and logical K.
     q.mul_(4.0)
@@ -7766,6 +7767,11 @@ def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
             256,
             CORE_PAGED_SOFTCAP_VALUE,
             id="page-256-softcap-50",
+        ),
+        pytest.param(
+            512,
+            CORE_PAGED_SOFTCAP_VALUE,
+            id="page-512-softcap-50",
         ),
     ],
 )
@@ -8176,9 +8182,6 @@ def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispa
         pytest.param("dropout", "dropout", id="dropout"),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param("deterministic", "deterministic=False", id="deterministic"),
-        pytest.param(
-            "page-512-softcap", "page-size-256", id="page-512-softcap"
-        ),
     ],
 )
 def test_core_varlen_large_page_diagnostics_reject_out_of_scope_calls_before_dispatch(
@@ -8227,8 +8230,6 @@ def test_core_varlen_large_page_diagnostics_reject_out_of_scope_calls_before_dis
         kwargs["window_size"] = (1, 1)
     elif scoped_case == "deterministic":
         kwargs["deterministic"] = True
-    elif scoped_case == "softcap":
-        kwargs["softcap"] = CORE_PAGED_SOFTCAP_VALUE
 
     def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
         raise AssertionError("out-of-scope paged diagnostics reached dispatch")
@@ -8287,12 +8288,12 @@ def test_core_varlen_large_page_diagnostics_reject_out_of_scope_calls_before_dis
         ),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param(
-            "page-512-diagnostic",
-            "page-size-256",
-            id="page-512-diagnostic",
+            "diagnostic-gradient", "softcap backward", id="diagnostic-gradient"
         ),
         pytest.param(
-            "diagnostic-gradient", "softcap backward", id="diagnostic-gradient"
+            "page-512-diagnostic-gradient",
+            "softcap backward",
+            id="page-512-diagnostic-gradient",
         ),
         pytest.param(
             "deterministic", "deterministic=True", id="deterministic"
