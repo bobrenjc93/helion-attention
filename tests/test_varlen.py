@@ -3067,6 +3067,117 @@ def test_llama3_2k_varlen_unpacked_matches_fp32_and_fa2(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "entry_point", ["unpacked", "kvpacked"], ids=["unpacked", "kv-packed"]
+)
+@pytest.mark.parametrize(
+    "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_llama3_2k_varlen_diagnostics_match_fa2(
+    entry_point: str,
+    attention: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    if attention == "self":
+        q, k, v, cu_q, _ = make_ragged_self_packed(
+            spec, lengths=[2048, 257, 31, 0], seed=20260811
+        )
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec,
+            lengths_q=[2048, 257, 31, 7],
+            lengths_k=[31, 2048, 17, 511],
+            seed=20260811,
+        )
+
+    with torch.no_grad():
+        if entry_point == "unpacked":
+            got = helion_attention.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+                shape=spec,
+            )
+            expected = flash_attn.flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+            )
+        else:
+            kv = torch.stack((k, v), dim=1)
+            got = helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                kv,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+                shape=spec,
+            )
+            expected = flash_attn.flash_attn_varlen_kvpacked_func(
+                q,
+                kv,
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+            )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    assert isinstance(expected, tuple) and len(expected) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.nheads_q,
+        q.shape[0],
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    finite_lse = torch.isfinite(expected_lse)
+    assert torch.equal(torch.isfinite(softmax_lse), finite_lse)
+    torch.testing.assert_close(
+        softmax_lse[finite_lse],
+        expected_lse[finite_lse],
+        atol=2e-3,
+        rtol=1e-5,
+    )
+    assert torch.equal(softmax_lse[~finite_lse], expected_lse[~finite_lse])
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
 )
 @pytest.mark.parametrize(
@@ -3464,9 +3575,6 @@ def test_llama3_2k_varlen_rejects_gradients_before_dispatch(
         pytest.param(
             "deterministic", True, "deterministic=True", id="deterministic"
         ),
-        pytest.param(
-            "return_attn_probs", True, "implemented only", id="diagnostics"
-        ),
     ],
 )
 @pytest.mark.parametrize("with_alibi", [False, True], ids=["plain", "alibi"])
@@ -3508,6 +3616,84 @@ def test_llama3_2k_varlen_rejects_optional_features_before_dispatch(
             spec.seqlen_k,
             causal=True,
             shape=spec,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        pytest.param("gradient", "grad-enabled", id="gradient"),
+        pytest.param("alibi", "ALiBi slopes", id="alibi"),
+        pytest.param("dropout", "dropout", id="dropout"),
+        pytest.param("window", "sliding-window", id="window"),
+        pytest.param("softcap", "softcap", id="softcap"),
+        pytest.param(
+            "deterministic", "deterministic=True", id="deterministic"
+        ),
+        pytest.param("paging", "block_table", id="paging"),
+    ],
+)
+def test_llama3_2k_varlen_diagnostics_reject_incompatible_features(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA3_2K_VARLEN_INFERENCE
+    q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+        spec,
+        lengths_q=[7, 3, 2, 1],
+        lengths_k=[3, 7, 1, 2],
+        seed=161803,
+    )
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "return_attn_probs": True,
+        "shape": spec,
+    }
+    if case == "gradient":
+        q.requires_grad_()
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(spec.nheads_q, device=q.device)
+    elif case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "window":
+        kwargs["window_size"] = (7, 7)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    else:
+        kwargs["block_table"] = torch.zeros(
+            spec.batch, 1, device=q.device, dtype=torch.int32
+        )
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
+        raise AssertionError("incompatible 2K diagnostic reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", reject_dispatch
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_forward", reject_dispatch
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_alibi_forward", reject_dispatch
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
             **kwargs,  # type: ignore[arg-type]
         )
 
@@ -3589,10 +3775,12 @@ def test_llama3_2k_varlen_rejects_paging_before_dispatch(
         ),
     ],
 )
-@pytest.mark.parametrize("with_alibi", [False, True], ids=["plain", "alibi"])
+@pytest.mark.parametrize(
+    "feature", ["plain", "alibi", "diagnostics"]
+)
 def test_llama3_2k_varlen_neighboring_profiles_remain_unsupported(
     spec: AttnShape,
-    with_alibi: bool,
+    feature: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     q = torch.zeros(
@@ -3615,15 +3803,20 @@ def test_llama3_2k_varlen_neighboring_profiles_remain_unsupported(
     monkeypatch.setattr(
         helion_attention, "_generic_varlen_alibi_forward", reject_generic
     )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", reject_generic
+    )
     slopes = (
-        torch.ones(spec.nheads_q, device=q.device) if with_alibi else None
+        torch.ones(spec.nheads_q, device=q.device)
+        if feature == "alibi"
+        else None
     )
     exception = (
         NotImplementedError
-        if with_alibi
+        if feature != "plain"
         else helion_attention.UnsupportedShapeError
     )
-    message = "implemented only" if with_alibi else "checked in"
+    message = "implemented only" if feature != "plain" else "checked in"
     with pytest.raises(exception, match=message):
         helion_attention.flash_attn_varlen_func(
             q,
@@ -3635,6 +3828,7 @@ def test_llama3_2k_varlen_neighboring_profiles_remain_unsupported(
             spec.seqlen_k,
             causal=spec.causal,
             alibi_slopes=slopes,
+            return_attn_probs=feature == "diagnostics",
             shape=spec,
         )
 

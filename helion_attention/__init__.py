@@ -12,10 +12,11 @@ ALiBi calls, encoder-training diagnostics, BERT-base diagnostics with optional
 ALiBi, ragged BERT-base varlen inference with optional ALiBi diagnostics,
 causal GPT-2 and global
 causal 2K Llama GQA diagnostics, two causal Llama-3 GQA varlen inference
-profiles, ALiBi on both Llama-3 profiles (with optional diagnostics on the
-smaller one), ALiBi on both shipped varlen profiles (with optional diagnostics
-on the causal one), and symmetric windows on the shipped noncausal varlen
-profile use a generic Triton forward kernel. The same runtime exposes exactly a
+profiles with slope-free diagnostics, ALiBi on both Llama-3 profiles (with
+ALiBi diagnostics on the smaller one), ALiBi on both shipped varlen profiles
+(with optional diagnostics on the causal one), and symmetric windows on the
+shipped noncausal varlen profile use a generic Triton forward kernel. The same
+runtime exposes exactly a
 127-token left plus
 current-token causal window
 for the full-length shipped causal varlen profile, while its global-window call
@@ -242,6 +243,7 @@ _VARLEN_DIAGNOSTIC_KEYS = frozenset(
     {
         _BERT_BASE_VARLEN_INFERENCE_KEY,
         _LLAMA3_VARLEN_INFERENCE_KEY,
+        _LLAMA3_2K_VARLEN_INFERENCE_KEY,
         _VARLEN_DIAGNOSTIC_KEY,
     }
 )
@@ -2278,13 +2280,16 @@ def flash_attn_varlen_func(
     maximum shape ``(4, 2048, 2048, 32, 8, 128)`` for forward-only unpacked
     and KV-packed inference. Query and key offsets may independently describe
     ragged self- or cross-attention, and either the default or a custom
-    ``softmax_scale`` is accepted. Calls may additionally supply forward-only
-    fp32 ALiBi slopes shaped ``[32]`` or ``[4, 32]`` through the same generic
-    packed ALiBi runtime used by the 256-token profile. Slope-free calls retain
-    their existing generic inference dispatch. Diagnostics, dropout, windows,
-    softcap, deterministic mode, paging, and backward remain unsupported for
-    this deliberately unregistered profile. Its dense generated specialization
-    and every registered varlen specialization retain their existing dispatch.
+    ``softmax_scale`` is accepted. Slope-free calls additionally accept
+    ``return_attn_probs=True`` and return fp32 LSE shaped ``[32, total_q]``
+    plus an empty bf16 ``S_dmask``. Calls may instead supply forward-only fp32
+    ALiBi slopes shaped ``[32]`` or ``[4, 32]`` through the same generic packed
+    ALiBi runtime used by the 256-token profile, but those slopes cannot be
+    combined with diagnostics. Ordinary slope-free and ALiBi-only calls retain
+    their existing dispatch. Dropout, windows, softcap, deterministic mode,
+    paging, and backward remain unsupported for this deliberately unregistered
+    profile. Its dense generated specialization and every registered varlen
+    specialization retain their existing dispatch.
 
     The noncausal version also supports local self-attention with
     ``window_size=(radius, radius)`` for a finite non-negative ``radius``.

@@ -260,12 +260,16 @@ A third deliberately unregistered profile exposes the production-sized causal
 bf16 Llama-3 GQA maximum `(4, 2048, 2048, 32, 8, 128)` for forward-only
 inference. The unpacked and KV-packed entry points accept independently ragged
 self- or cross-attention offsets, the default or a custom `softmax_scale`, and
-fp32 ALiBi slopes shaped `[32]` or `[4, 32]`. ALiBi calls use the same generic
-packed Triton runtime as the 256-token profile, while slope-free calls retain
-their existing generic inference dispatch and the registered dense
-specialization at this shape retains its generated dispatch. Gradients,
-diagnostic returns, dropout, windows, softcap, deterministic mode, and paging
-remain unsupported, and `is_varlen_shape_supported` remains false.
+fp32 ALiBi slopes shaped `[32]` or `[4, 32]`. Slope-free calls additionally
+accept `return_attn_probs=True` and return `(out, softmax_lse, S_dmask)`, with
+fp32 LSE shaped `[32, total_q]` and an empty bf16 `S_dmask`, at the default or
+a custom scale. Diagnostics support both ragged self- and cross-attention and
+are inherited by the KV-packed adapter. ALiBi calls use the same generic packed
+Triton runtime as the 256-token profile but cannot request diagnostics.
+Ordinary slope-free and ALiBi-only calls retain their existing dispatch, and
+the registered dense specialization at this shape retains generated dispatch.
+Gradients, ALiBi diagnostics, dropout, windows, softcap, deterministic mode,
+and paging remain unsupported, and `is_varlen_shape_supported` remains false.
 
 The noncausal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts finite
 symmetric windows as `window_size=(radius, radius)`, where `radius >= 0`, for
@@ -1074,7 +1078,8 @@ doing something else:
   calls for the three Llama GQA decode profiles, dense/KV-packed calls for the
   causal bf16 Gemma-2 profile with `softcap=50.0`, and the causal bf16 varlen
   profiles
-  `(8, 512, 512, 16, 16, 64)` and `(4, 256, 256, 32, 8, 128)` described above,
+  `(8, 512, 512, 16, 16, 64)`, `(4, 256, 256, 32, 8, 128)`, and slope-free
+  no-backward `(4, 2048, 2048, 32, 8, 128)` described above,
   or no-backward core paged-varlen page-size-16/page-size-256/page-size-512
   decode `(4, 1, 1024, 8, 2, 128)` without ALiBi, where page size 256 or 512
   additionally permits exactly `softcap=50.0`;

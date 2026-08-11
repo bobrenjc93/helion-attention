@@ -4783,6 +4783,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:ee4080ee8527958aa7d4a5e024ec0acae8f6ee9a",
+      "commit": "ee4080ee8527958aa7d4a5e024ec0acae8f6ee9a",
+      "recordedAt": "2026-08-11T16:39:04.390Z",
+      "label": "base ee4080e",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:204",
+      "recordedAt": "2026-08-11T16:39:04.390Z",
+      "label": "PR #204",
+      "kind": "leaf",
+      "prNumber": 204,
+      "title": "Return diagnostics for ragged 2K Llama-3 varlen inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
