@@ -63,9 +63,10 @@ disjoint physical blocks, then retains its generated reader for attention.
 Default-scale SM90 training on the shipped encoder-training profile keeps its
 generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
-that profile, the checked-in BERT-base encoder, and one shipped causal GPT-2
-profile, grad-enabled dense calls without a generated backward, grad-enabled
-diagnostics on that GPT-2 profile and the full-length causal varlen profile,
+that profile, the checked-in BERT-base encoder, and the shipped causal and
+noncausal GPT-2 profiles, grad-enabled dense calls without a generated
+backward, grad-enabled diagnostics on the causal GPT-2 profile and the
+full-length causal varlen profile,
 both shipped full-length varlen profiles, full-length BERT-base varlen
 attention, and ragged causal attention use PyTorch SDPA autograd. Full-length
 symmetric-window training on the shipped noncausal varlen profile and the exact
@@ -159,6 +160,9 @@ _INT32_MAX = 2**31 - 1
 _ENCODER_TRAINING_KEY = "b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
 _BERT_DIAGNOSTIC_KEY = "b16_sq512_sk512_hq12_hkv12_d64_bf16_noncausal"
 _CAUSAL_DROPOUT_KEY = "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal"
+_NONCAUSAL_DROPOUT_KEY = (
+    "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_noncausal"
+)
 _LLAMA_2K_LEFT_WINDOW_KEY = (
     "b1_sq2048_sk2048_hq32_hkv8_d128_bf16_causal"
 )
@@ -172,7 +176,12 @@ _GENERIC_DENSE_DIAGNOSTIC_KEYS = frozenset(
     }
 )
 _DROPOUT_SDPA_KEYS = frozenset(
-    {_ENCODER_TRAINING_KEY, _BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
+    {
+        _ENCODER_TRAINING_KEY,
+        _BERT_DIAGNOSTIC_KEY,
+        _CAUSAL_DROPOUT_KEY,
+        _NONCAUSAL_DROPOUT_KEY,
+    }
 )
 _DENSE_DETERMINISTIC_BACKWARD_KEYS = frozenset(
     {
@@ -1842,8 +1851,8 @@ def flash_attn_func(
         v: ``[batch, seqlen_k, nheads_kv, head_dim]``.
         dropout_p: values in ``(0, 1)`` are supported only for the shipped
             noncausal bf16 ``(8, 512, 512, 16, 16, 64)`` encoder-training and
-            ``(16, 512, 512, 12, 12, 64)`` BERT-base profiles, plus causal bf16
-            ``(2, 1024, 1024, 32, 32, 64)`` attention.
+            ``(16, 512, 512, 12, 12, 64)`` BERT-base profiles, plus causal and
+            noncausal bf16 ``(2, 1024, 1024, 32, 32, 64)`` attention.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
         window_size: ``(-1, -1)`` selects global attention. ``(left, 0)`` is
