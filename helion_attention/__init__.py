@@ -82,6 +82,7 @@ import torch
 from ._autograd import attention_autograd
 from ._autograd import attention_diagnostics
 from ._autograd import attention_with_flash_gradients
+from ._autograd import empty_key_attention
 from ._registry import UnsupportedShapeError
 from ._registry import available_paged_shapes
 from ._registry import available_shapes
@@ -992,12 +993,6 @@ def _ragged_varlen_attention_lengths(
             "ragged varlen backward requires at least one nonempty query "
             "sequence"
         )
-    if any(length == 0 for length in lengths_k) and offsets_q != offsets_k:
-        raise NotImplementedError(
-            "ragged varlen backward with empty key sequence slots is "
-            "implemented only for causal self-attention with identical "
-            "cu_seqlens_q and cu_seqlens_k"
-        )
     if any(length > spec.seqlen_q for length in lengths_q) or any(
         length > spec.seqlen_k for length in lengths_k
     ):
@@ -1018,7 +1013,7 @@ def _ragged_varlen_attention_sdpa(
     softmax_scale: float,
     spec: AttnShape,
 ) -> torch.Tensor:
-    """Run each validated nonempty ragged sequence through SDPA."""
+    """Run each validated ragged sequence through SDPA or its empty-KV branch."""
     q_sequences = torch.split(q, lengths_q)
     k_sequences = torch.split(k, lengths_k)
     v_sequences = torch.split(v, lengths_k)
@@ -1030,6 +1025,14 @@ def _ragged_varlen_attention_sdpa(
         # subproblem to launch. Their K/V slices remain unused and naturally
         # receive zero gradients. At least one nonempty query is guaranteed.
         if seqlen_q == 0:
+            continue
+        # FlashAttention returns exact zero rows for a request with no keys.
+        # Keep all three inputs in the autograd graph so an all-empty packed KV
+        # tensor still receives finite, correctly shaped zero gradients.
+        if seqlen_k == 0:
+            outputs.append(
+                empty_key_attention(q_sequence, k_sequence, v_sequence)
+            )
             continue
         # Preserve the established self-attention call exactly. Unequal
         # sequences need their actual lengths in the SDPA adapter so causal
@@ -2209,19 +2212,19 @@ def flash_attn_varlen_func(
     Both causal modes of the shipped batch-8 profile support zero-dropout
     backward when all eight query and key sequences have length 512. The causal
     profile additionally supports independent query and key cumulative offsets
-    describing eight nonempty key sequences and a mix of empty and nonempty
-    query sequences, all of length at most 512. Self-attention with identical
-    query/key offsets continues to accept mixed empty and nonempty slots.
-    Full-length inputs are reshaped to one dense BSHD call; ragged inputs use one
-    bounded PyTorch SDPA call per nonempty query sequence. All-empty query
-    batches, empty key slots in cross-attention, ragged noncausal (including
-    windowed calls), graph-captured ragged, paged, ALiBi, and ragged diagnostic
-    varlen backward remain unsupported. Deterministic zero-dropout backward is
-    supported for both shipped full-length profiles and the full-length
-    BERT-base profile above using direct math SDPA; all ragged and windowed
-    forms still reject deterministic backward. Calls that do not need backward
-    retain their existing generated or generic packed dispatch, including
-    ragged and full-length calls with the global window.
+    describing a mix of empty and nonempty query or key sequences, all of
+    length at most 512. Self-attention with identical query/key offsets
+    continues to accept mixed empty and nonempty slots. Full-length inputs are
+    reshaped to one dense BSHD call; ragged inputs use one bounded PyTorch SDPA
+    call per nonempty query sequence with keys, and differentiable zero rows for
+    a nonempty query sequence with no keys. All-empty query batches, ragged
+    noncausal (including windowed calls), graph-captured ragged, paged, ALiBi,
+    and ragged diagnostic varlen backward remain unsupported. Deterministic
+    zero-dropout backward is supported for both shipped full-length profiles
+    and the full-length BERT-base profile above using direct math SDPA; all
+    ragged and windowed forms still reject deterministic backward. Calls that
+    do not need backward retain their existing generated or generic packed
+    dispatch, including ragged and full-length calls with the global window.
     """
     window = _validate_varlen_window_size(window_size)
     # Non-default varlen windows have their narrow support checks below. Keep
