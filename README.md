@@ -195,20 +195,21 @@ runtime when no backward is required. Device-side query and key offsets may
 independently describe ragged lengths, so the unpacked and KV-packed APIs
 support both self- and cross-attention; the QKV-packed API supports ragged
 self-attention. All three accept the default or a custom `softmax_scale` and
-forward-only fp32 CUDA ALiBi slopes shaped `[12]` or `[16, 12]`. Slope-free
-forward-only calls additionally accept `return_attn_probs=True` and return
-`(out, softmax_lse, S_dmask)`, with fp32 LSE shaped `[12, total_q]` and an empty
-bf16 `S_dmask`, at the default or a custom scale. ALiBi calls and diagnostic
-calls use the generic packed runtime, while ordinary `alibi_slopes=None` calls
-retain the existing generic inference dispatch for both ragged and full-length
-inputs. Slope-free, global, zero-dropout backward is additionally supported when
+forward-only fp32 CUDA ALiBi slopes shaped `[12]` or `[16, 12]`. Forward-only
+calls additionally accept `return_attn_probs=True`, with or without those
+slopes, and return `(out, softmax_lse, S_dmask)`, with fp32 LSE shaped
+`[12, total_q]` and an empty bf16 `S_dmask`, at the default or a custom scale.
+ALiBi-only and diagnostic calls use their existing generic packed dispatch,
+while ordinary `alibi_slopes=None` calls retain the existing generic inference
+dispatch for both ragged and full-length inputs. Slope-free, global,
+zero-dropout backward is additionally supported when
 all sixteen query and key sequences have length 512. That path reshapes the
 packed tensors to one dense PyTorch SDPA call and provides Q/K/V gradients
 through the unpacked and QKV/KV-packed APIs at either scale. With
 `deterministic=True`, that exact full-length path uses direct math SDPA for
 bitwise-repeatable outputs and Q/K/V gradients. Ragged and diagnostic backward,
-paging, dropout, windows, softcap, ALiBi diagnostics and backward, deterministic
-diagnostics, and deterministic ragged backward remain explicitly unsupported.
+paging, dropout, windows, softcap, ALiBi backward, deterministic diagnostics,
+and deterministic ragged backward remain explicitly unsupported.
 This is narrow generic fallback coverage, not a generated varlen specialization,
 so `is_varlen_shape_supported` remains false for this profile.
 
@@ -996,9 +997,8 @@ doing something else:
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
   the exact full-head interleaved/NeoX or D64 half-head interleaved 4K partial
   append or the exact full-head interleaved two-token append
-- `return_attn_probs=True` outside the no-backward dense BERT-base profile (with
-  optional ALiBi slopes as described above), the slope-free no-backward
-  noncausal bf16 BERT-base varlen profile, and the
+- `return_attn_probs=True` outside the no-backward dense and varlen BERT-base
+  profiles (with optional ALiBi slopes as described above), and the
   backward-capable causal bf16 GPT-2 dense/QKV-packed/KV-packed calls,
   no-backward global causal bf16 `flash_attn_func`/`flash_attn_kvpacked_func`
   calls for `(1, 2048, 2048, 32, 8, 128)` with `dropout_p=0.0`, `softcap=0.0`,

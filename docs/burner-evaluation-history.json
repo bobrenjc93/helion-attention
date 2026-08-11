@@ -4303,6 +4303,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:187",
+      "recordedAt": "2026-08-11T08:47:24.012Z",
+      "label": "PR #187",
+      "kind": "leaf",
+      "prNumber": 187,
+      "title": "Combine ALiBi with ragged BERT-base varlen diagnostics",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
