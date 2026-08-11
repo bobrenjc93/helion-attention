@@ -354,17 +354,21 @@ The exact bf16 4K profile above also accepts forward-only fp32 ALiBi slopes
 shaped `[32]` or `[1, 32]` for a full-cache read or a Python-integer prefix from
 1 through 4095, with either decode-equivalent causal flag and the default or a
 custom `softmax_scale`. With `causal=True`, the same slopes may be paired with
-a contiguous CUDA int32 `cache_seqlens` tensor shaped `[1]` selecting a prefix
-from 1 through 4096, provided `cache_leftpad` is omitted:
+a contiguous CUDA int32 `cache_seqlens` tensor shaped `[1]`. Without
+`cache_leftpad`, values from 1 through 4096 select a prefix; an optional matching
+`cache_leftpad` tensor instead selects `[cache_leftpad, cache_seqlens)`, with
+`0 <= cache_leftpad < cache_seqlens <= 4096`:
 
 ```python
 slopes = torch.linspace(0.01, 0.2, H_Q, device="cuda", dtype=torch.float32)
-prefix_length = torch.tensor([1025], device="cuda", dtype=torch.int32)
+cache_leftpad = torch.tensor([1024], device="cuda", dtype=torch.int32)
+cache_end = torch.tensor([3073], device="cuda", dtype=torch.int32)
 out = helion_attention.flash_attn_with_kvcache(
     q,
     k_cache,
     v_cache,
-    cache_seqlens=prefix_length,
+    cache_seqlens=cache_end,
+    cache_leftpad=cache_leftpad,
     causal=True,
     alibi_slopes=slopes,
     shape=(B, 1, S_CACHE, H_Q, H_KV, D),
@@ -375,9 +379,9 @@ ALiBi uses the generic packed Triton runtime and never mutates the cache;
 slope-free full-cache global-window calls retain the checked-in generated
 specialization, and slope-free prefixes retain their existing packed-prefix
 dispatch. Full-cache ALiBi retains its existing generic dense dispatch. This
-narrow mode does not support LSE, updates, cache remapping, left padding,
-rotary, windows, softcap, or autograd. Tensor-selected ALiBi remains limited to
-the causal 4K prefix above; noncausal and other tensor-span profiles remain
+narrow mode does not support LSE, updates, cache remapping, rotary, windows,
+softcap, or autograd. Tensor-selected ALiBi remains limited to the causal 4K
+spans above; noncausal and other tensor-span profiles remain
 slope-free.
 
 The exact causal bf16 `(1, 1, 1024, 32, 8, 128)` profile accepts a read-only
@@ -418,18 +422,18 @@ padding, rotary, softcap, explicit split counts, autograd, other windows, and
 other profiles remain unsupported for this local-window path.
 
 The 4K profile also accepts a contiguous CUDA int32 `cache_seqlens` tensor
-shaped `[1]` for a read-only prefix. Slope-free tensor spans support both causal
-flags, either scale, optional fp32 LSE, and an optional contiguous CUDA int32
-`cache_leftpad` tensor shaped `[1]` selecting the half-open span
+shaped `[1]` for a read-only prefix. An optional matching contiguous CUDA int32
+`cache_leftpad` tensor selects the half-open span
 `[cache_leftpad, cache_seqlens)`, with
-`0 <= cache_leftpad < cache_seqlens <= 4096`. The causal profile additionally
-accepts ALiBi slopes shaped `[32]` or `[1, 32]` for a tensor-selected prefix
-when `cache_leftpad` is omitted; this combination supports either scale but not
-LSE. All tensor-span forms never mutate the cache and synchronize once for
+`0 <= cache_leftpad < cache_seqlens <= 4096`. Slope-free tensor spans support
+both causal flags, either scale, and optional fp32 LSE. The causal profile
+additionally accepts ALiBi slopes shaped `[32]` or `[1, 32]` for a tensor-selected
+prefix or left-padded span; this combination supports either scale but not LSE.
+All tensor-span forms never mutate the cache and synchronize once for
 recoverable bounds validation. Updates, cache remapping, rotary, windows,
 softcap, explicit split counts, autograd, and CUDA graph capture remain
-unsupported. Tensor-selected ALiBi with left padding, noncausal attention, or
-other dense profiles also remains unsupported. Scalar prefixes and tensor
+unsupported. Tensor-selected ALiBi with noncausal attention or on other dense
+profiles also remains unsupported. Scalar prefixes and tensor
 spans on other dense profiles, plus non-final appends outside this 4K profile,
 remain unsupported except for the separately documented two-token 1K update
 and 1K and 16K read slices.
@@ -912,8 +916,9 @@ raise `NotImplementedError` rather than silently doing something else:
   page-size-256/page-size-512 decode above; core paged-varlen ALiBi cannot be
   combined with dropout, windows, softcap, `deterministic=True`, diagnostic
   returns, or autograd; dense KV-cache ALiBi cannot be combined with LSE,
-  updates, remapping, left padding, rotary, windows, softcap, or autograd, and
-  tensor-selected lengths are limited to the exact causal 4K prefix above;
+  updates, remapping, rotary, windows, softcap, or autograd, and tensor-selected
+  spans, including left-padded spans, are limited to the exact causal 4K profile
+  above;
   paged KV-cache ALiBi cannot be combined with softcap, updates, rotary,
   windows, or autograd, and its LSE combination is limited to the exact
   read-only page-size-256/page-size-512 decode profile above
