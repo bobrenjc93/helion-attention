@@ -4693,6 +4693,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:30cc3c093439de2acbfe0dc6cecf9f3398cf33b6",
+      "commit": "30cc3c093439de2acbfe0dc6cecf9f3398cf33b6",
+      "recordedAt": "2026-08-11T14:50:55.618Z",
+      "label": "base 30cc3c0",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:201",
+      "recordedAt": "2026-08-11T14:50:55.618Z",
+      "label": "PR #201",
+      "kind": "leaf",
+      "prNumber": 201,
+      "title": "Add dropout to noncausal 1K GPT-2 BF16",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
