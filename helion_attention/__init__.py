@@ -63,19 +63,20 @@ full-cache dispatch.
 The page-16 1K paged decode profile likewise accepts one paired final-slot
 append when every device-resident length is 1023 and its logical pages map to
 disjoint physical blocks, then retains its generated reader for attention.
-Default-scale SM90 training on the shipped encoder-training profile keeps its
-generated forward values and uses raw PyTorch BSHD Flash gradients, falling
-back to its generated backward when Flash is unavailable. Positive dropout on
-that profile, the checked-in BERT-base encoder, and the shipped causal and
-noncausal GPT-2 profiles, grad-enabled dense calls without a generated
-backward, grad-enabled diagnostics on the causal GPT-2, global causal 2K
-Llama GQA, and full-length causal varlen profiles,
-both shipped full-length varlen profiles, full-length BERT-base varlen
-attention, and ragged causal attention use PyTorch SDPA autograd. Full-length
-symmetric-window training on the shipped noncausal varlen profile and the exact
-causal left window on the shipped causal varlen profile use the same bounded
-SDPA bridge. Deterministic zero-dropout dense BERT-base, causal and noncausal
-GPT-2, causal 2K Llama GQA, both shipped full-length varlen training profiles,
+Zero-dropout training without diagnostics on the shipped encoder-training
+profile keeps its generated forward values. Its default-scale SM90 path uses
+raw PyTorch BSHD Flash gradients, falling back to its generated backward when
+Flash is unavailable. Positive dropout on that profile, the checked-in
+BERT-base encoder, and the shipped causal and noncausal GPT-2 profiles,
+grad-enabled dense calls without a generated backward, grad-enabled diagnostics
+on the encoder-training, causal GPT-2, global causal 2K Llama GQA, and
+full-length causal varlen profiles, both shipped full-length varlen profiles,
+full-length BERT-base varlen attention, and ragged causal attention use PyTorch
+SDPA autograd. Full-length symmetric-window training on the shipped
+noncausal varlen profile and the exact causal left window on the shipped causal
+varlen profile use the same bounded SDPA bridge.
+Deterministic zero-dropout dense BERT-base, causal and noncausal GPT-2, causal
+2K Llama GQA, both shipped full-length varlen training profiles,
 and full-length BERT-base varlen training use the direct math operator without
 changing process-wide SDPA backend state. The explicit shape validates these
 paths and makes specialization introspection independent of fallback coverage.
@@ -195,7 +196,11 @@ _DENSE_DETERMINISTIC_BACKWARD_KEYS = frozenset(
     }
 )
 _DENSE_DIAGNOSTIC_BACKWARD_KEYS = frozenset(
-    {_CAUSAL_DROPOUT_KEY, _LLAMA_2K_LEFT_WINDOW_KEY}
+    {
+        _ENCODER_TRAINING_KEY,
+        _CAUSAL_DROPOUT_KEY,
+        _LLAMA_2K_LEFT_WINDOW_KEY,
+    }
 )
 _GEMMA2_SOFTCAP_KEY = "b1_sq4096_sk4096_hq16_hkv8_d256_bf16_causal"
 _GEMMA2_SOFTCAP = 50.0
@@ -1914,14 +1919,14 @@ def flash_attn_func(
             three Llama GQA decode profiles, and the ``softcap=50.0`` Gemma-2
             profile, return FlashAttention's diagnostic tuple. BERT-base
             diagnostics may additionally use forward-only ALiBi slopes. The
-            zero-dropout causal GPT-2 and global causal 2K Llama GQA profiles
-            also support backward through ``out``; their LSE and empty
-            ``S_dmask`` accept gradients with zero contribution, matching
-            FlashAttention. Other profiles require that no backward is needed,
-            and all options other than ``softmax_scale`` (plus the documented
-            BERT ALiBi and causal/softcap settings) retain their defaults. The
-            2K Llama diagnostic is global-only; its existing finite left-window
-            calls remain output-only.
+            zero-dropout encoder-training, causal GPT-2, and global causal 2K
+            Llama GQA profiles also support backward through ``out``; their LSE
+            and empty ``S_dmask`` accept gradients with zero contribution,
+            matching FlashAttention. Other profiles require that no backward
+            is needed, and all options other than ``softmax_scale`` (plus the
+            documented BERT ALiBi and causal/softcap settings) retain their
+            defaults. The 2K Llama diagnostic is global-only; its existing
+            finite left-window calls remain output-only.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -1952,11 +1957,11 @@ def flash_attn_func(
     Deterministic zero-dropout training on the exact BERT-base, causal and
     noncausal GPT-2, and global causal 2K Llama GQA profiles uses PyTorch's
     direct math SDPA operator for repeatable output and gradients.
-    Zero-dropout training on the shipped encoder profile retains generated
-    forward values. Its omitted/default-scale SM90 path uses raw BSHD PyTorch
-    Flash gradients, falling back to the generated backward when Flash is
-    unavailable. Explicit-scale, non-SM90, and deterministic calls retain the
-    generated backward.
+    Zero-dropout training without diagnostics on the shipped encoder profile
+    retains generated forward values. Its omitted/default-scale SM90 path uses
+    raw BSHD PyTorch Flash gradients, falling back to the generated backward
+    when Flash is unavailable. Explicit-scale, non-SM90, and deterministic
+    calls retain the generated backward.
     :func:`is_shape_supported` remains ``False`` for unregistered calls because
     it reports checked-in acceleration only.
     """

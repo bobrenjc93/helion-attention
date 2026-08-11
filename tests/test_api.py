@@ -935,48 +935,12 @@ def test_encoder_no_grad_retains_generated_dispatch(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "entry_point",
-    ["dense", "qkvpacked", "kvpacked"],
-    ids=["dense", "qkv-packed", "kv-packed"],
-)
-def test_encoder_return_attn_probs_rejects_backward(
-    entry_point: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    spec = ENCODER_TRAINING
-    q, k, v = make_inputs(spec, seed=31415)
-
-    def reject_dispatch(*args: object, **kwargs: object) -> object:
-        raise AssertionError("encoder diagnostic backward reached dispatch")
-
-    monkeypatch.setattr(
-        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
-    )
-    if entry_point == "dense":
-        q.requires_grad_()
-        entry = helion_attention.flash_attn_func
-        inputs = (q, k, v)
-    elif entry_point == "qkvpacked":
-        qkv = torch.stack((q, k, v), dim=2).requires_grad_()
-        entry = helion_attention.flash_attn_qkvpacked_func
-        inputs = (qkv,)
-    else:
-        q.requires_grad_()
-        kv = torch.stack((k, v), dim=2)
-        entry = helion_attention.flash_attn_kvpacked_func
-        inputs = (q, kv)
-
-    with pytest.raises(NotImplementedError, match="grad-enabled"):
-        entry(*inputs, return_attn_probs=True, shape=spec)
-
-
-@requires_cuda
-@pytest.mark.parametrize(
     ("case", "message"),
     [
         ("dropout", "with dropout"),
         ("causal", "encoder-training profile"),
         ("deterministic", "deterministic=False"),
+        ("deterministic-grad", "deterministic=False"),
         ("alibi", "with ALiBi slopes"),
         ("window", "Llama GQA profile"),
         ("softcap", "Gemma-2 profile"),
@@ -1007,7 +971,9 @@ def test_encoder_return_attn_probs_rejects_optional_features(
             spec.nheads_kv,
             spec.head_dim,
         )
-    elif case == "deterministic":
+    elif case in ("deterministic", "deterministic-grad"):
+        if case == "deterministic-grad":
+            q.requires_grad_()
         kwargs["deterministic"] = True
     elif case == "alibi":
         kwargs["alibi_slopes"] = torch.ones(
@@ -3348,10 +3314,16 @@ def test_causal_gpt2_return_attn_probs_matches_fa2(
 
 
 @requires_cuda
-def test_causal_gpt2_diagnostic_inference_retains_generic_dispatch(
+@pytest.mark.parametrize(
+    ("spec", "causal"),
+    [(ENCODER_TRAINING, False), (CAUSAL_DROPOUT, True)],
+    ids=["encoder-training", "causal-gpt2"],
+)
+def test_dense_diagnostic_inference_retains_generic_dispatch(
+    spec: AttnShape,
+    causal: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    spec = CAUSAL_DROPOUT
     q, k, v = make_inputs(spec, seed=212132)
     q.requires_grad_()
     sentinel = (
@@ -3395,7 +3367,7 @@ def test_causal_gpt2_diagnostic_inference_retains_generic_dispatch(
             q,
             k,
             v,
-            causal=True,
+            causal=causal,
             return_attn_probs=True,
             shape=spec,
         )
@@ -3413,12 +3385,18 @@ def test_causal_gpt2_diagnostic_inference_retains_generic_dispatch(
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
-def test_causal_gpt2_diagnostic_backward_matches_fp32_and_fa2(
+@pytest.mark.parametrize(
+    ("spec", "causal"),
+    [(ENCODER_TRAINING, False), (CAUSAL_DROPOUT, True)],
+    ids=["encoder-training", "causal-gpt2"],
+)
+def test_dense_diagnostic_backward_matches_fp32_and_fa2(
     entry_point: str,
     softmax_scale: float | None,
+    spec: AttnShape,
+    causal: bool,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
-    spec = CAUSAL_DROPOUT
     base_q, base_k, base_v = make_inputs(spec, seed=223606)
     grad_out = make_inputs(spec, seed=244949)[0]
     generator = torch.Generator(device="cuda").manual_seed(264575)
@@ -3437,7 +3415,7 @@ def test_causal_gpt2_diagnostic_backward_matches_fp32_and_fa2(
     ]:
         api_kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
-            "causal": True,
+            "causal": causal,
             "return_attn_probs": True,
         }
         if package is helion_attention:
@@ -3506,6 +3484,15 @@ def test_causal_gpt2_diagnostic_backward_matches_fp32_and_fa2(
 
     out, softmax_lse, s_dmask = got
     expected_out, expected_lse, expected_s_dmask = expected_fa2
+    assert out.shape == expected_out.shape == base_q.shape
+    assert out.dtype == expected_out.dtype == spec.dtype
+    assert out.is_contiguous()
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.batch,
+        spec.nheads_q,
+        spec.seqlen_q,
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
     assert s_dmask.shape == expected_s_dmask.shape == (0,)
     assert s_dmask.dtype == expected_s_dmask.dtype == spec.dtype
     torch.testing.assert_close(
@@ -3534,8 +3521,15 @@ def test_causal_gpt2_diagnostic_backward_matches_fp32_and_fa2(
 
 
 @requires_cuda
-def test_causal_gpt2_diagnostic_auxiliary_gradients_are_exactly_zero() -> None:
-    spec = CAUSAL_DROPOUT
+@pytest.mark.parametrize(
+    ("spec", "causal"),
+    [(ENCODER_TRAINING, False), (CAUSAL_DROPOUT, True)],
+    ids=["encoder-training", "causal-gpt2"],
+)
+def test_dense_diagnostic_auxiliary_gradients_are_exactly_zero(
+    spec: AttnShape,
+    causal: bool,
+) -> None:
     q, k, v = (
         tensor.requires_grad_()
         for tensor in make_inputs(spec, seed=282842)
@@ -3544,7 +3538,7 @@ def test_causal_gpt2_diagnostic_auxiliary_gradients_are_exactly_zero() -> None:
         q,
         k,
         v,
-        causal=True,
+        causal=causal,
         return_attn_probs=True,
         shape=spec,
     )
@@ -3555,6 +3549,10 @@ def test_causal_gpt2_diagnostic_auxiliary_gradients_are_exactly_zero() -> None:
         grad_outputs=(torch.ones_like(softmax_lse), torch.empty_like(s_dmask)),
     )
 
+    assert softmax_lse.shape == (spec.batch, spec.nheads_q, spec.seqlen_q)
+    assert softmax_lse.dtype == torch.float32
+    assert s_dmask.shape == (0,)
+    assert s_dmask.dtype == spec.dtype
     assert all(torch.count_nonzero(grad).item() == 0 for grad in grads)
 
 
