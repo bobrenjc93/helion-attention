@@ -489,7 +489,7 @@ def reference_packed(
     return out
 
 
-def reference_softcap_packed(
+def reference_softcap_packed_diagnostics(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -499,9 +499,12 @@ def reference_softcap_packed(
     causal: bool,
     scale: float,
     softcap: float,
-) -> torch.Tensor:
-    """Compute ragged softcapped attention directly in fp32."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute ragged softcapped attention and LSE directly in fp32."""
     out = torch.empty(q.shape, device=q.device, dtype=torch.float32)
+    softmax_lse = torch.empty(
+        q.shape[1], q.shape[0], device=q.device, dtype=torch.float32
+    )
     q_start = 0
     k_start = 0
     for seqlen_q, seqlen_k in zip(lengths_q, lengths_k):
@@ -519,6 +522,9 @@ def reference_softcap_packed(
             col = torch.arange(seqlen_k, device=q.device)[None, :]
             keep = col <= row + seqlen_k - seqlen_q
             scores.masked_fill_(~keep[None], float("-inf"))
+        softmax_lse[:, q_start : q_start + seqlen_q] = torch.logsumexp(
+            scores, dim=-1
+        )
         probabilities = torch.softmax(scores, dim=-1)
         # Bottom-right alignment can leave leading query rows with no keys.
         probabilities.nan_to_num_(nan=0.0)
@@ -526,6 +532,31 @@ def reference_softcap_packed(
         out[q_start : q_start + seqlen_q] = result
         q_start += seqlen_q
         k_start += seqlen_k
+    return out, softmax_lse
+
+
+def reference_softcap_packed(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lengths_q: list[int],
+    lengths_k: list[int],
+    *,
+    causal: bool,
+    scale: float,
+    softcap: float,
+) -> torch.Tensor:
+    """Compute ragged softcapped attention directly in fp32."""
+    out, _ = reference_softcap_packed_diagnostics(
+        q,
+        k,
+        v,
+        lengths_q,
+        lengths_k,
+        causal=causal,
+        scale=scale,
+        softcap=softcap,
+    )
     return out
 
 
@@ -7338,6 +7369,101 @@ def test_core_varlen_large_page_softcap_matches_fa2_and_fp32_for_ragged_permuted
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
+def test_core_varlen_page_256_softcap_diagnostics_match_fa2_and_fp32_for_ragged_permuted_pages(
+    causal: bool, softmax_scale: float | None
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, lengths_k, request_kv = (
+        make_paged_decode(page_size=256, seed=20260811)
+    )
+    # Exercise the nonlinear part of the cap in both physical and logical K.
+    q.mul_(4.0)
+    k.mul_(4.0)
+    for logical_k, _ in request_kv:
+        logical_k.mul_(4.0)
+    scale = (
+        1.0 / math.sqrt(PAGED_DECODE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=CORE_PAGED_SOFTCAP_VALUE,
+            return_attn_probs=True,
+            block_table=block_table,
+            shape=(4, 1, 1024, 8, 2, 128),
+        )
+        expected_fp32_out, expected_fp32_lse = (
+            reference_softcap_packed_diagnostics(
+                q,
+                torch.cat([logical_k for logical_k, _ in request_kv]),
+                torch.cat([logical_v for _, logical_v in request_kv]),
+                [1] * PAGED_DECODE.batch,
+                lengths_k,
+                causal=causal,
+                scale=scale,
+                softcap=CORE_PAGED_SOFTCAP_VALUE,
+            )
+        )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    out, softmax_lse, s_dmask = got
+    assert out.shape == q.shape
+    assert out.dtype == torch.bfloat16
+    assert softmax_lse.shape == (PAGED_DECODE.nheads_q, q.shape[0])
+    assert softmax_lse.dtype == torch.float32
+    assert s_dmask.shape == (0,)
+    assert s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_fp32_out, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_fp32_lse, atol=5e-2, rtol=2e-3
+    )
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    with torch.no_grad():
+        expected_fa2 = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=CORE_PAGED_SOFTCAP_VALUE,
+            return_attn_probs=True,
+            block_table=block_table,
+        )
+    expected_out, expected_lse, expected_s_dmask = expected_fa2
+    assert expected_s_dmask.shape == s_dmask.shape
+    assert expected_s_dmask.dtype == s_dmask.dtype
+    torch.testing.assert_close(out, expected_out, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
 @pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
 @pytest.mark.parametrize(
     "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
@@ -7585,10 +7711,19 @@ def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "page_size", [256, 512], ids=["page-256", "page-512"]
+    ("page_size", "softcap"),
+    [
+        pytest.param(256, 0.0, id="page-256"),
+        pytest.param(512, 0.0, id="page-512"),
+        pytest.param(
+            256,
+            CORE_PAGED_SOFTCAP_VALUE,
+            id="page-256-softcap-50",
+        ),
+    ],
 )
 def test_core_varlen_large_page_diagnostics_request_lse_from_generic_runtime(
-    monkeypatch: pytest.MonkeyPatch, page_size: int
+    monkeypatch: pytest.MonkeyPatch, page_size: int, softcap: float
 ) -> None:
     import helion_attention._paged_attention as generic_attention
 
@@ -7626,6 +7761,7 @@ def test_core_varlen_large_page_diagnostics_request_lse_from_generic_runtime(
         PAGED_DECODE.seqlen_k,
         softmax_scale=0.19,
         causal=False,
+        softcap=softcap,
         return_attn_probs=True,
         block_table=block_table,
         shape=(4, 1, 1024, 8, 2, 128),
@@ -7640,6 +7776,7 @@ def test_core_varlen_large_page_diagnostics_request_lse_from_generic_runtime(
     )
     assert kwargs["softmax_scale"] == 0.19
     assert kwargs["causal"] is False
+    assert kwargs["softcap"] == softcap
     assert kwargs["return_softmax_lse"] is True
     assert isinstance(result, tuple) and len(result) == 3
     assert result[0] is sentinel
@@ -7992,7 +8129,9 @@ def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispa
         pytest.param("dropout", "dropout", id="dropout"),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param("deterministic", "deterministic=False", id="deterministic"),
-        pytest.param("softcap", "softcap", id="softcap"),
+        pytest.param(
+            "page-512-softcap", "page-size-256", id="page-512-softcap"
+        ),
     ],
 )
 def test_core_varlen_large_page_diagnostics_reject_out_of_scope_calls_before_dispatch(
@@ -8101,14 +8240,12 @@ def test_core_varlen_large_page_diagnostics_reject_out_of_scope_calls_before_dis
         ),
         pytest.param("window", "sliding-window", id="window"),
         pytest.param(
-            "diagnostic",
-            "return_attn_probs=True.*softcap",
-            id="diagnostic",
+            "page-512-diagnostic",
+            "page-size-256",
+            id="page-512-diagnostic",
         ),
         pytest.param(
-            "page-512-diagnostic",
-            "return_attn_probs=True.*softcap",
-            id="page-512-diagnostic",
+            "diagnostic-gradient", "softcap backward", id="diagnostic-gradient"
         ),
         pytest.param(
             "deterministic", "deterministic=True", id="deterministic"
@@ -8161,6 +8298,9 @@ def test_core_varlen_large_page_softcap_rejects_out_of_scope_calls_before_dispat
     elif scoped_case == "window":
         kwargs["window_size"] = (1, 1)
     elif scoped_case == "diagnostic":
+        kwargs["return_attn_probs"] = True
+    elif scoped_case == "diagnostic-gradient":
+        q.requires_grad_()
         kwargs["return_attn_probs"] = True
     else:
         kwargs["deterministic"] = True
