@@ -4348,6 +4348,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:8407922024fca91370c100105f2399d2f372641c",
+      "commit": "8407922024fca91370c100105f2399d2f372641c",
+      "recordedAt": "2026-08-11T09:37:08.616Z",
+      "label": "base 8407922",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:189",
+      "recordedAt": "2026-08-11T09:37:08.616Z",
+      "label": "PR #189",
+      "kind": "leaf",
+      "prNumber": 189,
+      "title": "Return softcap diagnostics through core page-256 decode",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 66,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
