@@ -342,9 +342,9 @@ def dense_attention_math_sdpa(
     value = v.transpose(1, 2)
     enable_gqa = spec.nheads_q != spec.nheads_kv
 
-    # The validated deterministic profiles are equal-length MHA. Pass their
-    # causal semantics explicitly while preserving FlashAttention's input dtype
-    # under any active cross-dtype autocast context.
+    # The validated deterministic profiles are equal-length self-attention.
+    # Pass their causal semantics explicitly while preserving FlashAttention's
+    # input dtype under any active cross-dtype autocast context.
     with torch.autocast(device_type=q.device.type, enabled=False):
         out = _MATH_ATTENTION_FORWARD(
             query,

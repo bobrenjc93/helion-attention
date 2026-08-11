@@ -1588,6 +1588,196 @@ def test_llama_2k_global_return_attn_probs_matches_fa2(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_llama_2k_deterministic_training_is_repeatable_and_matches_references(
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA_2K_LEFT_WINDOW
+    base_q, base_k, base_v = make_inputs(spec, seed=271828)
+    grad_out = make_inputs(spec, seed=314159)[0]
+
+    def run() -> tuple[torch.Tensor, ...]:
+        if entry_point == "dense":
+            q = base_q.detach().requires_grad_()
+            k = base_k.detach().requires_grad_()
+            v = base_v.detach().requires_grad_()
+            out = helion_attention.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=True,
+                deterministic=True,
+                shape=spec,
+            )
+            grads = torch.autograd.grad(out, (q, k, v), grad_out)
+        else:
+            q = base_q.detach().requires_grad_()
+            kv = torch.stack((base_k, base_v), dim=2).requires_grad_()
+            out = helion_attention.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                deterministic=True,
+                shape=spec,
+            )
+            q_grad, kv_grad = torch.autograd.grad(out, (q, kv), grad_out)
+            grads = (q_grad, kv_grad[:, :, 0], kv_grad[:, :, 1])
+        return (out.detach(), *(grad.detach() for grad in grads))
+
+    first = run()
+    second = run()
+    assert all(
+        torch.equal(actual, repeated)
+        for actual, repeated in zip(first, second)
+    )
+
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    q_fp32 = base_q.float().requires_grad_()
+    k_fp32 = base_k.float().requires_grad_()
+    v_fp32 = base_v.float().requires_grad_()
+    expected_fp32 = reference_attention(
+        q_fp32, k_fp32, v_fp32, spec, scale
+    )
+    expected_fp32_grads = torch.autograd.grad(
+        expected_fp32, (q_fp32, k_fp32, v_fp32), grad_out.float()
+    )
+
+    if entry_point == "dense":
+        q_fa2 = base_q.detach().requires_grad_()
+        k_fa2 = base_k.detach().requires_grad_()
+        v_fa2 = base_v.detach().requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_func(
+            q_fa2,
+            k_fa2,
+            v_fa2,
+            softmax_scale=softmax_scale,
+            causal=True,
+            deterministic=True,
+        )
+        expected_fa2_grads = torch.autograd.grad(
+            expected_fa2, (q_fa2, k_fa2, v_fa2), grad_out
+        )
+    else:
+        q_fa2 = base_q.detach().requires_grad_()
+        kv_fa2 = torch.stack((base_k, base_v), dim=2).requires_grad_()
+        expected_fa2 = flash_attn.flash_attn_kvpacked_func(
+            q_fa2,
+            kv_fa2,
+            softmax_scale=softmax_scale,
+            causal=True,
+            deterministic=True,
+        )
+        q_grad_fa2, kv_grad_fa2 = torch.autograd.grad(
+            expected_fa2, (q_fa2, kv_fa2), grad_out
+        )
+        expected_fa2_grads = (
+            q_grad_fa2,
+            kv_grad_fa2[:, :, 0],
+            kv_grad_fa2[:, :, 1],
+        )
+
+    assert first[0].shape == expected_fa2.shape == base_q.shape
+    assert first[0].dtype == expected_fa2.dtype == torch.bfloat16
+    assert first[0].is_contiguous()
+    torch.testing.assert_close(
+        first[0].float(), expected_fa2.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        first[0].float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+
+    gradient_atol = 5e-2 if softmax_scale is None else 1.5e-1
+    for actual, fa2, fp32 in zip(
+        first[1:], expected_fa2_grads, expected_fp32_grads
+    ):
+        torch.testing.assert_close(
+            actual.float(), fa2.float(), atol=gradient_atol, rtol=5e-2
+        )
+        torch.testing.assert_close(
+            actual.float(), fp32, atol=gradient_atol, rtol=5e-2
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+@pytest.mark.parametrize(
+    ("deterministic", "expected_dispatch"),
+    [(False, "ordinary"), (True, "math")],
+)
+def test_llama_2k_deterministic_training_dispatch_is_narrow(
+    entry_point: str,
+    deterministic: bool,
+    expected_dispatch: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA_2K_LEFT_WINDOW
+    q, k, v = make_inputs(spec, seed=161803)
+    q.requires_grad_()
+    kv = torch.stack((k, v), dim=2).requires_grad_()
+    sentinel = torch.empty_like(q)
+    dispatched: list[str] = []
+
+    def bridge(name: str):
+        def run(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+            spec_arg: AttnShape,
+        ) -> torch.Tensor:
+            del q_arg, k_arg, v_arg
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            assert spec_arg == spec
+            dispatched.append(name)
+            return sentinel
+
+        return run
+
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_sdpa", bridge("ordinary")
+    )
+    monkeypatch.setattr(
+        helion_attention, "dense_attention_math_sdpa", bridge("math")
+    )
+
+    if entry_point == "dense":
+        out = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            deterministic=deterministic,
+            shape=spec,
+        )
+    else:
+        out = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            causal=True,
+            deterministic=deterministic,
+            shape=spec,
+        )
+
+    assert out is sentinel
+    assert dispatched == [expected_dispatch]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "window_left",
     LLAMA_2K_LEFT_WINDOW_RADII,
     ids=lambda radius: f"left-{radius}",
