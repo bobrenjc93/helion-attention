@@ -4048,6 +4048,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:1dd76675c05f23ddcfb730f085c69347fc0e6e0f",
+      "commit": "1dd76675c05f23ddcfb730f085c69347fc0e6e0f",
+      "recordedAt": "2026-08-11T04:32:28.331Z",
+      "label": "base 1dd7667",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 68,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:177",
+      "recordedAt": "2026-08-11T04:32:28.331Z",
+      "label": "PR #177",
+      "kind": "leaf",
+      "prNumber": 177,
+      "title": "Enable ALiBi on ragged BERT-base varlen inference",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 69,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
