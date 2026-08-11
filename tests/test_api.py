@@ -3576,6 +3576,117 @@ def test_bert_return_attn_probs_matches_fa2(
     ["dense", "qkvpacked", "kvpacked"],
     ids=["dense", "qkv-packed", "kv-packed"],
 )
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_bert_alibi_return_attn_probs_matches_fa2(
+    entry_point: str,
+    batched_slopes: bool,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = BERT_DIAGNOSTIC
+    q, k, v = make_inputs(spec, seed=20260810)
+    head_slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(spec.batch)], dim=0
+        )
+        if batched_slopes
+        else head_slopes
+    )
+    declared_shape = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+    )
+
+    with torch.no_grad():
+        if entry_point == "dense":
+            got = helion_attention.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                alibi_slopes=slopes,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                alibi_slopes=slopes,
+                return_attn_probs=True,
+            )
+        elif entry_point == "qkvpacked":
+            qkv = torch.stack((q, k, v), dim=2)
+            got = helion_attention.flash_attn_qkvpacked_func(
+                qkv,
+                softmax_scale=softmax_scale,
+                alibi_slopes=slopes,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_qkvpacked_func(
+                qkv,
+                softmax_scale=softmax_scale,
+                alibi_slopes=slopes,
+                return_attn_probs=True,
+            )
+        else:
+            kv = torch.stack((k, v), dim=2)
+            got = helion_attention.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                alibi_slopes=slopes,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                alibi_slopes=slopes,
+                return_attn_probs=True,
+            )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    assert isinstance(expected, tuple) and len(expected) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert slopes.shape == (
+        (spec.batch, spec.nheads_q) if batched_slopes else (spec.nheads_q,)
+    )
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (16, 12, 512)
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point",
+    ["dense", "qkvpacked", "kvpacked"],
+    ids=["dense", "qkv-packed", "kv-packed"],
+)
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_bert_zero_dropout_retains_generated_dispatch(
     entry_point: str,
@@ -3645,11 +3756,90 @@ def test_bert_zero_dropout_retains_generated_dispatch(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "features", ["ordinary", "alibi", "diagnostics", "combined"]
+)
+def test_bert_feature_dispatch_stays_separate(
+    features: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spec = BERT_DIAGNOSTIC
+    q, k, v = make_inputs(spec, seed=223607)
+    slopes = torch.linspace(0.01, 0.2, spec.nheads_q, device=q.device)
+    out = torch.empty_like(q)
+    diagnostics = (
+        out,
+        torch.empty(
+            spec.batch,
+            spec.nheads_q,
+            spec.seqlen_q,
+            device=q.device,
+            dtype=torch.float32,
+        ),
+        q.new_empty((0,)),
+    )
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    def generated(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(("generated", args, kwargs))
+        return out
+
+    def alibi_forward(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(("alibi", args, kwargs))
+        return out
+
+    def diagnostic_forward(
+        *args: object, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        calls.append(("diagnostics", args, kwargs))
+        return diagnostics
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("BERT feature call reached unrelated dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup", lambda _spec: generated)
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", alibi_forward)
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", diagnostic_forward
+    )
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "attention_diagnostics", reject_dispatch)
+
+    kwargs: dict[str, object] = {}
+    if features in ("alibi", "combined"):
+        kwargs["alibi_slopes"] = slopes
+    if features in ("diagnostics", "combined"):
+        kwargs["return_attn_probs"] = True
+    with torch.no_grad():
+        got = helion_attention.flash_attn_func(q, k, v, shape=spec, **kwargs)
+
+    expected_dispatch = {
+        "ordinary": "generated",
+        "alibi": "alibi",
+        "diagnostics": "diagnostics",
+        "combined": "diagnostics",
+    }[features]
+    assert got is (diagnostics if "diagnostics" in expected_dispatch else out)
+    assert len(calls) == 1
+    dispatch, args, dispatch_kwargs = calls[0]
+    assert dispatch == expected_dispatch
+    if features == "ordinary":
+        assert len(args) == 4
+        assert dispatch_kwargs == {}
+    elif features == "alibi":
+        assert len(args) == 6 and args[-1] is slopes
+        assert dispatch_kwargs == {}
+    else:
+        assert len(args) == 5
+        assert dispatch_kwargs == (
+            {"alibi_slopes": slopes} if features == "combined" else {}
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     ("case", "message"),
     [
         ("grad", "grad-enabled"),
         ("causal", "BERT-base encoder"),
-        ("alibi", "ALiBi"),
         ("dropout", "dropout"),
         ("other-shape", "BERT-base encoder"),
     ],
@@ -3675,10 +3865,6 @@ def test_bert_return_attn_probs_rejects_out_of_scope_calls(
             spec.nheads_q,
             spec.head_dim,
         )
-    elif case == "alibi":
-        kwargs["alibi_slopes"] = torch.ones(
-            spec.nheads_q, device=q.device, dtype=torch.float32
-        )
     elif case == "dropout":
         kwargs["dropout_p"] = 0.1
     else:
@@ -3692,6 +3878,84 @@ def test_bert_return_attn_probs_rejects_out_of_scope_calls(
     monkeypatch.setattr(
         helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
     )
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_func(q, k, v, **kwargs)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("q-gradient", "ALiBi backward"),
+        ("slope-gradient", "ALiBi backward"),
+        ("dropout", "dropout combined with ALiBi"),
+        ("causal", "noncausal bf16"),
+        ("window", "sliding-window"),
+        ("softcap", "softcap combined with ALiBi"),
+        ("deterministic", "deterministic=False"),
+        ("fp16", "noncausal bf16"),
+        ("other-profile", "BERT-base encoder"),
+    ],
+)
+def test_bert_alibi_diagnostics_reject_out_of_scope_calls(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = BERT_DIAGNOSTIC
+    q, k, v = make_inputs(spec, seed=31415)
+    slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
+    kwargs: dict[str, object] = {
+        "alibi_slopes": slopes,
+        "return_attn_probs": True,
+        "shape": spec,
+    }
+    if case == "q-gradient":
+        q.requires_grad_()
+    elif case == "slope-gradient":
+        slopes.requires_grad_()
+    elif case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "causal":
+        kwargs["causal"] = True
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.nheads_q,
+            spec.head_dim,
+        )
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 50.0
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    elif case == "fp16":
+        q, k, v = (tensor.to(torch.float16) for tensor in (q, k, v))
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
+    else:
+        spec = ENCODER_TRAINING
+        q, k, v = make_inputs(spec, seed=31415)
+        slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
+        kwargs["alibi_slopes"] = slopes
+        kwargs["shape"] = spec
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
+        raise AssertionError("out-of-scope BERT ALiBi diagnostic reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
     monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
     with pytest.raises(NotImplementedError, match=message):

@@ -8,11 +8,12 @@ time they are checked in: importing this package pulls in ``torch`` and
 Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
-ALiBi calls, BERT-base and causal GPT-2 diagnostics, one causal Llama-3 GQA
-varlen inference profile, ALiBi with optional diagnostics on that profile and
-the shipped causal varlen profile, ALiBi on both shipped varlen profiles, and
-symmetric windows on the shipped noncausal varlen profile use a generic Triton
-forward kernel. The same runtime exposes exactly a 127-token left plus
+ALiBi calls, BERT-base diagnostics with optional ALiBi, causal GPT-2
+diagnostics, one causal Llama-3 GQA varlen inference profile, ALiBi with optional
+diagnostics on that profile and the shipped causal varlen profile, ALiBi on
+both shipped varlen profiles, and symmetric windows on the shipped noncausal
+varlen profile use a generic Triton forward kernel. The same runtime exposes
+exactly a 127-token left plus
 current-token causal window for the full-length shipped causal varlen profile,
 while its global-window call retains generated dispatch. It also exposes
 exactly a 511-token left plus current-token causal window for the bf16 batch-1
@@ -1247,6 +1248,7 @@ def _generic_dense_diagnostic_forward(
     softmax_scale: float,
     spec: AttnShape,
     *,
+    alibi_slopes: torch.Tensor | None = None,
     softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return FA2-compatible dense diagnostics from the packed runtime."""
@@ -1283,7 +1285,7 @@ def _generic_dense_diagnostic_forward(
         causal=spec.causal,
         window_size=(-1, -1),
         softcap=softcap,
-        alibi_slopes=None,
+        alibi_slopes=alibi_slopes,
         q_descale=None,
         k_descale=None,
         v_descale=None,
@@ -1728,12 +1730,13 @@ def flash_attn_func(
         return_attn_probs: for the shipped bf16 BERT-base encoder and causal
             GPT-2 profile, three Llama GQA decode profiles, and the
             ``softcap=50.0`` Gemma-2 profile, return FlashAttention's diagnostic
-            tuple. The zero-dropout causal GPT-2 profile also supports
+            tuple. BERT-base diagnostics may additionally use forward-only
+            ALiBi slopes. The zero-dropout causal GPT-2 profile also supports
             backward through ``out``; its LSE and empty ``S_dmask`` accept
             gradients with zero contribution, matching FlashAttention. Other
             profiles require that no backward is needed, and all options other
-            than ``softmax_scale`` (plus the documented causal/softcap
-            settings) retain their defaults.
+            than ``softmax_scale`` (plus the documented BERT ALiBi and
+            causal/softcap settings) retain their defaults.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -1892,14 +1895,22 @@ def flash_attn_func(
             softcap=_GEMMA2_SOFTCAP,
         )
     if return_attn_probs:
+        if alibi_slopes is not None and torch.is_grad_enabled() and (
+            needs_backward or alibi_slopes.requires_grad
+        ):
+            raise NotImplementedError(
+                "ALiBi backward is not implemented; ALiBi calls are forward-only"
+            )
         if needs_backward and spec.key != _CAUSAL_DROPOUT_KEY:
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented for grad-enabled "
                 "calls"
             )
-        if alibi_slopes is not None:
+        if alibi_slopes is not None and spec.key != _BERT_DIAGNOSTIC_KEY:
             raise NotImplementedError(
-                "return_attn_probs=True is not implemented with ALiBi slopes"
+                "return_attn_probs=True with ALiBi slopes is implemented only "
+                f"for the no-backward noncausal bf16 {_BERT_DIAGNOSTIC_KEY} "
+                "BERT-base encoder"
             )
         if deterministic:
             raise NotImplementedError(
@@ -1920,6 +1931,15 @@ def flash_attn_func(
                 )
             return attention_diagnostics(out, softmax_lse, s_dmask)
         if spec.key in _GENERIC_DENSE_DIAGNOSTIC_KEYS:
+            if alibi_slopes is not None:
+                return _generic_dense_diagnostic_forward(
+                    q,
+                    k,
+                    v,
+                    scale,
+                    spec,
+                    alibi_slopes=alibi_slopes,
+                )
             return _generic_dense_diagnostic_forward(q, k, v, scale, spec)
         out, softmax_lse = lookup(spec)(
             q, k, v, scale, return_softmax_lse=True
