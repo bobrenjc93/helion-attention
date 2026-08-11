@@ -9,7 +9,7 @@ Every entry point takes a required ``shape`` argument. Registered shapes use an
 exact generated specialization, except evidenced SM90 fast paths that use
 direct PyTorch Flash or cuDNN SDPA; compatible unregistered dense shapes, dense
 ALiBi calls, BERT-base diagnostics with optional ALiBi, ragged BERT-base varlen
-inference with optional ALiBi or slope-free diagnostics, causal GPT-2 and global
+inference with optional ALiBi diagnostics, causal GPT-2 and global
 causal 2K Llama GQA diagnostics, one causal Llama-3 GQA varlen inference
 profile, ALiBi with optional diagnostics on that profile and the shipped causal
 varlen profile, ALiBi on both shipped varlen profiles, and symmetric windows on
@@ -205,7 +205,11 @@ _VARLEN_DIAGNOSTIC_KEYS = frozenset(
     }
 )
 _VARLEN_ALIBI_DIAGNOSTIC_KEYS = frozenset(
-    {_LLAMA3_VARLEN_INFERENCE_KEY, _VARLEN_DIAGNOSTIC_KEY}
+    {
+        _BERT_BASE_VARLEN_INFERENCE_KEY,
+        _LLAMA3_VARLEN_INFERENCE_KEY,
+        _VARLEN_DIAGNOSTIC_KEY,
+    }
 )
 _VARLEN_SYMMETRIC_WINDOW_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_noncausal"
@@ -1707,8 +1711,9 @@ def _generic_varlen_diagnostic_forward(
         return_softmax_lse=True,
         # FA2's causal ALiBi kernel drops the query-position constant from
         # its scores, which leaves the output unchanged but shifts its
-        # reported LSE. Restore that convention only for combined calls.
-        shift_fa2_lse=alibi_slopes is not None,
+        # reported LSE. Noncausal ALiBi reports the ordinary absolute-distance
+        # LSE, so restore the shifted convention only for causal combined calls.
+        shift_fa2_lse=spec.causal and alibi_slopes is not None,
         fa_version=2,
     )
     if not isinstance(packed_result, tuple):  # pragma: no cover - contract guard
@@ -2121,12 +2126,12 @@ def flash_attn_varlen_func(
     independently. The unpacked and KV-packed entry points support self- or
     cross-attention, while the QKV-packed entry point supports self-attention.
     All three accept the default or a custom ``softmax_scale`` and use the
-    generic packed Triton runtime for inference. Forward-only slope-free calls
-    additionally accept ``return_attn_probs=True`` and return fp32 LSE shaped
-    ``[12, total_q]`` plus an empty bf16 ``S_dmask``. Forward-only calls may
-    instead supply fp32 ALiBi slopes shaped ``[12]`` or ``[16, 12]``; ALiBi
-    diagnostics remain unsupported. Ordinary slope-free calls retain their
-    existing generic dispatch. When all sixteen query and key sequences have
+    generic packed Triton runtime for inference. Forward-only calls additionally
+    accept ``return_attn_probs=True`` and return fp32 LSE shaped
+    ``[12, total_q]`` plus an empty bf16 ``S_dmask``, with or without fp32 ALiBi
+    slopes shaped ``[12]`` or ``[16, 12]``. ALiBi-only and slope-free diagnostic
+    calls retain their existing generic dispatch. When all sixteen query and key
+    sequences have
     length 512, slope-free global zero-dropout calls additionally support
     backward by reshaping the packed tensors to the dense PyTorch SDPA bridge.
     Deterministic backward on that exact full-length, slope-free global form
