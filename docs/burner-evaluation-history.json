@@ -4108,6 +4108,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:f391704854af66771a187a5c500ed0a555875439",
+      "commit": "f391704854af66771a187a5c500ed0a555875439",
+      "recordedAt": "2026-08-11T05:45:50.502Z",
+      "label": "base f391704",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 68,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:179",
+      "recordedAt": "2026-08-11T05:45:50.502Z",
+      "label": "PR #179",
+      "kind": "leaf",
+      "prNumber": 179,
+      "title": "Return diagnostics on the 2K Llama GQA profile",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 69,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
