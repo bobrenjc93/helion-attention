@@ -99,6 +99,17 @@ shape. Other caps and profiles remain unsupported; softcap cannot be combined
 with dropout, ALiBi, local windows, or autograd, and its diagnostic return
 requires `deterministic=False`.
 
+The shipped noncausal bf16 encoder-training profile
+`(8, 512, 512, 16, 16, 64)` supports `return_attn_probs=True` through the
+dense, QKV-packed, and KV-packed entry points. Under `torch.no_grad()`, a
+global, zero-dropout call returns `(out, softmax_lse, S_dmask)` with fp32 LSE
+shaped `[8, 16, 512]` and an empty bf16 `S_dmask`, matching FA2 at the default
+or a custom `softmax_scale`. Diagnostic backward, causal mode, dropout,
+`deterministic=True`, ALiBi, local windows, softcap, other dtypes, and other
+shapes remain unsupported. Ordinary calls retain the generated forward,
+dropout calls retain the PyTorch SDPA path, and zero-dropout training retains
+its generated/Flash-gradient dispatch.
+
 The checked-in noncausal bf16 BERT-base encoder profile
 `(16, 512, 512, 12, 12, 64)` supports `return_attn_probs=True` through the
 dense, QKV-packed, and KV-packed entry points. A forward-only, dropout-free
@@ -1032,8 +1043,9 @@ doing something else:
   full-head interleaved/NeoX or D128 half-head interleaved final-slot append and
   the exact full-head interleaved/NeoX or D64 half-head interleaved 4K partial
   append or the exact full-head interleaved two-token append
-- `return_attn_probs=True` outside the no-backward dense and varlen BERT-base
-  profiles (with optional ALiBi slopes as described above), and the
+- `return_attn_probs=True` outside the no-backward dense encoder-training and
+  dense and varlen BERT-base profiles (with optional ALiBi slopes only on the
+  BERT-base profiles as described above), and the
   backward-capable causal bf16 GPT-2 dense/QKV-packed/KV-packed calls,
   no-backward global causal bf16 `flash_attn_func`/`flash_attn_kvpacked_func`
   calls for `(1, 2048, 2048, 32, 8, 128)` with `dropout_p=0.0`, `softcap=0.0`,
