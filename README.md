@@ -58,14 +58,15 @@ mask alignment.
 
 One dense local-window profile is exposed through `flash_attn_func` and
 `flash_attn_kvpacked_func`: causal bf16 Llama GQA with exact shape
-`(1, 2048, 2048, 32, 8, 128)` accepts `window_size=(511, 0)`. Each query sees
-itself and up to 511 preceding keys, for a 512-key window. Calls that do not
-need backward use the generic packed Triton runtime; grad-enabled calls use a
-bounded PyTorch SDPA autograd bridge for Q/K/V gradients. Both the default and
-a custom `softmax_scale` are supported. `window_size=(-1, -1)` retains the
-checked-in generated specialization when no backward is needed. Other windows
-and shapes, dropout, softcap, ALiBi, `deterministic=True`, and diagnostic
-returns remain unsupported for this local window.
+`(1, 2048, 2048, 32, 8, 128)` accepts `window_size=(left, 0)` for every Python
+integer `0 <= left < 2048`. Each query sees itself and up to `left` preceding
+keys. Calls that do not need backward use the generic packed Triton runtime;
+grad-enabled calls use a bounded PyTorch SDPA autograd bridge for Q/K/V
+gradients. Both the default and a custom `softmax_scale` are supported.
+`window_size=(-1, -1)` retains the checked-in generated specialization when no
+backward is needed. Other bounds and shapes, dropout, softcap, ALiBi,
+`deterministic=True`, and diagnostic returns remain unsupported for this local
+window.
 
 Score capping is limited to the forward-only inference profiles described
 below. The dense causal-bf16 Gemma-2 profile
@@ -903,11 +904,12 @@ raise `NotImplementedError` rather than silently doing something else:
 - sliding-window attention outside these exceptions: finite symmetric
   `window_size=(radius, radius)` (`radius >= 0`) on the noncausal bf16 varlen
   self-attention profile, exact `window_size=(127, 0)` on the causal bf16
-  varlen profile, and exact `window_size=(511, 0)` on the causal dense 2K
-  profile and the full-cache 4K KV-cache decode profile above; causal varlen
-  window backward is limited to zero-dropout training on eight canonical
-  length-512 sequences, ragged symmetric-window backward remains unsupported,
-  and all other KV-cache window calls remain unsupported
+  varlen profile, every `window_size=(left, 0)` with `0 <= left < 2048` on the
+  causal dense 2K profile, and exact `window_size=(511, 0)` on the full-cache
+  4K KV-cache decode profile above; causal varlen window backward is limited to
+  zero-dropout training on eight canonical length-512 sequences, ragged
+  symmetric-window backward remains unsupported, and all other KV-cache window
+  calls remain unsupported
 - softcap except for no-backward bf16 calls with exactly `softcap=50.0` on
   causal dense/KV-packed `(1, 4096, 4096, 16, 8, 256)`, causal
   unpacked/QKV/KV-packed varlen `(8, 512, 512, 16, 16, 64)`, read-only core

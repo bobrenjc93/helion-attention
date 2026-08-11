@@ -15,9 +15,9 @@ varlen profile, ALiBi on both shipped varlen profiles, and symmetric windows on
 the shipped noncausal varlen profile use a generic Triton forward kernel. The
 same runtime exposes exactly a 127-token left plus current-token causal window
 for the full-length shipped causal varlen profile, while its global-window call
-retains generated dispatch. It also exposes
-exactly a 511-token left plus current-token causal window for the bf16 batch-1
-2K Llama GQA profile while its global-window call retains generated dispatch.
+retains generated dispatch. It also exposes every causal left window from the
+current token alone through the full 2K context for the bf16 batch-1 2K Llama
+GQA profile while its global-window call retains generated dispatch.
 Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime
 also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
@@ -147,7 +147,7 @@ _CAUSAL_DROPOUT_KEY = "b2_sq1024_sk1024_hq32_hkv32_d64_bf16_causal"
 _LLAMA_2K_LEFT_WINDOW_KEY = (
     "b1_sq2048_sk2048_hq32_hkv8_d128_bf16_causal"
 )
-_LLAMA_2K_LEFT_WINDOW_SIZE = (511, 0)
+_LLAMA_2K_LEFT_WINDOW_UPPER_BOUND = 2048
 _GENERIC_DENSE_DIAGNOSTIC_KEYS = frozenset(
     {_BERT_DIAGNOSTIC_KEY, _CAUSAL_DROPOUT_KEY}
 )
@@ -346,6 +346,19 @@ def _reject_unsupported(
     if return_attn_probs and not allow_return_attn_probs:
         raise NotImplementedError("return_attn_probs is not implemented")
     return probability
+
+
+def _is_llama_2k_left_window(window_size: tuple[object, ...]) -> bool:
+    """Whether ``window_size`` is in the narrow dense Llama 2K range."""
+    if len(window_size) != 2:
+        return False
+    left, right = window_size
+    return (
+        type(left) is int
+        and type(right) is int
+        and 0 <= left < _LLAMA_2K_LEFT_WINDOW_UPPER_BOUND
+        and right == 0
+    )
 
 
 def _supports_diagnostic_return(spec: AttnShape) -> bool:
@@ -1725,8 +1738,9 @@ def flash_attn_func(
             ``(2, 1024, 1024, 32, 32, 64)`` attention.
         softmax_scale: defaults to ``1 / sqrt(head_dim)``.
         causal: bottom-right causal masking, including unequal sequence lengths.
-        window_size: ``(-1, -1)`` selects global attention. Exactly ``(511, 0)``
-            is additionally supported for zero-dropout causal bf16
+        window_size: ``(-1, -1)`` selects global attention. ``(left, 0)`` is
+            additionally supported for every Python integer
+            ``0 <= left < 2048`` on zero-dropout causal bf16
             ``(1, 2048, 2048, 32, 8, 128)`` Llama GQA attention through this
             entry point and :func:`flash_attn_kvpacked_func`.
         softcap: exactly ``50.0`` is supported for forward-only causal bf16
@@ -1757,7 +1771,7 @@ def flash_attn_func(
 
     Unregistered fp16/bf16 shapes with ``head_dim <= 256``, all ALiBi calls, and
     the supported Gemma-2 softcap call use a generic packed Triton forward
-    kernel. The exact Llama GQA local-window call described above also uses that
+    kernel. The Llama GQA local-window calls described above also use that
     runtime for calls that do not need backward. Grad-enabled calls use a
     bounded PyTorch SDPA bridge with either the default or a custom scale. All
     other optional features are unsupported, and ``window_size=(-1, -1)``
@@ -1794,7 +1808,9 @@ def flash_attn_func(
         allow_return_attn_probs=True,
         allow_softcap_return_attn_probs=True,
         allowed_softcap=_GEMMA2_SOFTCAP,
-        allowed_window_size=_LLAMA_2K_LEFT_WINDOW_SIZE,
+        allowed_window_size=(
+            window if _is_llama_2k_left_window(window) else None
+        ),
     )
     spec = normalize_shape(shape, q.dtype, causal)
     has_left_window = window != (-1, -1)
@@ -1803,7 +1819,8 @@ def flash_attn_func(
             raise NotImplementedError(
                 "dense sliding-window attention is implemented only for the "
                 "causal bf16 Llama GQA profile "
-                "(1, 2048, 2048, 32, 8, 128) with window_size=(511, 0); "
+                "(1, 2048, 2048, 32, 8, 128) with window_size=(left, 0) "
+                "where 0 <= left < 2048; "
                 f"got {spec.describe()}"
             )
         if dropout != 0.0:
@@ -1862,7 +1879,7 @@ def flash_attn_func(
                 v,
                 scale,
                 spec,
-                causal_window_left=_LLAMA_2K_LEFT_WINDOW_SIZE[0],
+                causal_window_left=window[0],
             )
         return _generic_dense_forward(
             q,
@@ -1871,7 +1888,7 @@ def flash_attn_func(
             scale,
             spec,
             None,
-            window_size=_LLAMA_2K_LEFT_WINDOW_SIZE,
+            window_size=window,
         )
     if has_softcap:
         if needs_backward:
