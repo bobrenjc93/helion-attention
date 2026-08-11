@@ -7629,9 +7629,9 @@ def test_core_varlen_generic_paged_decode_matches_fa2_and_fp32_for_ragged_permut
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
 @pytest.mark.parametrize(
-    "page_size", [256, 512], ids=["page-256", "page-512"]
+    "page_size", [16, 256, 512], ids=["page-16", "page-256", "page-512"]
 )
-def test_core_varlen_large_page_diagnostics_match_fa2_for_ragged_permuted_pages(
+def test_core_varlen_paged_diagnostics_match_fa2_for_ragged_permuted_pages(
     causal: bool, softmax_scale: float | None, page_size: int
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
@@ -7643,6 +7643,14 @@ def test_core_varlen_large_page_diagnostics_match_fa2_for_ragged_permuted_pages(
         if softmax_scale is None
         else softmax_scale
     )
+    fa2_k, fa2_v, fa2_block_table = k, v, block_table
+    if page_size == 16:
+        # FA2 requires physical cache pages divisible by 256. Re-page the same
+        # seeded logical caches for its reference call while exercising page 16
+        # through helion-attention above.
+        _, fa2_k, fa2_v, _, _, fa2_block_table, _, _ = make_paged_decode(
+            page_size=256, seed=20260810
+        )
 
     with torch.no_grad():
         got = helion_attention.flash_attn_varlen_func(
@@ -7661,8 +7669,8 @@ def test_core_varlen_large_page_diagnostics_match_fa2_for_ragged_permuted_pages(
         )
         expected_fa2 = flash_attn.flash_attn_varlen_func(
             q,
-            k,
-            v,
+            fa2_k,
+            fa2_v,
             cu_q,
             cu_k,
             PAGED_DECODE.seqlen_q,
@@ -7670,7 +7678,7 @@ def test_core_varlen_large_page_diagnostics_match_fa2_for_ragged_permuted_pages(
             softmax_scale=softmax_scale,
             causal=causal,
             return_attn_probs=True,
-            block_table=block_table,
+            block_table=fa2_block_table,
         )
 
     assert isinstance(got, tuple) and len(got) == 3
@@ -8137,6 +8145,7 @@ def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
 @pytest.mark.parametrize(
     ("page_size", "softcap"),
     [
+        pytest.param(16, 0.0, id="page-16"),
         pytest.param(256, 0.0, id="page-256"),
         pytest.param(512, 0.0, id="page-512"),
         pytest.param(
@@ -8151,7 +8160,7 @@ def test_core_varlen_non_generated_decode_uses_generic_paged_runtime(
         ),
     ],
 )
-def test_core_varlen_large_page_diagnostics_request_lse_from_generic_runtime(
+def test_core_varlen_paged_diagnostics_request_lse_from_generic_runtime(
     monkeypatch: pytest.MonkeyPatch, page_size: int, softcap: float
 ) -> None:
     import helion_attention._paged_attention as generic_attention
@@ -8540,16 +8549,26 @@ def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispa
     ("case", "message"),
     [
         pytest.param(
-            "page-16", "page-size-256 or page-size-512", id="page-16"
-        ),
-        pytest.param(
-            "page-128", "page-size-256 or page-size-512", id="other-page"
+            "page-128",
+            "page-size-16, page-size-256, or page-size-512",
+            id="other-page",
         ),
         pytest.param("other-profile", "no-backward bf16", id="other-profile"),
         pytest.param("fp16", "no-backward bf16", id="other-dtype"),
         pytest.param("alibi", "ALiBi", id="alibi"),
+        pytest.param("page-16-alibi", "ALiBi", id="page-16-alibi"),
         pytest.param("page-512-alibi", "ALiBi", id="page-512-alibi"),
+        pytest.param(
+            "page-16-softcap",
+            "page-size-256 or page-size-512",
+            id="page-16-softcap",
+        ),
         pytest.param("gradient", "paged-cache backward", id="gradient"),
+        pytest.param(
+            "page-16-gradient",
+            "paged-cache backward",
+            id="page-16-gradient",
+        ),
         pytest.param(
             "page-512-gradient",
             "paged-cache backward",
@@ -8560,7 +8579,7 @@ def test_core_varlen_generic_paged_decode_rejects_optional_features_before_dispa
         pytest.param("deterministic", "deterministic=False", id="deterministic"),
     ],
 )
-def test_core_varlen_large_page_diagnostics_reject_out_of_scope_calls_before_dispatch(
+def test_core_varlen_paged_diagnostics_reject_out_of_scope_calls_before_dispatch(
     case: str, message: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=256)
@@ -8573,13 +8592,19 @@ def test_core_varlen_large_page_diagnostics_reject_out_of_scope_calls_before_dis
     }
 
     scoped_case = case
-    if case.startswith("page-512-"):
+    if case.startswith("page-16-"):
+        q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
+            page_size=16
+        )
+        kwargs["block_table"] = block_table
+        scoped_case = case.removeprefix("page-16-")
+    elif case.startswith("page-512-"):
         q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
             page_size=512
         )
         kwargs["block_table"] = block_table
         scoped_case = case.removeprefix("page-512-")
-    elif case in {"page-16", "page-128"}:
+    elif case == "page-128":
         page_size = int(case.removeprefix("page-"))
         q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
             page_size=page_size
@@ -8598,6 +8623,8 @@ def test_core_varlen_large_page_diagnostics_reject_out_of_scope_calls_before_dis
         kwargs["alibi_slopes"] = torch.ones(
             spec.nheads_q, device=q.device, dtype=torch.float32
         )
+    elif scoped_case == "softcap":
+        kwargs["softcap"] = CORE_PAGED_SOFTCAP_VALUE
     elif scoped_case == "gradient":
         q.requires_grad_()
     elif scoped_case == "dropout":

@@ -28,8 +28,9 @@ profile, read-only page-256/page-512 core paged decode, and read-only
 page-256/page-512 KV-cache decode. The Gemma-2 and shipped causal varlen
 profiles also expose the diagnostic return with exactly that cap. The same
 runtime exposes page-256/page-512 decode with optional ALiBi through the core
-varlen API, plus the FA2 diagnostic return for slope-free page-256/page-512
-decode and softcapped page-256/page-512 decode. The KV-cache adapter also uses
+varlen API, plus the FA2 diagnostic return for slope-free
+page-16/page-256/page-512 decode and softcapped page-256/page-512 decode. The
+KV-cache adapter also uses
 the generic paged runtime for ALiBi on both exposed page-16 profiles and
 page-256/page-512 decode. Read-only causal
 1K and 16K dense decode, plus both causal modes of 4K dense decode, likewise
@@ -148,7 +149,7 @@ _CORE_PAGED_KVCACHE_SHAPES = frozenset(
 )
 _CORE_PAGED_GENERATED_PAGE_SIZE = 16
 _CORE_PAGED_VARLEN_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
-_CORE_PAGED_VARLEN_DIAGNOSTIC_PAGE_SIZES = frozenset({256, 512})
+_CORE_PAGED_VARLEN_DIAGNOSTIC_PAGE_SIZES = frozenset({16, 256, 512})
 _CORE_PAGED_VARLEN_SOFTCAP_DIAGNOSTIC_PAGE_SIZES = frozenset({256, 512})
 _PAGED_KVCACHE_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
 _PAGED_KVCACHE_SOFTCAP = 50.0
@@ -1545,10 +1546,10 @@ def _generic_paged_varlen_forward(
     softcap: float = 0.0,
     return_attn_probs: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run validated non-generated paged decode through Triton."""
-    # Page 16 has checked-in generated specializations. This helper is kept
-    # deliberately narrow so page sizes other than 256/512 and other paged
-    # profiles still fail before reaching the generic vLLM runtime.
+    """Run validated paged decode through the generic Triton runtime."""
+    # Page 16 output-only calls retain their checked-in specialization; only
+    # their diagnostic return joins page 256/512 here. Other page sizes and
+    # paged profiles still fail before reaching the generic vLLM runtime.
     from ._paged_attention import paged_attention
 
     result = paged_attention(
@@ -2163,18 +2164,19 @@ def flash_attn_varlen_func(
     ``(4, 1, 1024, 8, 2, 128)`` with either causal flag. They accept caches
     shaped ``[num_blocks, 16, 2, 128]``. The decode profile additionally
     accepts page-size-256 and page-size-512 caches through the existing generic
-    paged runtime; page-size-16 calls retain generated dispatch. Page-size-256
-    and page-size-512 decode also accept either forward-only fp32 ALiBi slopes
-    shaped ``[8]`` or ``[4, 8]``, or exactly ``softcap=50.0``. ALiBi and
-    softcap cannot be combined. Page-size-256 and page-size-512 decode without
-    ALiBi additionally accept ``return_attn_probs=True`` either uncapped or
-    with exactly ``softcap=50.0``. Both return fp32 LSE shaped ``[8, total_q]``
-    plus an empty bf16 ``S_dmask``. All paths
+    paged runtime; page-size-16 output-only calls retain generated dispatch.
+    Page-size-256 and page-size-512 decode also accept either forward-only fp32
+    ALiBi slopes shaped ``[8]`` or ``[4, 8]``, or exactly ``softcap=50.0``.
+    ALiBi and softcap cannot be combined. Slope-free page-size-16,
+    page-size-256, and page-size-512 decode additionally accept
+    ``return_attn_probs=True`` when uncapped; page-size-256 and page-size-512
+    also accept that return with exactly ``softcap=50.0``. They return fp32 LSE
+    shaped ``[8, total_q]`` plus an empty bf16 ``S_dmask``. All paths
     derive each request's used cache length from adjacent ``cu_seqlens_k``
-    offsets without copying them to the host. Large-page decode supports only
-    forward calls with the default options, apart from either causal flag, a
-    default or custom ``softmax_scale``, optional ALiBi, large-page softcap, or
-    the exact page-size-256/page-size-512 diagnostic returns described above.
+    offsets without copying them to the host. Diagnostic calls are
+    forward-only. Large-page decode otherwise supports the default options,
+    either causal flag, a default or custom ``softmax_scale``, optional ALiBi,
+    or large-page softcap.
     The int32 CUDA cumulative-length tensors contain ``batch + 1`` offsets.
     ``shape`` uses the same forms as :func:`flash_attn_func`, but its sequence
     dimensions are the maximum query and key lengths rather than dense tensor
@@ -2430,8 +2432,8 @@ def flash_attn_varlen_func(
             if requested != _CORE_PAGED_KVCACHE_SHAPE:
                 raise NotImplementedError(
                     "return_attn_probs=True with block_table is implemented "
-                    "only for no-backward bf16 page-size-256 or page-size-512 "
-                    "batch=4 "
+                    "only for no-backward bf16 page-size-16, page-size-256, "
+                    "or page-size-512 batch=4 "
                     "seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
                     "head_dim=128 decode"
                 )
@@ -2479,7 +2481,7 @@ def flash_attn_varlen_func(
         ):
             raise NotImplementedError(
                 "return_attn_probs=True with block_table is implemented only "
-                "for page-size-256 or page-size-512 decode"
+                "for page-size-16, page-size-256, or page-size-512 decode"
             )
         if alibi_slopes is not None:
             _check_core_paged_varlen_alibi_spec(spec, page_size)
@@ -2520,7 +2522,7 @@ def flash_attn_varlen_func(
         # Keep sequence metadata on-device. This allocates the four per-request
         # used lengths directly on CUDA and remains safe for graph capture.
         seqused_k = cu_seqlens_k[1:] - cu_seqlens_k[:-1]
-        if page_size != _CORE_PAGED_GENERATED_PAGE_SIZE:
+        if page_size != _CORE_PAGED_GENERATED_PAGE_SIZE or return_attn_probs:
             generic_kwargs: dict[str, object] = {}
             if alibi_slopes is not None:
                 generic_kwargs["alibi_slopes"] = alibi_slopes
