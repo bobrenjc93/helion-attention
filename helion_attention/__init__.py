@@ -281,6 +281,9 @@ _TWO_TOKEN_DENSE_KVCACHE_KEY = (
 _FOUR_TOKEN_DENSE_KVCACHE_KEY = (
     "b1_sq4_sk1024_hq32_hkv8_d128_bf16_causal"
 )
+_EIGHT_TOKEN_DENSE_KVCACHE_KEY = (
+    "b1_sq8_sk1024_hq32_hkv8_d128_bf16_causal"
+)
 _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE = (
     1,
     1,
@@ -3368,6 +3371,14 @@ def flash_attn_with_kvcache(
     does not support cache updates, tensor-valued lengths, rotary, remapping,
     autograd, optional attention features, or noncausal attention.
 
+    One further read-only slice accepts exactly eight query tokens: causal bf16
+    ``(1, 8, 1024, 32, 8, 128)`` with the full dense cache. It uses the generic
+    packed runtime with the default or a custom softmax scale. The cache length
+    must be omitted or supplied as the Python integer ``1024``. This profile
+    does not support LSE, cache updates, partial or tensor-valued lengths,
+    rotary, remapping, optional attention features, autograd, or noncausal
+    attention.
+
     Two paged profiles are also exposed with an int32 CUDA ``cache_seqlens``
     tensor shaped ``[batch]`` and ``block_table``. Bf16
     ``(2, 200, 320, 8, 2, 128)`` accepts page-size-16 caches and supports only
@@ -3491,9 +3502,10 @@ def flash_attn_with_kvcache(
     tensor spans outside the exact causal single-token 1K, either-causal 4K,
     and causal 16K profiles,
     scalar partial lengths outside the exact causal single-token 1K and 16K,
-    four-token 1K, and either-causal 4K read-only profiles, non-final one-token
-    appends outside the exact causal 1K and either-causal 4K profiles, and
-    multi-token updates outside the exact two-token profile fail explicitly.
+    four-token 1K, and either-causal 4K read-only profiles, lengths other than
+    omitted or full on the exact eight-token 1K read-only profile, non-final
+    one-token appends outside the exact causal 1K and either-causal 4K profiles,
+    and multi-token updates outside the exact two-token profile fail explicitly.
     Non-final one-token 1K updates accept only full-head interleaved rotary,
     non-final two-token 1K updates reject rotary, and all partial updates reject
     autograd, before either cache is mutated. Partial 4K updates additionally
@@ -3773,17 +3785,31 @@ def flash_attn_with_kvcache(
             )
     is_two_token_dense_profile = spec.key == _TWO_TOKEN_DENSE_KVCACHE_KEY
     is_four_token_dense_profile = spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
+    is_eight_token_dense_profile = spec.key == _EIGHT_TOKEN_DENSE_KVCACHE_KEY
     if (
         not spec.is_decode
         and not is_two_token_dense_profile
         and not is_four_token_dense_profile
+        and not is_eight_token_dense_profile
     ):
         raise NotImplementedError(
             "flash_attn_with_kvcache supports multi-token dense queries only "
             "for causal bf16 (1, 2, 1024, 32, 8, 128) and "
-            "(1, 4, 1024, 32, 8, 128); all other dense profiles require "
+            "(1, 4, 1024, 32, 8, 128), plus read-only causal bf16 "
+            "(1, 8, 1024, 32, 8, 128); all other dense profiles require "
             "seqlen_q=1 with a non-empty cache"
         )
+    if is_eight_token_dense_profile:
+        if append_kv:
+            raise NotImplementedError(
+                "the eight-token dense KV-cache profile is read-only; cache "
+                "updates are not implemented"
+            )
+        if return_softmax_lse:
+            raise NotImplementedError(
+                "return_softmax_lse is not implemented for the eight-token "
+                "dense KV-cache profile"
+            )
     if is_four_token_dense_profile:
         if append_kv:
             raise NotImplementedError(
@@ -4193,6 +4219,22 @@ def flash_attn_with_kvcache(
                 spec,
             )
             return out, softmax_lse
+        return _generic_dense_forward(
+            q,
+            k_cache,
+            v_cache,
+            scale,
+            spec,
+            None,
+        )
+
+    if is_eight_token_dense_profile:
+        if torch.is_grad_enabled() and any(
+            tensor.requires_grad for tensor in (q, k_cache, v_cache)
+        ):
+            raise NotImplementedError(
+                "the eight-token dense KV-cache profile does not support autograd"
+            )
         return _generic_dense_forward(
             q,
             k_cache,

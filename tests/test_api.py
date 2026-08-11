@@ -133,6 +133,16 @@ FOUR_TOKEN_KVCACHE = AttnShape(
     dtype=torch.bfloat16,
     causal=True,
 )
+EIGHT_TOKEN_KVCACHE = AttnShape(
+    batch=1,
+    seqlen_q=8,
+    seqlen_k=1024,
+    nheads_q=32,
+    nheads_kv=8,
+    head_dim=128,
+    dtype=torch.bfloat16,
+    causal=True,
+)
 DENSE_ALIBI_KVCACHE = AttnShape(
     batch=1,
     seqlen_q=1,
@@ -4980,6 +4990,309 @@ def test_kvcache_shape_argument_is_required() -> None:
     q = torch.zeros(1, 1, 1, 1)
     with pytest.raises(TypeError):
         helion_attention.flash_attn_with_kvcache(q, q, q)  # type: ignore[call-arg]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "cache_seqlens",
+    [None, EIGHT_TOKEN_KVCACHE.seqlen_k],
+    ids=["omitted-length", "full-scalar-length"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.37],
+    ids=["default-scale", "custom-scale"],
+)
+def test_eight_token_dense_kvcache_matches_fp32_without_mutating_cache(
+    cache_seqlens: int | None,
+    softmax_scale: float | None,
+) -> None:
+    spec = EIGHT_TOKEN_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec, seed=20260822)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    k_pointer = k_cache.data_ptr()
+    v_pointer = v_cache.data_ptr()
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    cache_kwargs = (
+        {} if cache_seqlens is None else {"cache_seqlens": cache_seqlens}
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=True,
+        shape=spec,
+        **cache_kwargs,
+    )
+    expected_fp32 = reference_attention(q, k_cache, v_cache, spec, scale)
+
+    assert isinstance(got, torch.Tensor)
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    assert k_cache.data_ptr() == k_pointer
+    assert v_cache.data_ptr() == v_pointer
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    assert (got.float() - expected_fp32).abs().mean().item() < 1e-3
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "cache_seqlens",
+    [None, EIGHT_TOKEN_KVCACHE.seqlen_k],
+    ids=["omitted-length", "full-scalar-length"],
+)
+@pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.37],
+    ids=["default-scale", "custom-scale"],
+)
+def test_eight_token_dense_kvcache_matches_fa2(
+    cache_seqlens: int | None,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = EIGHT_TOKEN_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec, seed=20260822)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    cache_kwargs = (
+        {} if cache_seqlens is None else {"cache_seqlens": cache_seqlens}
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=True,
+        shape=spec,
+        **cache_kwargs,
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        softmax_scale=softmax_scale,
+        causal=True,
+        **cache_kwargs,
+    )
+
+    assert isinstance(got, torch.Tensor)
+    assert isinstance(expected_fa2, torch.Tensor)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    assert (got.float() - expected_fa2.float()).abs().mean().item() < 1e-3
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "cache_seqlens",
+    [None, EIGHT_TOKEN_KVCACHE.seqlen_k],
+    ids=["omitted-length", "full-scalar-length"],
+)
+def test_eight_token_dense_kvcache_uses_generic_dispatch(
+    cache_seqlens: int | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = EIGHT_TOKEN_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec)
+    calls: list[AttnShape] = []
+
+    def generic(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        scale: float,
+        spec_arg: AttnShape,
+        alibi_slopes: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert query is q
+        assert key is k_cache
+        assert value is v_cache
+        assert scale == 1.0 / math.sqrt(spec.head_dim)
+        assert spec_arg is spec
+        assert alibi_slopes is None
+        calls.append(spec_arg)
+        return query
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("eight-token KV-cache call reached another dispatch")
+
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "_tensor_length_dense_kvcache_forward", reject_dispatch
+    )
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        causal=True,
+        shape=spec,
+    )
+
+    assert got is q
+    assert calls == [spec]
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "error", "message"),
+    [
+        ("partial-scalar", NotImplementedError, "partial or ragged scalar"),
+        ("tensor-length", NotImplementedError, "tensor-valued cache_seqlens"),
+        ("lse", NotImplementedError, "return_softmax_lse"),
+        ("update", NotImplementedError, "read-only"),
+        ("rotary", NotImplementedError, "rotary embeddings"),
+        ("remapping", NotImplementedError, "cache_batch_idx"),
+        ("block-table", NotImplementedError, "block_table currently supports only"),
+        ("leftpad", NotImplementedError, "requires tensor-valued cache_seqlens"),
+        ("alibi", NotImplementedError, "ALiBi is implemented only"),
+        ("window", NotImplementedError, "sliding-window attention"),
+        ("softcap", NotImplementedError, "softcap is implemented only"),
+        ("splits", NotImplementedError, "num_splits=16 is implemented only"),
+        ("autograd", NotImplementedError, "does not support autograd"),
+        ("noncausal", NotImplementedError, "multi-token dense queries only"),
+        ("fp16", NotImplementedError, "multi-token dense queries only"),
+        ("other-query-length", NotImplementedError, "multi-token dense queries only"),
+        ("other-profile", NotImplementedError, "multi-token dense queries only"),
+    ],
+)
+def test_eight_token_dense_kvcache_rejects_out_of_scope_calls_before_dispatch(
+    case: str,
+    error: type[Exception],
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = EIGHT_TOKEN_KVCACHE
+    q, k_cache, v_cache = make_inputs(spec)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    kwargs: dict[str, object] = {
+        "cache_seqlens": spec.seqlen_k,
+        "causal": True,
+        "shape": spec,
+    }
+
+    if case == "partial-scalar":
+        kwargs["cache_seqlens"] = spec.seqlen_k - 1
+    elif case == "tensor-length":
+        kwargs["cache_seqlens"] = torch.tensor(
+            [spec.seqlen_k], device=q.device, dtype=torch.int32
+        )
+    elif case == "lse":
+        kwargs["return_softmax_lse"] = True
+    elif case == "update":
+        kwargs.update(
+            k=k_cache[:, : spec.seqlen_q].clone(),
+            v=v_cache[:, : spec.seqlen_q].clone(),
+            cache_seqlens=spec.seqlen_k - spec.seqlen_q,
+        )
+    elif case == "rotary":
+        kwargs.update(rotary_cos=q, rotary_sin=q)
+    elif case == "remapping":
+        kwargs["cache_batch_idx"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
+        )
+    elif case == "block-table":
+        kwargs["block_table"] = torch.zeros(
+            spec.batch, 1, device=q.device, dtype=torch.int32
+        )
+    elif case == "leftpad":
+        kwargs["cache_leftpad"] = torch.zeros(
+            spec.batch, device=q.device, dtype=torch.int32
+        )
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (1, 0)
+    elif case == "softcap":
+        kwargs["softcap"] = 1.0
+    elif case == "splits":
+        kwargs["num_splits"] = 16
+    elif case == "autograd":
+        q.requires_grad_()
+    elif case == "noncausal":
+        kwargs.update(
+            causal=False,
+            shape=(
+                spec.batch,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                spec.nheads_q,
+                spec.nheads_kv,
+                spec.head_dim,
+            ),
+        )
+    elif case == "fp16":
+        q = q.to(torch.float16)
+        k_cache = k_cache.to(torch.float16)
+        v_cache = v_cache.to(torch.float16)
+        original_k = k_cache.clone()
+        original_v = v_cache.clone()
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
+    elif case == "other-query-length":
+        q = q[:, :-1].contiguous()
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q - 1,
+            spec.seqlen_k,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
+    elif case == "other-profile":
+        kwargs["shape"] = (
+            spec.batch,
+            spec.seqlen_q,
+            spec.seqlen_k * 2,
+            spec.nheads_q,
+            spec.nheads_kv,
+            spec.head_dim,
+        )
+    else:  # pragma: no cover - parametrization guard
+        raise AssertionError(f"unknown case {case}")
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope eight-token call reached dispatch")
+
+    for dispatch_name in (
+        "_generic_dense_forward",
+        "_generic_dense_diagnostic_forward",
+        "_tensor_length_dense_kvcache_forward",
+        "lookup",
+        "attention_autograd",
+    ):
+        monkeypatch.setattr(helion_attention, dispatch_name, reject_dispatch)
+    with pytest.raises(error, match=message):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            k_cache,
+            v_cache,
+            **kwargs,
+        )
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
 
 
 @requires_cuda
