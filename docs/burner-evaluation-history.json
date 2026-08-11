@@ -4723,6 +4723,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:a696990d77e4c3a7f78a88253404ec90366030ac",
+      "commit": "a696990d77e4c3a7f78a88253404ec90366030ac",
+      "recordedAt": "2026-08-11T15:48:20.443Z",
+      "label": "base a696990",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:202",
+      "recordedAt": "2026-08-11T15:48:20.443Z",
+      "label": "PR #202",
+      "kind": "leaf",
+      "prNumber": 202,
+      "title": "Select index 1 from a two-row 1K dense cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 99,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
