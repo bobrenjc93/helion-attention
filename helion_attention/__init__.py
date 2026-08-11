@@ -36,8 +36,9 @@ use it for read-only CUDA-tensor-selected spans, while
 the 4K profiles support full-cache or scalar-prefix ALiBi. The causal 4K
 profile also supports ALiBi on tensor-selected spans, including left-padded
 spans.
-The causal 1K profile accepts the exact device length 1023 for its paired
-final-slot update and retains generated full-cache dispatch.
+The causal 1K profile also uses the prefix runtime for paired one-token scalar
+appends at positions 0 through 1022. It accepts the exact device length 1023
+for its paired final-slot update and retains generated full-cache dispatch.
 The same two 4K profiles expose exactly a 511-token left plus current-token
 window for a forward-only full-cache read, while their global-window calls
 retain generated dispatch. Their prefix runtime handles a paired one-token K/V
@@ -3325,8 +3326,12 @@ def flash_attn_with_kvcache(
     integers from 1 through 1023 for read-only prefixes. This path uses the
     generic packed runtime with the default or a custom softmax scale and
     optional fp32 LSE, while omitted and full Python-int reads retain the
-    generated specialization. It does not widen the profile's existing
-    final-slot-only update support. The causal and noncausal bf16
+    generated specialization. Paired one-token K/V updates at Python-integer
+    positions 0 through 1022 mutate the selected slot and attend through the
+    appended prefix using the same generic runtime, with either scale and
+    optional fp32 LSE. These partial updates reject rotary. The existing
+    final-slot update at position 1023 retains the generated specialization.
+    The causal and noncausal bf16
     ``(1, 1, 4096, 32, 8, 128)`` profiles likewise accept Python integers from
     1 through 4095 for read-only prefixes and paired one-token K/V updates at
     positions 0 through 4094. Read-only prefixes optionally accept fp32 ALiBi
@@ -3383,9 +3388,10 @@ def flash_attn_with_kvcache(
     cannot be combined with tensor-valued cache spans, updates, rotary metadata,
     paged caches, or autograd. For the single-token dense paths, a paired ``k``
     and ``v`` update is supported when a Python integer ``cache_seqlens`` is
-    exactly one less than the declared length. The exact 4K profiles also
-    accept positions 0 through 4094. Each update is copied into its selected
-    cache slot before attention runs. On this dense path,
+    exactly one less than the declared length. The exact causal 1K profile also
+    accepts positions 0 through 1022, and the exact 4K profiles accept positions
+    0 through 4094. Each update is copied into its selected cache slot before
+    attention runs. On this dense path,
     ``return_softmax_lse=True`` returns ``(out, softmax_lse)`` with LSE shape
     ``[batch, nheads_q, 1]`` and fp32 dtype, matching FlashAttention. The paged
     decode profile supports the same return for page sizes 16, 256, and 512
@@ -3405,12 +3411,12 @@ def flash_attn_with_kvcache(
     and causal 16K profiles,
     scalar partial lengths outside the exact causal single-token 1K and 16K,
     four-token 1K, and either-causal 4K read-only profiles, non-final one-token
-    appends outside the exact 4K profile, and multi-token updates outside the exact
-    two-token profile fail explicitly.
-    Non-final two-token 1K updates reject rotary, and all partial updates reject
-    autograd, before either cache is mutated. Partial 4K updates additionally
-    reject rotary dimensions other than full-head or D64 half-head and
-    non-interleaved partial-head rotary. A paired
+    appends outside the exact causal 1K and either-causal 4K profiles, and
+    multi-token updates outside the exact two-token profile fail explicitly.
+    Non-final one- and two-token 1K updates reject rotary, and all partial
+    updates reject autograd, before either cache is mutated. Partial 4K updates
+    additionally reject rotary dimensions other than full-head or D64 half-head
+    and non-interleaved partial-head rotary. A paired
     ``rotary_cos``/``rotary_sin`` table may be supplied
     for the Python-integer one-token final-slot append: the default interleaved
     layout may cover the full head or the first 64 dimensions of a
@@ -3622,6 +3628,9 @@ def flash_attn_with_kvcache(
     is_4k_scalar_prefix_dense_profile = (
         requested_dense_profile == _SCALAR_PREFIX_DENSE_KVCACHE_PROFILE
     )
+    is_1k_partial_append_dense_profile = (
+        spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
+    )
     is_scalar_prefix_dense_profile = (
         is_4k_scalar_prefix_dense_profile
         or spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
@@ -3748,9 +3757,19 @@ def flash_attn_with_kvcache(
                     )
                 scalar_cache_append_position = cache_seqlens
         elif (
-            is_4k_scalar_prefix_dense_profile
+            (
+                is_4k_scalar_prefix_dense_profile
+                or is_1k_partial_append_dense_profile
+            )
             and cache_seqlens < spec.seqlen_k - 1
         ):
+            if is_1k_partial_append_dense_profile and apply_rotary:
+                raise NotImplementedError(
+                    "rotary embeddings are not implemented for non-final "
+                    "causal bf16 (1, 1, 1024, 32, 8, 128) KV-cache "
+                    "updates; rotary remains limited to the final cache slot "
+                    "at cache_seqlens=1023"
+                )
             scalar_cache_append_position = cache_seqlens
         elif cache_seqlens + 1 != spec.seqlen_k:
             raise NotImplementedError(
