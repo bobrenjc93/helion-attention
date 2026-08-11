@@ -133,6 +133,26 @@ def test_vllm_surface_has_no_shape_argument() -> None:
     )
 
 
+@requires_cuda
+@pytest.mark.parametrize(
+    "softcap",
+    [math.ulp(0.0), 1e-50, 1e40, sys.float_info.max],
+    ids=["min-positive", "below-fp32", "above-fp32", "max-finite"],
+)
+def test_softcap_device_transport_preserves_full_float_range(
+    softcap: float,
+) -> None:
+    import helion_attention._paged_attention as generic_attention
+
+    transported = generic_attention._softcap_device_value(
+        softcap, torch.device("cuda")
+    )
+
+    assert transported.dtype == torch.float64
+    assert transported.ndim == 0
+    assert transported.item() == softcap
+
+
 def test_adapter_import_does_not_require_generated_kernel_internals() -> None:
     script = """
 import importlib.abc

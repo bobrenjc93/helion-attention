@@ -60,7 +60,7 @@ def _varlen_attention_kernel(
     stride_sink_b,
     stride_sink_h,
     softmax_scale,
-    softcap: tl.float64,
+    softcap_ptr,
     window_left,
     window_right,
     max_seqlen_q_value,
@@ -268,9 +268,10 @@ def _varlen_attention_kernel(
                 )
         scores *= softmax_scale
         if HAS_SOFTCAP:
-            # Python softcaps span IEEE fp64. Preserve that range through the
-            # launch and use tanh directly: narrowing the cap to fp32 can
-            # underflow/overflow, while the sigmoid identity loses scores when
+            # Load from device storage because Triton 3.0-3.3 narrow Python
+            # float kernel arguments to fp32 even with an fp64 annotation.
+            softcap = tl.load(softcap_ptr)
+            # Use tanh directly: the sigmoid identity loses scores when
             # scores / softcap is small. Attention accumulation remains fp32.
             scores = (
                 softcap * libdevice.tanh(scores.to(tl.float64) / softcap)
@@ -390,6 +391,11 @@ def _head_metadata_strides(
     raise ValueError("head metadata must be scalar, [heads], or [batch, heads]")
 
 
+def _softcap_device_value(softcap: float, device: torch.device) -> torch.Tensor:
+    """Transport a Python softcap without Triton scalar-argument narrowing."""
+    return torch.tensor(softcap, device=device, dtype=torch.float64)
+
+
 def _attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -487,6 +493,12 @@ def _attention(
         if dynamic_max_seqlen_k is None
         else dynamic_max_seqlen_k
     )
+    has_softcap = softcap > 0.0
+    # HAS_SOFTCAP makes the pointer unused for ordinary attention. Reusing q
+    # there avoids a device allocation and preserves its existing launch path.
+    softcap_arg = (
+        _softcap_device_value(softcap, q.device) if has_softcap else q
+    )
 
     if paged:
         k_strides = k.stride()
@@ -543,7 +555,7 @@ def _attention(
             skb,
             skh,
             softmax_scale,
-            softcap,
+            softcap_arg,
             window_size[0],
             window_size[1],
             max_seqlen_q,
@@ -564,7 +576,7 @@ def _attention(
             HAS_ALIBI=alibi_slopes is not None,
             HAS_SINK=s_aux is not None,
             HAS_CP_TOTAL=cp_tot_seqused_k is not None,
-            HAS_SOFTCAP=softcap > 0.0,
+            HAS_SOFTCAP=has_softcap,
             STORE_LSE=return_softmax_lse,
             SHIFT_FA2_LSE=shift_fa2_lse,
             HAS_DYNAMIC_MAX_Q=dynamic_max_seqlen_q is not None,
