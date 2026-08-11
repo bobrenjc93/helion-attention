@@ -67,8 +67,8 @@ generated forward values and uses raw PyTorch BSHD Flash gradients, falling
 back to its generated backward when Flash is unavailable. Positive dropout on
 that profile, the checked-in BERT-base encoder, and the shipped causal and
 noncausal GPT-2 profiles, grad-enabled dense calls without a generated
-backward, grad-enabled diagnostics on the causal GPT-2 profile and the
-full-length causal varlen profile,
+backward, grad-enabled diagnostics on the causal GPT-2, global causal 2K
+Llama GQA, and full-length causal varlen profiles,
 both shipped full-length varlen profiles, full-length BERT-base varlen
 attention, and ragged causal attention use PyTorch SDPA autograd. Full-length
 symmetric-window training on the shipped noncausal varlen profile and the exact
@@ -191,6 +191,9 @@ _DENSE_DETERMINISTIC_BACKWARD_KEYS = frozenset(
         _CAUSAL_DROPOUT_KEY,
         _LLAMA_2K_LEFT_WINDOW_KEY,
     }
+)
+_DENSE_DIAGNOSTIC_BACKWARD_KEYS = frozenset(
+    {_CAUSAL_DROPOUT_KEY, _LLAMA_2K_LEFT_WINDOW_KEY}
 )
 _GEMMA2_SOFTCAP_KEY = "b1_sq4096_sk4096_hq16_hkv8_d256_bf16_causal"
 _GEMMA2_SOFTCAP = 50.0
@@ -1907,13 +1910,14 @@ def flash_attn_func(
             three Llama GQA decode profiles, and the ``softcap=50.0`` Gemma-2
             profile, return FlashAttention's diagnostic tuple. BERT-base
             diagnostics may additionally use forward-only ALiBi slopes. The
-            zero-dropout causal GPT-2 profile also supports backward through
-            ``out``; its LSE and empty ``S_dmask`` accept gradients with zero
-            contribution, matching FlashAttention. Other profiles require that
-            no backward is needed, and all options other than ``softmax_scale``
-            (plus the documented BERT ALiBi and causal/softcap settings) retain
-            their defaults. The 2K Llama diagnostic is global-only; its
-            existing finite left-window calls remain output-only.
+            zero-dropout causal GPT-2 and global causal 2K Llama GQA profiles
+            also support backward through ``out``; their LSE and empty
+            ``S_dmask`` accept gradients with zero contribution, matching
+            FlashAttention. Other profiles require that no backward is needed,
+            and all options other than ``softmax_scale`` (plus the documented
+            BERT ALiBi and causal/softcap settings) retain their defaults. The
+            2K Llama diagnostic is global-only; its existing finite left-window
+            calls remain output-only.
         shape: required. Either an :class:`AttnShape`, a 4-tuple
             ``(batch, seqlen, nheads, head_dim)``, or a 6-tuple
             ``(batch, seqlen_q, seqlen_k, nheads_q, nheads_kv, head_dim)``.
@@ -2081,7 +2085,7 @@ def flash_attn_func(
             raise NotImplementedError(
                 "ALiBi backward is not implemented; ALiBi calls are forward-only"
             )
-        if needs_backward and spec.key != _CAUSAL_DROPOUT_KEY:
+        if needs_backward and spec.key not in _DENSE_DIAGNOSTIC_BACKWARD_KEYS:
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented for grad-enabled "
                 "calls"
