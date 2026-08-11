@@ -28,9 +28,9 @@ exposes page-256/page-512 decode with optional ALiBi through the core varlen
 API, plus the FA2 diagnostic return for slope-free page-256 decode. The
 KV-cache adapter also uses the generic paged runtime for ALiBi on
 both exposed page-16 profiles and page-256/page-512 decode. Read-only causal
-1K and both causal variants of 4K dense decode likewise use the generic
-runtime for a bounded Python-int prefix. Those profiles and
-causal 16K decode also use it for read-only CUDA-tensor-selected spans, while
+1K and 16K dense decode, plus both causal modes of 4K dense decode, likewise
+use the generic runtime for a bounded Python-int prefix. Those profiles also
+use it for read-only CUDA-tensor-selected spans, while
 the 4K profiles support full-cache or scalar-prefix ALiBi. The causal 4K
 profile also supports ALiBi on tensor-selected spans, including left-padded
 spans.
@@ -218,12 +218,15 @@ _VARLEN_DETERMINISTIC_BACKWARD_KEYS = frozenset(
 _RAGGED_VARLEN_SDPA_BACKWARD_KEY = (
     "varlen_b8_sq512_sk512_hq16_hkv16_d64_bf16_causal"
 )
+_CAUSAL_16K_DENSE_KVCACHE_KEY = (
+    "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal"
+)
 _TENSOR_SPAN_DENSE_KVCACHE_KEYS = frozenset(
     {
         "b1_sq1_sk1024_hq32_hkv8_d128_bf16_causal",
         "b1_sq1_sk4096_hq32_hkv8_d128_bf16_causal",
         "b1_sq1_sk4096_hq32_hkv8_d128_bf16_noncausal",
-        "b1_sq1_sk16384_hq32_hkv8_d128_bf16_causal",
+        _CAUSAL_16K_DENSE_KVCACHE_KEY,
     }
 )
 _TENSOR_SPAN_DENSE_KVCACHE_DESCRIPTION = (
@@ -3285,6 +3288,10 @@ def flash_attn_with_kvcache(
     rotary tables, or with D64 half-head interleaved tables. Omitted and full
     Python-int slope-free reads, plus the existing update at position 4095,
     retain the generated specialization.
+    The causal bf16 ``(1, 1, 16384, 32, 8, 128)`` profile similarly accepts
+    Python integers from 1 through 16383 for read-only prefixes through the
+    generic packed runtime, with either scale and optional fp32 LSE. Omitted
+    and full Python-int reads retain the generated split-KV specialization.
     The same causal and noncausal 4K profiles accept exactly
     ``window_size=(511, 0)`` for a forward-only, slope-free read of the full
     cache, with ``cache_seqlens`` omitted or supplied as the Python integer
@@ -3346,9 +3353,9 @@ def flash_attn_with_kvcache(
     single-token 1K final-slot update, left padding on all dense updates, or
     tensor spans outside the exact causal single-token 1K, either-causal 4K,
     and causal 16K profiles,
-    scalar partial lengths outside the exact causal single-token and four-token
-    1K and either-causal 4K read-only profiles, non-final one-token appends
-    outside the exact 4K profile, and multi-token updates outside the exact
+    scalar partial lengths outside the exact causal single-token 1K and 16K,
+    four-token 1K, and either-causal 4K read-only profiles, non-final one-token
+    appends outside the exact 4K profile, and multi-token updates outside the exact
     two-token profile fail explicitly.
     Non-final two-token 1K updates reject rotary, and all partial updates reject
     autograd, before either cache is mutated. Partial 4K updates additionally
@@ -3440,6 +3447,14 @@ def flash_attn_with_kvcache(
                 "num_splits=16 is implemented only for the full, read-only "
                 "bf16 (1, 1, 16384, 32, 8, 128) dense KV-cache decode profile; "
                 f"got {explicit_split_spec.describe()}"
+            )
+        if (
+            type(cache_seqlens) is int
+            and cache_seqlens != explicit_split_spec.seqlen_k
+        ):
+            raise NotImplementedError(
+                "num_splits=16 is implemented only for a full KV cache; "
+                "omit cache_seqlens or pass the full cache length as a Python int"
             )
         if torch.is_grad_enabled() and any(
             tensor.requires_grad
@@ -3560,6 +3575,7 @@ def flash_attn_with_kvcache(
     is_scalar_prefix_dense_profile = (
         is_4k_scalar_prefix_dense_profile
         or spec.key == _CAUSAL_1K_SCALAR_PREFIX_DENSE_KVCACHE_KEY
+        or spec.key == _CAUSAL_16K_DENSE_KVCACHE_KEY
         or spec.key == _FOUR_TOKEN_DENSE_KVCACHE_KEY
     )
     has_dense_alibi = alibi_slopes is not None

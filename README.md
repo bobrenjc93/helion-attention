@@ -475,16 +475,19 @@ shape `[batch, heads_q, query_len]`, matching FlashAttention's KV-cache API.
 The exact paged decode profile below supports the same return for both the
 default and a custom `softmax_scale`.
 
-The causal bf16 dense profile `(1, 1, 16384, 32, 8, 128)` accepts the same
+The causal bf16 dense profile `(1, 1, 16384, 32, 8, 128)` accepts a read-only
+Python integer `cache_seqlens` from 1 through 16383. These scalar prefixes use
+the generic packed Triton runtime and support the default or a custom
+`softmax_scale` and optional fp32 LSE. The profile also accepts the same
 contiguous CUDA int32 span tensors. Values from 1 through 16384 select a prefix,
 and `cache_leftpad` changes it to `[cache_leftpad, cache_seqlens)`, with
-`0 <= cache_leftpad < cache_seqlens <= 16384`. Both forms support the default or
-a custom `softmax_scale` and optional fp32 LSE. This path synchronizes once to
-check bounds recoverably, so it rejects CUDA graph capture and autograd.
+`0 <= cache_leftpad < cache_seqlens <= 16384`. Tensor-selected spans support the
+same scale and LSE options but synchronize once to check bounds recoverably, so
+they reject CUDA graph capture and autograd.
 `cache_leftpad` is not supported with updates, cache remapping, rotary, paged
 caches, or profiles outside the exact causal 1K, either-causal 4K, and causal
-16K slices. Omitting the length or passing the full length as a Python integer
-retains the checked-in split-KV generated kernel. Those full, read-only calls
+16K slices. Omitting the length or passing 16384 as a Python integer retains the
+checked-in split-KV generated kernel. Those full, read-only calls
 also accept `num_splits=16`, matching the generated kernel's fixed split count.
 Other explicit split counts, profiles, tensor spans, updates, rotary calls, and
 autograd are rejected before dispatch.
@@ -595,16 +598,16 @@ integer `cache_seqlens` positions 0 through 1022 and mutates only those two
 slots. Non-final positions attend through the appended prefix; position 1022
 retains the existing full-cache dispatch.
 Dense read-only calls may omit `cache_seqlens` or pass the full cache length,
-including the exact four-token profile above; the exact causal single-token and
-four-token 1K and either-causal 4K profiles additionally accept their documented
-scalar prefixes, the 4K profile accepts tensor-selected spans with either
-causal flag, and the exact causal 16K profile accepts its tensor prefix or
-left-padded span.
+including the exact four-token profile above; the exact causal single-token 1K
+and 16K, four-token 1K, and either-causal 4K profiles additionally accept their
+documented scalar prefixes. The exact causal single-token 1K and 16K profiles
+and the 4K profile with either causal flag accept their documented
+tensor-selected prefixes or left-padded spans.
 Single-token update lengths must satisfy `cache_seqlens + 1 == S_CACHE`, except
 for the exact 4K non-final appends above; the exact two-token update accepts
 `0 <= cache_seqlens <= 1022`. Tensor-valued updates are limited to `[1023]` on
 the exact causal bf16 1K profile. Other multi-token updates, scalar partial
-lengths outside the exact causal single-token and four-token 1K and
+lengths outside the exact causal single-token 1K and 16K, four-token 1K, and
 either-causal 4K read-only profiles, non-final appends outside the exact 4K
 one-token and 1K two-token profiles, and tensor lengths on every other dense
 profile are rejected explicitly. Caches created
@@ -941,8 +944,8 @@ raise `NotImplementedError` rather than silently doing something else:
   the exact four-token profile is read-only;
   dense tensor lengths outside the exact causal single-token 1K, either-causal
   4K, and causal 16K profiles above, dense tensor updates outside the exact
-  causal 1K `[1023]` slice, scalar partial caches outside the exact
-  causal single-token and four-token 1K and either-causal 4K profiles above,
+  causal 1K `[1023]` slice, scalar partial caches outside the exact causal
+  single-token 1K and 16K, four-token 1K, and either-causal 4K profiles above,
   `cache_leftpad` outside those tensor-span profiles or combined with updates,
   remapping, rotary, or autograd, paged
   cache reads outside the exact page-size-16 profiles and page-size-256 and

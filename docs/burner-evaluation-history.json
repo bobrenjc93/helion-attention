@@ -4033,6 +4033,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:176",
+      "recordedAt": "2026-08-11T04:08:07.911Z",
+      "label": "PR #176",
+      "kind": "leaf",
+      "prNumber": 176,
+      "title": "Read scalar prefixes from the 16K dense cache",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
