@@ -342,9 +342,11 @@ varlen profiles still reject ALiBi explicitly. The one direct core paged-varlen
 profile with ALiBi is
 forward-only bf16 page-size-256 or page-size-512 decode
 `(4, 1, 1024, 8, 2, 128)`, which accepts fp32 CUDA slopes shaped `[8]` or
-`[4, 8]`; page-size-16 calls, chunked prefill, and other paged profiles still
-reject them. The KV-cache paths described below have their own paged ALiBi
-support.
+`[4, 8]`. Noncausal page-size-256 decode may additionally combine those slopes
+with `return_attn_probs=True`, returning fp32 `[8, total_q]` LSE and an empty
+bf16 `S_dmask`. Page-size-16 calls, chunked prefill, and other paged profiles
+still reject core paged-varlen ALiBi. The KV-cache paths described below have
+their own paged ALiBi support.
 
 Zero-dropout backward is supported for both the causal and noncausal bf16
 `(8, 512, 512, 16, 16, 64)` varlen profiles when all eight query and key
@@ -401,15 +403,16 @@ forward-only fp32 ALiBi slopes shaped `[8]` or `[4, 8]` or exactly
 `softcap=50.0`. ALiBi and softcap use the generic paged runtime
 and support the same ragged, permuted logical caches, but cannot be combined.
 Slope-free page-size-16, page-size-256, and page-size-512 decode additionally
-accept `return_attn_probs=True` when uncapped. Page-size-256 and page-size-512
-also accept that return with exactly `softcap=50.0`. These calls return fp32
-LSE shaped `[8, total_q]` and an empty bf16 `S_dmask`; page-size-16 diagnostics
-use the generic paged runtime while output-only page-size-16 calls retain their
+accept `return_attn_probs=True` when uncapped. Noncausal page-size-256 decode may
+combine that return with ALiBi, while page-size-256 and page-size-512 also
+accept it with exactly `softcap=50.0`. These calls return fp32 LSE shaped
+`[8, total_q]` and an empty bf16 `S_dmask`; page-size-16 diagnostics use the
+generic paged runtime while output-only page-size-16 calls retain their
 generated dispatch. Gradients, dropout, sliding windows, `deterministic=True`,
 diagnostic returns on other profiles, page-size-16 diagnostics with softcap,
-other caps and softcap page sizes, and combinations with ALiBi remain
-unsupported. Other page sizes and paged core-varlen profiles are rejected
-explicitly.
+other caps and softcap page sizes, and ALiBi diagnostics outside the exact
+noncausal page-size-256 exception remain unsupported. Other page sizes and
+paged core-varlen profiles are rejected explicitly.
 
 vLLM's unified paged-cache path is available through
 `helion_attention.vllm_flash_attn`. It accepts packed queries plus
@@ -1053,12 +1056,13 @@ doing something else:
   causal bf16 dense `(1, 1, 1024, 32, 8, 128)` full-cache decode, bf16 dense
   `(1, 1, 4096, 32, 8, 128)` decode, page-size-16 profiles, and
   page-size-256/page-size-512 decode above; core paged-varlen ALiBi cannot be
-  combined with dropout, windows, softcap, `deterministic=True`, diagnostic
-  returns, or autograd; dense KV-cache ALiBi cannot be combined with LSE,
-  updates, remapping, rotary, windows, softcap, or autograd; ALiBi on the causal
-  1K dense profile is limited to a full cache selected by an omitted length or
-  the Python integer `1024`, while tensor-selected spans, including left-padded
-  spans, are limited to the exact causal 4K profile above;
+  combined with dropout, windows, softcap, `deterministic=True`, or autograd,
+  and its diagnostic-return combination is limited to exact no-backward
+  noncausal page-size-256 decode above; dense KV-cache ALiBi cannot be combined
+  with LSE, updates, remapping, rotary, windows, softcap, or autograd; ALiBi on
+  the causal 1K dense profile is limited to a full cache selected by an omitted
+  length or the Python integer `1024`, while tensor-selected spans, including
+  left-padded spans, are limited to the exact causal 4K profile above;
   paged KV-cache ALiBi cannot be combined with softcap, updates, rotary,
   windows, or autograd, and its LSE combination is limited to exact read-only
   noncausal page-size-16 or either-causal page-size-256/page-size-512 decode
@@ -1094,9 +1098,9 @@ doing something else:
   `(8, 512, 512, 16, 16, 64)`, `(4, 256, 256, 32, 8, 128)`, and no-backward
   `(4, 2048, 2048, 32, 8, 128)`, each with optional ALiBi slopes as described
   above,
-  or no-backward core paged-varlen page-size-16/page-size-256/page-size-512
-  decode `(4, 1, 1024, 8, 2, 128)` without ALiBi, where page size 256 or 512
-  additionally permits exactly `softcap=50.0`;
+  or no-backward core paged-varlen decode `(4, 1, 1024, 8, 2, 128)`: page-size-16,
+  page-size-256, or page-size-512 without ALiBi, noncausal page-size-256 with
+  ALiBi, or page-size-256/page-size-512 with exactly `softcap=50.0`;
   varlen diagnostic backward is limited to full-length zero-dropout training
   on the former profile with `deterministic=False`
 
