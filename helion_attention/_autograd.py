@@ -62,6 +62,38 @@ class _AttentionDiagnostics(torch.autograd.Function):
         return grad_out, None, None
 
 
+class _EmptyKeyAttention(torch.autograd.Function):
+    """Return exact zero rows while retaining zero Q/K/V gradients."""
+
+    @staticmethod
+    def forward(
+        ctx: Any,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+    ) -> torch.Tensor:
+        ctx.save_for_backward(q, k, v)
+        return torch.zeros_like(q)
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(
+        ctx: Any, grad_out: torch.Tensor
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        del grad_out
+        q, k, v = ctx.saved_tensors
+        needs_q, needs_k, needs_v = ctx.needs_input_grad
+        return (
+            torch.zeros_like(q) if needs_q else None,
+            torch.zeros_like(k) if needs_k else None,
+            torch.zeros_like(v) if needs_v else None,
+        )
+
+
 class _Attention(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -141,3 +173,12 @@ def attention_diagnostics(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Attach FA2-compatible zero-gradient diagnostic outputs to ``out``."""
     return _AttentionDiagnostics.apply(out, softmax_lse, s_dmask)
+
+
+def empty_key_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> torch.Tensor:
+    """Return FA2-compatible zero output and gradients for an empty KV slot."""
+    return _EmptyKeyAttention.apply(q, k, v)
