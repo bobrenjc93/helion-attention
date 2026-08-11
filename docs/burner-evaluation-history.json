@@ -4198,6 +4198,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:bb9b091aabc9244b5cc7586d9b4c0b037d07fe0e",
+      "commit": "bb9b091aabc9244b5cc7586d9b4c0b037d07fe0e",
+      "recordedAt": "2026-08-11T06:53:18.528Z",
+      "label": "base bb9b091",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:182",
+      "recordedAt": "2026-08-11T06:53:18.528Z",
+      "label": "PR #182",
+      "kind": "leaf",
+      "prNumber": 182,
+      "title": "Append one token to partial 1K dense caches",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
