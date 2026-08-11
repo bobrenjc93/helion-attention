@@ -31,7 +31,8 @@ decode. The Gemma-2 profile exposes the diagnostic return with exactly that
 cap. The same
 runtime exposes page-256/page-512 decode with optional ALiBi through the core
 varlen API, plus the FA2 diagnostic return for slope-free
-page-16/page-256/page-512 decode and softcapped page-256/page-512 decode. The
+page-16/page-256/page-512 decode, ALiBi noncausal page-256 decode, and
+softcapped page-256/page-512 decode. The
 KV-cache adapter also uses the generic paged runtime for ALiBi on both exposed
 page-16 profiles and page-256/page-512 decode, including the diagnostic return
 for noncausal page-16 decode. Read-only causal
@@ -156,6 +157,7 @@ _CORE_PAGED_GENERATED_PAGE_SIZE = 16
 _CORE_PAGED_VARLEN_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
 _CORE_PAGED_VARLEN_DIAGNOSTIC_PAGE_SIZES = frozenset({16, 256, 512})
 _CORE_PAGED_VARLEN_SOFTCAP_DIAGNOSTIC_PAGE_SIZES = frozenset({256, 512})
+_CORE_PAGED_VARLEN_ALIBI_DIAGNOSTIC_PAGE_SIZE = 256
 _PAGED_KVCACHE_DECODE_PAGE_SIZES = frozenset({16, 256, 512})
 _PAGED_KVCACHE_SOFTCAP = 50.0
 _GENERIC_DENSE_MAX_HEAD_DIM = 256
@@ -759,6 +761,32 @@ def _check_core_paged_varlen_alibi_spec(
             "core paged varlen ALiBi slopes are implemented only for the bf16 "
             "page-size-256 or page-size-512 batch=4 seqlen_q=1 "
             "seqlen_k=1024 nheads=8 (GQA 8:2) head_dim=128 decode profile"
+        )
+
+
+def _check_core_paged_varlen_alibi_diagnostic_spec(
+    spec: AttnShape, page_size: int
+) -> None:
+    """Restrict combined core paged-varlen ALiBi diagnostics."""
+    requested = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+        spec.dtype,
+    )
+    if (
+        requested != _CORE_PAGED_KVCACHE_SHAPE
+        or spec.causal
+        or page_size != _CORE_PAGED_VARLEN_ALIBI_DIAGNOSTIC_PAGE_SIZE
+    ):
+        raise NotImplementedError(
+            "return_attn_probs=True with ALiBi slopes and block_table is "
+            "implemented only for no-backward noncausal bf16 page-size-256 "
+            "batch=4 seqlen_q=1 seqlen_k=1024 nheads=8 (GQA 8:2) "
+            "head_dim=128 decode"
         )
 
 
@@ -2225,9 +2253,10 @@ def flash_attn_varlen_func(
     ALiBi slopes shaped ``[8]`` or ``[4, 8]``, or exactly ``softcap=50.0``.
     ALiBi and softcap cannot be combined. Slope-free page-size-16,
     page-size-256, and page-size-512 decode additionally accept
-    ``return_attn_probs=True`` when uncapped; page-size-256 and page-size-512
-    also accept that return with exactly ``softcap=50.0``. They return fp32 LSE
-    shaped ``[8, total_q]`` plus an empty bf16 ``S_dmask``. All paths
+    ``return_attn_probs=True`` when uncapped; noncausal page-size-256 decode may
+    combine that return with ALiBi, and page-size-256/page-size-512 decode may
+    combine it with exactly ``softcap=50.0``. They return fp32 LSE shaped
+    ``[8, total_q]`` plus an empty bf16 ``S_dmask``. All paths
     derive each request's used cache length from adjacent ``cu_seqlens_k``
     offsets without copying them to the host. Diagnostic calls are
     forward-only. Large-page decode otherwise supports the default options,
@@ -2470,11 +2499,6 @@ def flash_attn_varlen_func(
 
     if return_attn_probs:
         if block_table is not None:
-            if alibi_slopes is not None:
-                raise NotImplementedError(
-                    "return_attn_probs=True is not implemented with ALiBi "
-                    "slopes and block_table"
-                )
             if deterministic:
                 raise NotImplementedError(
                     "return_attn_probs=True requires deterministic=False"
@@ -2542,6 +2566,8 @@ def flash_attn_varlen_func(
                 "return_attn_probs=True with block_table is implemented only "
                 "for page-size-16, page-size-256, or page-size-512 decode"
             )
+        if return_attn_probs and alibi_slopes is not None:
+            _check_core_paged_varlen_alibi_diagnostic_spec(spec, page_size)
         if alibi_slopes is not None:
             _check_core_paged_varlen_alibi_spec(spec, page_size)
         if has_softcap:

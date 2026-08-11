@@ -500,6 +500,53 @@ def reference_packed(
     return out
 
 
+def reference_packed_alibi_lse(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    lengths_q: list[int],
+    lengths_k: list[int],
+    *,
+    causal: bool,
+    scale: float,
+    alibi_slopes: torch.Tensor,
+) -> torch.Tensor:
+    """Compute ragged ALiBi LSE directly in fp32."""
+    softmax_lse = torch.empty(
+        q.shape[1], q.shape[0], device=q.device, dtype=torch.float32
+    )
+    q_start = 0
+    k_start = 0
+    for batch, (seqlen_q, seqlen_k) in enumerate(zip(lengths_q, lengths_k)):
+        if seqlen_q == 0:
+            k_start += seqlen_k
+            continue
+        q_seq = q[q_start : q_start + seqlen_q].float().transpose(0, 1)
+        k_seq = k[k_start : k_start + seqlen_k].float().transpose(0, 1)
+        if q_seq.shape[0] != k_seq.shape[0]:
+            group_size = q_seq.shape[0] // k_seq.shape[0]
+            k_seq = k_seq.repeat_interleave(group_size, dim=0)
+        scores = torch.matmul(q_seq, k_seq.transpose(-1, -2)) * scale
+        row = torch.arange(seqlen_q, device=q.device)[:, None]
+        col = torch.arange(seqlen_k, device=q.device)[None, :]
+        distance = torch.abs(row + seqlen_k - seqlen_q - col)
+        slopes = (
+            alibi_slopes
+            if alibi_slopes.ndim == 1
+            else alibi_slopes[batch]
+        )
+        scores -= slopes.float()[:, None, None] * distance.float()[None]
+        if causal:
+            keep = col <= row + seqlen_k - seqlen_q
+            scores.masked_fill_(~keep[None], float("-inf"))
+        lse = torch.logsumexp(scores, dim=-1)
+        softmax_lse[:, q_start : q_start + seqlen_q] = torch.where(
+            torch.isneginf(lse), torch.full_like(lse, float("inf")), lse
+        )
+        q_start += seqlen_q
+        k_start += seqlen_k
+    return softmax_lse
+
+
 def reference_softcap_packed_diagnostics(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -8741,6 +8788,126 @@ def test_core_varlen_large_page_alibi_matches_fa2_and_fp32_for_ragged_permuted_p
 
 @requires_cuda
 @pytest.mark.parametrize(
+    ("batched_slopes", "softmax_scale"),
+    [
+        pytest.param(False, None, id="head-default-scale"),
+        pytest.param(True, None, id="batch-head-default-scale"),
+        pytest.param(False, 0.37, id="head-custom-scale"),
+        pytest.param(True, 0.37, id="batch-head-custom-scale"),
+    ],
+)
+def test_core_varlen_page256_noncausal_alibi_diagnostics_match_fa2_and_fp32(
+    batched_slopes: bool, softmax_scale: float | None
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    q, k, v, cu_q, cu_k, block_table, lengths_k, request_kv = (
+        make_paged_decode(page_size=256, seed=20260811)
+    )
+    head_slopes = torch.linspace(
+        0.01,
+        0.2,
+        PAGED_DECODE.nheads_q,
+        device=q.device,
+        dtype=torch.float32,
+    )
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(PAGED_DECODE.batch)]
+        )
+        if batched_slopes
+        else head_slopes
+    )
+    scale = (
+        1.0 / math.sqrt(PAGED_DECODE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    packed_k = torch.cat([key for key, _ in request_kv])
+    packed_v = torch.cat([value for _, value in request_kv])
+    expected_fp32_out = reference_packed(
+        q,
+        packed_k,
+        packed_v,
+        [1] * PAGED_DECODE.batch,
+        lengths_k,
+        causal=False,
+        scale=scale,
+        alibi_slopes=slopes,
+    )
+    expected_fp32_lse = reference_packed_alibi_lse(
+        q,
+        packed_k,
+        [1] * PAGED_DECODE.batch,
+        lengths_k,
+        causal=False,
+        scale=scale,
+        alibi_slopes=slopes,
+    )
+
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=False,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+            block_table=block_table,
+            shape=(4, 1, 1024, 8, 2, 128),
+        )
+        expected_fa2 = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=False,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+            block_table=block_table,
+        )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    assert isinstance(expected_fa2, tuple) and len(expected_fa2) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected_fa2
+    assert slopes.shape == (
+        (PAGED_DECODE.batch, PAGED_DECODE.nheads_q)
+        if batched_slopes
+        else (PAGED_DECODE.nheads_q,)
+    )
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (
+        PAGED_DECODE.nheads_q,
+        q.shape[0],
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_fp32_out, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(out, expected_out, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        softmax_lse, expected_fp32_lse, atol=5e-2, rtol=2e-3
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     ("lengths_q", "lengths_k"),
     [
         pytest.param((137, 200), (233, 320), id="maxima-split-across-requests"),
@@ -9535,6 +9702,91 @@ def test_core_varlen_large_page_softcap_rejects_out_of_scope_calls_before_dispat
             spec.seqlen_q,
             spec.seqlen_k,
             **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("page_size", "causal"),
+    [
+        pytest.param(256, True, id="causal-page-256"),
+        pytest.param(16, False, id="noncausal-page-16"),
+        pytest.param(512, False, id="noncausal-page-512"),
+    ],
+)
+def test_core_varlen_paged_alibi_diagnostics_reject_other_compositions(
+    page_size: int, causal: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(
+        page_size=page_size
+    )
+    slopes = torch.ones(
+        PAGED_DECODE.nheads_q, device=q.device, dtype=torch.float32
+    )
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError(
+            "out-of-scope core paged ALiBi diagnostics reached dispatch"
+        )
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_dispatch
+    )
+    with pytest.raises(
+        NotImplementedError, match="noncausal bf16 page-size-256"
+    ):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            causal=causal,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+            block_table=block_table,
+            shape=(4, 1, 1024, 8, 2, 128),
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize("gradient_source", ["q", "slopes"])
+def test_core_varlen_page256_noncausal_alibi_diagnostics_reject_gradients(
+    gradient_source: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    q, k, v, cu_q, cu_k, block_table, *_ = make_paged_decode(page_size=256)
+    slopes = torch.ones(
+        PAGED_DECODE.nheads_q, device=q.device, dtype=torch.float32
+    )
+    if gradient_source == "q":
+        q.requires_grad_()
+    else:
+        slopes.requires_grad_()
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError(
+            "gradient-bearing core paged ALiBi diagnostics reached dispatch"
+        )
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_paged_varlen_forward", reject_dispatch
+    )
+    with pytest.raises(NotImplementedError, match="ALiBi backward"):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            PAGED_DECODE.seqlen_q,
+            PAGED_DECODE.seqlen_k,
+            causal=False,
+            alibi_slopes=slopes,
+            return_attn_probs=True,
+            block_table=block_table,
+            shape=(4, 1, 1024, 8, 2, 128),
         )
 
 
