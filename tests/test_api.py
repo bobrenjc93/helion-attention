@@ -9408,10 +9408,16 @@ def test_kvcache_1k_scalar_prefix_rejects_out_of_scope_before_dispatch(
     ids=["default-scale", "custom-scale"],
 )
 @pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["output-only", "output-lse"],
+)
 def test_kvcache_4k_left_window_matches_fa2_and_fp32_without_mutation(
     cache_seqlens: int | None,
     softmax_scale: float | None,
     causal: bool,
+    return_softmax_lse: bool,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     manifest_spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
@@ -9447,6 +9453,7 @@ def test_kvcache_4k_left_window_matches_fa2_and_fp32_without_mutation(
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+            return_softmax_lse=return_softmax_lse,
             shape=spec,
             **cache_kwargs,
         )
@@ -9457,9 +9464,10 @@ def test_kvcache_4k_left_window_matches_fa2_and_fp32_without_mutation(
             softmax_scale=softmax_scale,
             causal=causal,
             window_size=DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+            return_softmax_lse=return_softmax_lse,
             **cache_kwargs,
         )
-        expected_fp32, _ = reference_single_token_prefix_attention(
+        expected_fp32, expected_lse = reference_single_token_prefix_attention(
             q,
             k_cache,
             v_cache,
@@ -9469,16 +9477,31 @@ def test_kvcache_4k_left_window_matches_fa2_and_fp32_without_mutation(
             leftpad=spec.seqlen_k - DENSE_KVCACHE_LEFT_WINDOW_SIZE[0] - 1,
         )
 
-    assert isinstance(got, torch.Tensor)
-    assert isinstance(expected_fa2, torch.Tensor)
-    assert got.shape == expected_fa2.shape == q.shape
-    assert got.dtype == expected_fa2.dtype == torch.bfloat16
+    if return_softmax_lse:
+        assert isinstance(got, tuple)
+        assert isinstance(expected_fa2, tuple)
+        out, softmax_lse = got
+        fa2_out, fa2_lse = expected_fa2
+        assert softmax_lse.shape == (1, 32, 1)
+        assert softmax_lse.dtype == torch.float32
+        assert softmax_lse.device == q.device
+        torch.testing.assert_close(softmax_lse, fa2_lse, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            softmax_lse, expected_lse, atol=1e-5, rtol=1e-5
+        )
+    else:
+        assert isinstance(got, torch.Tensor)
+        assert isinstance(expected_fa2, torch.Tensor)
+        out = got
+        fa2_out = expected_fa2
+    assert out.shape == fa2_out.shape == q.shape
+    assert out.dtype == fa2_out.dtype == torch.bfloat16
     assert k_cache.data_ptr() == k_pointer
     assert v_cache.data_ptr() == v_pointer
     assert torch.equal(k_cache, original_k)
     assert torch.equal(v_cache, original_v)
-    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
-    torch.testing.assert_close(got.float(), expected_fp32, atol=5e-2, rtol=2e-2)
+    torch.testing.assert_close(out, fa2_out, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(out.float(), expected_fp32, atol=5e-2, rtol=2e-2)
 
 
 @requires_cuda
@@ -9544,9 +9567,15 @@ def test_kvcache_4k_left_window_isolates_out_of_window_nonfinite_values(
     [None, 4096],
     ids=["omitted-length", "full-scalar-length"],
 )
+@pytest.mark.parametrize(
+    "return_softmax_lse",
+    [False, True],
+    ids=["output-only", "output-lse"],
+)
 def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispatch(
     causal: bool,
     cache_seqlens: int | None,
+    return_softmax_lse: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manifest_spec = spec_from_manifest_entry(SCALAR_PREFIX_DECODE)
@@ -9574,22 +9603,22 @@ def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispat
     original_k = k_cache.clone()
     original_v = v_cache.clone()
     windowed_out = torch.full_like(q, 3.0)
+    windowed_lse = torch.full(
+        (spec.batch, spec.nheads_q, spec.seqlen_q), 4.0, dtype=torch.float32
+    )
     global_out = torch.full_like(q, 5.0)
+    global_lse = torch.full_like(windowed_lse, 6.0)
     dispatches: list[str] = []
 
     monkeypatch.setattr(helion_attention, "check_tensors", lambda *args: None)
 
-    def generic(
+    def validate_window_dispatch(
         q_arg: torch.Tensor,
         k_arg: torch.Tensor,
         v_arg: torch.Tensor,
         scale_arg: float,
         spec_arg: AttnShape,
-        slopes_arg: torch.Tensor | None,
-        *,
-        softcap: float = 0.0,
-        window_size: tuple[int, int] = (-1, -1),
-    ) -> torch.Tensor:
+    ) -> None:
         assert q_arg is q
         assert tuple(k_arg.shape) == tuple(v_arg.shape) == (
             spec.batch,
@@ -9610,11 +9639,40 @@ def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispat
             spec.dtype,
             spec.causal,
         )
+
+    def generic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        slopes_arg: torch.Tensor | None,
+        *,
+        softcap: float = 0.0,
+        window_size: tuple[int, int] = (-1, -1),
+    ) -> torch.Tensor:
+        validate_window_dispatch(q_arg, k_arg, v_arg, scale_arg, spec_arg)
         assert slopes_arg is None
         assert softcap == 0.0
         assert window_size == DENSE_KVCACHE_LEFT_WINDOW_SIZE
         dispatches.append("generic-window")
         return windowed_out
+
+    def diagnostic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+        *,
+        alibi_slopes: torch.Tensor | None = None,
+        softcap: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        validate_window_dispatch(q_arg, k_arg, v_arg, scale_arg, spec_arg)
+        assert alibi_slopes is None
+        assert softcap == 0.0
+        dispatches.append("diagnostic-window")
+        return windowed_out, windowed_lse, q.new_empty((0,))
 
     def lookup_stub(spec_arg: AttnShape):  # noqa: ANN202
         assert spec_arg == spec
@@ -9624,15 +9682,23 @@ def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispat
             k_arg: torch.Tensor,
             v_arg: torch.Tensor,
             scale_arg: float,
-        ) -> torch.Tensor:
+            *,
+            return_softmax_lse: bool = False,
+        ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
             assert q_arg is q and k_arg is k_cache and v_arg is v_cache
             assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            if return_softmax_lse:
+                dispatches.append("generated-global-lse")
+                return global_out, global_lse
             dispatches.append("generated-global")
             return global_out
 
         return generated
 
     monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", diagnostic
+    )
     monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
     cache_kwargs = (
         {} if cache_seqlens is None else {"cache_seqlens": cache_seqlens}
@@ -9644,6 +9710,7 @@ def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispat
         v_cache,
         causal=causal,
         window_size=DENSE_KVCACHE_LEFT_WINDOW_SIZE,
+        return_softmax_lse=return_softmax_lse,
         shape=spec,
         **cache_kwargs,
     )
@@ -9653,13 +9720,22 @@ def test_kvcache_4k_left_window_uses_generic_and_global_retains_generated_dispat
         v_cache,
         causal=causal,
         window_size=(-1, -1),
+        return_softmax_lse=return_softmax_lse,
         shape=spec,
         **cache_kwargs,
     )
 
-    assert windowed is windowed_out
-    assert global_attention is global_out
-    assert dispatches == ["generic-window", "generated-global"]
+    if return_softmax_lse:
+        assert isinstance(windowed, tuple)
+        assert windowed[0] is windowed_out and windowed[1] is windowed_lse
+        assert isinstance(global_attention, tuple)
+        assert global_attention[0] is global_out
+        assert global_attention[1] is global_lse
+        assert dispatches == ["diagnostic-window", "generated-global-lse"]
+    else:
+        assert windowed is windowed_out
+        assert global_attention is global_out
+        assert dispatches == ["generic-window", "generated-global"]
     assert torch.equal(k_cache, original_k)
     assert torch.equal(v_cache, original_v)
 
@@ -9686,6 +9762,7 @@ def test_kvcache_4k_left_window_rejects_out_of_scope_before_dispatch(
         "_paged_kvcache_forward",
         "_tensor_length_dense_kvcache_forward",
         "_generic_dense_forward",
+        "_generic_dense_diagnostic_forward",
         "attention_autograd",
     ):
         monkeypatch.setattr(helion_attention, dispatch_name, reject_dispatch)
@@ -9725,15 +9802,6 @@ def test_kvcache_4k_left_window_rejects_out_of_scope_before_dispatch(
                 "cache_seqlens": torch.tensor([spec.seqlen_k]),
             },
             "tensor-valued",
-        ),
-        (
-            q,
-            spec,
-            {
-                "window_size": DENSE_KVCACHE_LEFT_WINDOW_SIZE,
-                "return_softmax_lse": True,
-            },
-            "return_softmax_lse",
         ),
         (
             q,
@@ -9820,19 +9888,22 @@ def test_kvcache_4k_left_window_rejects_out_of_scope_before_dispatch(
     ]
 
     for query, case_spec, kwargs, message in cases:
-        original_k = k_cache.clone()
-        original_v = v_cache.clone()
-        with pytest.raises(NotImplementedError, match=message):
-            helion_attention.flash_attn_with_kvcache(
-                query,
-                k_cache,
-                v_cache,
-                causal=case_spec.causal,
-                shape=case_spec,
-                **kwargs,  # type: ignore[arg-type]
-            )
-        assert torch.equal(k_cache, original_k)
-        assert torch.equal(v_cache, original_v)
+        for return_softmax_lse in (False, True):
+            original_k = k_cache.clone()
+            original_v = v_cache.clone()
+            call_kwargs = dict(kwargs)
+            call_kwargs["return_softmax_lse"] = return_softmax_lse
+            with pytest.raises(NotImplementedError, match=message):
+                helion_attention.flash_attn_with_kvcache(
+                    query,
+                    k_cache,
+                    v_cache,
+                    causal=case_spec.causal,
+                    shape=case_spec,
+                    **call_kwargs,  # type: ignore[arg-type]
+                )
+            assert torch.equal(k_cache, original_k)
+            assert torch.equal(v_cache, original_v)
 
 
 @requires_cuda

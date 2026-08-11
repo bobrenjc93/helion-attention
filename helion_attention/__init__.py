@@ -3358,10 +3358,11 @@ def flash_attn_with_kvcache(
     ``window_size=(511, 0)`` for a forward-only, slope-free read of the full
     cache, with ``cache_seqlens`` omitted or supplied as the Python integer
     ``4096``. This path uses the generic packed runtime with the default or a
-    custom softmax scale and presents only the visible 512-row cache tail to
-    the kernel. Partial or tensor-valued lengths, cache updates, LSE, optional
-    features, and autograd remain unsupported; the global window continues to
-    use the generated specialization.
+    custom softmax scale, optionally returns fp32 LSE shaped ``[1, 32, 1]``,
+    and presents only the visible 512-row cache tail to the kernel. Partial or
+    tensor-valued lengths, cache updates, optional features, and autograd
+    remain unsupported; the global window continues to use the generated
+    specialization.
     The causal 1K profile and both 4K profiles additionally accept contiguous
     CUDA int32 ``cache_seqlens`` tensors shaped ``[1]`` for read-only spans.
     An optional matching ``cache_leftpad`` tensor selects
@@ -3611,11 +3612,6 @@ def flash_attn_with_kvcache(
             raise NotImplementedError(
                 "the 4K dense KV-cache left window is read-only; cache updates "
                 "are not supported"
-            )
-        if return_softmax_lse:
-            raise NotImplementedError(
-                "return_softmax_lse=True is not implemented for the 4K dense "
-                "KV-cache left window"
             )
         if tensor_cache_seqlens is not None or tensor_cache_leftpad is not None:
             raise NotImplementedError(
@@ -3948,10 +3944,21 @@ def flash_attn_with_kvcache(
             spec.dtype,
             spec.causal,
         )
+        window_k = k_cache[:, window_start:]
+        window_v = v_cache[:, window_start:]
+        if return_softmax_lse:
+            out, softmax_lse, _ = _generic_dense_diagnostic_forward(
+                q,
+                window_k,
+                window_v,
+                scale,
+                window_spec,
+            )
+            return out, softmax_lse
         return _generic_dense_forward(
             q,
-            k_cache[:, window_start:],
-            v_cache[:, window_start:],
+            window_k,
+            window_v,
             scale,
             window_spec,
             None,

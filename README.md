@@ -458,10 +458,11 @@ A forward-only, slope-free full-cache read on this exact 4K profile also accepts
 `window_size=(511, 0)` with either causal flag and the default or a custom
 `softmax_scale`. It attends only to cache rows 3584 through 4095, exposes only
 that 512-row tail to the generic packed Triton kernel, and never mutates cache
-storage. `cache_seqlens` must be omitted or supplied as the Python integer 4096.
-Partial or tensor-valued lengths, LSE, updates, ALiBi, cache remapping, left
-padding, rotary, softcap, explicit split counts, autograd, other windows, and
-other profiles remain unsupported for this local-window path.
+storage. It optionally returns fp32 LSE shaped `[1, 32, 1]`. `cache_seqlens`
+must be omitted or supplied as the Python integer 4096. Partial or
+tensor-valued lengths, updates, ALiBi, cache remapping, left padding, rotary,
+softcap, explicit split counts, autograd, other windows, and other profiles
+remain unsupported for this local-window path.
 
 The 4K profile also accepts a contiguous CUDA int32 `cache_seqlens` tensor
 shaped `[1]` for a read-only prefix. An optional matching contiguous CUDA int32
