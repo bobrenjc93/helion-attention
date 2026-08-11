@@ -4438,6 +4438,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6ba6d71bab1365be1e4051013d2f3f5a59edb8b5",
+      "commit": "6ba6d71bab1365be1e4051013d2f3f5a59edb8b5",
+      "recordedAt": "2026-08-11T11:09:21.922Z",
+      "label": "base 6ba6d71",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:192",
+      "recordedAt": "2026-08-11T11:09:21.922Z",
+      "label": "PR #192",
+      "kind": "leaf",
+      "prNumber": 192,
+      "title": "Backpropagate causal varlen empty-key slots",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 63,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
