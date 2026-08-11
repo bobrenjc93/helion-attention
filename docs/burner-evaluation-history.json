@@ -4498,6 +4498,36 @@
         "eval_5b403bea": 98,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:6d2870801480f717da31321e2768165be5cde396",
+      "commit": "6d2870801480f717da31321e2768165be5cde396",
+      "recordedAt": "2026-08-11T11:59:08.668Z",
+      "label": "base 6d28708",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 64,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:194",
+      "recordedAt": "2026-08-11T11:59:08.668Z",
+      "label": "PR #194",
+      "kind": "leaf",
+      "prNumber": 194,
+      "title": "Read a full 1K cache with eight query tokens",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 65,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
