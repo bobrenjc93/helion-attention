@@ -1510,6 +1510,84 @@ def test_unregistered_dense_fallback_matches_fp32_sdpa(spec: AttnShape) -> None:
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_llama_2k_global_return_attn_probs_matches_fa2(
+    entry_point: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = LLAMA_2K_LEFT_WINDOW
+    q, k, v = make_inputs(spec, seed=20260810)
+    declared_shape = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+    )
+
+    with torch.no_grad():
+        if entry_point == "dense":
+            got = helion_attention.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_func(
+                q,
+                k,
+                v,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+            )
+        else:
+            kv = torch.stack((k, v), dim=2)
+            got = helion_attention.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+                shape=declared_shape,
+            )
+            expected = flash_attn.flash_attn_kvpacked_func(
+                q,
+                kv,
+                softmax_scale=softmax_scale,
+                causal=True,
+                return_attn_probs=True,
+            )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (1, 32, 2048)
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "window_left",
     LLAMA_2K_LEFT_WINDOW_RADII,
     ids=lambda radius: f"left-{radius}",
@@ -1726,6 +1804,17 @@ def test_llama_2k_global_window_retains_generated_dispatch(
     kv = torch.stack((k, v), dim=2)
     q.requires_grad_()
     sentinel = torch.empty_like(q)
+    diagnostics = (
+        sentinel,
+        torch.empty(
+            spec.batch,
+            spec.nheads_q,
+            spec.seqlen_q,
+            device=q.device,
+            dtype=torch.float32,
+        ),
+        q.new_empty((0,)),
+    )
     dispatches: list[str] = []
 
     def generic(
@@ -1762,7 +1851,24 @@ def test_llama_2k_global_window_retains_generated_dispatch(
 
         return generated
 
+    def diagnostic(
+        q_arg: torch.Tensor,
+        k_arg: torch.Tensor,
+        v_arg: torch.Tensor,
+        scale_arg: float,
+        spec_arg: AttnShape,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        del q_arg, k_arg, v_arg, scale_arg
+        assert spec_arg == spec
+        dispatches.append("generic-diagnostic")
+        return diagnostics
+
     monkeypatch.setattr(helion_attention, "_generic_dense_forward", generic)
+    monkeypatch.setattr(
+        helion_attention,
+        "_generic_dense_diagnostic_forward",
+        diagnostic,
+    )
     monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
 
     with torch.no_grad():
@@ -1787,14 +1893,32 @@ def test_llama_2k_global_window_retains_generated_dispatch(
         packed_global_attention = helion_attention.flash_attn_kvpacked_func(
             q, kv, causal=True, window_size=(-1, -1), shape=spec
         )
+        diagnostic_attention = helion_attention.flash_attn_func(
+            q,
+            k,
+            v,
+            causal=True,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        packed_diagnostic_attention = helion_attention.flash_attn_kvpacked_func(
+            q,
+            kv,
+            causal=True,
+            return_attn_probs=True,
+            shape=spec,
+        )
 
     assert windowed is packed_windowed is sentinel
     assert global_attention is packed_global_attention is sentinel
+    assert diagnostic_attention is packed_diagnostic_attention is diagnostics
     assert dispatches == [
         "generic-window",
         "generic-window",
         "generated-global",
         "generated-global",
+        "generic-diagnostic",
+        "generic-diagnostic",
     ]
 
 
@@ -1881,6 +2005,131 @@ def test_llama_2k_left_window_rejects_out_of_scope_calls_before_dispatch(
                 shape=case_spec,
                 **kwargs,  # type: ignore[arg-type]
             )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
+)
+def test_llama_2k_global_diagnostics_reject_gradients_before_dispatch(
+    entry_point: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA_2K_LEFT_WINDOW
+    q, k, v = make_inputs(spec, seed=27182)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("grad-enabled Llama diagnostic reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+
+    with pytest.raises(NotImplementedError, match="grad-enabled"):
+        if entry_point == "dense":
+            helion_attention.flash_attn_func(
+                q.requires_grad_(),
+                k,
+                v,
+                causal=True,
+                return_attn_probs=True,
+                shape=spec,
+            )
+        else:
+            kv = torch.stack((k, v), dim=2).requires_grad_()
+            helion_attention.flash_attn_kvpacked_func(
+                q,
+                kv,
+                causal=True,
+                return_attn_probs=True,
+                shape=spec,
+            )
+
+
+@requires_cuda
+def test_llama_2k_global_diagnostics_reject_features_and_neighbor_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = LLAMA_2K_LEFT_WINDOW
+    q, k, v = make_inputs(spec, seed=31415)
+    slopes = torch.ones(spec.nheads_q, device=q.device, dtype=torch.float32)
+    declared_shape = (
+        spec.batch,
+        spec.seqlen_q,
+        spec.seqlen_k,
+        spec.nheads_q,
+        spec.nheads_kv,
+        spec.head_dim,
+    )
+    fp16_tensors = tuple(tensor.to(torch.float16) for tensor in (q, k, v))
+    mha_spec = AttnShape(
+        1, 2048, 2048, 32, 32, 128, torch.bfloat16, True
+    )
+    mha_tensors = make_inputs(mha_spec, seed=31415)
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("out-of-scope Llama diagnostic reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+
+    cases: list[
+        tuple[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+            dict[str, object],
+            str,
+        ]
+    ] = [
+        ((q, k, v), {"dropout_p": 0.1}, "with dropout"),
+        ((q, k, v), {"deterministic": True}, "deterministic=False"),
+        ((q, k, v), {"alibi_slopes": slopes}, "with ALiBi"),
+        (
+            (q, k, v),
+            {"dropout_p": 0.1, "alibi_slopes": slopes},
+            "dropout combined with ALiBi",
+        ),
+        (
+            (q, k, v),
+            {"window_size": LLAMA_2K_LEFT_WINDOW_SIZE},
+            "return_attn_probs=True",
+        ),
+        ((q, k, v), {"softcap": 50.0}, "Gemma-2 profile"),
+        (
+            (q, k, v),
+            {"causal": False, "shape": declared_shape},
+            "global Llama GQA profile",
+        ),
+        (
+            fp16_tensors,  # type: ignore[arg-type]
+            {"shape": declared_shape},
+            "global Llama GQA profile",
+        ),
+        (
+            mha_tensors,
+            {"shape": mha_spec},
+            "global Llama GQA profile",
+        ),
+    ]
+
+    for tensors, overrides, message in cases:
+        kwargs: dict[str, object] = {
+            "causal": True,
+            "return_attn_probs": True,
+            "shape": spec,
+        }
+        kwargs.update(overrides)
+        with pytest.raises(NotImplementedError, match=message):
+            helion_attention.flash_attn_func(
+                *tensors,
+                **kwargs,  # type: ignore[arg-type]
+            )
+
 
 @requires_cuda
 @pytest.mark.parametrize(
