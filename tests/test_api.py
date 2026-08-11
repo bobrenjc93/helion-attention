@@ -7789,6 +7789,105 @@ def test_paged_kvcache_alibi_matches_fa2_and_fp32_for_ragged_permuted_pages(
 
 
 @requires_cuda
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+@pytest.mark.parametrize(
+    "batched_slopes", [False, True], ids=["head-slopes", "batch-head-slopes"]
+)
+def test_page16_noncausal_paged_kvcache_alibi_returns_fp32_lse(
+    softmax_scale: float | None,
+    batched_slopes: bool,
+) -> None:
+    q, k_cache, v_cache, cache_seqlens, block_table, logical_caches = (
+        make_paged_kvcache_inputs(page_size=16, seed=20260811)
+    )
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    head_slopes = torch.linspace(
+        0.01, 0.2, PAGED_KVCACHE.nheads_q, device=q.device, dtype=torch.float32
+    )
+    slopes = (
+        torch.stack(
+            [head_slopes.roll(batch) for batch in range(PAGED_KVCACHE.batch)]
+        )
+        if batched_slopes
+        else head_slopes
+    )
+    scale = (
+        1.0 / math.sqrt(PAGED_KVCACHE.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_seqlens=cache_seqlens,
+        block_table=block_table,
+        softmax_scale=softmax_scale,
+        causal=False,
+        alibi_slopes=slopes,
+        return_softmax_lse=True,
+        shape=(4, 1, 1024, 8, 2, 128),
+    )
+    assert isinstance(result, tuple)
+    out, lse = result
+    expected_fp32_out = reference_paged_alibi(
+        q,
+        logical_caches,
+        PAGED_KVCACHE,
+        scale,
+        slopes,
+        causal=False,
+    )
+    expected_fp32_lse = reference_paged_alibi_lse(
+        q,
+        logical_caches,
+        PAGED_KVCACHE,
+        scale,
+        slopes,
+        causal=False,
+    )
+
+    assert out.shape == q.shape
+    assert lse.shape == (PAGED_KVCACHE.batch, PAGED_KVCACHE.nheads_q, 1)
+    assert lse.dtype == torch.float32
+    torch.testing.assert_close(
+        out.float(), expected_fp32_out, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(lse, expected_fp32_lse, atol=2e-3, rtol=1e-3)
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+    try:
+        import flash_attn
+    except ImportError:
+        return
+    # FA2 requires cache pages to be a multiple of 256. Re-page the same
+    # logical, ragged caches to compare its noncausal output and LSE.
+    fa2_k, fa2_v, fa2_block_table = page_logical_caches(
+        PAGED_KVCACHE, logical_caches, page_size=256
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        fa2_k,
+        fa2_v,
+        cache_seqlens=cache_seqlens,
+        block_table=fa2_block_table,
+        softmax_scale=softmax_scale,
+        causal=False,
+        alibi_slopes=slopes,
+        return_softmax_lse=True,
+    )
+    assert isinstance(expected_fa2, tuple)
+    fa2_out, fa2_lse = expected_fa2
+    torch.testing.assert_close(out, fa2_out, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, fa2_lse, atol=2e-3, rtol=1e-3)
+
+
+@requires_cuda
 @pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
 @pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
@@ -8331,6 +8430,12 @@ def test_large_page_paged_kvcache_uses_generic_runtime(
             id="alibi",
         ),
         pytest.param(
+            "page16-alibi",
+            NotImplementedError,
+            "softcap combined with ALiBi",
+            id="page-16-alibi",
+        ),
+        pytest.param(
             "page512-alibi",
             NotImplementedError,
             "softcap combined with ALiBi",
@@ -8366,7 +8471,15 @@ def test_large_page_paged_kvcache_softcap_rejects_out_of_scope_calls(
         "shape": PAGED_KVCACHE,
     }
     scoped_case = case
-    if case.startswith("page512-"):
+    if case.startswith("page16-"):
+        q, k_cache, v_cache, cache_seqlens, block_table, _ = (
+            make_paged_kvcache_inputs(page_size=16)
+        )
+        kwargs["cache_seqlens"] = cache_seqlens
+        kwargs["block_table"] = block_table
+        kwargs["causal"] = False
+        scoped_case = case.removeprefix("page16-")
+    elif case.startswith("page512-"):
         k_cache, v_cache, block_table = page_logical_caches(
             PAGED_KVCACHE, logical_caches, page_size=512
         )
@@ -8525,9 +8638,17 @@ def test_paged_kvcache_alibi_uses_generic_paged_runtime(
 
 
 @requires_cuda
-@pytest.mark.parametrize("causal", [True, False], ids=["causal", "noncausal"])
-@pytest.mark.parametrize("page_size", [256, 512], ids=["page-256", "page-512"])
-def test_large_page_paged_kvcache_alibi_lse_uses_generic_paged_runtime(
+@pytest.mark.parametrize(
+    ("page_size", "causal"),
+    [
+        pytest.param(16, False, id="page-16-noncausal"),
+        pytest.param(256, True, id="page-256-causal"),
+        pytest.param(256, False, id="page-256-noncausal"),
+        pytest.param(512, True, id="page-512-causal"),
+        pytest.param(512, False, id="page-512-noncausal"),
+    ],
+)
+def test_paged_kvcache_alibi_lse_uses_generic_paged_runtime(
     monkeypatch: pytest.MonkeyPatch,
     page_size: int,
     causal: bool,
@@ -8655,8 +8776,18 @@ def test_paged_kvcache_alibi_rejects_incompatible_modes_before_dispatch(
         "alibi_slopes": slopes,
         "shape": spec,
     }
-    if spec == PAGED_KVCACHE and page_size in (256, 512):
+    if spec == PAGED_KVCACHE:
         kwargs["return_softmax_lse"] = True
+        if page_size == 16:
+            kwargs["causal"] = False
+            kwargs["shape"] = (
+                spec.batch,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                spec.nheads_q,
+                spec.nheads_kv,
+                spec.head_dim,
+            )
     if case == "update":
         update_shape = (
             spec.batch,
@@ -8699,7 +8830,8 @@ def test_paged_kvcache_alibi_rejects_incompatible_modes_before_dispatch(
         pytest.param(
             PAGED_KVCACHE,
             [37, 128, 1024, 5],
-            "return_softmax_lse=True with paged KV-cache ALiBi.*page-size-256",
+            "return_softmax_lse=True with paged KV-cache ALiBi.*noncausal "
+            "page-size-16",
             id="decode-page-16",
         ),
         pytest.param(
