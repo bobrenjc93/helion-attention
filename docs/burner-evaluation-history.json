@@ -4753,6 +4753,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:41f391839e8a22320e3175af38b4ec07a36ddc14",
+      "commit": "41f391839e8a22320e3175af38b4ec07a36ddc14",
+      "recordedAt": "2026-08-11T16:12:41.765Z",
+      "label": "base 41f3918",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 98,
+        "eval_1afd133e": 58,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:203",
+      "recordedAt": "2026-08-11T16:12:41.765Z",
+      "label": "PR #203",
+      "kind": "leaf",
+      "prNumber": 203,
+      "title": "Backpropagate global 2K Llama GQA diagnostics",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
