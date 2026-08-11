@@ -159,6 +159,7 @@ LLAMA_2K_LEFT_WINDOW = AttnShape(
     1, 2048, 2048, 32, 8, 128, torch.bfloat16, True
 )
 LLAMA_2K_LEFT_WINDOW_SIZE = (511, 0)
+LLAMA_2K_LEFT_WINDOW_RADII = (0, 127, 511, 1023, 2047)
 
 
 def make_inputs(
@@ -1509,13 +1510,20 @@ def test_unregistered_dense_fallback_matches_fp32_sdpa(spec: AttnShape) -> None:
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "window_left",
+    LLAMA_2K_LEFT_WINDOW_RADII,
+    ids=lambda radius: f"left-{radius}",
+)
+@pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
 def test_llama_2k_left_window_dense_and_kvpacked_match_fa2_and_fp32(
     softmax_scale: float | None,
+    window_left: int,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = LLAMA_2K_LEFT_WINDOW
+    window_size = (window_left, 0)
     q, k, v = make_inputs(spec, seed=20260810)
     kv = torch.stack((k, v), dim=2)
     scale = (
@@ -1531,7 +1539,7 @@ def test_llama_2k_left_window_dense_and_kvpacked_match_fa2_and_fp32(
             v,
             softmax_scale=softmax_scale,
             causal=True,
-            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            window_size=window_size,
             shape=spec,
         )
         expected_dense = flash_attn.flash_attn_func(
@@ -1540,14 +1548,14 @@ def test_llama_2k_left_window_dense_and_kvpacked_match_fa2_and_fp32(
             v,
             softmax_scale=softmax_scale,
             causal=True,
-            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            window_size=window_size,
         )
         packed = helion_attention.flash_attn_kvpacked_func(
             q,
             kv,
             softmax_scale=softmax_scale,
             causal=True,
-            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            window_size=window_size,
             shape=spec,
         )
         expected_packed = flash_attn.flash_attn_kvpacked_func(
@@ -1555,7 +1563,7 @@ def test_llama_2k_left_window_dense_and_kvpacked_match_fa2_and_fp32(
             kv,
             softmax_scale=softmax_scale,
             causal=True,
-            window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+            window_size=window_size,
         )
         expected_fp32 = reference_causal_left_window_attention(
             q,
@@ -1563,7 +1571,7 @@ def test_llama_2k_left_window_dense_and_kvpacked_match_fa2_and_fp32(
             v,
             spec,
             scale,
-            LLAMA_2K_LEFT_WINDOW_SIZE[0],
+            window_left,
         )
 
     assert dense.shape == packed.shape == q.shape
@@ -1576,13 +1584,20 @@ def test_llama_2k_left_window_dense_and_kvpacked_match_fa2_and_fp32(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "window_left",
+    LLAMA_2K_LEFT_WINDOW_RADII,
+    ids=lambda radius: f"left-{radius}",
+)
+@pytest.mark.parametrize(
     "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
 )
 def test_llama_2k_left_window_backward_matches_fa2_and_fp32(
     softmax_scale: float | None,
+    window_left: int,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
     spec = LLAMA_2K_LEFT_WINDOW
+    window_size = (window_left, 0)
     base_q, base_k, base_v = make_inputs(spec, seed=20260810)
     grad_out = make_inputs(spec, seed=20260811)[0]
     scale = (
@@ -1600,7 +1615,7 @@ def test_llama_2k_left_window_backward_matches_fa2_and_fp32(
         v_ref,
         spec,
         scale,
-        LLAMA_2K_LEFT_WINDOW_SIZE[0],
+        window_left,
     )
     expected_fp32_grads = torch.autograd.grad(
         expected_fp32, (q_ref, k_ref, v_ref), grad_out.float()
@@ -1615,7 +1630,7 @@ def test_llama_2k_left_window_backward_matches_fa2_and_fp32(
         v,
         softmax_scale=softmax_scale,
         causal=True,
-        window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+        window_size=window_size,
         shape=spec,
     )
     dense_grads = torch.autograd.grad(dense, (q, k, v), grad_out)
@@ -1629,7 +1644,7 @@ def test_llama_2k_left_window_backward_matches_fa2_and_fp32(
         v_fa2,
         softmax_scale=softmax_scale,
         causal=True,
-        window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+        window_size=window_size,
     )
     expected_dense_grads = torch.autograd.grad(
         expected_dense, (q_fa2, k_fa2, v_fa2), grad_out
@@ -1642,7 +1657,7 @@ def test_llama_2k_left_window_backward_matches_fa2_and_fp32(
         kv,
         softmax_scale=softmax_scale,
         causal=True,
-        window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+        window_size=window_size,
         shape=spec,
     )
     q_grad, kv_grad = torch.autograd.grad(packed, (q_packed, kv), grad_out)
@@ -1655,7 +1670,7 @@ def test_llama_2k_left_window_backward_matches_fa2_and_fp32(
         kv_fa2,
         softmax_scale=softmax_scale,
         causal=True,
-        window_size=LLAMA_2K_LEFT_WINDOW_SIZE,
+        window_size=window_size,
     )
     q_grad_fa2, kv_grad_fa2 = torch.autograd.grad(
         expected_packed, (q_packed_fa2, kv_fa2), grad_out
@@ -1808,8 +1823,12 @@ def test_llama_2k_left_window_rejects_out_of_scope_calls_before_dispatch(
             str,
         ]
     ] = [
-        ((q, k, v), spec, {"window_size": (510, 0)}, "sliding-window"),
+        ((q, k, v), spec, {"window_size": (-1, 0)}, "sliding-window"),
+        ((q, k, v), spec, {"window_size": (2048, 0)}, "sliding-window"),
+        ((q, k, v), spec, {"window_size": (511, -1)}, "sliding-window"),
+        ((q, k, v), spec, {"window_size": (511, 1)}, "sliding-window"),
         ((q, k, v), spec, {"window_size": (511.0, 0)}, "sliding-window"),
+        ((q, k, v), spec, {"window_size": (True, 0)}, "sliding-window"),
         (
             (other_q, other_k, other_v),
             other_spec,
