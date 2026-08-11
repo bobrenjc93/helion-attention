@@ -155,6 +155,7 @@ GEMMA2_SOFTCAP = AttnShape(
     1, 4096, 4096, 16, 8, 256, torch.bfloat16, True
 )
 GEMMA2_SOFTCAP_VALUE = 50.0
+GEMMA2_NON_DIAGNOSTIC_SOFTCAP = 30.0
 LLAMA_2K_LEFT_WINDOW = AttnShape(
     1, 2048, 2048, 32, 8, 128, torch.bfloat16, True
 )
@@ -1884,9 +1885,12 @@ def test_llama_2k_left_window_rejects_out_of_scope_calls_before_dispatch(
 
 @requires_cuda
 @pytest.mark.parametrize(
-    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+    ("softcap", "softmax_scale"),
+    [(GEMMA2_NON_DIAGNOSTIC_SOFTCAP, None), (80.0, 0.37)],
+    ids=["cap-30-default-scale", "cap-80-custom-scale"],
 )
 def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
+    softcap: float,
     softmax_scale: float | None,
 ) -> None:
     flash_attn = pytest.importorskip("flash_attn")
@@ -1909,7 +1913,7 @@ def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
             v,
             softmax_scale=softmax_scale,
             causal=True,
-            softcap=GEMMA2_SOFTCAP_VALUE,
+            softcap=softcap,
             shape=spec,
         )
         expected_dense = flash_attn.flash_attn_func(
@@ -1918,7 +1922,7 @@ def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
             v,
             softmax_scale=softmax_scale,
             causal=True,
-            softcap=GEMMA2_SOFTCAP_VALUE,
+            softcap=softcap,
         )
         kv = torch.stack((k, v), dim=2)
         packed = helion_attention.flash_attn_kvpacked_func(
@@ -1926,7 +1930,7 @@ def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
             kv,
             softmax_scale=softmax_scale,
             causal=True,
-            softcap=GEMMA2_SOFTCAP_VALUE,
+            softcap=softcap,
             shape=spec,
         )
         expected_packed = flash_attn.flash_attn_kvpacked_func(
@@ -1934,10 +1938,10 @@ def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
             kv,
             softmax_scale=softmax_scale,
             causal=True,
-            softcap=GEMMA2_SOFTCAP_VALUE,
+            softcap=softcap,
         )
         expected_fp32 = reference_softcap_attention(
-            q, k, v, spec, scale, GEMMA2_SOFTCAP_VALUE
+            q, k, v, spec, scale, softcap
         )
 
     assert dense.shape == packed.shape == q.shape
@@ -1951,8 +1955,8 @@ def test_gemma2_softcap_dense_and_kvpacked_match_fa2_and_fp32(
 @requires_cuda
 @pytest.mark.parametrize(
     "softcap",
-    [0.0, GEMMA2_SOFTCAP_VALUE],
-    ids=["zero", "output-only-softcap"],
+    [0.0, GEMMA2_NON_DIAGNOSTIC_SOFTCAP, GEMMA2_SOFTCAP_VALUE],
+    ids=["zero", "non-50", "50"],
 )
 def test_gemma2_softcap_output_dispatch_is_unchanged(
     softcap: float,
@@ -2068,7 +2072,9 @@ def test_gemma2_softcap_return_attn_probs_matches_fa2(
 @pytest.mark.parametrize(
     ("case", "message"),
     [
-        ("other-cap", "only as softcap=50.0"),
+        ("non-50-diagnostics", "only as softcap=50.0"),
+        ("negative-cap", "finite positive"),
+        ("nonfinite-cap", "finite positive"),
         ("other-shape", "implemented only.*Gemma-2 profile"),
         ("fp16", "implemented only.*Gemma-2 profile"),
         ("noncausal", "implemented only.*Gemma-2 profile"),
@@ -2093,11 +2099,15 @@ def test_gemma2_softcap_rejects_out_of_scope_calls_before_dispatch(
     q, k, v = make_inputs(spec, seed=223607)
     kwargs: dict[str, object] = {
         "causal": spec.causal,
-        "softcap": GEMMA2_SOFTCAP_VALUE,
+        "softcap": GEMMA2_NON_DIAGNOSTIC_SOFTCAP,
         "shape": spec,
     }
-    if case == "other-cap":
-        kwargs["softcap"] = 49.0
+    if case == "non-50-diagnostics":
+        kwargs["return_attn_probs"] = True
+    elif case == "negative-cap":
+        kwargs["softcap"] = -1.0
+    elif case == "nonfinite-cap":
+        kwargs["softcap"] = float("inf")
     elif case == "gradient":
         q.requires_grad_()
     elif case == "window":
@@ -2112,6 +2122,9 @@ def test_gemma2_softcap_rejects_out_of_scope_calls_before_dispatch(
         raise AssertionError("out-of-scope Gemma-2 softcap call reached dispatch")
 
     monkeypatch.setattr(helion_attention, "_generic_dense_forward", reject_dispatch)
+    monkeypatch.setattr(
+        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
+    )
     monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
     monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
 

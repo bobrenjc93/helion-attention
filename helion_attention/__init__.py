@@ -19,13 +19,13 @@ retains generated dispatch. It also exposes every causal left window from the
 current token alone through the full 2K context for the bf16 batch-1 2K Llama
 GQA profile while its global-window call retains generated dispatch.
 Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime
-also provides
-``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
+also provides any finite positive softcap for output-only calls on one
+forward-only Gemma-2 profile, plus ``softcap=50.0`` for the shipped causal
 varlen profile, read-only page-256/page-512 core paged decode, and read-only
 page-256/page-512 KV-cache decode. The Gemma-2 and shipped causal varlen
-profiles also expose the diagnostic return with that cap. The same runtime
-exposes page-256/page-512 decode with optional ALiBi through the core varlen
-API, plus the FA2 diagnostic return for slope-free page-256 decode. The
+profiles also expose the diagnostic return with exactly that cap. The same
+runtime exposes page-256/page-512 decode with optional ALiBi through the core
+varlen API, plus the FA2 diagnostic return for slope-free page-256 decode. The
 KV-cache adapter also uses the generic paged runtime for ALiBi on
 both exposed page-16 profiles and page-256/page-512 decode. Read-only causal
 1K and both causal variants of 4K dense decode likewise use the generic
@@ -295,6 +295,7 @@ def _reject_unsupported(
     allow_return_attn_probs: bool = False,
     allow_softcap_return_attn_probs: bool = False,
     allowed_softcap: float | None = None,
+    allow_positive_softcap: bool = False,
     allowed_window_size: tuple[int, int] | None = None,
 ) -> float:
     if isinstance(dropout_p, bool) or not isinstance(dropout_p, Real):
@@ -314,11 +315,24 @@ def _reject_unsupported(
     if requested_window != (-1, -1) and not has_allowed_window:
         raise NotImplementedError("sliding-window attention is not implemented")
     has_softcap = softcap != 0.0
-    if has_softcap and softcap != allowed_softcap:
-        raise NotImplementedError(
-            "softcap is implemented only as softcap=50.0 for the supported "
-            "inference profiles"
+    has_allowed_positive_softcap = (
+        allow_positive_softcap
+        and not isinstance(softcap, bool)
+        and isinstance(softcap, Real)
+        and math.isfinite(float(softcap))
+        and float(softcap) > 0.0
+    )
+    if (
+        has_softcap
+        and softcap != allowed_softcap
+        and not has_allowed_positive_softcap
+    ):
+        qualifier = (
+            "as a finite positive value for the supported output-only profile"
+            if allow_positive_softcap
+            else "only as softcap=50.0 for the supported inference profiles"
         )
+        raise NotImplementedError(f"softcap is implemented {qualifier}")
     if alibi_slopes is not None and not allow_alibi:
         raise NotImplementedError("ALiBi slopes are not implemented")
     if probability != 0.0 and alibi_slopes is not None:
@@ -1743,9 +1757,10 @@ def flash_attn_func(
             ``0 <= left < 2048`` on zero-dropout causal bf16
             ``(1, 2048, 2048, 32, 8, 128)`` Llama GQA attention through this
             entry point and :func:`flash_attn_kvpacked_func`.
-        softcap: exactly ``50.0`` is supported for forward-only causal bf16
-            ``(1, 4096, 4096, 16, 8, 256)`` Gemma-2 attention. Zero retains
-            ordinary dispatch; every other positive value remains unsupported.
+        softcap: any finite positive value is supported for forward-only,
+            output-only causal bf16 ``(1, 4096, 4096, 16, 8, 256)`` Gemma-2
+            attention. Zero retains ordinary dispatch. Diagnostic returns
+            remain limited to exactly ``50.0``.
         alibi_slopes: fp32 CUDA tensor shaped ``[nheads_q]`` or
             ``[batch, nheads_q]``. ALiBi calls are currently forward-only.
         return_attn_probs: for the shipped bf16 BERT-base encoder and causal
@@ -1808,6 +1823,7 @@ def flash_attn_func(
         allow_return_attn_probs=True,
         allow_softcap_return_attn_probs=True,
         allowed_softcap=_GEMMA2_SOFTCAP,
+        allow_positive_softcap=not return_attn_probs,
         allowed_window_size=(
             window if _is_llama_2k_left_window(window) else None
         ),
@@ -1847,8 +1863,8 @@ def flash_attn_func(
     has_softcap = softcap != 0.0
     if has_softcap and spec.key != _GEMMA2_SOFTCAP_KEY:
         raise NotImplementedError(
-            "softcap=50.0 is implemented only for the no-backward bf16 causal "
-            "Gemma-2 profile (1, 4096, 4096, 16, 8, 256); "
+            "positive softcap is implemented only for the no-backward bf16 "
+            "causal Gemma-2 profile (1, 4096, 4096, 16, 8, 256); "
             f"got {spec.describe()}"
         )
     if dropout != 0.0:
@@ -1916,7 +1932,7 @@ def flash_attn_func(
             scale,
             spec,
             None,
-            softcap=_GEMMA2_SOFTCAP,
+            softcap=float(softcap),
         )
     if return_attn_probs:
         if alibi_slopes is not None and torch.is_grad_enabled() and (
