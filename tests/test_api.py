@@ -2328,41 +2328,161 @@ def test_llama_2k_left_window_rejects_out_of_scope_calls_before_dispatch(
 @pytest.mark.parametrize(
     "entry_point", ["dense", "kvpacked"], ids=["dense", "kv-packed"]
 )
-def test_llama_2k_global_diagnostics_reject_gradients_before_dispatch(
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_llama_2k_global_diagnostic_backward_matches_fp32_and_fa2(
     entry_point: str,
-    monkeypatch: pytest.MonkeyPatch,
+    softmax_scale: float | None,
 ) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
     spec = LLAMA_2K_LEFT_WINDOW
-    q, k, v = make_inputs(spec, seed=27182)
-
-    def reject_dispatch(*args: object, **kwargs: object) -> object:
-        raise AssertionError("grad-enabled Llama diagnostic reached dispatch")
-
-    monkeypatch.setattr(
-        helion_attention, "_generic_dense_diagnostic_forward", reject_dispatch
+    base_q, base_k, base_v = make_inputs(spec, seed=27182)
+    grad_out = make_inputs(spec, seed=31415)[0]
+    generator = torch.Generator(device="cuda").manual_seed(161803)
+    grad_lse = torch.randn(
+        (spec.batch, spec.nheads_q, spec.seqlen_q),
+        device="cuda",
+        dtype=torch.float32,
+        generator=generator,
     )
-    monkeypatch.setattr(helion_attention, "lookup", reject_dispatch)
-    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
 
-    with pytest.raises(NotImplementedError, match="grad-enabled"):
+    def run(
+        package: object,
+    ) -> tuple[
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ]:
+        kwargs: dict[str, object] = {
+            "softmax_scale": softmax_scale,
+            "causal": True,
+            "return_attn_probs": True,
+        }
+        if package is helion_attention:
+            kwargs["shape"] = spec
+
         if entry_point == "dense":
-            helion_attention.flash_attn_func(
-                q.requires_grad_(),
-                k,
-                v,
-                causal=True,
-                return_attn_probs=True,
-                shape=spec,
-            )
+            q = base_q.detach().requires_grad_()
+            k = base_k.detach().requires_grad_()
+            v = base_v.detach().requires_grad_()
+            result = package.flash_attn_func(q, k, v, **kwargs)
+            grad_inputs = (q, k, v)
         else:
-            kv = torch.stack((k, v), dim=2).requires_grad_()
-            helion_attention.flash_attn_kvpacked_func(
-                q,
-                kv,
-                causal=True,
-                return_attn_probs=True,
-                shape=spec,
+            q = base_q.detach().requires_grad_()
+            kv = torch.stack((base_k, base_v), dim=2).requires_grad_()
+            result = package.flash_attn_kvpacked_func(q, kv, **kwargs)
+            grad_inputs = (q, kv)
+
+        assert isinstance(result, tuple) and len(result) == 3
+        assert all(tensor.requires_grad for tensor in result)
+        out, softmax_lse, s_dmask = result
+        raw_grads = torch.autograd.grad(
+            result,
+            grad_inputs,
+            grad_outputs=(
+                grad_out,
+                grad_lse,
+                torch.empty_like(s_dmask),
+            ),
+        )
+        if entry_point == "dense":
+            grads = raw_grads
+        else:
+            grads = (
+                raw_grads[0],
+                raw_grads[1][:, :, 0],
+                raw_grads[1][:, :, 1],
             )
+        return (
+            tuple(tensor.detach() for tensor in result),
+            tuple(grad.detach() for grad in grads),
+        )
+
+    got, got_grads = run(helion_attention)
+    expected_fa2, expected_fa2_grads = run(flash_attn)
+
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+    q_ref = base_q.float().requires_grad_()
+    k_ref = base_k.float().requires_grad_()
+    v_ref = base_v.float().requires_grad_()
+    expected_fp32 = reference_attention(q_ref, k_ref, v_ref, spec, scale)
+    expected_fp32_grads = torch.autograd.grad(
+        expected_fp32, (q_ref, k_ref, v_ref), grad_out.float()
+    )
+
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected_fa2
+    assert out.shape == expected_out.shape == base_q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert out.is_contiguous()
+    assert softmax_lse.shape == expected_lse.shape == (1, 32, 2048)
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        out.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+    torch.testing.assert_close(
+        softmax_lse, expected_lse, atol=2e-3, rtol=1e-5
+    )
+
+    gradient_atol = 5e-2 if softmax_scale is None else 1.5e-1
+    for actual, reference_fa2, reference_fp32 in zip(
+        got_grads, expected_fa2_grads, expected_fp32_grads
+    ):
+        # The nonzero LSE gradient above must contribute exactly zero, as in
+        # FA2; the fp32 reference differentiates only the attention output.
+        torch.testing.assert_close(
+            actual.float(),
+            reference_fa2.float(),
+            atol=gradient_atol,
+            rtol=5e-2,
+        )
+        torch.testing.assert_close(
+            actual.float(),
+            reference_fp32,
+            atol=gradient_atol,
+            rtol=5e-2,
+        )
+
+
+@requires_cuda
+def test_llama_2k_global_diagnostic_auxiliary_gradients_are_exactly_zero() -> None:
+    spec = LLAMA_2K_LEFT_WINDOW
+    q, k, v = (
+        tensor.requires_grad_()
+        for tensor in make_inputs(spec, seed=141421)
+    )
+    _, softmax_lse, s_dmask = helion_attention.flash_attn_func(
+        q,
+        k,
+        v,
+        causal=True,
+        return_attn_probs=True,
+        shape=spec,
+    )
+
+    grads = torch.autograd.grad(
+        (softmax_lse, s_dmask),
+        (q, k, v),
+        grad_outputs=(
+            torch.ones_like(softmax_lse),
+            torch.empty_like(s_dmask),
+        ),
+    )
+
+    assert softmax_lse.shape == (1, 32, 2048)
+    assert softmax_lse.dtype == torch.float32
+    assert s_dmask.shape == (0,)
+    assert s_dmask.dtype == torch.bfloat16
+    assert all(torch.count_nonzero(grad).item() == 0 for grad in grads)
 
 
 @requires_cuda

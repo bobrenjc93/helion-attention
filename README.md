@@ -70,14 +70,16 @@ window.
 
 The global call for that same causal bf16 Llama GQA profile additionally
 supports `return_attn_probs=True` through `flash_attn_func` and
-`flash_attn_kvpacked_func`. For calls that do not require backward, exact shape
-`(1, 2048, 2048, 32, 8, 128)` returns `(out, softmax_lse, S_dmask)` with fp32
-LSE shaped `[1, 32, 2048]` and an empty bf16 `S_dmask`, matching FA2 at the
-default or a custom `softmax_scale`. This diagnostic path requires
+`flash_attn_kvpacked_func`. Exact shape `(1, 2048, 2048, 32, 8, 128)` returns
+`(out, softmax_lse, S_dmask)` with fp32 LSE shaped `[1, 32, 2048]` and an empty
+bf16 `S_dmask`, matching FA2 at the default or a custom `softmax_scale`.
+Grad-enabled calls use PyTorch SDPA for the output and Q/K/V gradients while
+retaining the generic packed runtime's LSE; as in FA2, LSE and `S_dmask`
+gradients contribute zero. This diagnostic path requires
 `causal=True`, `window_size=(-1, -1)`, `dropout_p=0.0`, `softcap=0.0`, no ALiBi,
 and `deterministic=False`; finite left-window calls remain output-only.
-Diagnostics use the generic packed Triton runtime, while ordinary no-backward
-global calls retain generated dispatch.
+No-backward diagnostics use the generic packed Triton runtime, while ordinary
+no-backward global calls retain generated dispatch.
 Zero-dropout training on that exact causal bf16
 `(1, 2048, 2048, 32, 8, 128)` profile additionally accepts
 `deterministic=True` through the dense and KV-packed APIs, with either the
@@ -1066,7 +1068,7 @@ doing something else:
   dense and varlen BERT-base profiles (with optional ALiBi slopes only on the
   BERT-base profiles as described above), and the
   backward-capable causal bf16 GPT-2 dense/QKV-packed/KV-packed calls,
-  no-backward global causal bf16 `flash_attn_func`/`flash_attn_kvpacked_func`
+  backward-capable global causal bf16 `flash_attn_func`/`flash_attn_kvpacked_func`
   calls for `(1, 2048, 2048, 32, 8, 128)` with `dropout_p=0.0`, `softcap=0.0`,
   no ALiBi, `deterministic=False`, and `window_size=(-1, -1)`, dense/KV-packed
   calls for the three Llama GQA decode profiles, dense/KV-packed calls for the
