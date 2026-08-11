@@ -4288,6 +4288,21 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "pr:186",
+      "recordedAt": "2026-08-11T08:25:04.649Z",
+      "label": "PR #186",
+      "kind": "leaf",
+      "prNumber": 186,
+      "title": "Honor deterministic BERT-base varlen backward",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
