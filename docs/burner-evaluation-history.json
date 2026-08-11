@@ -4318,6 +4318,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:589a410213e414a5d370a34e0438cfaee5539147",
+      "commit": "589a410213e414a5d370a34e0438cfaee5539147",
+      "recordedAt": "2026-08-11T09:14:41.238Z",
+      "label": "base 589a410",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 59,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:188",
+      "recordedAt": "2026-08-11T09:14:41.238Z",
+      "label": "PR #188",
+      "kind": "leaf",
+      "prNumber": 188,
+      "title": "Rotate the tensor-selected final 1K append",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 60,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }

@@ -440,10 +440,13 @@ length or passing 1024 as a Python integer retains the checked-in generated
 dispatch, as does the existing final-slot append at position 1023. That append
 also accepts the exact CUDA int32 tensor value `[1023]`, leaves the length
 tensor unchanged, supports either scale and optional fp32 LSE, and retains the
-same generated dispatch. Other tensor values remain read-only.
-Tensor updates reject left padding, cache remapping, rotary, ALiBi, windows,
-softcap, explicit split counts, autograd, and CUDA graph capture. Noncausal
-tensor spans and tensor spans on other 1K profiles remain unsupported.
+same generated dispatch. This tensor-selected update optionally applies
+full-head interleaved rotary to Q and the appended K at position 1023;
+half-head interleaved and GPT-NeoX rotary remain unsupported. Other tensor
+values remain read-only. Tensor updates reject left padding, cache remapping,
+ALiBi, windows, softcap, explicit split counts, autograd, and CUDA graph
+capture. Noncausal tensor spans and tensor spans on other 1K profiles remain
+unsupported.
 
 The same exact bf16 4K profile accepts a Python integer `cache_seqlens` from 1
 through 4095 for read-only prefix attention, optionally with ALiBi as described
@@ -651,14 +654,17 @@ inside `torch.inference_mode()` must be updated while that mode remains
 enabled. For an append, `q`, `k_cache`, and `v_cache` must occupy disjoint
 memory; update `k`/`v` aliases are staged safely.
 
-The Python-integer one-token final-slot append accepts paired, contiguous
+A Python-integer one-token final-slot append accepts paired, contiguous
 `rotary_cos` and `rotary_sin` tensors shaped `[seqlen_ro, rotary_dim / 2]`, with
-`seqlen_ro >= S_CACHE` and the same CUDA dtype/device as `q`. The default
+`seqlen_ro >= S_CACHE` and the same CUDA dtype/device as `q`. The exact causal
+bf16 1K append selected by the CUDA int32 tensor value `[1023]` accepts the same
+metadata only for full-head rotation with the default interleaved layout. The
 interleaved layout rotates adjacent pairs in `q` and `new_k` at position
-`cache_seqlens`; the rotated key is what the cache stores. `rotary_dim` may be
-the full head dimension, or 64 for a D128 head; the latter preserves dimensions
-64 through 127 unchanged. Passing `rotary_interleaved=False` selects the GPT-NeoX
-split-half pair layout and is supported only for full-head rotation. Other
+`cache_seqlens`; the rotated key is what the cache stores. For Python-integer
+one-token appends, `rotary_dim` may be the full head dimension, or 64 for a D128
+head; the latter preserves dimensions 64 through 127 unchanged. Passing
+`rotary_interleaved=False` selects the GPT-NeoX split-half pair layout and is
+supported only for full-head rotation on those Python-integer appends. Other
 partial rotary dimensions and rotary on a read-only call are rejected. The
 exact 4K non-final append accepts full-head rotation in either layout and D64
 half-head rotation in the interleaved layout. The exact two-token final append
