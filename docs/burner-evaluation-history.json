@@ -3853,6 +3853,36 @@
         "eval_5b403bea": 100,
         "eval_1d780d3a": 100
       }
+    },
+    {
+      "key": "base:ff74f8e28833b1db78483986e0ab208f713cac56",
+      "commit": "ff74f8e28833b1db78483986e0ab208f713cac56",
+      "recordedAt": "2026-08-11T00:05:57.606Z",
+      "label": "base ff74f8e",
+      "kind": "baseline",
+      "title": "main",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 61,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
+    },
+    {
+      "key": "pr:168",
+      "recordedAt": "2026-08-11T00:05:57.606Z",
+      "label": "PR #168",
+      "kind": "leaf",
+      "prNumber": 168,
+      "title": "Append the final 1K token with a tensor cache length",
+      "scores": {
+        "eval_90b186af": 100,
+        "eval_24dff610": 100,
+        "eval_1afd133e": 62,
+        "eval_5b403bea": 100,
+        "eval_1d780d3a": 100
+      }
     }
   ]
 }
