@@ -21,12 +21,13 @@ Grad-enabled calls use a bounded PyTorch SDPA autograd bridge. That runtime
 also provides
 ``softcap=50.0`` for one forward-only Gemma-2 profile, the shipped causal
 varlen profile, read-only page-256/page-512 core paged decode, and read-only
-page-256/page-512 KV-cache decode. The same runtime exposes
-page-256/page-512 decode with optional ALiBi through the core varlen API. The
-KV-cache adapter also uses the generic paged runtime for ALiBi on both exposed
-page-16 profiles and page-256/page-512 decode. Read-only causal 1K and both
-causal variants of 4K dense decode likewise
-use the generic runtime for a bounded Python-int prefix. Those profiles and
+page-256/page-512 KV-cache decode. The Gemma-2 and shipped causal varlen
+profiles also expose the diagnostic return with that cap. The same runtime
+exposes page-256/page-512 decode with optional ALiBi through the core varlen
+API. The KV-cache adapter also uses the generic paged runtime for ALiBi on
+both exposed page-16 profiles and page-256/page-512 decode. Read-only causal
+1K and both causal variants of 4K dense decode likewise use the generic
+runtime for a bounded Python-int prefix. Those profiles and
 causal 16K decode also use it for read-only CUDA-tensor-selected spans, while
 the 4K profiles support full-cache or scalar-prefix ALiBi. The causal 4K
 profile also supports ALiBi on tensor-selected prefixes without left padding.
@@ -1605,6 +1606,7 @@ def _generic_varlen_diagnostic_forward(
     spec: AttnShape,
     *,
     alibi_slopes: torch.Tensor | None = None,
+    softcap: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return FA2-compatible diagnostics from the generic packed runtime."""
     # The generated specialization remains the default fast path, but it does
@@ -1625,7 +1627,7 @@ def _generic_varlen_diagnostic_forward(
         softmax_scale=softmax_scale,
         causal=True,
         window_size=(-1, -1),
-        softcap=0.0,
+        softcap=softcap,
         alibi_slopes=alibi_slopes,
         q_descale=None,
         k_descale=None,
@@ -2052,17 +2054,21 @@ def flash_attn_varlen_func(
     The causal version of that profile accepts exactly ``softcap=50.0`` for
     calls that do not need backward, with either the default or a custom
     ``softmax_scale``. Softcapped calls use the generic packed Triton runtime;
-    ``softcap=0`` retains the generated specialization. Other caps and
-    profiles, gradients, dropout, ALiBi, local windows, and diagnostic returns
-    remain unsupported with softcap. Paged softcap remains unsupported except
-    for the exact page-size-256/page-size-512 decode profile described above.
+    they may additionally request ``return_attn_probs=True`` to receive fp32
+    LSE shaped ``[16, total_q]`` and an empty bf16 ``S_dmask``. ``softcap=0``
+    retains the generated specialization. Other caps and profiles, gradients,
+    dropout, ALiBi, local windows, determinism, and paging remain unsupported
+    for this composition. Paged softcap remains unsupported except for the
+    exact page-size-256/page-size-512 decode profile described above, without
+    diagnostic returns.
 
     The causal version of that profile also supports
-    ``return_attn_probs=True`` with ``causal=True`` and all options other than
-    ``softmax_scale`` and optional ALiBi retaining their defaults. Forward
-    calls may be ragged, and ALiBi slopes may have shape ``[16]`` or
-    ``[8, 16]``. Slope-free backward is restricted to full-length inputs, where
-    all eight query and key sequences have length 512. It returns
+    ``return_attn_probs=True`` with ``causal=True``, optional
+    ``softmax_scale``, and either optional ALiBi or the exact softcap described
+    above; ALiBi and softcap cannot be combined. Forward calls may be ragged,
+    and ALiBi slopes may have shape ``[16]`` or ``[8, 16]``. Slope-free,
+    uncapped backward is restricted to full-length inputs, where all eight
+    query and key sequences have length 512. It returns
     ``(out, softmax_lse, S_dmask)`` with fp32 LSE shaped
     ``[nheads_q, total_q]`` and an empty bf16 ``S_dmask``. In backward, only
     ``out`` contributes Q/K/V gradients; auxiliary gradients are ignored,
@@ -2098,6 +2104,7 @@ def flash_attn_varlen_func(
         return_attn_probs,
         allow_alibi=True,
         allow_return_attn_probs=True,
+        allow_softcap_return_attn_probs=True,
         allowed_softcap=_VARLEN_SOFTCAP,
     )
     if type(max_seqlen_q) is not int or type(max_seqlen_k) is not int:
@@ -2188,6 +2195,11 @@ def flash_attn_varlen_func(
 
     if return_attn_probs:
         if block_table is not None:
+            if has_softcap:
+                raise NotImplementedError(
+                    "return_attn_probs=True is not implemented with softcap "
+                    "and block_table"
+                )
             raise NotImplementedError(
                 "return_attn_probs=True is not implemented with block_table"
             )
@@ -2449,6 +2461,17 @@ def flash_attn_varlen_func(
             window,
         )
     if has_softcap:
+        if return_attn_probs:
+            return _generic_varlen_diagnostic_forward(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                scale,
+                spec,
+                softcap=_VARLEN_SOFTCAP,
+            )
         return _generic_varlen_softcap_forward(
             q,
             k,

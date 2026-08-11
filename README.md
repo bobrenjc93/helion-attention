@@ -219,26 +219,31 @@ This shipped causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile accepts
 exactly `softcap=50.0` for calls that do not require backward. Dynamic ragged
 query/key lengths and the default or a custom `softmax_scale` are supported by
 the unpacked and QKV/KV-packed entry points. Softcapped calls use the generic
-packed Triton runtime and apply `50 * tanh(scores / 50)` before softmax;
+packed Triton runtime and apply `50 * tanh(scores / 50)` before softmax. They
+may additionally pass `return_attn_probs=True` and receive `(out, softmax_lse,
+S_dmask)`, with fp32 LSE shaped `[16, total_q]` and an empty bf16 `S_dmask`.
 `softcap=0` retains the generated specialization. Other caps and profiles,
-gradients, dropout, ALiBi, local windows, and diagnostic returns remain
-unsupported with softcap. Paged softcap remains unsupported except for the
-exact core page-size-256/page-size-512 decode profile described below.
+gradients, dropout, ALiBi, local windows, deterministic mode, and paging remain
+unsupported for this diagnostic composition. Paged softcap remains unsupported
+except for the exact core page-size-256/page-size-512 decode profile described
+below, without diagnostic returns.
 
 The causal bf16 `(8, 512, 512, 16, 16, 64)` varlen profile supports
-`return_attn_probs=True` with otherwise default options apart from `causal=True`,
-an optional custom `softmax_scale`, and optional fp32 ALiBi slopes shaped `[16]`
-or `[8, 16]`. Forward calls may be ragged; slope-free backward is restricted to
-all eight query and key sequences having length 512. It returns
+`return_attn_probs=True` with `causal=True`, an optional custom `softmax_scale`,
+and either optional fp32 ALiBi slopes shaped `[16]` or `[8, 16]` or exactly
+`softcap=50.0`; ALiBi and softcap cannot be combined. Forward calls may be
+ragged; slope-free, uncapped backward is restricted to all eight query and key
+sequences having length 512. It returns
 `(out, softmax_lse, S_dmask)`, where LSE is fp32 with shape `[16, total_q]` and
 `S_dmask` is an empty bf16 tensor. Only `out` contributes Q/K/V gradients; LSE
 and `S_dmask` gradients are ignored, matching FA2. Fully masked causal rows in
 ragged forward calls have zero output and `+inf` LSE. The generated
-specialization remains the path when the option is false and no ALiBi slopes
-are supplied; diagnostic calls use the generic packed runtime that produces
-LSE directly. The varlen QKV/KV-packed adapters inherit this support. Combined
-ALiBi diagnostic calls remain forward-only and reject paging, deterministic
-mode, and other optional features.
+specialization remains the path when the option is false, no ALiBi slopes are
+supplied, and `softcap=0`; diagnostic calls use the generic packed runtime that
+produces LSE directly. The varlen QKV/KV-packed adapters inherit this support.
+Combined ALiBi diagnostic calls and softcapped diagnostic calls remain
+forward-only and reject paging, deterministic mode, and other incompatible
+optional features.
 
 Both the causal and noncausal bf16 profiles at these maxima support forward-only
 ALiBi. Pass fp32 CUDA slopes shaped `[16]` or `[8, 16]` through `alibi_slopes`;
@@ -888,8 +893,9 @@ raise `NotImplementedError` rather than silently doing something else:
   page-size-256 or page-size-512 decode `(4, 1, 1024, 8, 2, 128)` with either
   decode-equivalent causal flag; the supported softcap cannot be
   combined with dropout, ALiBi, local windows, or autograd; the dense/KV-packed
-  Gemma-2 exception permits its diagnostic tuple described above, while only
-  the paged KV-cache exception permits its documented LSE return
+  Gemma-2 and unpacked/QKV/KV-packed causal varlen exceptions permit their
+  diagnostic tuples described above, core paged-varlen softcap does not, and
+  only the paged KV-cache exception permits its documented LSE return
 - ALiBi slopes for non-paged varlen profiles other than the causal and
   noncausal bf16 `(8, 512, 512, 16, 16, 64)` profiles and causal bf16
   `(4, 256, 256, 32, 8, 128)` profile above, for core paged-varlen calls outside

@@ -5037,6 +5037,93 @@ def test_causal_varlen_softcap_matches_fa2_and_fp32_for_dynamic_ragged_calls(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "attention", ["self", "cross"], ids=["ragged-self", "ragged-cross"]
+)
+@pytest.mark.parametrize(
+    "softmax_scale", [None, 0.37], ids=["default-scale", "custom-scale"]
+)
+def test_causal_varlen_softcap_diagnostics_match_fa2(
+    attention: str,
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = VARLEN_SOFTCAP
+    if attention == "self":
+        q, k, v, cu_q, _ = make_ragged_self_packed(
+            spec, seed=20260810
+        )
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, lengths_q, lengths_k = (
+            make_ragged_cross_packed(spec, seed=20260810)
+        )
+        assert all(length > 0 for length in lengths_q + lengths_k)
+        assert cu_q.data_ptr() != cu_k.data_ptr()
+        assert q.shape[0] != k.shape[0]
+
+    # Exercise the nonlinear region of the cap rather than only its near-zero
+    # approximation.
+    q.mul_(4.0)
+    k.mul_(4.0)
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            softcap=VARLEN_SOFTCAP_VALUE,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        expected = flash_attn.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=softmax_scale,
+            causal=True,
+            softcap=VARLEN_SOFTCAP_VALUE,
+            return_attn_probs=True,
+        )
+
+    assert isinstance(got, tuple) and len(got) == 3
+    assert isinstance(expected, tuple) and len(expected) == 3
+    out, softmax_lse, s_dmask = got
+    expected_out, expected_lse, expected_s_dmask = expected
+    assert out.shape == expected_out.shape == q.shape
+    assert out.dtype == expected_out.dtype == torch.bfloat16
+    assert softmax_lse.shape == expected_lse.shape == (
+        spec.nheads_q,
+        q.shape[0],
+    )
+    assert softmax_lse.dtype == expected_lse.dtype == torch.float32
+    assert s_dmask.shape == expected_s_dmask.shape == (0,)
+    assert s_dmask.dtype == expected_s_dmask.dtype == torch.bfloat16
+    assert s_dmask.device == expected_s_dmask.device == q.device
+    torch.testing.assert_close(
+        out.float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    finite_lse = torch.isfinite(expected_lse)
+    assert torch.equal(torch.isfinite(softmax_lse), finite_lse)
+    torch.testing.assert_close(
+        softmax_lse[finite_lse],
+        expected_lse[finite_lse],
+        atol=2e-3,
+        rtol=1e-5,
+    )
+    assert torch.equal(softmax_lse[~finite_lse], expected_lse[~finite_lse])
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "name",
     ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
     ids=["qkv-packed", "kv-packed"],
@@ -5099,6 +5186,135 @@ def test_varlen_packed_entry_points_inherit_softcap_support(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "name",
+    ["flash_attn_varlen_qkvpacked_func", "flash_attn_varlen_kvpacked_func"],
+    ids=["qkv-packed", "kv-packed"],
+)
+def test_varlen_packed_entry_points_inherit_softcap_diagnostics(
+    name: str,
+) -> None:
+    spec = VARLEN_SOFTCAP
+    if name == "flash_attn_varlen_qkvpacked_func":
+        q, k, v, cu_q, _ = make_ragged_self_packed(spec, seed=173205)
+        cu_k = cu_q
+    else:
+        q, k, v, cu_q, cu_k, *_ = make_ragged_cross_packed(
+            spec, seed=223607
+        )
+
+    with torch.no_grad():
+        expected = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            softmax_scale=0.37,
+            causal=True,
+            softcap=VARLEN_SOFTCAP_VALUE,
+            return_attn_probs=True,
+            shape=spec,
+        )
+        if name == "flash_attn_varlen_qkvpacked_func":
+            got = helion_attention.flash_attn_varlen_qkvpacked_func(
+                torch.stack((q, k, v), dim=1),
+                cu_q,
+                spec.seqlen_q,
+                softmax_scale=0.37,
+                causal=True,
+                softcap=VARLEN_SOFTCAP_VALUE,
+                return_attn_probs=True,
+                shape=spec,
+            )
+        else:
+            got = helion_attention.flash_attn_varlen_kvpacked_func(
+                q,
+                torch.stack((k, v), dim=1),
+                cu_q,
+                cu_k,
+                spec.seqlen_q,
+                spec.seqlen_k,
+                softmax_scale=0.37,
+                causal=True,
+                softcap=VARLEN_SOFTCAP_VALUE,
+                return_attn_probs=True,
+                shape=spec,
+            )
+
+    assert isinstance(got, tuple) and isinstance(expected, tuple)
+    for actual_tensor, expected_tensor in zip(got, expected):
+        torch.testing.assert_close(actual_tensor, expected_tensor)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "features", ["softcap", "diagnostics", "combined"]
+)
+def test_varlen_softcap_and_diagnostic_dispatch_stays_separate(
+    features: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_SOFTCAP
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0)
+    out = torch.empty_like(q)
+    diagnostics = (out, torch.empty(1, device=q.device), q.new_empty((0,)))
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    def softcap_forward(*args: object, **kwargs: object) -> torch.Tensor:
+        calls.append(("softcap", args, kwargs))
+        return out
+
+    def diagnostic_forward(
+        *args: object, **kwargs: object
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        calls.append(("diagnostics", args, kwargs))
+        return diagnostics
+
+    def reject_dispatch(*args: object, **kwargs: object) -> object:
+        raise AssertionError("feature call reached unrelated varlen dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_softcap_forward", softcap_forward
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", diagnostic_forward
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+
+    kwargs: dict[str, object] = {}
+    if features in ("softcap", "combined"):
+        kwargs["softcap"] = VARLEN_SOFTCAP_VALUE
+    if features in ("diagnostics", "combined"):
+        kwargs["return_attn_probs"] = True
+    with torch.no_grad():
+        got = helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            causal=True,
+            shape=spec,
+            **kwargs,
+        )
+
+    expected_dispatch = "softcap" if features == "softcap" else "diagnostics"
+    assert got is (out if features == "softcap" else diagnostics)
+    assert len(calls) == 1
+    dispatch, args, dispatch_kwargs = calls[0]
+    assert dispatch == expected_dispatch
+    assert len(args) == 7
+    assert dispatch_kwargs == (
+        {"softcap": VARLEN_SOFTCAP_VALUE} if features == "combined" else {}
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     ("case", "message"),
     [
         ("other-cap", "only as softcap=50.0"),
@@ -5109,7 +5325,6 @@ def test_varlen_packed_entry_points_inherit_softcap_support(
         ("dropout", "dropout"),
         ("alibi", "softcap combined with ALiBi"),
         ("window", "sliding-window"),
-        ("diagnostic", "return_attn_probs=True.*softcap"),
     ],
 )
 def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
@@ -5144,14 +5359,93 @@ def test_varlen_softcap_rejects_out_of_scope_calls_before_dispatch(
         )
     elif case == "window":
         kwargs["window_size"] = (128, 0)
-    elif case == "diagnostic":
-        kwargs["return_attn_probs"] = True
 
     def reject_dispatch(*args: object, **dispatch_kwargs: object) -> torch.Tensor:
         raise AssertionError("out-of-scope varlen softcap call reached dispatch")
 
     monkeypatch.setattr(
         helion_attention, "_generic_varlen_softcap_forward", reject_dispatch
+    )
+    monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
+    monkeypatch.setattr(helion_attention, "dense_attention_sdpa", reject_dispatch)
+    with pytest.raises(NotImplementedError, match=message):
+        helion_attention.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            spec.seqlen_q,
+            spec.seqlen_k,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("other-cap", "only as softcap=50.0"),
+        ("noncausal", "only.*causal varlen"),
+        ("other-shape", "only.*causal varlen"),
+        ("fp16", "only.*causal varlen"),
+        ("gradient", "forward-only"),
+        ("dropout", "dropout"),
+        ("alibi", "softcap combined with ALiBi"),
+        ("window", "sliding-window"),
+        ("deterministic", "deterministic=False"),
+        ("paging", "block_table"),
+    ],
+)
+def test_varlen_softcap_diagnostics_reject_out_of_scope_calls_before_dispatch(
+    case: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = VARLEN_SOFTCAP
+    q, k, v, cu_q, cu_k, *_ = make_packed(spec, variant=0, seed=244949)
+    kwargs: dict[str, object] = {
+        "causal": True,
+        "softcap": VARLEN_SOFTCAP_VALUE,
+        "return_attn_probs": True,
+        "shape": spec,
+    }
+    if case == "other-cap":
+        kwargs["softcap"] = 49.0
+    elif case == "noncausal":
+        spec = VARLEN_ALIBI_NONCAUSAL
+        kwargs.update(causal=False, shape=spec)
+    elif case == "other-shape":
+        spec = AttnShape(8, 256, 256, 16, 16, 64, torch.bfloat16, True)
+        kwargs["shape"] = spec
+    elif case == "fp16":
+        spec = AttnShape(8, 512, 512, 16, 16, 64, torch.float16, True)
+        q, k, v = (tensor.to(torch.float16) for tensor in (q, k, v))
+        kwargs["shape"] = spec
+    elif case == "gradient":
+        q.requires_grad_()
+    elif case == "dropout":
+        kwargs["dropout_p"] = 0.1
+    elif case == "alibi":
+        kwargs["alibi_slopes"] = torch.ones(
+            spec.nheads_q, device=q.device, dtype=torch.float32
+        )
+    elif case == "window":
+        kwargs["window_size"] = (128, 0)
+    elif case == "deterministic":
+        kwargs["deterministic"] = True
+    elif case == "paging":
+        kwargs["block_table"] = torch.zeros(1, device=q.device)
+
+    def reject_dispatch(*args: object, **dispatch_kwargs: object) -> object:
+        raise AssertionError("out-of-scope softcap diagnostic reached dispatch")
+
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_softcap_forward", reject_dispatch
+    )
+    monkeypatch.setattr(
+        helion_attention, "_generic_varlen_diagnostic_forward", reject_dispatch
     )
     monkeypatch.setattr(helion_attention, "lookup_varlen", reject_dispatch)
     monkeypatch.setattr(helion_attention, "lookup_paged", reject_dispatch)
