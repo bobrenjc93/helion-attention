@@ -9567,6 +9567,340 @@ def test_kvcache_1k_identity_batch_idx_matches_fa2_and_omitted_selector(
 
 @requires_cuda
 @pytest.mark.parametrize(
+    "softmax_scale",
+    [None, 0.17],
+    ids=["default-scale", "custom-scale"],
+)
+def test_kvcache_1k_second_row_batch_idx_matches_fa2_and_fp32_without_mutation(
+    softmax_scale: float | None,
+) -> None:
+    flash_attn = pytest.importorskip("flash_attn")
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, selected_k, selected_v = make_inputs(spec, seed=20260856)
+    _, first_k, first_v = make_inputs(spec, seed=20260857)
+    k_cache = torch.cat((first_k, selected_k), dim=0)
+    v_cache = torch.cat((first_v, selected_v), dim=0)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    k_pointer = k_cache.data_ptr()
+    v_pointer = v_cache.data_ptr()
+    cache_batch_idx = torch.tensor(
+        [1], device=q.device, dtype=torch.int32
+    )
+    scale = (
+        1.0 / math.sqrt(spec.head_dim)
+        if softmax_scale is None
+        else softmax_scale
+    )
+
+    got = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_batch_idx=cache_batch_idx,
+        softmax_scale=softmax_scale,
+        causal=True,
+        shape=spec,
+    )
+    expected_fa2 = flash_attn.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_batch_idx=cache_batch_idx,
+        softmax_scale=softmax_scale,
+        causal=True,
+    )
+    expected_fp32, _ = reference_single_token_prefix_attention(
+        q,
+        k_cache[1:2],
+        v_cache[1:2],
+        spec.seqlen_k,
+        spec,
+        scale,
+    )
+
+    assert isinstance(got, torch.Tensor)
+    assert isinstance(expected_fa2, torch.Tensor)
+    assert got.shape == q.shape
+    assert got.dtype == q.dtype
+    torch.testing.assert_close(got, expected_fa2, atol=2e-2, rtol=1e-2)
+    torch.testing.assert_close(
+        got.float(), expected_fp32, atol=5e-2, rtol=2e-2
+    )
+    assert k_cache.data_ptr() == k_pointer
+    assert v_cache.data_ptr() == v_pointer
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+def test_kvcache_1k_second_row_batch_idx_uses_generated_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, second_k, second_v = make_inputs(spec, seed=20260858)
+    _, first_k, first_v = make_inputs(spec, seed=20260859)
+    k_cache = torch.cat((first_k, second_k), dim=0)
+    v_cache = torch.cat((first_v, second_v), dim=0)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    cache_batch_idx = torch.tensor(
+        [1], device=q.device, dtype=torch.int32
+    )
+    marker = torch.empty_like(q)
+    lookup_calls: list[AttnShape] = []
+
+    def lookup_stub(spec_arg: AttnShape):  # noqa: ANN202
+        lookup_calls.append(spec_arg)
+
+        def kernel(
+            q_arg: torch.Tensor,
+            k_arg: torch.Tensor,
+            v_arg: torch.Tensor,
+            scale_arg: float,
+        ) -> torch.Tensor:
+            assert q_arg is q
+            assert tuple(k_arg.shape) == tuple(second_k.shape)
+            assert tuple(v_arg.shape) == tuple(second_v.shape)
+            assert k_arg.data_ptr() == k_cache[1].data_ptr()
+            assert v_arg.data_ptr() == v_cache[1].data_ptr()
+            assert torch.equal(k_arg, second_k)
+            assert torch.equal(v_arg, second_v)
+            assert scale_arg == 1.0 / math.sqrt(spec.head_dim)
+            return marker
+
+        return kernel
+
+    def reject_generic(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("two-row cache remap reached generic dispatch")
+
+    monkeypatch.setattr(helion_attention, "lookup", lookup_stub)
+    for dispatch_name in (
+        "_tensor_length_dense_kvcache_forward",
+        "_generic_dense_forward",
+        "_generic_dense_diagnostic_forward",
+        "attention_autograd",
+    ):
+        monkeypatch.setattr(helion_attention, dispatch_name, reject_generic)
+
+    result = helion_attention.flash_attn_with_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        cache_batch_idx=cache_batch_idx,
+        causal=True,
+        shape=spec,
+    )
+
+    assert result is marker
+    assert lookup_calls == [spec]
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+
+
+@requires_cuda
+def test_kvcache_1k_second_row_batch_idx_rejects_every_other_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, second_k, second_v = make_inputs(spec, seed=20260860)
+    _, first_k, first_v = make_inputs(spec, seed=20260861)
+    k_cache = torch.cat((first_k, second_k), dim=0)
+    v_cache = torch.cat((first_v, second_v), dim=0)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    selector = torch.tensor([1], device=q.device, dtype=torch.int32)
+    new_k = second_k[:, :1].clone()
+    new_v = second_v[:, :1].clone()
+    cases: list[
+        tuple[str, torch.Tensor, type[Exception], str, dict[str, object]]
+    ] = [
+        (
+            "full-python-length",
+            q,
+            NotImplementedError,
+            "requires cache_seqlens to be omitted",
+            {"cache_seqlens": spec.seqlen_k},
+        ),
+        (
+            "partial-python-length",
+            q,
+            NotImplementedError,
+            "requires cache_seqlens to be omitted",
+            {"cache_seqlens": spec.seqlen_k - 1},
+        ),
+        (
+            "tensor-length",
+            q,
+            NotImplementedError,
+            "requires cache_seqlens to be omitted",
+            {
+                "cache_seqlens": torch.tensor(
+                    [spec.seqlen_k], device=q.device, dtype=torch.int32
+                )
+            },
+        ),
+        (
+            "leftpad",
+            q,
+            NotImplementedError,
+            "cache_leftpad",
+            {
+                "cache_leftpad": torch.tensor(
+                    [0], device=q.device, dtype=torch.int32
+                )
+            },
+        ),
+        (
+            "update",
+            q,
+            NotImplementedError,
+            "read-only",
+            {
+                "k": new_k,
+                "v": new_v,
+                "cache_seqlens": spec.seqlen_k - 1,
+            },
+        ),
+        (
+            "lse",
+            q,
+            NotImplementedError,
+            "return_softmax_lse",
+            {"return_softmax_lse": True},
+        ),
+        (
+            "alibi",
+            q,
+            NotImplementedError,
+            "ALiBi is implemented only",
+            {
+                "alibi_slopes": torch.ones(
+                    spec.nheads_q, device=q.device, dtype=torch.float32
+                )
+            },
+        ),
+        (
+            "window",
+            q,
+            NotImplementedError,
+            "sliding-window attention is implemented only",
+            {"window_size": (511, 0)},
+        ),
+        (
+            "softcap",
+            q,
+            NotImplementedError,
+            "softcap",
+            {"softcap": 50.0},
+        ),
+        (
+            "num-splits",
+            q,
+            NotImplementedError,
+            "only.*16384",
+            {"num_splits": 16},
+        ),
+        (
+            "autograd",
+            q.detach().requires_grad_(),
+            NotImplementedError,
+            "autograd",
+            {},
+        ),
+    ]
+
+    def reject_dispatch(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("out-of-scope two-row remap reached dispatch")
+
+    for dispatch_name in (
+        "lookup",
+        "_paged_kvcache_forward",
+        "_tensor_length_dense_kvcache_forward",
+        "_generic_dense_forward",
+        "_generic_dense_diagnostic_forward",
+        "attention_autograd",
+    ):
+        monkeypatch.setattr(helion_attention, dispatch_name, reject_dispatch)
+
+    for case, q_arg, error, message, kwargs in cases:
+        with pytest.raises(error, match=message):
+            helion_attention.flash_attn_with_kvcache(
+                q_arg,
+                k_cache,
+                v_cache,
+                cache_batch_idx=selector,
+                causal=True,
+                shape=spec,
+                **kwargs,  # type: ignore[arg-type]
+            )
+        assert torch.equal(k_cache, original_k), case
+        assert torch.equal(v_cache, original_v), case
+
+    for selected_row in (-1, 0, 2):
+        with pytest.raises(NotImplementedError, match="only cache_batch_idx"):
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                cache_batch_idx=torch.tensor(
+                    [selected_row], device=q.device, dtype=torch.int32
+                ),
+                causal=True,
+                shape=spec,
+            )
+        assert torch.equal(k_cache, original_k)
+        assert torch.equal(v_cache, original_v)
+
+    three_row_k = torch.cat((k_cache, second_k), dim=0)
+    three_row_v = torch.cat((v_cache, second_v), dim=0)
+    original_three_row_k = three_row_k.clone()
+    original_three_row_v = three_row_v.clone()
+    with pytest.raises(NotImplementedError, match="exact two-row"):
+        helion_attention.flash_attn_with_kvcache(
+            q,
+            three_row_k,
+            three_row_v,
+            cache_batch_idx=selector,
+            causal=True,
+            shape=spec,
+        )
+    assert torch.equal(three_row_k, original_three_row_k)
+    assert torch.equal(three_row_v, original_three_row_v)
+
+
+@requires_cuda
+def test_kvcache_1k_second_row_batch_idx_rejects_cuda_graph_capture() -> None:
+    spec = spec_from_manifest_entry(CAUSAL_1K_SCALAR_PREFIX_DECODE)
+    q, second_k, second_v = make_inputs(spec, seed=20260862)
+    _, first_k, first_v = make_inputs(spec, seed=20260863)
+    k_cache = torch.cat((first_k, second_k), dim=0)
+    v_cache = torch.cat((first_v, second_v), dim=0)
+    original_k = k_cache.clone()
+    original_v = v_cache.clone()
+    selector = torch.tensor([1], device=q.device, dtype=torch.int32)
+
+    graph = torch.cuda.CUDAGraph()
+    capture_marker = torch.empty_like(q)
+    with pytest.raises(NotImplementedError, match="CUDA graph capture"):
+        with torch.cuda.graph(graph):
+            capture_marker.copy_(q)
+            helion_attention.flash_attn_with_kvcache(
+                q,
+                k_cache,
+                v_cache,
+                cache_batch_idx=selector,
+                causal=True,
+                shape=spec,
+            )
+
+    assert torch.equal(k_cache, original_k)
+    assert torch.equal(v_cache, original_v)
+    torch.cuda.synchronize(q.device)
+
+
+@requires_cuda
+@pytest.mark.parametrize(
     "position", [0, 512, 1022], ids=["beginning", "middle", "penultimate"]
 )
 @pytest.mark.parametrize(
